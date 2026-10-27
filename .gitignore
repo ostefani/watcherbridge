@@ -1,0 +1,47 @@
+# --- Build output ---
+/watcherbridge
+/bin/
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# --- Go tooling ---
+*.test
+*.out
+coverage.*
+go.work
+go.work.sum
+
+# --- Secrets and local config (never commit) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+config.local.*
+
+# --- Runtime data: may contain real network information ---
+# Local event log, pseudonym map, and scan reports stay on your machine.
+# Committed test fixtures belong in testdata/ and must be synthetic.
+/data/
+/reports/
+/scan-reports/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+pseudonyms.*
+
+# --- Editors and IDEs ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+.innerdoc
