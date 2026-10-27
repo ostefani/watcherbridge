@@ -1,11 +1,13 @@
 # WatcherBridge
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Go Version](https://img.shields.io/badge/go-1.25-blue)
 ![Status: early development](https://img.shields.io/badge/status-early%20development-orange)
 ![Developed with Muse Spark](https://img.shields.io/badge/developed%20with-Muse%20Spark-0467DF)
 ![Model is configurable](https://img.shields.io/badge/model-configurable-lightgrey)
 ![Redaction on by default](https://img.shields.io/badge/redaction-on%20by%20default-brightgreen)
 ![Built for a hackathon](https://img.shields.io/badge/built%20for-hackathon-blueviolet)
+![Visitors](https://visitor-badge.laobi.icu/badge?page_id=ostefani.subnetlense)
 
 An open-source bridge that receives network watch events via webhooks and turns them into short, prioritized briefings.
 
@@ -129,6 +131,9 @@ export WEBHOOK_SECRET=...
 
 # 4. Point SubnetLens Pro's webhook at the bridge
 # 5. Open the built-in viewer
+
+# Test
+go test -v ./internal/store/...
 ```
 
 ## Roadmap
