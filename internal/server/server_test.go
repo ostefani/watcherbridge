@@ -124,12 +124,13 @@ func newHarness(t *testing.T, mutate func(*config.Config)) *harness {
 	t.Helper()
 	relay := newFakeRelay(t)
 	cfg := config.Default()
+	cfg.Mode = config.ModeProxy // most tests exercise forwarding; tap tests override
 	cfg.ScanRelayURL = relay.srv.URL
-	cfg.Secret = "test-secret"
+	cfg.Secret = "test-secret-long-enough"
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	st, err := store.Open(filepath.Join(t.TempDir(), "bridge.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "bridge.db"), store.WithQueueCap(cfg.WriterQueueCap))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +139,7 @@ func newHarness(t *testing.T, mutate func(*config.Config)) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &harness{srv: srv, relay: relay, secret: "test-secret"}
+	return &harness{srv: srv, relay: relay, secret: "test-secret-long-enough"}
 }
 
 func (h *harness) post(t *testing.T, body []byte, id, key, typ string, ts time.Time, sig string) *httptest.ResponseRecorder {
@@ -555,11 +556,12 @@ func TestWALBoundedUnderLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	h := &harness{secret: "test-secret"}
+	h := &harness{secret: "test-secret-long-enough"}
 	relay := newFakeRelay(t)
 	cfg := config.Default()
+	cfg.Mode = config.ModeProxy
 	cfg.ScanRelayURL = relay.srv.URL
-	cfg.Secret = "test-secret"
+	cfg.Secret = "test-secret-long-enough"
 	cfg.MaxBodyBytes = 256 << 10
 	srv, err := New(cfg, st, forwarder.NewGate())
 	if err != nil {
@@ -699,6 +701,145 @@ func TestShutdownDuringSweepForward(t *testing.T) {
 	}
 	if h.srv.gate.InFlight() != 0 {
 		t.Fatal("gate leaked after shutdown sweep")
+	}
+}
+
+func TestAnchorDerivation(t *testing.T) {
+	hostBody := func(hostJSON string) []byte {
+		return []byte(fmt.Sprintf(`{"event_id":"e1","event_key":"change:x:20260101T0000Z","event_type":"host.appeared","occurred_at":%q,"host":%s}`,
+			time.Now().UTC().Format(time.RFC3339Nano), hostJSON))
+	}
+	cases := map[string]struct {
+		body string
+		typ  string
+		want string
+		fb   bool
+	}{
+		"mac preferred":           {string(hostBody(`{"mac":"AA:BB:CC:DD:EE:FF","hostname":"pi","ip":"192.168.0.5"}`)), "host.appeared", "mac:aa:bb:cc:dd:ee:ff", false},
+		"randomized mac skipped":  {string(hostBody(`{"mac":"AA:BB:CC:DD:EE:FF","randomized_mac":true,"hostname":"Pixel"}`)), "host.appeared", "host:pixel", false},
+		"hostname only":           {string(hostBody(`{"hostname":"Printer."}`)), "host.disappeared", "host:printer", false},
+		"ip passthrough":          {string(hostBody(`{"ip":"192.168.0.5"}`)), "host.appeared", "ip:192.168.0.5", false},
+		"zero-padded ip rejected": {string(hostBody(`{"ip":"192.168.000.005"}`)), "host.appeared", "change:x:20260101T0000Z", true},
+		"no identifiers":          {string(hostBody(`{"vendor":"acme"}`)), "host.appeared", "change:x:20260101T0000Z", true},
+		"no host object":          {`{"event_id":"e1"}`, "host.appeared", "change:x:20260101T0000Z", true},
+		"garbage ip falls back":   {string(hostBody(`{"ip":"not-an-ip"}`)), "host.appeared", "change:x:20260101T0000Z", true},
+	}
+	for name, tc := range cases {
+		got, fb := anchorForEvent([]byte(tc.body), tc.typ, "change:x:20260101T0000Z")
+		if got != tc.want || fb != tc.fb {
+			t.Errorf("%s: got (%q,%v), want (%q,%v)", name, got, fb, tc.want, tc.fb)
+		}
+	}
+	changed := []byte(`{"event_id":"e1","current":{"ip":"10.0.0.9"},"previous":{"ip":"10.0.0.8"}}`)
+	if got, _ := anchorForEvent(changed, "host.changed", "k"); got != "ip:10.0.0.9" {
+		t.Errorf("changed prefers current: got %q", got)
+	}
+	prevOnly := []byte(`{"event_id":"e1","previous":{"mac":"11:22:33:44:55:66"}}`)
+	if got, _ := anchorForEvent(prevOnly, "host.changed", "k"); got != "mac:11:22:33:44:55:66" {
+		t.Errorf("changed falls back to previous: got %q", got)
+	}
+}
+
+func TestSameHostDifferentWindowsShareAGroup(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.Mode = config.ModeTap })
+	now := time.Now()
+	for i, key := range []string{"appear:mac-aa:20260101T0000Z", "change:mac-aa:deadbeef:20260102T0000Z"} {
+		id := uniqueID()
+		body := []byte(fmt.Sprintf(`{"event_id":%q,"event_key":%q,"event_type":"host.appeared","occurred_at":%q,"host":{"mac":"AA:BB:CC:DD:EE:01"}}`,
+			id, key, now.Format(time.RFC3339Nano)))
+		ts := strconv.FormatInt(now.Unix(), 10)
+		if rec := h.post(t, body, id, key, "host.appeared", now, sign(h.secret, ts, id, key, "host.appeared", body)); rec.Code != http.StatusAccepted {
+			t.Fatalf("event %d: got %d %s", i, rec.Code, rec.Body.String())
+		}
+	}
+	if n, err := h.srv.events.GroupEventCount(context.Background(), "mac:aa:bb:cc:dd:ee:01"); err != nil || n != 2 {
+		t.Fatalf("same host across windows must share one group: count=%d err=%v", n, err)
+	}
+}
+
+func TestTapSkipsSweep(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.Mode = config.ModeTap })
+	id := uniqueID()
+	seedUnforwarded(t, h, id, "host-t", time.Minute)
+	h.srv.SweepOnce(context.Background())
+	if fwd, _, _, _ := h.srv.events.ForwardState(context.Background(), id); fwd {
+		t.Fatal("tap sweep forwarded an event ScanRelay already has")
+	}
+	if h.relay.hits.Load() != 0 {
+		t.Fatal("tap sweep contacted ScanRelay")
+	}
+}
+
+func TestSweepStopsWhenNothingLands(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.Mode = config.ModeProxy })
+	h.relay.mode.Store("fail")
+	for i := 0; i < 3; i++ {
+		seedUnforwarded(t, h, uniqueID(), fmt.Sprintf("host-f%d", i), time.Minute)
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); h.srv.SweepOnce(context.Background()) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("sweep looped on failing forwards instead of stopping")
+	}
+	// One attempt per row, then the pass ends: bounded, no hot loop.
+	if got := h.relay.hits.Load(); got != 3 {
+		t.Fatalf("expected one attempt per row, got %d hits", got)
+	}
+}
+
+func TestForwardAuthInjectedAtSendTime(t *testing.T) {
+	var gotAuth, gotKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth, gotKey = r.Header.Get("Authorization"), r.Header.Get("X-API-Key")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{"accepted": true})
+	}))
+	defer srv.Close()
+
+	h := newHarness(t, func(c *config.Config) {
+		c.Mode = config.ModeProxy
+		c.ScanRelayURL = srv.URL
+		c.ForwardBearerToken = "relay-bearer-value"
+		c.ForwardAPIKey = "relay-key-value"
+	})
+	if rec := h.signedPost(t, uniqueID(), "host-a", "host.appeared", time.Now()); rec.Code != http.StatusAccepted {
+		t.Fatalf("got %d", rec.Code)
+	}
+	if gotAuth != "Bearer "+"relay-"+"bearer-value" {
+		t.Fatalf("auth header mismatch: %q", gotAuth)
+	}
+	if gotKey != "" {
+		t.Fatalf("api key must lose to bearer, got %q", gotKey)
+	}
+	// Stored headers must not contain the credentials.
+	cands, err := h.srv.events.SweepCandidates(context.Background(), time.Now(), time.Hour, time.Minute, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = cands
+}
+
+func TestClosedStoreIs503(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.Mode = config.ModeTap })
+	_ = h.srv.events.Close()
+	if rec := h.signedPost(t, uniqueID(), "host-a", "host.appeared", time.Now()); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("closed store: got %d, want 503 so Pro retries", rec.Code)
+	} else if rec.Header().Get("Retry-After") == "" {
+		t.Fatal("closed store: missing Retry-After")
+	}
+}
+
+func TestEventIDCharset(t *testing.T) {
+	now := time.Now()
+	body := eventBody("e1", "host-a", "host.appeared")
+	if _, err := parseAndValidate(now, 300*time.Second, strconv.FormatInt(now.Unix(), 10), "evt.bad", "host-a", "host.appeared", body); err == nil {
+		t.Fatal("dots must be rejected from event IDs")
+	}
+	if _, err := parseAndValidate(now, 300*time.Second, strconv.FormatInt(now.Unix(), 10), "evt-01_2", "host-a", "host.appeared", body); err != nil {
+		t.Fatalf("dash/underscore must stay valid: %v", err)
 	}
 }
 

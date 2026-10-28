@@ -17,9 +17,13 @@ const (
 	maxEventKeyLen = 256
 )
 
-// allowedEventIDChars is the charset Pro generates event IDs from.
+// validEventIDChar bounds the gate key and the store index. It is a
+// superset of what Pro generates today (UUID-like hex with '-'), kept
+// wide for forward compatibility: width is not a security boundary here,
+// the HMAC already binds the exact bytes, and a rejection is a visible
+// 400 Pro will retry.
 func validEventIDChar(c byte) bool {
-	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.'
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_'
 }
 
 type malformedError struct{ msg string }

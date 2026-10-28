@@ -3,9 +3,10 @@
 //
 // Contract (statuses mirror ScanRelay's /webhook where they overlap):
 // 202 accepted (persisted; forwarded in proxy mode), 401 bad signature or
-// timestamp, 400 malformed, 413 oversize, 405 non-POST, 503 saturated with
-// Retry-After, 502 ScanRelay delivery failed. A duplicate of a known event is
-// idempotent (202 when forwarded, 502 when not) — never a 401/409.
+// timestamp, 400 malformed, 413 oversize, 405 non-POST, 503 saturated or
+// store unavailable with Retry-After, 502 ScanRelay delivery failed.
+// A duplicate of a known event is idempotent (202 when forwarded, 502 when
+// not) — never a 401/409.
 package server
 
 import (
@@ -15,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -30,7 +32,13 @@ import (
 // event forwarded without a 2xx.
 const replayBody = `{"error":"replayed request"}`
 
+// forwardRespCap bounds the forwarded-response read: status plus the small
+// replay body are all the forwarder ever needs.
+const forwardRespCap = 8 << 10
+
 // eventTypes is the allowlist of Pro webhook event types (Designv5 §4).
+// Pro generates UUID-like IDs (hex and '-'); the charset below matches that
+// generator exactly rather than guessing wider.
 var eventTypes = map[string]bool{
 	"host.appeared":    true,
 	"host.disappeared": true,
@@ -50,6 +58,7 @@ type Server struct {
 
 	http *http.Server
 
+	sweepCtx    context.Context // created in New so Shutdown is safe before Start
 	sweepCancel context.CancelFunc
 	sweepDone   chan struct{}
 }
@@ -67,17 +76,17 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now
 	proxy := &http.Client{
 		Timeout: cfg.ProxyForwardTimeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse // 3xx is a forward failure, not a hop
 		},
 	}
+	sweepCtx, sweepCancel := context.WithCancel(context.Background())
 	s := &Server{
-		cfg: cfg, secret: secret, events: events, gate: gate, now: now,
+		cfg: cfg, secret: secret, events: events, gate: gate, now: time.Now,
 		sem: make(chan struct{}, cfg.InFlightCap), proxy: proxy,
-		sweepDone: make(chan struct{}),
+		sweepCtx: sweepCtx, sweepCancel: sweepCancel, sweepDone: make(chan struct{}),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook", s.handleWebhook)
@@ -99,30 +108,31 @@ func (s *Server) Handler() http.Handler { return s.http.Handler }
 // Start serves ingest and runs the startup sweep on one background worker.
 // It blocks until the listener fails or Shutdown is called.
 func (s *Server) Start() error {
-	ctx, cancel := context.WithCancel(context.Background())
-	s.sweepCancel = cancel
 	go func() {
 		defer close(s.sweepDone)
-		s.sweep(ctx)
+		s.sweep(s.sweepCtx)
 	}()
 	err := s.http.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
+	s.sweepCancel() // listener failed; nothing left for the sweeper to serve
 	return err
 }
 
 // Shutdown cancels the sweeper first, waits for it and for in-flight
-// handlers, then returns. The caller closes the store after Shutdown
-// returns so a sweep forward in flight can still commit its receipt.
+// handlers, checkpoints the WAL through the writer, then returns. The
+// caller closes the store after Shutdown returns so an in-flight forward
+// can still commit its receipt.
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s.sweepCancel != nil {
-		s.sweepCancel()
-	}
+	s.sweepCancel()
 	err := s.http.Shutdown(ctx)
 	select {
 	case <-s.sweepDone:
 	case <-ctx.Done():
+	}
+	if cerr := s.events.Checkpoint(ctx); cerr != nil {
+		log.Printf("ingest: shutdown checkpoint: %v", cerr)
 	}
 	return err
 }
@@ -133,17 +143,19 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
+func (s *Server) writeSaturated(w http.ResponseWriter, msg string) {
+	w.Header().Set("Retry-After", strconv.Itoa(s.cfg.RetryAfterSecs))
+	writeError(w, http.StatusServiceUnavailable, msg)
+}
+
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
+	// Non-POST methods never reach here: the "POST /webhook" pattern
+	// makes the mux answer 405 itself.
 	select {
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
 	default:
-		w.Header().Set("Retry-After", strconv.Itoa(s.cfg.RetryAfterSecs))
-		writeError(w, http.StatusServiceUnavailable, "server saturated")
+		s.writeSaturated(w, "server saturated")
 		return
 	}
 
@@ -184,13 +196,16 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	release, wait := s.gate.Acquire(eventID)
 	if wait != nil {
-		// Duplicate while the first handler is in flight: wait for its
-		// outcome, then follow the stored state. Waiting caps memory at
-		// one waiter per event instead of one body copy each.
+		// Duplicate while the holder is in flight: drop our body copy
+		// so a crowd of waiters cannot pile up MaxBodyBytes each, then
+		// follow the stored state — 202 when forwarded, 502 when not.
+		// A waiter never forwards inline: a second forward inside this
+		// deadline could exceed it.
+		body = nil
 		select {
 		case <-wait:
 		case <-ctx.Done():
-			writeError(w, http.StatusServiceUnavailable, "duplicate wait timed out")
+			s.writeSaturated(w, "duplicate wait timed out")
 			return
 		}
 		s.replyForStoredState(ctx, w, eventID, eventType)
@@ -198,64 +213,26 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
-	ev, perr := s.persist(ctx, body, r, eventID, eventKey, eventType, sigTime)
-	if perr != nil {
-		if errors.Is(perr, errDuplicate) {
-			// Post-completion retry (no holder in flight: we ARE the
-			// holder). If an earlier attempt already landed, accept;
-			// otherwise forward inline — this is Pro's outbox retry
-			// doing its job. In-flight duplicates never reach here:
-			// they wait on the gate and follow the stored state.
-			if fwd, _, _, err := s.events.ForwardState(ctx, eventID); err == nil && fwd {
-				writeAccepted(w, eventID, eventType)
-				return
-			}
-			if s.cfg.Mode == config.ModeTap || s.forwardOne(ctx, body, headerMap(r.Header), eventID) {
-				writeAccepted(w, eventID, eventType)
-				return
-			}
-			writeError(w, http.StatusBadGateway, "scanrelay delivery failed")
-			return
-		}
-		// A cancelled persist is "unknown, retry safely": Pro's outbox
-		// redelivers and the retry reports Inserted=false.
-		if errors.Is(perr, context.Canceled) || errors.Is(perr, context.DeadlineExceeded) {
-			writeError(w, http.StatusServiceUnavailable, "persist interrupted")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "invalid event")
-		return
+	anchor, fallback := anchorForEvent(body, eventType, eventKey)
+	if fallback {
+		log.Printf("ingest: event %s has no host identifier, grouping by event key", eventID)
 	}
-	_ = ev
-
-	if s.cfg.Mode == config.ModeTap {
-		writeAccepted(w, eventID, eventType)
-		return
+	if perr := s.persistAndReply(ctx, w, body, r, eventID, eventKey, eventType, anchor, sigTime); perr != nil {
+		s.reportPersistError(w, eventID, perr)
 	}
-	if s.forwardOne(ctx, body, headerMap(r.Header), eventID) {
-		writeAccepted(w, eventID, eventType)
-		return
-	}
-	writeError(w, http.StatusBadGateway, "scanrelay delivery failed")
 }
 
-var errDuplicate = errors.New("duplicate event")
+var errMalformedBody = errors.New("invalid event body")
 
-// persist stores the raw event and joins its host group in one transaction.
-// Inserted=false surfaces as errDuplicate so the caller follows §4.3.
-func (s *Server) persist(ctx context.Context, body []byte, r *http.Request, eventID, eventKey, eventType string, sigTime time.Time) (store.RawEvent, error) {
+// persistAndReply stores the event (or follows the duplicate path) and
+// writes the response. A nil return means the response is written.
+func (s *Server) persistAndReply(ctx context.Context, w http.ResponseWriter, body []byte, r *http.Request, eventID, eventKey, eventType, anchor string, sigTime time.Time) error {
 	pctx, cancel := context.WithTimeout(ctx, s.cfg.PersistBudget)
 	defer cancel()
 
-	headers := map[string]string{}
-	for k, v := range r.Header {
-		if len(v) > 0 {
-			headers[k] = v[0]
-		}
-	}
-	headersJSON, err := json.Marshal(store.WhitelistForwardHeaders(headers))
+	headersJSON, err := json.Marshal(store.WhitelistForwardHeaders(headerMap(r.Header)))
 	if err != nil {
-		return store.RawEvent{}, err
+		return errMalformedBody
 	}
 	var decoded struct {
 		EventID    string    `json:"event_id"`
@@ -266,7 +243,7 @@ func (s *Server) persist(ctx context.Context, body []byte, r *http.Request, even
 		Target     string    `json:"target"`
 	}
 	if err := json.Unmarshal(body, &decoded); err != nil {
-		return store.RawEvent{}, err
+		return errMalformedBody
 	}
 	ev := store.RawEvent{
 		EventID:            eventID,
@@ -275,7 +252,7 @@ func (s *Server) persist(ctx context.Context, body []byte, r *http.Request, even
 		OccurredAt:         decoded.OccurredAt,
 		Cycle:              decoded.Cycle,
 		Target:             decoded.Target,
-		Payload:            bytes.Clone(body),
+		Payload:            body, // ReadAll-owned; the store keeps it, no second copy
 		HeadersJSON:        string(headersJSON),
 		ReceivedAt:         s.now().UTC(),
 		SignatureTimestamp: sigTime,
@@ -283,18 +260,54 @@ func (s *Server) persist(ctx context.Context, body []byte, r *http.Request, even
 	if ev.OccurredAt.IsZero() {
 		ev.OccurredAt = ev.ReceivedAt
 	}
-	res, err := s.events.PersistEventAndGroup(pctx, ev, eventKey, store.GroupPolicy{
+	res, err := s.events.PersistEventAndGroup(pctx, ev, anchor, store.GroupPolicy{
 		QuietWindow: s.cfg.GroupQuietWindow,
 		MaxWindow:   s.cfg.GroupMaxWindow,
 		MaxEvents:   s.cfg.GroupMaxEvents,
 	})
 	if err != nil {
-		return store.RawEvent{}, err
+		return err
 	}
 	if !res.Inserted {
-		return store.RawEvent{}, errDuplicate
+		// Post-completion retry (no holder in flight: we ARE the
+		// holder). If an earlier attempt already landed, accept;
+		// otherwise forward inline — this is Pro's outbox retry
+		// doing its job. In-flight duplicates never reach here:
+		// they wait on the gate and follow the stored state.
+		if fwd, _, _, ferr := s.events.ForwardState(ctx, eventID); ferr == nil && fwd {
+			writeAccepted(w, eventID, eventType)
+			return nil
+		}
+		if s.cfg.Mode == config.ModeTap || s.forwardOne(ctx, body, headerMap(r.Header), eventID) {
+			writeAccepted(w, eventID, eventType)
+			return nil
+		}
+		writeError(w, http.StatusBadGateway, "scanrelay delivery failed")
+		return nil
 	}
-	return ev, nil
+
+	if s.cfg.Mode == config.ModeTap {
+		writeAccepted(w, eventID, eventType)
+		return nil
+	}
+	if s.forwardOne(ctx, body, headerMap(r.Header), eventID) {
+		writeAccepted(w, eventID, eventType)
+		return nil
+	}
+	writeError(w, http.StatusBadGateway, "scanrelay delivery failed")
+	return nil
+}
+
+// reportPersistError maps persist failures to statuses. Only pre-store
+// validation is a 400; everything past it (busy, closed, saturated) is a
+// 503 so Pro retries, and the failure is logged without request content.
+func (s *Server) reportPersistError(w http.ResponseWriter, eventID string, err error) {
+	if errors.Is(err, errMalformedBody) {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	log.Printf("ingest: persist %s: %v", eventID, err)
+	s.writeSaturated(w, "persist unavailable")
 }
 
 // replyForStoredState answers a duplicate from the forwarded flag: 202 when
@@ -317,8 +330,6 @@ func writeAccepted(w http.ResponseWriter, eventID, eventType string) {
 	})
 }
 
-// forwardOne forwards one event's original bytes with its original headers
-// and records the receipt. It reports whether the event counts as delivered.
 func headerMap(src http.Header) map[string]string {
 	out := make(map[string]string, len(src))
 	for k, v := range src {
@@ -329,13 +340,15 @@ func headerMap(src http.Header) map[string]string {
 	return out
 }
 
+// forwardOne forwards one event's original bytes with its original headers
+// and records the receipt. It reports whether the event counts as delivered.
 func (s *Server) forwardOne(ctx context.Context, body []byte, src map[string]string, eventID string) bool {
 	fctx, cancel := context.WithTimeout(ctx, s.cfg.ProxyForwardTimeout)
 	defer cancel()
 
 	out, err := http.NewRequestWithContext(fctx, http.MethodPost, strings.TrimSuffix(s.cfg.ScanRelayURL, "/")+"/webhook", bytes.NewReader(body))
 	if err != nil {
-		_ = s.events.RecordForwardFailure(context.WithoutCancel(ctx), eventID, "build forward request")
+		s.recordFailure(ctx, eventID, "build forward request")
 		return false
 	}
 	for k, v := range src {
@@ -344,28 +357,61 @@ func (s *Server) forwardOne(ctx context.Context, body []byte, src map[string]str
 			out.Header.Set(k, v)
 		}
 	}
+	// Forward credentials are injected here at send time, never stored:
+	// the whitelist keeps them out of headers_json by construction.
+	if s.cfg.ForwardBearerToken != "" {
+		out.Header.Set("Authorization", "Bearer "+s.cfg.ForwardBearerToken)
+	} else if s.cfg.ForwardAPIKey != "" {
+		out.Header.Set(s.cfg.ForwardAPIKeyHeader, s.cfg.ForwardAPIKey)
+	}
 	resp, err := s.proxy.Do(out)
 	if err != nil {
-		_ = s.events.RecordForwardFailure(context.WithoutCancel(ctx), eventID, err.Error())
+		s.recordFailure(ctx, eventID, err.Error())
 		return false
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, s.cfg.MaxBodyBytes))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, forwardRespCap))
 	if err != nil {
-		_ = s.events.RecordForwardFailure(context.WithoutCancel(ctx), eventID, "read forward response")
+		s.recordFailure(ctx, eventID, "read forward response")
 		return false
 	}
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		_, _ = s.events.MarkForwarded(context.WithoutCancel(ctx), eventID, s.now().UTC())
+		s.recordDelivered(ctx, eventID)
 		return true
 	case resp.StatusCode == http.StatusConflict && strings.TrimSpace(string(respBody)) == replayBody:
 		// ScanRelay proves an earlier attempt landed (e.g. the bridge
 		// crashed after accept but before the flag write).
-		_, _ = s.events.MarkForwarded(context.WithoutCancel(ctx), eventID, s.now().UTC())
+		s.recordDelivered(ctx, eventID)
 		return true
 	default:
-		_ = s.events.RecordForwardFailure(context.WithoutCancel(ctx), eventID, "scanrelay status "+resp.Status)
+		s.recordFailure(ctx, eventID, "scanrelay status "+resp.Status)
 		return false
 	}
+}
+
+// receiptCtx bounds the receipt writes: without a deadline a stuck writer
+// would hold the handler, the gate slot, and the in-flight slot past
+// WriteTimeout. The margin is the ingest path's slack by definition.
+func (s *Server) receiptCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), s.cfg.Margin)
+}
+
+func (s *Server) recordDelivered(ctx context.Context, eventID string) {
+	rctx, cancel := s.receiptCtx(ctx)
+	defer cancel()
+	if _, err := s.events.MarkForwarded(rctx, eventID, s.now().UTC()); err != nil {
+		// Safe direction: a retry gets ScanRelay's replay shape and
+		// heals the flag. Still loud, because silent 202s hide trouble.
+		log.Printf("ingest: receipt write %s: %v", eventID, err)
+	}
+}
+
+func (s *Server) recordFailure(ctx context.Context, eventID, reason string) {
+	rctx, cancel := s.receiptCtx(ctx)
+	defer cancel()
+	if err := s.events.RecordForwardFailure(rctx, eventID, reason); err != nil {
+		log.Printf("ingest: receipt write %s: %v", eventID, err)
+	}
+	log.Printf("ingest: forward %s failed: %s", eventID, reason)
 }

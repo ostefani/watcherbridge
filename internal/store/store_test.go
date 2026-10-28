@@ -21,6 +21,48 @@ func openTestStore(t *testing.T) *Store {
 	return s
 }
 
+func TestQueueCapOption(t *testing.T) {
+	if _, err := Open(filepath.Join(t.TempDir(), "q.db"), WithQueueCap(0)); err == nil {
+		t.Fatal("zero queue cap must be rejected")
+	}
+	s, err := Open(filepath.Join(t.TempDir(), "q2.db"), WithQueueCap(1))
+	if err != nil {
+		t.Fatalf("cap 1 must open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	ev := RawEvent{EventID: "e1", EventKey: "k", EventType: "host.appeared", OccurredAt: now, Payload: []byte(`{}`), ReceivedAt: now, SignatureTimestamp: now}
+	if _, err := s.PersistEventAndGroup(context.Background(), ev, "a", GroupPolicy{QuietWindow: time.Minute}); !errors.Is(err, ErrStoreClosed) {
+		t.Fatalf("write after close must report closed, got %v", err)
+	}
+}
+
+func TestMarkUndeliverableExcludesFromSweep(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC()
+	ev := RawEvent{EventID: "e-u", EventKey: "k", EventType: "host.appeared", OccurredAt: now, Payload: []byte(`{}`), ReceivedAt: now, SignatureTimestamp: now}
+	if _, err := s.PersistEventAndGroup(context.Background(), ev, "a", GroupPolicy{QuietWindow: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	cands, err := s.SweepCandidates(context.Background(), now, 300*time.Second, 30*time.Second, 10)
+	if err != nil || len(cands) != 1 {
+		t.Fatalf("seeded row must be a candidate: %v %v", len(cands), err)
+	}
+	if err := s.MarkUndeliverable(context.Background(), "e-u", "undeliverable_headers"); err != nil {
+		t.Fatal(err)
+	}
+	cands, err = s.SweepCandidates(context.Background(), now, 300*time.Second, 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 0 {
+		t.Fatal("undeliverable row must never be selected again")
+	}
+}
+
 func TestPersistEventAndGroupIsIdempotent(t *testing.T) {
 	s := openTestStore(t)
 	now := time.Now().UTC().Truncate(time.Second)

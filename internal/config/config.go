@@ -7,6 +7,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -18,6 +19,12 @@ const (
 	ModeTap   = "tap"
 	ModeProxy = "proxy"
 )
+
+// minSecretBytes floors the HMAC key length. Short keys verify correctly
+// but brute-force faster; refusing them is a visible startup error, so an
+// operator with an older short secret must rotate it, not wonder why
+// ingest silently changed.
+const minSecretBytes = 16
 
 // Config carries the Step 8 receiver settings. Durations are real
 // time.Duration values; callers that read env/flags convert into these.
@@ -31,6 +38,18 @@ type Config struct {
 	SecretFile string
 
 	ScanRelayURL string
+
+	// Forward credentials for a ScanRelay that requires auth. Injected
+	// into the outgoing request at send time; never stored or logged.
+	// The Authorization header form is preferred when both are set,
+	// mirroring ScanRelay's own check order.
+	ForwardBearerToken  string
+	ForwardAPIKey       string
+	ForwardAPIKeyHeader string
+
+	// ScanRelayTolerance is ScanRelay's own timestamp window. The bridge
+	// must not accept events ScanRelay would reject as stale.
+	ScanRelayTolerance time.Duration
 
 	MaxBodyBytes       int64
 	MaxHeaderBytes     int
@@ -48,7 +67,7 @@ type Config struct {
 	IdleTimeout       time.Duration
 
 	InFlightCap    int
-	WriterQueueCap int // recorded for the store wiring; enforced by the writer queue depth
+	WriterQueueCap int // enforced by the writer queue depth; overflow is 503
 	RetryAfterSecs int
 
 	SweepSafetyMargin time.Duration
@@ -63,14 +82,18 @@ type Config struct {
 }
 
 // Default returns the approved starting thresholds (Designv5 §12/§15).
+// Tap is the default mode: the README prefers it, and it needs no
+// ScanRelay credentials or forwarding path to be useful.
 func Default() Config {
 	return Config{
-		Bind:               "127.0.0.1:8081",
-		Mode:               ModeProxy,
-		ScanRelayURL:       "http://127.0.0.1:8080",
-		MaxBodyBytes:       1 << 20,
-		MaxHeaderBytes:     16 << 10,
-		TimestampTolerance: 300 * time.Second,
+		Bind:                "127.0.0.1:8081",
+		Mode:                ModeTap,
+		ScanRelayURL:        "http://127.0.0.1:8080",
+		ForwardAPIKeyHeader: "X-API-Key",
+		ScanRelayTolerance:  300 * time.Second,
+		MaxBodyBytes:        1 << 20,
+		MaxHeaderBytes:      16 << 10,
+		TimestampTolerance:  300 * time.Second,
 
 		ProxyForwardTimeout: 3 * time.Second,
 		PersistBudget:       500 * time.Millisecond,
@@ -101,18 +124,24 @@ func Default() Config {
 
 // ResolveSecret returns the webhook secret from Secret or SecretFile. File
 // rules: it must be a regular file with no group/other permission bits; a
-// single trailing newline is trimmed.
+// single trailing newline is trimmed. The handle is opened before stat so
+// the checks apply to the file actually read.
 func (c Config) ResolveSecret() (string, error) {
 	if c.Secret != "" && c.SecretFile != "" {
 		return "", fmt.Errorf("set exactly one of secret or secret file")
 	}
 	if c.Secret != "" {
-		return c.Secret, nil
+		return checkSecretLength(c.Secret)
 	}
 	if c.SecretFile == "" {
 		return "", fmt.Errorf("webhook secret is unset: refusing to start")
 	}
-	fi, err := os.Stat(c.SecretFile)
+	f, err := os.Open(c.SecretFile)
+	if err != nil {
+		return "", fmt.Errorf("open secret file: %w", err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
 	if err != nil {
 		return "", fmt.Errorf("stat secret file: %w", err)
 	}
@@ -131,6 +160,13 @@ func (c Config) ResolveSecret() (string, error) {
 	if secret == "" {
 		return "", fmt.Errorf("webhook secret is empty: refusing to start")
 	}
+	return checkSecretLength(secret)
+}
+
+func checkSecretLength(secret string) (string, error) {
+	if len(secret) < minSecretBytes {
+		return "", fmt.Errorf("webhook secret must be at least %d bytes", minSecretBytes)
+	}
 	return secret, nil
 }
 
@@ -147,8 +183,11 @@ func (c Config) Validate() error {
 	if c.Mode != ModeTap && c.Mode != ModeProxy {
 		return fmt.Errorf("mode must be %q or %q", ModeTap, ModeProxy)
 	}
-	if c.Mode == ModeProxy && c.ScanRelayURL == "" {
-		return fmt.Errorf("proxy mode requires a ScanRelay URL")
+	if c.Mode == ModeProxy {
+		u, err := url.Parse(c.ScanRelayURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("proxy mode requires a valid http(s) ScanRelay URL, got %q", c.ScanRelayURL)
+		}
 	}
 	if c.MaxBodyBytes <= 0 {
 		return fmt.Errorf("max body bytes must be positive")
@@ -158,6 +197,13 @@ func (c Config) Validate() error {
 	}
 	if c.TimestampTolerance <= 0 {
 		return fmt.Errorf("timestamp tolerance must be positive")
+	}
+	if c.ScanRelayTolerance <= 0 {
+		return fmt.Errorf("scanrelay tolerance must be positive")
+	}
+	if c.TimestampTolerance > c.ScanRelayTolerance {
+		return fmt.Errorf("bridge tolerance %v must not exceed ScanRelay's %v, or forwarded events get rejected as stale",
+			c.TimestampTolerance, c.ScanRelayTolerance)
 	}
 	want := c.ProxyForwardTimeout + c.PersistBudget + c.Margin
 	if c.HandlerDeadline != want {
