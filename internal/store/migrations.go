@@ -1,0 +1,194 @@
+package store
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+const schemaV1 = `
+CREATE TABLE IF NOT EXISTS raw_events (
+    event_id TEXT PRIMARY KEY,
+    event_key TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    occurred_at INTEGER NOT NULL,
+    cycle INTEGER NOT NULL,
+    target TEXT,
+    payload BLOB NOT NULL,
+    headers_json TEXT NOT NULL DEFAULT '',
+    received_at INTEGER NOT NULL,
+    signature_timestamp INTEGER NOT NULL,
+    forwarded INTEGER NOT NULL DEFAULT 0,
+    forwarded_at INTEGER,
+    forward_attempts INTEGER NOT NULL DEFAULT 0,
+    last_forward_error TEXT,
+    delivery_error TEXT
+);
+CREATE TABLE IF NOT EXISTS active_groups (
+    group_id TEXT PRIMARY KEY,
+    host_anchor_key TEXT NOT NULL,
+    opened_at INTEGER NOT NULL,
+    last_event_at INTEGER NOT NULL,
+    deadline_at INTEGER NOT NULL,
+    event_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL CHECK(status IN ('open','processing','closed','done','failed'))
+);
+CREATE TABLE IF NOT EXISTS group_events (
+    group_id TEXT NOT NULL REFERENCES active_groups(group_id) ON DELETE CASCADE,
+    event_id TEXT NOT NULL REFERENCES raw_events(event_id),
+    PRIMARY KEY(group_id, event_id)
+);
+CREATE TABLE IF NOT EXISTS briefings (
+    briefing_id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL REFERENCES active_groups(group_id),
+    host_anchor_key TEXT NOT NULL,
+    baseline TEXT NOT NULL,
+    model_suggestion TEXT,
+    priority TEXT NOT NULL,
+    priority_reason TEXT NOT NULL,
+    clamped INTEGER NOT NULL DEFAULT 0,
+    fallback_used INTEGER NOT NULL DEFAULT 0,
+    what_changed TEXT NOT NULL,
+    context TEXT NOT NULL,
+    recommended_check TEXT NOT NULL,
+    model_raw_json TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pseudonym_map (
+    real_value TEXT PRIMARY KEY,
+    category TEXT NOT NULL CHECK(category IN ('ip','mac','hostname','net')),
+    token TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pseudonym_counters (
+    category TEXT PRIMARY KEY,
+    next INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_open_group_per_anchor ON active_groups(host_anchor_key) WHERE status = 'open';
+CREATE UNIQUE INDEX IF NOT EXISTS one_briefing_per_group ON briefings(group_id);
+CREATE INDEX IF NOT EXISTS raw_forward_sweep ON raw_events(forwarded, signature_timestamp);
+CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
+CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
+`
+
+const supportedSchemaVersion = 3
+
+func migrate(db *sql.DB) error {
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return err
+	}
+	if version > supportedSchemaVersion {
+		return fmt.Errorf("database schema version %d is newer than supported %d; upgrade the binary", version, supportedSchemaVersion)
+	}
+	if version == 0 {
+		var name string
+		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='raw_events'`).Scan(&name)
+		if err == nil {
+			return fmt.Errorf("unversioned legacy database is not supported; delete the database file and restart to recreate it")
+		}
+		if err != sql.ErrNoRows {
+			return err
+		}
+	}
+	for version < supportedSchemaVersion {
+		var err error
+		switch version {
+		case 0:
+			err = applyMigration(db, 1, func(tx *sql.Tx) error { _, err := tx.Exec(schemaV1); return err })
+		case 1:
+			err = applyMigration(db, 2, migrateV2)
+		case 2:
+			err = applyMigration(db, 3, migrateV3)
+		}
+		if err != nil {
+			return err
+		}
+		version++
+	}
+	return nil
+}
+
+func applyMigration(db *sql.DB, to int, fn func(*sql.Tx) error) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, to)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// migrateV2: retry_count on groups; pseudonym_map keyed by (category,
+// real_value) with the original display value kept for exact restoration;
+// counters seeded past the highest existing token per category.
+func migrateV2(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE active_groups ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`,
+		`CREATE TABLE pseudonym_map_v2 (
+			category TEXT NOT NULL CHECK(category IN ('ip','mac','hostname','net')),
+			real_value TEXT NOT NULL,
+			display_value TEXT NOT NULL,
+			token TEXT NOT NULL UNIQUE,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (category, real_value)
+		)`,
+		`INSERT INTO pseudonym_map_v2 (category, real_value, display_value, token, created_at)
+			SELECT category, real_value, real_value, token, created_at FROM pseudonym_map`,
+		`DROP TABLE pseudonym_map`,
+		`ALTER TABLE pseudonym_map_v2 RENAME TO pseudonym_map`,
+		`INSERT INTO pseudonym_counters (category, next)
+			SELECT category, MAX(CAST(substr(token, instr(token, '_') + 1) AS INTEGER)) + 1 FROM pseudonym_map WHERE true GROUP BY category
+			ON CONFLICT(category) DO UPDATE SET next = MAX(next, excluded.next)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV3: processing_since for stale-lease release, briefings gain
+// event_ids_json plus CHECK constraints on the priority levels (table
+// rebuild), and an event_id index on group_events for purge/FK lookups.
+func migrateV3(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE active_groups ADD COLUMN processing_since INTEGER`,
+		`CREATE TABLE briefings_v3 (
+			briefing_id TEXT PRIMARY KEY,
+			group_id TEXT NOT NULL REFERENCES active_groups(group_id),
+			host_anchor_key TEXT NOT NULL,
+			baseline TEXT NOT NULL CHECK(baseline IN ('low','medium','high','critical')),
+			model_suggestion TEXT CHECK(model_suggestion IS NULL OR model_suggestion IN ('low','medium','high','critical')),
+			priority TEXT NOT NULL CHECK(priority IN ('low','medium','high','critical')),
+			priority_reason TEXT NOT NULL,
+			clamped INTEGER NOT NULL DEFAULT 0,
+			fallback_used INTEGER NOT NULL DEFAULT 0,
+			what_changed TEXT NOT NULL,
+			context TEXT NOT NULL,
+			recommended_check TEXT NOT NULL,
+			model_raw_json TEXT,
+			created_at INTEGER NOT NULL,
+			event_ids_json TEXT NOT NULL DEFAULT '[]'
+		)`,
+		`INSERT INTO briefings_v3 (briefing_id, group_id, host_anchor_key, baseline, model_suggestion, priority, priority_reason, clamped, fallback_used, what_changed, context, recommended_check, model_raw_json, created_at)
+			SELECT briefing_id, group_id, host_anchor_key, baseline, model_suggestion, priority, priority_reason, clamped, fallback_used, what_changed, context, recommended_check, model_raw_json, created_at FROM briefings`,
+		`DROP TABLE briefings`,
+		`ALTER TABLE briefings_v3 RENAME TO briefings`,
+		`CREATE UNIQUE INDEX one_briefing_per_group ON briefings(group_id)`,
+		`CREATE INDEX IF NOT EXISTS group_events_event ON group_events(event_id)`,
+		`CREATE INDEX IF NOT EXISTS briefings_created ON briefings(created_at)`,
+		`UPDATE briefings SET event_ids_json = COALESCE((SELECT json_group_array(event_id) FROM (SELECT event_id FROM group_events WHERE group_events.group_id = briefings.group_id ORDER BY event_id)), '[]')`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
