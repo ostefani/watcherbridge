@@ -7,6 +7,31 @@ import (
 	"time"
 )
 
+// Checkpoint runs a TRUNCATE checkpoint on the single writer goroutine (but
+// outside a transaction, which SQLite forbids for checkpoints) so the -wal
+// file drains after load spikes. Checkpoints only run here, never beside
+// the writer, so they cannot race an in-flight commit.
+func (s *Store) Checkpoint(ctx context.Context) error {
+	job := writeJob{ctx: ctx, done: make(chan error, 1)}
+	job.raw = func() error {
+		_, err := s.db.ExecContext(job.ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
+		return err
+	}
+	select {
+	case <-s.quit:
+		return fmt.Errorf("store is closed")
+	case <-ctx.Done():
+		return ctx.Err()
+	case s.jobs <- job:
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-job.done:
+		return err
+	}
+}
+
 const briefingPurgeFloor = 24 * time.Hour
 
 // PurgeBriefings deletes briefings (and their emptied done groups) created

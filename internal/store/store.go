@@ -20,8 +20,11 @@ import (
 )
 
 type writeJob struct {
-	ctx  context.Context
-	fn   func(*sql.Tx) error
+	ctx context.Context
+	fn  func(*sql.Tx) error
+	// raw runs on the writer goroutine without opening a transaction,
+	// for statements SQLite forbids inside one (e.g. wal_checkpoint).
+	raw  func() error
 	done chan error
 }
 
@@ -135,6 +138,9 @@ func (s *Store) runJob(job writeJob) (err error) {
 	}()
 	if err := job.ctx.Err(); err != nil {
 		return err
+	}
+	if job.raw != nil {
+		return job.raw()
 	}
 	tx, err := s.db.BeginTx(job.ctx, nil)
 	if err != nil {
