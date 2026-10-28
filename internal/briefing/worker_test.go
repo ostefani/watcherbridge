@@ -124,6 +124,46 @@ func TestWorkerParkFailedOnStoreError(t *testing.T) {
 	}
 }
 
+// The worker must keep ticking on a live context: a group that becomes
+// due after the first pass is still closed and briefed. Regression: Run
+// once stalled after its first pass (the second select waited on an
+// already-drained timer), so nothing after startup was ever briefed.
+func TestWorkerRunTicksUntilBriefed(t *testing.T) {
+	s := openWorkerStore(t)
+	// Due 2s out on a live clock: the first pass (t=0) must leave it
+	// open, a later tick must close and brief it. One pass is not enough.
+	now := time.Now().UTC()
+	res, err := s.PersistEventAndGroup(context.Background(), store.RawEvent{
+		EventID: "evt-t1", EventKey: "k", EventType: "host.changed",
+		OccurredAt: now, Payload: []byte(changedPayload("", `{"number":22,"protocol":"tcp","state":"open"}`)),
+		ReceivedAt: now, SignatureTimestamp: now,
+	}, "host:t", store.GroupPolicy{QuietWindow: 2 * time.Second, MaxWindow: time.Hour, MaxEvents: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid := res.GroupID
+	d := testDeps(t, s)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, d) }()
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		if st, _ := s.GroupStatus(context.Background(), gid); st == "done" {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("group never closed: Run stopped ticking after its first pass")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWorkerRunStopsOnCancel(t *testing.T) {
 	s := openWorkerStore(t)
 	d := testDeps(t, s)

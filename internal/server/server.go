@@ -25,6 +25,7 @@ import (
 	"github.com/ostefani/watcherbridge/internal/config"
 	"github.com/ostefani/watcherbridge/internal/forwarder"
 	"github.com/ostefani/watcherbridge/internal/store"
+	"github.com/ostefani/watcherbridge/internal/viewer"
 )
 
 // replayBody is ScanRelay's exact replay response (json.Encoder adds the
@@ -45,12 +46,15 @@ var eventTypes = map[string]bool{
 	"host.changed":     true,
 }
 
-// Server serves the ingest endpoint and runs the startup sweep.
+// Server serves the ingest endpoint and runs the startup sweep. The
+// viewer (UI, JSON, SSE) shares the same loopback mux; the annotation
+// publisher is composed in main over viewer.Fanout.
 type Server struct {
 	cfg    config.Config
 	secret string
 	events *store.Store
 	gate   *forwarder.Gate
+	viewer *viewer.Viewer
 	now    func() time.Time
 
 	sem   chan struct{} // in-flight cap; acquired before reading the body
@@ -88,8 +92,10 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 		sem: make(chan struct{}, cfg.InFlightCap), proxy: proxy,
 		sweepCtx: sweepCtx, sweepCancel: sweepCancel, sweepDone: make(chan struct{}),
 	}
+	s.viewer = viewer.New(events, nil)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook", s.handleWebhook)
+	s.viewer.Attach(mux)
 	s.http = &http.Server{
 		Addr:              cfg.Bind,
 		Handler:           mux,
@@ -104,6 +110,10 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 
 // Handler exposes the mux for tests without binding a socket.
 func (s *Server) Handler() http.Handler { return s.http.Handler }
+
+// Viewer exposes the attached viewer (and its hub) so main can wire the
+// briefing worker callbacks through viewer.Fanout.
+func (s *Server) Viewer() *viewer.Viewer { return s.viewer }
 
 // Start serves ingest and runs the startup sweep on one background worker.
 // It blocks until the listener fails or Shutdown is called.

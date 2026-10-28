@@ -54,6 +54,52 @@ func (s *Store) BriefingForGroup(ctx context.Context, groupID string) (Briefing,
 	return b, nil
 }
 
+// RecentBriefings returns the newest briefings first, capped at limit.
+// The briefings_created index serves the ORDER BY; readers use the
+// single-writer-safe read pool, never a long transaction.
+func (s *Store) RecentBriefings(ctx context.Context, limit int) ([]Briefing, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT briefing_id, group_id, host_anchor_key, baseline, model_suggestion,
+		priority, priority_reason, baseline_rule, clamped, fallback_used, what_changed, context,
+		recommended_check, model_raw_json, created_at, event_ids_json
+		FROM briefings ORDER BY created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Briefing
+	for rows.Next() {
+		var b Briefing
+		var suggestion, rule sql.NullString
+		var eventIDs string
+		var created int64
+		if err := rows.Scan(&b.BriefingID, &b.GroupID, &b.HostAnchorKey, &b.Baseline, &suggestion,
+			&b.Priority, &b.PriorityReason, &rule, &b.Clamped, &b.FallbackUsed, &b.WhatChanged, &b.Context,
+			&b.RecommendedCheck, &b.ModelRawJSON, &created, &eventIDs); err != nil {
+			return nil, err
+		}
+		if suggestion.Valid {
+			b.ModelSuggestion = &suggestion.String
+		}
+		if rule.Valid {
+			b.BaselineRule = rule.String
+		}
+		b.CreatedAt = fromNanos(created)
+		if eventIDs != "" {
+			if err := json.Unmarshal([]byte(eventIDs), &b.EventIDs); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
 func groupEventIDs(tx *sql.Tx, groupID string) ([]string, error) {
 	rows, err := tx.Query(`SELECT event_id FROM group_events WHERE group_id = ? ORDER BY event_id`, groupID)
 	if err != nil {

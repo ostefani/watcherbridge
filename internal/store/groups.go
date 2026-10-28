@@ -284,4 +284,39 @@ func (s *Store) GroupDeadline(ctx context.Context, groupID string) (time.Time, e
 	return fromNanos(n), err
 }
 
+// GroupSnapshot is the viewer-facing view of an in-progress group: all
+// fields are safe for local display (anchors are raw local identifiers).
+type GroupSnapshot struct {
+	GroupID    string
+	Anchor     string
+	Status     string
+	Deadline   time.Time
+	EventCount int
+}
+
+// OpenGroupSnapshots lists groups still accumulating events, oldest
+// deadline first. The groups_status_deadline index serves the filter and
+// order; the event count comes from the join table in the same query.
+func (s *Store) OpenGroupSnapshots(ctx context.Context) ([]GroupSnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT ag.group_id, ag.host_anchor_key, ag.status, ag.deadline_at,
+		COUNT(ge.event_id) FROM active_groups ag
+		LEFT JOIN group_events ge ON ge.group_id = ag.group_id
+		WHERE ag.status = 'open' GROUP BY ag.group_id ORDER BY ag.deadline_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GroupSnapshot
+	for rows.Next() {
+		var g GroupSnapshot
+		var deadline int64
+		if err := rows.Scan(&g.GroupID, &g.Anchor, &g.Status, &deadline, &g.EventCount); err != nil {
+			return nil, err
+		}
+		g.Deadline = fromNanos(deadline)
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
 // ForwardState reports delivery state for one event.

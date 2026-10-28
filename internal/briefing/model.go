@@ -132,11 +132,13 @@ func insertFallback(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 	if d.Now != nil {
 		now = d.Now()
 	}
-	if err := d.Store.InsertBriefing(ctx, fallbackBriefing(taken, outcome, now, contextNote)); err != nil {
+	b := fallbackBriefing(taken, outcome, now, contextNote)
+	if err := d.Store.InsertBriefing(ctx, b); err != nil {
 		log.Printf("briefing: group %s fallback insert: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
 		releaseOrPark(ctx, d, taken, "fallback insert failed")
 		return
 	}
+	notifyBriefing(d, taken, b)
 	if len(outcome.Skipped) > 0 {
 		log.Printf("briefing: group %s baseline %s skipped %d unknown-input rules", taken.GroupID, outcome.RuleID, len(outcome.Skipped))
 	}
@@ -244,6 +246,7 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 		releaseOrPark(ctx, d, taken, "insert failed")
 		return
 	}
+	notifyBriefing(d, taken, b)
 	if len(outcome.Skipped) > 0 {
 		log.Printf("briefing: group %s baseline %s skipped %d unknown-input rules", taken.GroupID, outcome.RuleID, len(outcome.Skipped))
 	}

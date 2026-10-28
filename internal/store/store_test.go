@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,99 @@ func openTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+// seedFeedGroup persists one open group and returns its ID.
+func seedFeedGroup(t *testing.T, s *Store, anchor, eventID string) string {
+	t.Helper()
+	now := time.Now().UTC().Truncate(time.Second)
+	res, err := s.PersistEventAndGroup(context.Background(), RawEvent{
+		EventID: eventID, EventKey: "k", EventType: "host.appeared",
+		OccurredAt: now, Payload: []byte(`{"event_id":"e"}`), ReceivedAt: now, SignatureTimestamp: now,
+	}, anchor, GroupPolicy{QuietWindow: time.Hour, MaxWindow: 2 * time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res.GroupID
+}
+
+func TestViewerFeeds(t *testing.T) {
+	s := openTestStore(t)
+	g1 := seedFeedGroup(t, s, "host:a", "evt-a1")
+	seedFeedGroup(t, s, "host:b", "evt-b1")
+	snaps, err := s.OpenGroupSnapshots(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snaps) != 2 {
+		t.Fatalf("open snapshots = %d", len(snaps))
+	}
+	for _, g := range snaps {
+		if g.Status != "open" || g.EventCount != 1 || g.Deadline.IsZero() {
+			t.Fatalf("snapshot = %+v", g)
+		}
+	}
+	// Brief one group: it leaves the open set and appears in the feed.
+	// CloseDue closes both seeds, so re-seed the bystander afterwards.
+	if _, err := s.CloseDue(context.Background(), time.Now().UTC().Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := s.TakeGroup(context.Background(), g1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertBriefing(context.Background(), Briefing{
+		BriefingID: "brf-" + taken.GroupID, GroupID: taken.GroupID, HostAnchorKey: "host:a",
+		Baseline: "low", Priority: "low", PriorityReason: "r",
+		WhatChanged: "w", Context: "c", RecommendedCheck: "k", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Fresh anchor: a new event on the closed host:b group would rejoin
+	// it instead of opening a new one.
+	seedFeedGroup(t, s, "host:c", "evt-c1")
+	snaps, err = s.OpenGroupSnapshots(context.Background())
+	if err != nil || len(snaps) != 1 || snaps[0].Anchor != "host:c" {
+		t.Fatalf("after brief: %+v %v", snaps, err)
+	}
+	rows, err := s.RecentBriefings(context.Background(), 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("recent = %+v %v", rows, err)
+	}
+	if rows[0].GroupID != g1 || len(rows[0].EventIDs) != 1 || rows[0].EventIDs[0] != "evt-a1" {
+		t.Fatalf("row = %+v", rows[0])
+	}
+	if got, _ := s.RecentBriefings(context.Background(), 0); len(got) != 1 {
+		t.Fatalf("zero limit must default, got %d", len(got))
+	}
+}
+
+func TestViewerFeedQueriesUseIndexes(t *testing.T) {
+	s := openTestStore(t)
+	for _, q := range []string{
+		`EXPLAIN QUERY PLAN SELECT briefing_id FROM briefings ORDER BY created_at DESC LIMIT 10`,
+		`EXPLAIN QUERY PLAN SELECT ag.group_id FROM active_groups ag LEFT JOIN group_events ge ON ge.group_id = ag.group_id WHERE ag.status = 'open' GROUP BY ag.group_id ORDER BY ag.deadline_at`,
+	} {
+		rows, err := s.db.Query(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		used := false
+		for rows.Next() {
+			var id, parent, notused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(detail, "SCAN") || strings.Contains(detail, "USING") {
+				used = true
+			}
+		}
+		rows.Close()
+		if !used {
+			t.Fatalf("query falls back to a full scan: %s", q)
+		}
+	}
 }
 
 func TestQueueCapOption(t *testing.T) {

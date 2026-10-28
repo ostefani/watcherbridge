@@ -406,6 +406,61 @@ func BenchmarkBriefOneValid(b *testing.B) {
 	}
 }
 
+func TestOnBriefingFiresWithEventIDs(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	fake.Handle = func(repair bool, payload []byte, issued map[string]string) (provider.RawBriefing, error) {
+		return provider.RawBriefing{JSON: validAnswer(t, payload, issued, strptr("high"), nil, nil)}, nil
+	}
+	var got []store.Briefing
+	d := modelDeps(t, s, fake)
+	d.OnBriefing = func(b store.Briefing) { got = append(got, b) }
+	briefOne(context.Background(), d, gid)
+	if len(got) != 1 {
+		t.Fatalf("OnBriefing fired %d times", len(got))
+	}
+	if got[0].GroupID != gid || len(got[0].EventIDs) != 1 || got[0].EventIDs[0] != "evt-w1" {
+		t.Fatalf("callback briefing = %+v", got[0])
+	}
+	if _, err := json.Marshal(got[0]); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOnBriefingFiresForFallback(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake(provider.FakeStep{Hang: true})
+	var n int
+	d := modelDeps(t, s, fake)
+	d.ModelTimeout = 50 * time.Millisecond
+	d.OnBriefing = func(store.Briefing) { n++ }
+	briefOne(context.Background(), d, gid)
+	if n != 1 {
+		t.Fatalf("fallback must also notify, fired %d", n)
+	}
+}
+
+func TestOnGroupsFiresPerTick(t *testing.T) {
+	s := openWorkerStore(t)
+	now := time.Now()
+	_, err := s.PersistEventAndGroup(context.Background(), store.RawEvent{
+		EventID: "evt-g1", EventKey: "k", EventType: "host.appeared",
+		OccurredAt: now, Payload: []byte(`{"event_id":"e"}`), ReceivedAt: now, SignatureTimestamp: now,
+	}, "host:tick", store.GroupPolicy{QuietWindow: time.Hour, MaxWindow: 2 * time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snaps [][]store.GroupSnapshot
+	d := testDeps(t, s)
+	d.OnGroups = func(g []store.GroupSnapshot) { snaps = append(snaps, g) }
+	drainOnce(context.Background(), d, now)
+	if len(snaps) != 1 || len(snaps[0]) != 1 || snaps[0][0].Anchor != "host:tick" {
+		t.Fatalf("snapshots = %+v", snaps)
+	}
+}
+
 func TestDecodeModelBriefingRejects(t *testing.T) {
 	full := `{"event_ids":["e1"],"host":"HOST_1","what_changed":"w","context":"c","model_suggestion":"high","priority_reason":"r","recommended_check":"k"}`
 	for name, raw := range map[string]string{
