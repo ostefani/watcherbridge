@@ -15,6 +15,12 @@ func TestDefaultPairs(t *testing.T) {
 	if c.Mode != ModeTap {
 		t.Fatalf("default mode must be tap (README preference), got %q", c.Mode)
 	}
+	if !c.Redaction {
+		t.Fatal("redaction must default on")
+	}
+	if c.MaxFieldChars != 256 {
+		t.Fatalf("default field cap must be 256, got %d", c.MaxFieldChars)
+	}
 	// The approved chain: handler = proxy + persist + margin, below Pro's 10s.
 	if want := c.ProxyForwardTimeout + c.PersistBudget + c.Margin; c.HandlerDeadline != want {
 		t.Fatalf("handler deadline %v != proxy+persist+margin %v", c.HandlerDeadline, want)

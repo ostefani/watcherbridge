@@ -76,6 +76,9 @@ type Config struct {
 
 	ShutdownGrace time.Duration
 
+	Redaction     bool // model-bound bundles are tokenized; off passes raw (warned at startup)
+	MaxFieldChars int  // rune cap per bundle string, truncation marked
+
 	GroupQuietWindow time.Duration
 	GroupMaxWindow   time.Duration
 	GroupMaxEvents   int
@@ -121,6 +124,9 @@ func Default() Config {
 		SweepWorkers:      1,
 
 		ShutdownGrace: 10 * time.Second,
+
+		Redaction:     true,
+		MaxFieldChars: 256,
 
 		GroupQuietWindow: 45 * time.Second,
 		GroupMaxWindow:   120 * time.Second,
@@ -274,6 +280,9 @@ func (c Config) Validate() error {
 	}
 	if c.SweepWorkers != 1 {
 		return fmt.Errorf("sweep workers must be exactly 1, got %d", c.SweepWorkers)
+	}
+	if c.MaxFieldChars <= 0 {
+		return fmt.Errorf("max field chars must be positive")
 	}
 	if c.GroupQuietWindow <= 0 {
 		return fmt.Errorf("group quiet window must be positive")

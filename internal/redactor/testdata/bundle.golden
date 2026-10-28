@@ -1,0 +1,27 @@
+{
+  "GroupID": "grp-golden",
+  "EventIDs": [
+    "e1"
+  ],
+  "Anchor": "host:HOST_1",
+  "EventsJSON": [
+    {
+      "changes": [
+        {
+          "after": "5432/open",
+          "before": "",
+          "field": "ports"
+        }
+      ],
+      "event_id": "e1",
+      "event_key": "k",
+      "event_type": "host.changed",
+      "host": {
+        "hostname": "HOST_1",
+        "ip": "IP_1",
+        "mac": "MAC_1"
+      }
+    }
+  ],
+  "Baseline": "high"
+}
