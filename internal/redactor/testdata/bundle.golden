@@ -1,10 +1,10 @@
 {
-  "GroupID": "grp-golden",
-  "EventIDs": [
+  "group_id": "grp-golden",
+  "event_ids": [
     "e1"
   ],
-  "Anchor": "host:HOST_1",
-  "EventsJSON": [
+  "anchor": "host:HOST_1",
+  "events": [
     {
       "changes": [
         {
@@ -23,5 +23,5 @@
       }
     }
   ],
-  "Baseline": "high"
+  "baseline": "high"
 }

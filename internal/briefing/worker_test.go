@@ -15,7 +15,7 @@ import (
 	"github.com/ostefani/watcherbridge/internal/store"
 )
 
-func testDeps(t *testing.T, s *store.Store) Deps {
+func testDeps(t tb, s *store.Store) Deps {
 	t.Helper()
 	return Deps{
 		Store:  s,
@@ -31,7 +31,7 @@ func testDeps(t *testing.T, s *store.Store) Deps {
 	}
 }
 
-func seedGroup(t *testing.T, s *store.Store, anchor, eventID, eventType, payload string) string {
+func seedGroup(t tb, s *store.Store, anchor, eventID, eventType, payload string) string {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
 	res, err := s.PersistEventAndGroup(context.Background(), store.RawEvent{

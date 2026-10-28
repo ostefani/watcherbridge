@@ -30,13 +30,15 @@ const (
 // issuance record Step 11 checks model output against (§6.3).
 type TokenMap map[string]string
 
-// RedactedBundle is the model-bound view of a group.
+// RedactedBundle is the model-bound view of a group. The JSON tags are
+// the wire contract: Step 11 sends this exact shape to the provider, so
+// the field names are fixed, not Go defaults.
 type RedactedBundle struct {
-	GroupID    string
-	EventIDs   []string
-	Anchor     string
-	EventsJSON json.RawMessage
-	Baseline   string
+	GroupID    string          `json:"group_id"`
+	EventIDs   []string        `json:"event_ids"`
+	Anchor     string          `json:"anchor"`
+	EventsJSON json.RawMessage `json:"events"`
+	Baseline   string          `json:"baseline"`
 }
 
 // Policy carries the redactor knobs.
@@ -278,7 +280,7 @@ func visitSpans(s string, fn func(glo, ghi int, d discovered, emit bool)) {
 // discoverString collects typed hostnames (hostname-bearing keys seed the
 // map) and address spans from one leaf.
 func (b *builder) discoverString(key, s string) {
-	s = stripControls(s)
+	s = StripControls(s)
 	if key == "hostname" || key == "identity_aliases" || key == "aliases" {
 		for _, h := range splitAliases(s) {
 			if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
@@ -399,7 +401,7 @@ func (b *builder) registerAll(ctx context.Context) error {
 // result. Address spans missing from the map are left literal: the leak
 // scan fails the bundle loudly instead of silently dropping them.
 func (b *builder) tokenizeString(s string) string {
-	s = stripControls(s)
+	s = StripControls(s)
 	if b.hostRe != nil {
 		s = b.hostRe.ReplaceAllStringFunc(s, func(m string) string {
 			tok := b.hostTok[strings.ToLower(m)]
@@ -407,7 +409,7 @@ func (b *builder) tokenizeString(s string) string {
 			return tok
 		})
 	}
-	return capField(replaceSpans(s, func(cat, norm string) string {
+	return CapField(replaceSpans(s, func(cat, norm string) string {
 		tok := b.tokens[cat][norm]
 		if tok != "" {
 			b.issued[tok] = norm

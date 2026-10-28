@@ -7,6 +7,8 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/ostefani/watcherbridge/internal/provider"
+	"github.com/ostefani/watcherbridge/internal/redactor"
 	"github.com/ostefani/watcherbridge/internal/store"
 )
 
@@ -15,7 +17,9 @@ const fallbackReason = "Rule-based fallback: model unavailable."
 
 // Deps wires the worker. Tick and Lease come from config (GROUPER_TICK,
 // PROCESSING_LEASE); Policy carries the baseline knobs; Now is injectable
-// for tests.
+// for tests. Provider is nil in Step 9 scope (nil means the deterministic
+// minimal briefing); Step 11 sets it, plus the redaction policy and the
+// shared provider timeout.
 type Deps struct {
 	Store  *store.Store
 	Groups store.GroupPolicy
@@ -23,6 +27,10 @@ type Deps struct {
 	Lease  time.Duration
 	Now    func() time.Time
 	Policy Policy
+
+	Provider     provider.Provider
+	Redaction    redactor.Policy
+	ModelTimeout time.Duration
 }
 
 // Run ticks until ctx ends: close due groups, reap stale leases, then drain
@@ -31,6 +39,13 @@ type Deps struct {
 func Run(ctx context.Context, d Deps) error {
 	if d.Store == nil {
 		return fmt.Errorf("briefing worker requires a store")
+	}
+	// Operator-chosen degradations are loud at startup, never silent.
+	if d.Provider == nil || d.Provider.Name() == "fake" {
+		log.Print("briefing: no model provider; all briefings will be deterministic fallbacks")
+	}
+	if !d.Redaction.Enabled {
+		log.Print("briefing: WARNING: redaction is off; raw values go to the provider and the leak scan is bypassed")
 	}
 	now := d.Now
 	if now == nil {
@@ -115,27 +130,17 @@ func briefOne(ctx context.Context, d Deps, groupID string) {
 		releaseOrPark(ctx, d, taken, "no events")
 		return
 	}
-	final, clamped := Resolve(outcome.Level, nil) // no provider in Step 9
+	if d.Provider != nil {
+		briefWithModel(ctx, d, taken, outcome)
+		return
+	}
+	// No provider in Step 9 scope: the deterministic minimal briefing.
+	// Resolve(level, nil) is identity, which fallbackBriefing encodes.
 	now := time.Now()
 	if d.Now != nil {
 		now = d.Now()
 	}
-	b := store.Briefing{
-		BriefingID:       "brf-" + taken.GroupID,
-		GroupID:          taken.GroupID,
-		HostAnchorKey:    taken.Anchor,
-		Baseline:         outcome.Level.String(),
-		ModelSuggestion:  nil,
-		Priority:         final.String(),
-		PriorityReason:   fallbackReason,
-		BaselineRule:     outcome.RuleID,
-		Clamped:          clamped,
-		FallbackUsed:     true,
-		WhatChanged:      describeEvents(taken),
-		Context:          "provider unavailable; briefing from deterministic baseline only",
-		RecommendedCheck: "Review the recent changes on this host.",
-		CreatedAt:        now,
-	}
+	b := fallbackBriefing(taken, outcome, now, "provider unavailable; briefing from deterministic baseline only")
 	if taken.LastAttempt() {
 		// Final attempt: write the deterministic briefing inline instead
 		// of releasing, so a poison group converges to done, not failed.

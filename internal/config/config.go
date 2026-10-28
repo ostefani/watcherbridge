@@ -79,6 +79,20 @@ type Config struct {
 	Redaction     bool // model-bound bundles are tokenized; off passes raw (warned at startup)
 	MaxFieldChars int  // rune cap per bundle string, truncation marked
 
+	// Model provider selection. Only "meta" and "fake" exist; anything
+	// else refuses startup, so a typo can never route bundles to an
+	// unexpected endpoint.
+	ModelProvider string
+	ModelID       string
+	// Model API key material: exactly one of ModelAPIKey /
+	// ModelAPIKeyFile when the provider is meta. Never logged or stored.
+	ModelAPIKey     string
+	ModelAPIKeyFile string
+	ModelBaseURL    string // full endpoint to POST the bundle to
+
+	ProviderTimeout       time.Duration // shared budget for the attempt + one repair
+	MaxModelResponseBytes int64         // response cap; oversize fails the call
+
 	GroupQuietWindow time.Duration
 	GroupMaxWindow   time.Duration
 	GroupMaxEvents   int
@@ -128,6 +142,16 @@ func Default() Config {
 		Redaction:     true,
 		MaxFieldChars: 256,
 
+		// Fake by default: a keyless start must degrade loudly to
+		// deterministic fallbacks (each marked fallback_used), never
+		// refuse to boot the local pipeline. The worker warns at
+		// startup while the provider is fake, like REDACTION=off.
+		ModelProvider:         "fake",
+		ModelID:               "test-only",
+		ModelBaseURL:          "http://127.0.0.1:9/unused",
+		ProviderTimeout:       30 * time.Second,
+		MaxModelResponseBytes: 64 << 10,
+
 		GroupQuietWindow: 45 * time.Second,
 		GroupMaxWindow:   120 * time.Second,
 		GroupMaxEvents:   10,
@@ -149,10 +173,7 @@ var stableFieldVocabulary = map[string]bool{
 	"metadata": true, "identity_aliases": true, "identity_anchor_keys": true,
 }
 
-// ResolveSecret returns the webhook secret from Secret or SecretFile. File
-// rules: it must be a regular file with no group/other permission bits; a
-// single trailing newline is trimmed. The handle is opened before stat so
-// the checks apply to the file actually read.
+// ResolveSecret returns the webhook secret from Secret or SecretFile.
 func (c Config) ResolveSecret() (string, error) {
 	if c.Secret != "" && c.SecretFile != "" {
 		return "", fmt.Errorf("set exactly one of secret or secret file")
@@ -163,29 +184,53 @@ func (c Config) ResolveSecret() (string, error) {
 	if c.SecretFile == "" {
 		return "", fmt.Errorf("webhook secret is unset: refusing to start")
 	}
-	f, err := os.Open(c.SecretFile)
+	return readSecretFile(c.SecretFile, "webhook secret")
+}
+
+// ResolveModelKey returns the model API key from ModelAPIKey or
+// ModelAPIKeyFile. Required exactly when the provider is meta; the fake
+// provider needs no key.
+func (c Config) ResolveModelKey() (string, error) {
+	if c.ModelAPIKey != "" && c.ModelAPIKeyFile != "" {
+		return "", fmt.Errorf("set exactly one of model API key or key file")
+	}
+	if c.ModelAPIKey != "" {
+		return checkSecretLength(c.ModelAPIKey)
+	}
+	if c.ModelAPIKeyFile == "" {
+		return "", fmt.Errorf("model API key is unset: refusing to start")
+	}
+	return readSecretFile(c.ModelAPIKeyFile, "model API key")
+}
+
+// readSecretFile enforces the secret-file rules: it must be a regular file
+// with no group/other permission bits; a single trailing newline is
+// trimmed. The handle is opened before stat so the checks apply to the
+// file actually read.
+func readSecretFile(path, what string) (string, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("open secret file: %w", err)
+		return "", fmt.Errorf("open %s file: %w", what, err)
 	}
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {
-		return "", fmt.Errorf("stat secret file: %w", err)
+		return "", fmt.Errorf("stat %s file: %w", what, err)
 	}
 	if !fi.Mode().IsRegular() {
-		return "", fmt.Errorf("secret file %s is not a regular file", c.SecretFile)
+		return "", fmt.Errorf("%s file %s is not a regular file", what, path)
 	}
 	if fi.Mode().Perm()&0o077 != 0 {
-		return "", fmt.Errorf("secret file %s must have no group/other permission bits", c.SecretFile)
+		return "", fmt.Errorf("%s file %s must have no group/other permission bits", what, path)
 	}
-	raw, err := os.ReadFile(c.SecretFile)
+	raw, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("read secret file: %w", err)
+		return "", fmt.Errorf("read %s file: %w", what, err)
 	}
 	secret := strings.TrimSuffix(string(raw), "\n")
 	secret = strings.TrimSuffix(secret, "\r")
 	if secret == "" {
-		return "", fmt.Errorf("webhook secret is empty: refusing to start")
+		return "", fmt.Errorf("%s is empty: refusing to start", what)
 	}
 	return checkSecretLength(secret)
 }
@@ -315,6 +360,37 @@ func (c Config) Validate() error {
 		if !stableFieldVocabulary[f] {
 			return fmt.Errorf("stable identity field %q is not a known Pro change field", f)
 		}
+	}
+	if c.ModelProvider != "meta" && c.ModelProvider != "fake" {
+		return fmt.Errorf("model provider must be %q or %q, got %q", "meta", "fake", c.ModelProvider)
+	}
+	if c.ModelProvider == "meta" {
+		if c.ModelID == "" {
+			return fmt.Errorf("model ID is required with the meta provider")
+		}
+		u, err := url.Parse(c.ModelBaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("model base URL must be a valid http(s) endpoint, got %q", c.ModelBaseURL)
+		}
+		if c.ModelAPIKey == "" && c.ModelAPIKeyFile == "" {
+			return fmt.Errorf("model API key is unset: refusing to start")
+		}
+		if c.ModelAPIKey != "" && c.ModelAPIKeyFile != "" {
+			return fmt.Errorf("set exactly one of model API key or key file")
+		}
+	}
+	if c.ProviderTimeout <= 0 {
+		return fmt.Errorf("provider timeout must be positive")
+	}
+	if c.MaxModelResponseBytes <= 0 {
+		return fmt.Errorf("max model response bytes must be positive")
+	}
+	// The stale-lease reaper must outlive two full provider budgets plus
+	// margin: otherwise a slow (not hung) model plus its repair can see
+	// the group re-taken while the first attempt is still running.
+	if c.ProcessingLease <= 2*c.ProviderTimeout+c.Margin {
+		return fmt.Errorf("processing lease %v must exceed 2 x provider timeout %v plus margin %v",
+			c.ProcessingLease, c.ProviderTimeout, c.Margin)
 	}
 	return nil
 }

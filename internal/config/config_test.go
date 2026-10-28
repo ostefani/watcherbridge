@@ -55,6 +55,20 @@ func TestValidateRejects(t *testing.T) {
 		"empty stable fields":     func(c *Config) { c.StableIdentityFields = nil },
 		"zero in-flight":          func(c *Config) { c.InFlightCap = 0 },
 		"two sweep workers":       func(c *Config) { c.SweepWorkers = 2 },
+		"unknown model provider":  func(c *Config) { c.ModelProvider = "openai" },
+		"meta without model ID":   func(c *Config) { c.ModelProvider = "meta" },
+		"meta without base URL":   func(c *Config) { c.ModelProvider = "meta"; c.ModelID = "m" },
+		"meta without key":        func(c *Config) { c.ModelProvider = "meta"; c.ModelID = "m"; c.ModelBaseURL = "https://m.example/v1" },
+		"meta key and key file": func(c *Config) {
+			c.ModelProvider = "meta"
+			c.ModelID = "m"
+			c.ModelBaseURL = "https://m.example/v1"
+			c.ModelAPIKey = "0123456789abcdef"
+			c.ModelAPIKeyFile = "f"
+		},
+		"zero provider timeout":   func(c *Config) { c.ProviderTimeout = 0 },
+		"zero response cap":       func(c *Config) { c.MaxModelResponseBytes = 0 },
+		"lease below 2x provider": func(c *Config) { c.ProcessingLease = 2*c.ProviderTimeout + c.Margin },
 		"zero quiet window":       func(c *Config) { c.GroupQuietWindow = 0 },
 		"max window below quiet":  func(c *Config) { c.GroupMaxWindow = time.Second },
 		"group max below quiet":   func(c *Config) { c.GroupMaxWindow = c.GroupQuietWindow - time.Second },
