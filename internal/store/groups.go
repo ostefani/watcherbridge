@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// DefaultBriefingPage bounds one NeedsBriefing drain page. The worker loops
+// pages until empty, checking its context between groups.
+const DefaultBriefingPage = 64
+
 type GroupPolicy struct {
 	QuietWindow time.Duration // debounce: group closes this long after last event
 	MaxWindow   time.Duration // hard cap from first event
@@ -50,7 +54,11 @@ var ErrGroupNotClosed = errors.New("group is not closed")
 func (s *Store) TakeGroup(ctx context.Context, groupID string) (TakenGroup, error) {
 	var taken TakenGroup
 	err := s.write(ctx, func(tx *sql.Tx) error {
-		res, err := tx.Exec(`UPDATE active_groups SET status = 'processing', processing_since = ? WHERE group_id = ? AND status = 'closed'`, nanos(s.now()), groupID)
+		// The take is the attempt: the counter advances here and only
+		// here, so a crash between take and briefing still counts and a
+		// poison group cannot crash-loop forever. Release paths never
+		// increment; they only park at the cap.
+		res, err := tx.Exec(`UPDATE active_groups SET status = 'processing', processing_since = ?, retry_count = retry_count + 1 WHERE group_id = ? AND status = 'closed'`, nanos(s.now()), groupID)
 		if err != nil {
 			return err
 		}
@@ -112,7 +120,7 @@ func (s *Store) ReleaseStale(ctx context.Context, now time.Time, maxAge time.Dur
 			return err
 		}
 		for _, id := range ids {
-			if _, err := tx.Exec(`UPDATE active_groups SET status = CASE WHEN retry_count + 1 >= ? THEN 'failed' ELSE 'closed' END, retry_count = retry_count + 1, processing_since = NULL WHERE group_id = ? AND status = 'processing'`, maxGroupRetries, id); err != nil {
+			if _, err := tx.Exec(`UPDATE active_groups SET status = CASE WHEN retry_count >= ? THEN 'failed' ELSE 'closed' END, processing_since = NULL WHERE group_id = ? AND status = 'processing'`, maxGroupRetries, id); err != nil {
 				return err
 			}
 		}
@@ -166,7 +174,7 @@ func (s *Store) Recover(ctx context.Context, now time.Time) ([]string, error) {
 			return err
 		}
 		for _, id := range ids {
-			if _, err := tx.Exec(`UPDATE active_groups SET status = CASE WHEN status = 'processing' AND retry_count + 1 >= ? THEN 'failed' ELSE 'closed' END, retry_count = retry_count + (CASE WHEN status = 'processing' THEN 1 ELSE 0 END), processing_since = NULL WHERE group_id = ?`, maxGroupRetries, id); err != nil {
+			if _, err := tx.Exec(`UPDATE active_groups SET status = CASE WHEN status = 'processing' AND retry_count >= ? THEN 'failed' ELSE 'closed' END, processing_since = NULL WHERE group_id = ?`, maxGroupRetries, id); err != nil {
 				return err
 			}
 		}
@@ -214,13 +222,13 @@ func (s *Store) CloseDue(ctx context.Context, now time.Time) ([]string, error) {
 
 const maxGroupRetries = 5
 
-// ReleaseGroup returns a processing group to closed for a later retry and
-// increments its retry counter. At maxGroupRetries the group is parked in
-// 'failed' instead, so a poison group cannot loop forever.
+// ReleaseGroup returns a processing group to closed for a later retry. It
+// never increments the counter — takes own counting. At maxGroupRetries the
+// group is parked in 'failed' instead, so a poison group cannot loop forever.
 func (s *Store) ReleaseGroup(ctx context.Context, groupID string) (bool, error) {
 	matched := false
 	err := s.write(ctx, func(tx *sql.Tx) error {
-		res, err := tx.Exec(`UPDATE active_groups SET status = CASE WHEN retry_count + 1 >= ? THEN 'failed' ELSE 'closed' END, retry_count = retry_count + 1, processing_since = NULL WHERE group_id = ? AND status = 'processing'`, maxGroupRetries, groupID)
+		res, err := tx.Exec(`UPDATE active_groups SET status = CASE WHEN retry_count >= ? THEN 'failed' ELSE 'closed' END, processing_since = NULL WHERE group_id = ? AND status = 'processing'`, maxGroupRetries, groupID)
 		if err != nil {
 			return err
 		}
@@ -234,10 +242,14 @@ func (s *Store) ReleaseGroup(ctx context.Context, groupID string) (bool, error) 
 	return matched, nil
 }
 
-// NeedsBriefing lists closed groups with no briefing row yet.
-func (s *Store) NeedsBriefing(ctx context.Context) ([]string, error) {
+// NeedsBriefing lists closed groups with no briefing row yet, oldest first,
+// at most limit rows. A non-positive limit selects the default page.
+func (s *Store) NeedsBriefing(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = DefaultBriefingPage
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT group_id FROM active_groups WHERE status = 'closed'
-		AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id) ORDER BY opened_at`)
+		AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id) ORDER BY opened_at LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -270,6 +282,41 @@ func (s *Store) GroupDeadline(ctx context.Context, groupID string) (time.Time, e
 	var n int64
 	err := s.db.QueryRowContext(ctx, `SELECT deadline_at FROM active_groups WHERE group_id = ?`, groupID).Scan(&n)
 	return fromNanos(n), err
+}
+
+// GroupSnapshot is the viewer-facing view of an in-progress group: all
+// fields are safe for local display (anchors are raw local identifiers).
+type GroupSnapshot struct {
+	GroupID    string
+	Anchor     string
+	Status     string
+	Deadline   time.Time
+	EventCount int
+}
+
+// OpenGroupSnapshots lists groups still accumulating events, oldest
+// deadline first. The groups_status_deadline index serves the filter and
+// order; the event count comes from the join table in the same query.
+func (s *Store) OpenGroupSnapshots(ctx context.Context) ([]GroupSnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT ag.group_id, ag.host_anchor_key, ag.status, ag.deadline_at,
+		COUNT(ge.event_id) FROM active_groups ag
+		LEFT JOIN group_events ge ON ge.group_id = ag.group_id
+		WHERE ag.status = 'open' GROUP BY ag.group_id ORDER BY ag.deadline_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GroupSnapshot
+	for rows.Next() {
+		var g GroupSnapshot
+		var deadline int64
+		if err := rows.Scan(&g.GroupID, &g.Anchor, &g.Status, &deadline, &g.EventCount); err != nil {
+			return nil, err
+		}
+		g.Deadline = fromNanos(deadline)
+		out = append(out, g)
+	}
+	return out, rows.Err()
 }
 
 // ForwardState reports delivery state for one event.

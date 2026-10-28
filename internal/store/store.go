@@ -20,10 +20,33 @@ import (
 )
 
 type writeJob struct {
-	ctx  context.Context
-	fn   func(*sql.Tx) error
+	ctx context.Context
+	fn  func(*sql.Tx) error
+	// raw runs on the writer goroutine without opening a transaction,
+	// for statements SQLite forbids inside one (e.g. wal_checkpoint).
+	raw  func() error
 	done chan error
 }
+
+// ErrStoreClosed is returned when the store is shut down; ErrQueueSaturated
+// when the bounded writer queue is full. Both mean "retry later", never
+// "bad request".
+var (
+	ErrStoreClosed    = fmt.Errorf("store is closed")
+	ErrQueueSaturated = fmt.Errorf("writer queue saturated")
+)
+
+// DefaultQueueCap bounds the writer channel when the caller has no number.
+const DefaultQueueCap = 64
+
+// Option adjusts Open.
+type Option func(*options)
+
+type options struct{ queueCap int }
+
+// WithQueueCap bounds the writer queue; overflow fails fast with
+// ErrQueueSaturated instead of blocking ingest.
+func WithQueueCap(n int) Option { return func(o *options) { o.queueCap = n } }
 
 // Store owns the database. The zero value is invalid; use Open.
 type Store struct {
@@ -43,14 +66,21 @@ func fromNanos(n int64) time.Time {
 
 // Open creates (0600 file in a 0700 directory) or opens the database at path,
 // runs migrations, and starts the writer goroutine.
-func Open(path string) (*Store, error) { return openStore(path, nil) }
+func Open(path string, opts ...Option) (*Store, error) { return openStore(path, nil, opts...) }
 
 // OpenWithWarnFunc is Open with a caller-supplied warning sink (nil = log).
-func OpenWithWarnFunc(path string, warn func(format string, args ...any)) (*Store, error) {
-	return openStore(path, warn)
+func OpenWithWarnFunc(path string, warn func(format string, args ...any), opts ...Option) (*Store, error) {
+	return openStore(path, warn, opts...)
 }
 
-func openStore(path string, warn func(format string, args ...any)) (*Store, error) {
+func openStore(path string, warn func(format string, args ...any), opts ...Option) (*Store, error) {
+	o := options{queueCap: DefaultQueueCap}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if o.queueCap < 1 {
+		return nil, fmt.Errorf("writer queue cap must be positive")
+	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("resolve database path: %w", err)
@@ -105,7 +135,7 @@ func openStore(path string, warn func(format string, args ...any)) (*Store, erro
 		db.Close()
 		return nil, fmt.Errorf("tighten database permissions: %w", err)
 	}
-	s := &Store{db: db, jobs: make(chan writeJob), quit: make(chan struct{}), now: time.Now}
+	s := &Store{db: db, jobs: make(chan writeJob, o.queueCap), quit: make(chan struct{}), now: time.Now}
 	s.wg.Add(1)
 	go s.writer()
 	return s, nil
@@ -136,6 +166,9 @@ func (s *Store) runJob(job writeJob) (err error) {
 	if err := job.ctx.Err(); err != nil {
 		return err
 	}
+	if job.raw != nil {
+		return job.raw()
+	}
 	tx, err := s.db.BeginTx(job.ctx, nil)
 	if err != nil {
 		return err
@@ -154,13 +187,27 @@ func (s *Store) runJob(job writeJob) (err error) {
 // "unknown, retry safely" and rely on idempotency (e.g.
 // PersistEventAndGroup reports Inserted=false on the retry).
 func (s *Store) write(ctx context.Context, fn func(*sql.Tx) error) error {
-	job := writeJob{ctx: ctx, fn: fn, done: make(chan error, 1)}
+	return s.enqueue(ctx, writeJob{ctx: ctx, fn: fn, done: make(chan error, 1)})
+}
+
+// enqueue submits a job without ever blocking the caller: a full queue
+// fails fast so ingest can answer 503 instead of piling up memory.
+func (s *Store) enqueue(ctx context.Context, job writeJob) error {
 	select {
 	case <-s.quit:
-		return fmt.Errorf("store is closed")
+		return ErrStoreClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	select {
+	case <-s.quit:
+		return ErrStoreClosed
 	case <-ctx.Done():
 		return ctx.Err()
 	case s.jobs <- job:
+	default:
+		return ErrQueueSaturated
 	}
 	select {
 	case <-ctx.Done():

@@ -7,6 +7,37 @@ import (
 	"time"
 )
 
+// Checkpoint runs a TRUNCATE checkpoint on the single writer goroutine (but
+// outside a transaction, which SQLite forbids for checkpoints) so the -wal
+// file drains after load spikes. Checkpoints only run here, never beside
+// the writer, so they cannot race an in-flight commit.
+func (s *Store) Checkpoint(ctx context.Context) error {
+	job := writeJob{ctx: ctx, done: make(chan error, 1)}
+	// QueryRow surfaces the busy count: a nonzero second column means a
+	// reader blocked the TRUNCATE and the WAL did not drain.
+	job.raw = func() error {
+		var busy, logFrames, checkpointed int64
+		if err := s.db.QueryRowContext(job.ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointed); err != nil {
+			return err
+		}
+		if busy != 0 {
+			return fmt.Errorf("wal checkpoint blocked: busy=%d log=%d checkpointed=%d", busy, logFrames, checkpointed)
+		}
+		return nil
+	}
+	return s.enqueue(ctx, job)
+}
+
+// MarkUndeliverable parks an event the forwarder can never send (e.g. its
+// stored headers no longer parse). Terminal like stale_for_sweep: the sweep
+// never selects it again, and the viewer can show the reason.
+func (s *Store) MarkUndeliverable(ctx context.Context, eventID, reason string) error {
+	return s.write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE raw_events SET delivery_error = ? WHERE event_id = ? AND delivery_error IS NULL`, reason, eventID)
+		return err
+	})
+}
+
 const briefingPurgeFloor = 24 * time.Hour
 
 // PurgeBriefings deletes briefings (and their emptied done groups) created

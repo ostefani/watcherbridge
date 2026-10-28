@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 3
+const supportedSchemaVersion = 4
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -99,6 +99,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 2, migrateV2)
 		case 2:
 			err = applyMigration(db, 3, migrateV3)
+		case 3:
+			err = applyMigration(db, 4, migrateV4)
 		}
 		if err != nil {
 			return err
@@ -184,6 +186,22 @@ func migrateV3(tx *sql.Tx) error {
 		`CREATE INDEX IF NOT EXISTS group_events_event ON group_events(event_id)`,
 		`CREATE INDEX IF NOT EXISTS briefings_created ON briefings(created_at)`,
 		`UPDATE briefings SET event_ids_json = COALESCE((SELECT json_group_array(event_id) FROM (SELECT event_id FROM group_events WHERE group_events.group_id = briefings.group_id ORDER BY event_id)), '[]')`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV4: briefings gain the matched baseline rule ID (nullable: rows
+// written before v4 have none), and the stale-lease scan gets a partial
+// index so the grouper tick stays indexed as history accumulates.
+func migrateV4(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE briefings ADD COLUMN baseline_rule TEXT`,
+		`CREATE INDEX IF NOT EXISTS groups_processing_since ON active_groups(processing_since) WHERE status = 'processing'`,
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt); err != nil {
