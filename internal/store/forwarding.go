@@ -40,7 +40,10 @@ var (
 	addrPattern = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}(:\d+)?\b`)
 )
 
-func sanitizeErrorText(s string) string {
+// SanitizeErrorText strips URLs and IP:port pairs from error text so logs
+// and stored errors carry IDs and statuses, never payload values. Shared by
+// the forwarder receipt path and the briefing worker.
+func SanitizeErrorText(s string) string {
 	s = urlPattern.ReplaceAllString(s, "[url]")
 	s = addrPattern.ReplaceAllString(s, "[addr]")
 	if len(s) > 256 {
@@ -54,7 +57,7 @@ func sanitizeErrorText(s string) string {
 
 func (s *Store) RecordForwardFailure(ctx context.Context, eventID, errText string) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
-		_, err := tx.Exec(`UPDATE raw_events SET forward_attempts = forward_attempts + 1, last_forward_error = ? WHERE event_id = ?`, sanitizeErrorText(errText), eventID)
+		_, err := tx.Exec(`UPDATE raw_events SET forward_attempts = forward_attempts + 1, last_forward_error = ? WHERE event_id = ?`, SanitizeErrorText(errText), eventID)
 		return err
 	})
 }

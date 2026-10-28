@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ostefani/watcherbridge/internal/briefing"
 	"github.com/ostefani/watcherbridge/internal/config"
 	"github.com/ostefani/watcherbridge/internal/forwarder"
 	"github.com/ostefani/watcherbridge/internal/store"
@@ -840,6 +841,124 @@ func TestEventIDCharset(t *testing.T) {
 	}
 	if _, err := parseAndValidate(now, 300*time.Second, strconv.FormatInt(now.Unix(), 10), "evt-01_2", "host-a", "host.appeared", body); err != nil {
 		t.Fatalf("dash/underscore must stay valid: %v", err)
+	}
+}
+
+func seedClosedGroups(t *testing.T, h *harness, n int) []string {
+	t.Helper()
+	now := time.Now().UTC()
+	ids := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		id := uniqueID()
+		key := fmt.Sprintf("host-drain-%d", i)
+		body := eventBody(id, key, "host.changed")
+		res, err := h.srv.events.PersistEventAndGroup(context.Background(), store.RawEvent{
+			EventID: id, EventKey: key, EventType: "host.changed",
+			OccurredAt: now, Payload: body, ReceivedAt: now, SignatureTimestamp: now,
+		}, key, store.GroupPolicy{QuietWindow: time.Second, MaxWindow: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, res.GroupID)
+	}
+	// Quiet windows are 1s by construction; one CloseDue far in the future
+	// closes every seeded group deterministically.
+	if _, err := h.srv.events.CloseDue(context.Background(), now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+func seededDone(t *testing.T, h *harness, ids []string) bool {
+	t.Helper()
+	for _, id := range ids {
+		st, err := h.srv.events.GroupStatus(context.Background(), id)
+		if err != nil || st != "done" {
+			return false
+		}
+	}
+	return true
+}
+
+func briefingDeps(t *testing.T, h *harness) briefing.Deps {
+	t.Helper()
+	return briefing.Deps{
+		Store:  h.srv.events,
+		Groups: store.GroupPolicy{QuietWindow: time.Second, MaxWindow: time.Hour},
+		Tick:   10 * time.Millisecond,
+		Lease:  h.srv.cfg.ProcessingLease,
+		Now:    time.Now,
+		Policy: briefing.Policy{
+			EstablishedAge:   h.srv.cfg.EstablishedAge,
+			StrongHistoryAge: h.srv.cfg.StrongHistoryAge,
+			StableFields:     h.srv.cfg.StableIdentityFields,
+		},
+	}
+}
+
+func TestClosureDrainBudgets(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.Mode = config.ModeProxy })
+	now := time.Now()
+	seeded := seedClosedGroups(t, h, 256)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- briefing.Run(ctx, briefingDeps(t, h)) }()
+	start := time.Now()
+
+	// Background ingest at 50 ev/s on its own goroutine while the main
+	// goroutine polls the seeded groups: every request lands while the
+	// worker holds the shared writer.
+	type ingestResult struct {
+		durs      []time.Duration
+		lost      int
+		saturated int
+	}
+	ingestDone := make(chan ingestResult, 1)
+	go func() {
+		tick := time.NewTicker(20 * time.Millisecond)
+		defer tick.Stop()
+		var res ingestResult
+		for i := 0; i < 100; i++ {
+			<-tick.C
+			reqStart := time.Now()
+			rec := h.signedPost(t, uniqueID(), "host-bg", "host.appeared", now)
+			res.durs = append(res.durs, time.Since(reqStart))
+			switch rec.Code {
+			case http.StatusAccepted:
+			case http.StatusServiceUnavailable:
+				res.saturated++
+			default:
+				res.lost++
+			}
+		}
+		ingestDone <- res
+	}()
+	for !seededDone(t, h, seeded) {
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("256 seeded groups not briefed within 5s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	drainElapsed := time.Since(start)
+	t.Logf("256-group drain took %v (budget 5s)", drainElapsed)
+	res := <-ingestDone
+	sort.Slice(res.durs, func(a, b int) bool { return res.durs[a] < res.durs[b] })
+	p99 := res.durs[int(float64(len(res.durs))*0.99)]
+	t.Logf("ingest p99 during drain over %d requests: %v (budget 50ms)", len(res.durs), p99)
+	if p99 > 50*time.Millisecond {
+		t.Fatalf("ingest p99 %v exceeds 50ms during drain", p99)
+	}
+	if res.saturated != 0 || res.lost != 0 {
+		t.Fatalf("ingest loss during drain: saturated=%d lost=%d", res.saturated, res.lost)
+	}
+	var mem runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&mem)
+	t.Logf("heap after drain: %d bytes (budget 64MiB)", mem.HeapInuse)
+	if mem.HeapInuse > 64<<20 {
+		t.Fatalf("heap %d exceeds 64MiB", mem.HeapInuse)
 	}
 }
 

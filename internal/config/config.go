@@ -79,6 +79,12 @@ type Config struct {
 	GroupQuietWindow time.Duration
 	GroupMaxWindow   time.Duration
 	GroupMaxEvents   int
+
+	GrouperTick          time.Duration
+	ProcessingLease      time.Duration // stale processing age; must exceed 2 x provider timeout + margin
+	EstablishedAge       time.Duration // first-seen age for established; dormant until Pro ships the field
+	StrongHistoryAge     time.Duration // first-seen age for strong history; dormant until Pro ships the field
+	StableIdentityFields []string      // change-field names that break stability; validated at startup
 }
 
 // Default returns the approved starting thresholds (Designv5 §12/§15).
@@ -119,7 +125,22 @@ func Default() Config {
 		GroupQuietWindow: 45 * time.Second,
 		GroupMaxWindow:   120 * time.Second,
 		GroupMaxEvents:   10,
+
+		GrouperTick:          1 * time.Second,
+		ProcessingLease:      90 * time.Second,
+		EstablishedAge:       1 * time.Hour,
+		StrongHistoryAge:     24 * time.Hour,
+		StableIdentityFields: []string{"mac", "hostname", "host_id", "identity_confidence", "identity_source"},
 	}
+}
+
+// stableFieldVocabulary is every Change.Field name Pro's tracker can emit
+// (watch/tracker.go diffHostState). STABLE_IDENTITY_FIELDS must be a subset.
+var stableFieldVocabulary = map[string]bool{
+	"ip": true, "host_id": true, "identity_confidence": true, "identity_source": true,
+	"hostname": true, "mac": true, "vendor": true, "os": true, "device": true,
+	"source": true, "source_name": true, "alive": true, "weak": true, "ports": true,
+	"metadata": true, "identity_aliases": true, "identity_anchor_keys": true,
 }
 
 // ResolveSecret returns the webhook secret from Secret or SecretFile. File
@@ -259,6 +280,32 @@ func (c Config) Validate() error {
 	}
 	if c.GroupMaxWindow > 0 && c.GroupMaxWindow < c.GroupQuietWindow {
 		return fmt.Errorf("group max window must be >= quiet window")
+	}
+	if c.GrouperTick <= 0 {
+		return fmt.Errorf("grouper tick must be positive")
+	}
+	if c.GrouperTick > c.GroupQuietWindow {
+		return fmt.Errorf("grouper tick %v must not exceed the quiet window %v, or closures lag a full window", c.GrouperTick, c.GroupQuietWindow)
+	}
+	if c.ProcessingLease <= 0 {
+		return fmt.Errorf("processing lease must be positive")
+	}
+	if c.GrouperTick >= c.ProcessingLease {
+		return fmt.Errorf("grouper tick %v must be below the processing lease %v, or a stale worker is never reaped in time", c.GrouperTick, c.ProcessingLease)
+	}
+	if c.EstablishedAge <= 0 || c.StrongHistoryAge <= 0 {
+		return fmt.Errorf("established and strong-history ages must be positive")
+	}
+	if c.EstablishedAge > c.StrongHistoryAge {
+		return fmt.Errorf("established age %v must not exceed strong-history age %v", c.EstablishedAge, c.StrongHistoryAge)
+	}
+	if len(c.StableIdentityFields) == 0 {
+		return fmt.Errorf("stable identity fields must not be empty")
+	}
+	for _, f := range c.StableIdentityFields {
+		if !stableFieldVocabulary[f] {
+			return fmt.Errorf("stable identity field %q is not a known Pro change field", f)
+		}
 	}
 	return nil
 }
