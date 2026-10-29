@@ -127,7 +127,7 @@ func newHarness(t *testing.T, mutate func(*config.Config)) *harness {
 	cfg := config.Default()
 	cfg.Mode = config.ModeProxy // most tests exercise forwarding; tap tests override
 	cfg.ScanRelayURL = relay.srv.URL
-	cfg.Secret = "test-secret-long-enough"
+	cfg.Secret = "test-secret-long-enough-01234567"
 	if mutate != nil {
 		mutate(&cfg)
 	}
@@ -140,7 +140,7 @@ func newHarness(t *testing.T, mutate func(*config.Config)) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &harness{srv: srv, relay: relay, secret: "test-secret-long-enough"}
+	return &harness{srv: srv, relay: relay, secret: "test-secret-long-enough-01234567"}
 }
 
 func (h *harness) post(t *testing.T, body []byte, id, key, typ string, ts time.Time, sig string) *httptest.ResponseRecorder {
@@ -557,12 +557,12 @@ func TestWALBoundedUnderLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	h := &harness{secret: "test-secret-long-enough"}
+	h := &harness{secret: "test-secret-long-enough-01234567"}
 	relay := newFakeRelay(t)
 	cfg := config.Default()
 	cfg.Mode = config.ModeProxy
 	cfg.ScanRelayURL = relay.srv.URL
-	cfg.Secret = "test-secret-long-enough"
+	cfg.Secret = "test-secret-long-enough-01234567"
 	cfg.MaxBodyBytes = 256 << 10
 	srv, err := New(cfg, st, forwarder.NewGate())
 	if err != nil {

@@ -51,13 +51,82 @@ func changedPayload(prevPorts, curPorts string) string {
 	return `{"event_id":"e1","previous":{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[` + prevPorts + `]},"current":{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[` + curPorts + `]}}`
 }
 
+// A saturated release write retries instead of burning the take: two
+// saturated attempts then success reports the success; a non-saturation
+// error returns at once; a dead context breaks the wait.
+func TestRetryReleaseOnSaturated(t *testing.T) {
+	calls := 0
+	matched, err := retryReleaseOnSaturated(context.Background(), func(context.Context) (bool, error) {
+		calls++
+		if calls < 3 {
+			return false, store.ErrQueueSaturated
+		}
+		return true, nil
+	})
+	if err != nil || !matched || calls != 3 {
+		t.Fatalf("saturated release must retry to success: %v %v %d", matched, err, calls)
+	}
+
+	calls = 0
+	if _, err := retryReleaseOnSaturated(context.Background(), func(context.Context) (bool, error) {
+		calls++
+		return false, sql.ErrNoRows
+	}); !errors.Is(err, sql.ErrNoRows) || calls != 1 {
+		t.Fatalf("non-saturation error must return at once: %v %d", err, calls)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := retryReleaseOnSaturated(ctx, func(context.Context) (bool, error) {
+		return false, store.ErrQueueSaturated
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("dead context must break the wait: %v", err)
+	}
+}
+
+// The transient-release backoff must escalate on the refund count, not
+// the take count: refunds unhappen takes, so retry counts would retry
+// flat out and the runaway cap would cover minutes, not ~80s.
+func TestTransientRefundBackoffEscalates(t *testing.T) {
+	s := openWorkerStore(t)
+	ctx := context.Background()
+	gid := seedGroup(t, s, "host:esc", "evt-esc", "host.appeared", `{"event_id":"e"}`)
+	for i := 0; i < 5; i++ {
+		if _, err := s.TakeGroup(ctx, gid); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ReleaseGroupTransient(ctx, gid, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	taken, err := s.TakeGroup(ctx, gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if taken.TransientRefunds != 5 {
+		t.Fatalf("take must expose the refund count, got %d", taken.TransientRefunds)
+	}
+	if !releaseTransient(ctx, testDeps(t, s), taken) {
+		t.Fatal("transient release must move the group")
+	}
+	// releaseBackoff(5) caps at 30s: due long after a retry-counted
+	// delay (retry counts stay at 1 through refunds) would land.
+	now := time.Now().UTC()
+	if needs, err := s.NeedsBriefing(ctx, 64, now.Add(5*time.Second)); err != nil || len(needs) != 0 {
+		t.Fatalf("escalated refund must hide the group at +5s: %v %v", needs, err)
+	}
+	if needs, err := s.NeedsBriefing(ctx, 64, now.Add(31*time.Second)); err != nil || len(needs) != 1 {
+		t.Fatalf("escalated refund must elapse by +31s: %v %v", needs, err)
+	}
+}
+
 func TestWorkerDrainWritesMinimalBriefing(t *testing.T) {
 	s := openWorkerStore(t)
 	gid := seedGroup(t, s, "host:w", "evt-w1", "host.changed", changedPayload("", `{"number":22,"protocol":"tcp","state":"open"}`))
 	d := testDeps(t, s)
 	drainOnce(context.Background(), d, time.Now())
 
-	if needs, err := s.NeedsBriefing(context.Background(), 64); err != nil || len(needs) != 0 {
+	if needs, err := s.NeedsBriefing(context.Background(), 64, time.Now()); err != nil || len(needs) != 0 {
 		t.Fatalf("drain must empty the queue: %v %v", needs, err)
 	}
 	if st, _ := s.GroupStatus(context.Background(), gid); st != "done" {
@@ -179,7 +248,7 @@ func TestWorkerRunStopsOnCancel(t *testing.T) {
 	if time.Since(start) > 5*time.Second {
 		t.Fatal("cancelled Run must return promptly")
 	}
-	if needs, _ := s.NeedsBriefing(context.Background(), 64); len(needs) != 3 {
+	if needs, _ := s.NeedsBriefing(context.Background(), 64, time.Now()); len(needs) != 3 {
 		t.Fatal("cancelled run must brief nothing")
 	}
 	before := runtime.NumGoroutine()
@@ -206,7 +275,7 @@ func TestWorkerDrainChecksCtx(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	drainOnce(ctx, d, time.Now())
-	if needs, _ := s.NeedsBriefing(context.Background(), 64); len(needs) != 1 {
+	if needs, _ := s.NeedsBriefing(context.Background(), 64, time.Now()); len(needs) != 1 {
 		t.Fatal("cancelled drain must leave state consistent and untouched")
 	}
 }
@@ -375,4 +444,125 @@ func openWorkerStore(t *testing.T) *store.Store {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+// H2: a group released with backoff leaves the drain queue: one pass
+// briefs only the due group, and the backed-off group converges later
+// without burning takes in between.
+func TestDrainOnceSkipsBackedOffGroup(t *testing.T) {
+	s := openWorkerStore(t)
+	d := testDeps(t, s)
+	gA := seedGroup(t, s, "host:ba", "evt-ba1", "host.appeared", `{"event_id":"e"}`)
+	gB := seedGroup(t, s, "host:bb", "evt-bb1", "host.appeared", `{"event_id":"e"}`)
+	taken, err := s.TakeGroup(context.Background(), gA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReleaseGroupDelayed(context.Background(), gA, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	drainOnce(context.Background(), d, time.Now())
+	if st, _ := s.GroupStatus(context.Background(), gB); st != "done" {
+		t.Fatalf("due group must brief, got %q", st)
+	}
+	if st, _ := s.GroupStatus(context.Background(), gA); st != "closed" {
+		t.Fatalf("backed-off group must stay closed, got %q", st)
+	}
+	if _, err := s.BriefingForGroup(context.Background(), gA); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("backed-off group must have no briefing yet: %v", err)
+	}
+	_ = taken
+}
+
+// H2: a pass whose takes all fail must end instead of spinning. A group
+// released with backoff is listed by a future-dated pass but refused by
+// takes (which use the store clock), so every take fails the same way:
+// the pass must return after one page, leaving the group closed.
+func TestDrainOnceEndsPassWithoutProgress(t *testing.T) {
+	s := openWorkerStore(t)
+	d := testDeps(t, s)
+	gid := seedGroup(t, s, "host:np", "evt-np1", "host.appeared", `{"event_id":"e"}`)
+	if _, err := s.TakeGroup(context.Background(), gid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReleaseGroupDelayed(context.Background(), gid, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); drainOnce(context.Background(), d, time.Now().Add(2*time.Hour)) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("drain pass spun on failing takes instead of ending")
+	}
+	if st, _ := s.GroupStatus(context.Background(), gid); st != "closed" {
+		t.Fatalf("group must stay closed, got %q", st)
+	}
+	if _, err := s.BriefingForGroup(context.Background(), gid); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("unprogressed group must have no briefing: %v", err)
+	}
+}
+
+// M11: a fallback stores a permanent record, so a dead context must
+// store nothing — the group stays processing for the lease (or the next
+// startup) instead of gaining a briefing the model never saw.
+func TestInsertFallbackDeadContextStoresNothing(t *testing.T) {
+	s := openWorkerStore(t)
+	d := testDeps(t, s)
+	gid := seedGroup(t, s, "host:dc", "evt-dc1", "host.appeared", `{"event_id":"e"}`)
+	taken, err := s.TakeGroup(context.Background(), gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := Baseline(decodeTaken(taken), asOf(taken), d.Policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if insertFallback(ctx, d, taken, outcome, "dead context") {
+		t.Fatal("dead-context fallback must report no progress")
+	}
+	if _, err := s.BriefingForGroup(context.Background(), gid); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("dead-context fallback must store nothing: %v", err)
+	}
+	if st, _ := s.GroupStatus(context.Background(), gid); st != "processing" {
+		t.Fatalf("group must stay processing for the lease, got %q", st)
+	}
+}
+
+func TestReleaseBackoffSchedule(t *testing.T) {
+	if got := releaseBackoff(0); got != 2*time.Second {
+		t.Fatalf("retry 0: %v", got)
+	}
+	if got := releaseBackoff(2); got != 8*time.Second {
+		t.Fatalf("retry 2: %v", got)
+	}
+	if got := releaseBackoff(4); got != 30*time.Second {
+		t.Fatalf("retry 4 must cap: %v", got)
+	}
+	if got := releaseBackoff(100); got != 30*time.Second {
+		t.Fatalf("overflow must cap: %v", got)
+	}
+}
+
+func TestTransientStoreErrClassification(t *testing.T) {
+	ctx := context.Background()
+	if transientStoreErr(ctx, nil) {
+		t.Fatal("nil error is not transient")
+	}
+	if !transientStoreErr(ctx, store.ErrQueueSaturated) {
+		t.Fatal("saturated queue must be transient")
+	}
+	if !transientStoreErr(ctx, store.ErrStoreClosed) {
+		t.Fatal("closed store must be transient")
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if !transientStoreErr(cancelled, context.Canceled) {
+		t.Fatal("cancelled context must be transient")
+	}
+	if transientStoreErr(ctx, errors.New("constraint failed")) {
+		t.Fatal("constraint errors are real outcomes, not transient")
+	}
 }

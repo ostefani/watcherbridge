@@ -10,6 +10,7 @@ package briefing
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -95,6 +96,7 @@ type Outcome struct {
 const (
 	RuleCritIdentityService = "CRIT_IDENTITY_SERVICE"
 	RuleHighNewService      = "HIGH_NEW_SERVICE"
+	RuleHighMultiSensitive  = "HIGH_MULTI_SENSITIVE"
 	RuleMedNewIdentity      = "MED_NEW_IDENTITY"
 	RuleMedGoneAfterHistory = "MED_GONE_AFTER_HISTORY"
 	RuleLowWeakGone         = "LOW_WEAK_GONE"
@@ -168,7 +170,7 @@ func Baseline(events []GroupEvent, asOf time.Time, pol Policy) (Outcome, error) 
 	// asOf-less evaluation with first-seen data leaves age gates unknown.
 	// Gate-false is not a skip — only unknown input is counted.
 	if unknownHost {
-		skipped = append(skipped, RuleCritIdentityService, RuleHighNewService, RuleMedNewIdentity, RuleMedGoneAfterHistory, RuleLowWeakGone, RuleLowCosmetic)
+		skipped = append(skipped, RuleCritIdentityService, RuleHighNewService, RuleHighMultiSensitive, RuleMedNewIdentity, RuleMedGoneAfterHistory, RuleLowWeakGone, RuleLowCosmetic)
 		return Outcome{Level: Low, RuleID: RuleDefault, Skipped: skipped}, nil
 	}
 	pairDiffs, singleSided := false, false
@@ -184,10 +186,10 @@ func Baseline(events []GroupEvent, asOf time.Time, pol Policy) (Outcome, error) 
 		}
 	}
 	if singleSided && !pairDiffs {
-		skipped = append(skipped, RuleCritIdentityService, RuleHighNewService)
+		skipped = append(skipped, RuleCritIdentityService, RuleHighNewService, RuleHighMultiSensitive)
 	}
 	if !firstSeen.IsZero() && asOf.IsZero() {
-		skipped = append(skipped, RuleCritIdentityService, RuleHighNewService, RuleMedGoneAfterHistory)
+		skipped = append(skipped, RuleCritIdentityService, RuleHighNewService, RuleHighMultiSensitive, RuleMedGoneAfterHistory)
 	}
 
 	stableSet := map[string]bool{}
@@ -262,16 +264,18 @@ func Baseline(events []GroupEvent, asOf time.Time, pol Policy) (Outcome, error) 
 				newOpens[portKey(p)] = true
 			}
 		}
-		for field, differ := range map[string]bool{
-			"mac":                 prev.MAC != cur.MAC,
-			"hostname":            prev.Hostname != cur.Hostname,
-			"host_id":             false, // host_id is not in the decoded view; identity moves surface via the fields above
-			"identity_confidence": prev.IdentityConfidence != cur.IdentityConfidence,
-			"identity_source":     false,
-		} {
-			if differ && stableSet[field] {
-				stable = false
-			}
+		// Unrolled per-pair differ map: the stable fields are fixed, so
+		// there is no map to allocate per pair. host_id and
+		// identity_source are not in the decoded view; identity moves
+		// surface via the fields below.
+		if prev.Hostname != cur.Hostname && stableSet["hostname"] {
+			stable = false
+		}
+		if normMAC(prev.MAC) != normMAC(cur.MAC) && stableSet["mac"] {
+			stable = false
+		}
+		if prev.IdentityConfidence != cur.IdentityConfidence && stableSet["identity_confidence"] {
+			stable = false
 		}
 	}
 	if changedPairs == 0 {
@@ -293,7 +297,7 @@ func Baseline(events []GroupEvent, asOf time.Time, pol Policy) (Outcome, error) 
 		return Outcome{Level: High, RuleID: RuleHighNewService, Skipped: skipped}, nil
 	}
 	if sensitiveKinds(osDevReplaced, macChanged, identDowngrade) >= 2 && established {
-		return Outcome{Level: High, RuleID: RuleHighNewService, Skipped: skipped}, nil
+		return Outcome{Level: High, RuleID: RuleHighMultiSensitive, Skipped: skipped}, nil
 	}
 
 	for _, e := range events {
@@ -342,7 +346,7 @@ func sensitiveKinds(osDev, mac, downgrade bool) int {
 }
 
 func portKey(p portView) string {
-	return p.Protocol + "/" + itoa(p.Number)
+	return p.Protocol + "/" + strconv.Itoa(p.Number)
 }
 
 func normMAC(m string) string {
@@ -358,26 +362,4 @@ func normMAC(m string) string {
 		out = append(out, c)
 	}
 	return string(out)
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		b[i] = '-'
-	}
-	return string(b[i:])
 }

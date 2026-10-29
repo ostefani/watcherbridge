@@ -63,9 +63,7 @@ func (s *Store) PurgeBriefings(ctx context.Context, now, cutoff time.Time) (int6
 	return affected, nil
 }
 
-// SweepCandidates returns unforwarded events still fresh enough to forward
-// (signature_timestamp within tolerance-margin); older ones are the caller's
-// to mark via MarkStaleSweep.
+// purgeFloor is the youngest age PurgeRawEvents will ever accept.
 const purgeFloor = time.Hour
 
 // failedEventFloor keeps failed groups' events for debugging a week.

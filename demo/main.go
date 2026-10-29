@@ -46,7 +46,7 @@ var webhookSecret string
 func resolveSecret() {
 	webhookSecret = os.Getenv("DEMO_WEBHOOK_SECRET")
 	if webhookSecret == "" {
-		webhookSecret = "demo-secret-0123456789abcdef"
+		webhookSecret = "demo-secret-0123456789abcdef0123"
 		log.Print("demo: WARNING: using the hardcoded dev webhook secret; set DEMO_WEBHOOK_SECRET for anything else")
 	}
 }
@@ -81,19 +81,19 @@ func postEvent(eventID, eventType, payload string) {
 }
 
 // fakeAnswer builds a schema-valid model answer from the live bundle.
-func fakeAnswer(payload []byte, issued map[string]string) []byte {
+func fakeAnswer(payload []byte, toks map[string]struct{}) []byte {
 	var bundle struct {
 		EventIDs []string `json:"event_ids"`
 	}
 	if err := json.Unmarshal(payload, &bundle); err != nil {
 		return []byte(`{"bogus":true}`)
 	}
-	hosts := sortedWithPrefix(issued, "HOST_")
+	hosts := sortedWithPrefix(toks, "HOST_")
 	host := ""
 	if len(hosts) > 0 {
 		host = hosts[0]
 	}
-	ips := sortedWithPrefix(issued, "IP_")
+	ips := sortedWithPrefix(toks, "IP_")
 	what := "observed activity"
 	if len(ips) > 0 {
 		what = "traffic from " + ips[0]
@@ -107,9 +107,9 @@ func fakeAnswer(payload []byte, issued map[string]string) []byte {
 	return raw
 }
 
-func sortedWithPrefix(issued map[string]string, prefix string) []string {
+func sortedWithPrefix(toks map[string]struct{}, prefix string) []string {
 	var out []string
-	for tok := range issued {
+	for tok := range toks {
 		if strings.HasPrefix(tok, prefix) {
 			out = append(out, tok)
 		}
@@ -130,7 +130,7 @@ func main() {
 	cfg := config.Default()
 	cfg.Bind = bind
 	cfg.Mode = config.ModeTap
-	cfg.Secret = webhookSecret
+	cfg.Secret = config.Secret(webhookSecret)
 	cfg.GroupQuietWindow = 5 * time.Second
 	cfg.GroupMaxWindow = 60 * time.Second
 	cfg.GrouperTick = time.Second
@@ -149,11 +149,11 @@ func main() {
 	}
 
 	fake := provider.NewFake()
-	fake.Handle = func(repair bool, payload []byte, issued map[string]string) (provider.RawBriefing, error) {
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
 		if repair {
 			return provider.RawBriefing{}, fmt.Errorf("demo: no repair script")
 		}
-		return provider.RawBriefing{JSON: fakeAnswer(payload, issued)}, nil
+		return provider.RawBriefing{JSON: fakeAnswer(payload, valid)}, nil
 	}
 
 	pub := viewer.NewPublisher(scanRelay, "", "", "", 3*time.Second, nil)

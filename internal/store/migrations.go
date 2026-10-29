@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 4
+const supportedSchemaVersion = 7
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -101,6 +101,12 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 3, migrateV3)
 		case 3:
 			err = applyMigration(db, 4, migrateV4)
+		case 4:
+			err = applyMigration(db, 5, migrateV5)
+		case 5:
+			err = applyMigration(db, 6, migrateV6)
+		case 6:
+			err = applyMigration(db, 7, migrateV7)
 		}
 		if err != nil {
 			return err
@@ -209,4 +215,46 @@ func migrateV4(tx *sql.Tx) error {
 		}
 	}
 	return nil
+}
+
+// migrateV5: groups gain next_attempt_at, the earliest time a released
+// group may be briefed again. Releases park a bounded backoff there so a
+// transient failure cannot hot-loop through the retry budget inside one
+// drain pass; the briefing queue filters on it. NULL (pre-v5 rows and
+// freshly closed groups) means due immediately.
+func migrateV5(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE active_groups ADD COLUMN next_attempt_at INTEGER`,
+		`CREATE INDEX IF NOT EXISTS groups_closed_next_attempt ON active_groups(status, next_attempt_at)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV6: groups gain total_bytes, a running payload-byte counter so
+// the in-persist byte cap needs no per-event SUM. The backfill covers
+// open groups only: closed groups take no more joins, so their counter
+// is never read again. CAST to BLOB makes LENGTH count bytes even if a
+// value ever lands with TEXT affinity.
+func migrateV6(tx *sql.Tx) error {
+	if _, err := tx.Exec(`ALTER TABLE active_groups ADD COLUMN total_bytes INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`UPDATE active_groups SET total_bytes = COALESCE((SELECT SUM(LENGTH(CAST(re.payload AS BLOB))) FROM raw_events re JOIN group_events ge ON ge.event_id = re.event_id WHERE ge.group_id = active_groups.group_id), 0) WHERE status = 'open'`)
+	return err
+}
+
+// migrateV7: groups gain transient_refunds, counting takes forgiven for
+// transient store pressure (saturated queue, shutdown, dead context).
+// Without a bound a persistently saturated store would requeue the same
+// group forever, each cycle costing a provider call after the model
+// already ran. At maxTransientRefunds the next refund parks failed
+// instead — the one terminal state that stops the spend.
+func migrateV7(tx *sql.Tx) error {
+	_, err := tx.Exec(`ALTER TABLE active_groups ADD COLUMN transient_refunds INTEGER NOT NULL DEFAULT 0`)
+	return err
 }

@@ -126,8 +126,14 @@ func fallbackBriefing(taken store.TakenGroup, outcome Outcome, now time.Time, co
 }
 
 // insertFallback stores the deterministic briefing; on storage error the
-// group is released (or parked at the cap) — never silently dropped.
-func insertFallback(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome, contextNote string) {
+// group is released (or parked at the cap) — never silently dropped. A
+// dead context stores nothing: a fallback for a group the model never
+// saw would be a permanent wrong record, so shutdown leaves the group
+// for the lease (or next startup) instead. Reports whether state changed.
+func insertFallback(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome, contextNote string) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	now := time.Now()
 	if d.Now != nil {
 		now = d.Now()
@@ -135,24 +141,26 @@ func insertFallback(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 	b := fallbackBriefing(taken, outcome, now, contextNote)
 	if err := d.Store.InsertBriefing(ctx, b); err != nil {
 		log.Printf("briefing: group %s fallback insert: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
-		releaseOrPark(ctx, d, taken, "fallback insert failed")
-		return
+		if transientStoreErr(ctx, err) {
+			return releaseTransient(ctx, d, taken)
+		}
+		return releaseOrPark(ctx, d, taken, "fallback insert failed")
 	}
 	notifyBriefing(d, taken, b)
 	if len(outcome.Skipped) > 0 {
 		log.Printf("briefing: group %s baseline %s skipped %d unknown-input rules", taken.GroupID, outcome.RuleID, len(outcome.Skipped))
 	}
+	return true
 }
 
 // briefWithModel runs the Step 11 pipeline for a taken group: bundle →
 // leak scan → provider (+1 repair) → validate → resolve → restore →
 // insert. Every terminal path stores exactly one briefing.
-func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome) {
+func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome) bool {
 	if taken.LastAttempt() {
 		// Final take: skip the provider and write the deterministic
 		// briefing inline, so a poison group converges to done.
-		insertFallback(ctx, d, taken, outcome, "retry cap reached; briefing from deterministic baseline only")
-		return
+		return insertFallback(ctx, d, taken, outcome, "retry cap reached; briefing from deterministic baseline only")
 	}
 	timeout := d.ModelTimeout
 	if timeout <= 0 {
@@ -164,7 +172,7 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 	for _, ev := range taken.Events {
 		events = append(events, redactor.InputEvent{EventID: ev.EventID, EventType: ev.EventType, Payload: ev.Payload})
 	}
-	bundle, issued, err := redactor.BuildBundle(ctx, d.Store, redactor.BundleInput{
+	bundle, issued, display, err := redactor.BuildBundle(ctx, d.Store, redactor.BundleInput{
 		GroupID:  taken.GroupID,
 		Anchor:   taken.Anchor,
 		Baseline: outcome.Level.String(),
@@ -172,45 +180,54 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 	}, d.Redaction)
 	if err != nil {
 		log.Printf("briefing: group %s bundle build: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
-		insertFallback(ctx, d, taken, outcome, "bundle build failed; briefing from deterministic baseline only")
-		return
+		return insertFallback(ctx, d, taken, outcome, "bundle build failed; briefing from deterministic baseline only")
 	}
 	raw, err := json.Marshal(bundle)
 	if err != nil {
 		log.Printf("briefing: group %s bundle encode: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
-		insertFallback(ctx, d, taken, outcome, "bundle encode failed; briefing from deterministic baseline only")
-		return
+		return insertFallback(ctx, d, taken, outcome, "bundle encode failed; briefing from deterministic baseline only")
+	}
+	// The model-side limit is the serialized bundle, not the group
+	// payload: field capping makes the mapping nonlinear, so only the
+	// artifact the model actually receives can bound the call. Over the
+	// cap the group degrades to the deterministic fallback — cheap and
+	// explicit, never a billed multi-megabyte call.
+	if len(raw) > redactor.MaxBundleBytes {
+		log.Printf("briefing: group %s bundle %d bytes exceeds the %d-byte cap", taken.GroupID, len(raw), redactor.MaxBundleBytes)
+		return insertFallback(ctx, d, taken, outcome, "bundle exceeds size cap; briefing from deterministic baseline only")
 	}
 	if d.Redaction.Enabled {
 		// Last step before anything leaves the machine: fail closed.
 		// A hit aborts the provider call — no send, fallback instead.
-		if hits, err := redactor.ScanOutboundLeaks(raw); err != nil || len(hits) > 0 {
+		if hits, err := redactor.ScanOutboundLeaks(raw, issued, bundle.EventIDs); err != nil || len(hits) > 0 {
 			log.Printf("briefing: group %s redaction blocked at %v", taken.GroupID, hits)
-			insertFallback(ctx, d, taken, outcome, "redaction blocked the model call; briefing from deterministic baseline only")
-			return
+			return insertFallback(ctx, d, taken, outcome, "redaction blocked the model call; briefing from deterministic baseline only")
 		}
 	}
 
+	// The adapter gets the token-name set for echo validation — never
+	// the token-to-value map, which stays in this layer for Restore.
+	valid := make(map[string]struct{}, len(issued))
+	for tok := range issued {
+		valid[tok] = struct{}{}
+	}
 	modelCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	answer, err := d.Provider.Brief(modelCtx, raw, issued)
+	answer, err := d.Provider.Brief(modelCtx, raw, valid)
 	if err != nil {
 		log.Printf("briefing: group %s provider: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
-		insertFallback(ctx, d, taken, outcome, "model call failed; briefing from deterministic baseline only")
-		return
+		return insertFallback(ctx, d, taken, outcome, "model call failed; briefing from deterministic baseline only")
 	}
 	a := acceptAnswer(answer.JSON, taken, issued, d.Redaction.Enabled)
 	if !a.OK {
-		repair, err := d.Provider.Repair(modelCtx, repairPrompt(a.Correction), issued)
+		repair, err := d.Provider.Repair(modelCtx, repairPrompt(a.Correction), valid)
 		if err != nil {
 			log.Printf("briefing: group %s repair: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
-			insertFallback(ctx, d, taken, outcome, "model repair failed; briefing from deterministic baseline only")
-			return
+			return insertFallback(ctx, d, taken, outcome, "model repair failed; briefing from deterministic baseline only")
 		}
 		if a = acceptAnswer(repair.JSON, taken, issued, d.Redaction.Enabled); !a.OK {
 			log.Printf("briefing: group %s model invalid after repair (%s)", taken.GroupID, a.Correction)
-			insertFallback(ctx, d, taken, outcome, "model output invalid; briefing from deterministic baseline only")
-			return
+			return insertFallback(ctx, d, taken, outcome, "model output invalid; briefing from deterministic baseline only")
 		}
 	}
 	m, suggestion, rawJSON := a.Model, a.Suggestion, a.Raw
@@ -235,21 +252,38 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 		BaselineRule:     outcome.RuleID,
 		Clamped:          clamped,
 		FallbackUsed:     false,
-		WhatChanged:      clean(redactor.Restore(m.What, issued), maxChars),
-		Context:          clean(redactor.Restore(m.Context, issued), maxChars),
-		RecommendedCheck: clean(redactor.Restore(m.Check, issued), maxChars),
+		WhatChanged:      clean(redactor.Restore(m.What, restoreMap(issued, display)), maxChars),
+		Context:          clean(redactor.Restore(m.Context, restoreMap(issued, display)), maxChars),
+		RecommendedCheck: clean(redactor.Restore(m.Check, restoreMap(issued, display)), maxChars),
 		ModelRawJSON:     string(rawJSON),
 		CreatedAt:        now,
 	}
 	if err := d.Store.InsertBriefing(ctx, b); err != nil {
 		log.Printf("briefing: group %s insert: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
-		releaseOrPark(ctx, d, taken, "insert failed")
-		return
+		if transientStoreErr(ctx, err) {
+			return releaseTransient(ctx, d, taken)
+		}
+		return releaseOrPark(ctx, d, taken, "insert failed")
 	}
 	notifyBriefing(d, taken, b)
 	if len(outcome.Skipped) > 0 {
 		log.Printf("briefing: group %s baseline %s skipped %d unknown-input rules", taken.GroupID, outcome.RuleID, len(outcome.Skipped))
 	}
+	return true
+}
+
+// restoreMap merges the issued (normalized) and display (first-seen
+// original) maps for Restore: exact operator-facing text wins, the
+// normalized value covers any token missing a display entry.
+func restoreMap(issued, display redactor.TokenMap) redactor.TokenMap {
+	out := make(redactor.TokenMap, len(issued))
+	for tok, norm := range issued {
+		out[tok] = norm
+	}
+	for tok, orig := range display {
+		out[tok] = orig
+	}
+	return out
 }
 
 // answer is one model attempt: the decoded briefing and suggestion when

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -30,9 +32,9 @@ func payload(t *testing.T, host string, extra string) []byte {
 
 const richHost = `{"ip":"192.168.0.5","hostname":"Printer-2","mac":"AA:BB:CC:DD:EE:FF","weak":false,"alive":true,"identity_confidence":"high","evidence":"banner from 10.0.0.9 via fe80::1%eth0, see also 2001:db8::/32 and AA-BB-CC-DD-EE-00 and aabb.ccdd.eeff and deadbeefcafe"}`
 
-func buildOne(t *testing.T, s *store.Store, p Policy, payload []byte) (*RedactedBundle, TokenMap) {
+func buildOne(t *testing.T, s *store.Store, p Policy, payload []byte) (*RedactedBundle, TokenMap, TokenMap) {
 	t.Helper()
-	b, issued, err := BuildBundle(context.Background(), s, BundleInput{
+	b, issued, display, err := BuildBundle(context.Background(), s, BundleInput{
 		GroupID: "grp-1", Anchor: "host:Printer-2", Target: "192.168.0.0/24",
 		Baseline: "low",
 		Events:   []InputEvent{{EventID: "e1", EventType: "host.changed", Payload: payload}},
@@ -40,12 +42,12 @@ func buildOne(t *testing.T, s *store.Store, p Policy, payload []byte) (*Redacted
 	if err != nil {
 		t.Fatal(err)
 	}
-	return b, issued
+	return b, issued, display
 }
 
 func TestRoundTrip(t *testing.T) {
 	s := testStore(t)
-	b, issued := buildOne(t, s, testPolicy(), payload(t, richHost, ""))
+	b, issued, _ := buildOne(t, s, testPolicy(), payload(t, richHost, ""))
 	if len(issued) == 0 {
 		t.Fatal("expected issued tokens")
 	}
@@ -53,7 +55,7 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits, err := ScanOutboundLeaks(ser); err != nil || len(hits) != 0 {
+	if hits, err := ScanOutboundLeaks(ser, issued, nil); err != nil || len(hits) != 0 {
 		t.Fatalf("leaks in tokenized bundle: %v %v", hits, err)
 	}
 	// Every token restores; two-digit tokens prove IP_10 vs IP_1 safety.
@@ -76,6 +78,28 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+// Integers past float64's exact range (2^53) must survive the bundle
+// byte-identical: the builder decodes with UseNumber, so the model sees the
+// counter the device sent, not an exponent-mangled approximation.
+func TestBigIntegersSurviveBundle(t *testing.T) {
+	s := testStore(t)
+	const big = `12345678901234567890`
+	pay := []byte(`{"event_id":"e-big","event_key":"k","event_type":"host.changed","host":{"ip":"192.168.0.5"},"rx_bytes":` + big + `}`)
+	for _, p := range []Policy{testPolicy(), {Enabled: false}} {
+		b, _, _, err := BuildBundle(context.Background(), s, BundleInput{
+			GroupID: "grp-big", Anchor: "ip:192.168.0.5", Target: "192.168.0.0/24",
+			Baseline: "low",
+			Events:   []InputEvent{{EventID: "e-big", EventType: "host.changed", Payload: pay}},
+		}, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b.EventsJSON), big) {
+			t.Fatalf("big integer mangled (enabled=%v): %s", p.Enabled, b.EventsJSON)
+		}
+	}
+}
+
 func TestElevenIPsTwoDigitTokens(t *testing.T) {
 	s := testStore(t)
 	var parts []string
@@ -83,9 +107,9 @@ func TestElevenIPsTwoDigitTokens(t *testing.T) {
 		parts = append(parts, fmt.Sprintf(`"ip%d":"10.0.0.%d"`, i, i))
 	}
 	p := []byte(`{"event_id":"e1",` + strings.Join(parts, ",") + `}`)
-	b, issued := buildOne(t, s, testPolicy(), p)
+	b, issued, _ := buildOne(t, s, testPolicy(), p)
 	ser, _ := json.Marshal(b)
-	if hits, _ := ScanOutboundLeaks(ser); len(hits) != 0 {
+	if hits, _ := ScanOutboundLeaks(ser, issued, nil); len(hits) != 0 {
 		t.Fatalf("leaks: %v", hits)
 	}
 	var found10, found1 bool
@@ -116,7 +140,7 @@ func TestInvalidIPv6StaysWhole(t *testing.T) {
 	s := testStore(t)
 	in := "0000000000000000 00:00:00:00:00:000.0.0.0"
 	p := []byte(`{"event_id":"e","s":` + qjson(in) + `}`)
-	b, issued, err := BuildBundle(context.Background(), s, BundleInput{
+	b, issued, _, err := BuildBundle(context.Background(), s, BundleInput{
 		GroupID: "g", Baseline: "low",
 		Events: []InputEvent{{EventID: "e", EventType: "host.appeared", Payload: p}},
 	}, testPolicy())
@@ -124,7 +148,7 @@ func TestInvalidIPv6StaysWhole(t *testing.T) {
 		t.Fatal(err)
 	}
 	ser, _ := json.Marshal(b)
-	if hits, _ := ScanOutboundLeaks(ser); len(hits) != 0 {
+	if hits, _ := ScanOutboundLeaks(ser, issued, nil); len(hits) != 0 {
 		t.Fatalf("leaks: %v", hits)
 	}
 	if got := Restore(string(ser), issued); !strings.Contains(got, in) {
@@ -144,7 +168,7 @@ func TestZoneGlueFailClosed(t *testing.T) {
 	if out != "::0%IP_1" {
 		t.Fatalf("unexpected tokenize: %q", out)
 	}
-	if hits, _ := ScanOutboundLeaks(mustJSON(out)); len(hits) == 0 {
+	if hits, _ := ScanOutboundLeaks(mustJSON(out), toks, nil); len(hits) == 0 {
 		t.Fatalf("zone-glued remainder not flagged: %q", out)
 	}
 	// netip normalizes the restored "::0" to "::"; the point is no
@@ -180,13 +204,13 @@ func TestInventedTokenRejected(t *testing.T) {
 func TestURLAndSocketIsolation(t *testing.T) {
 	s := testStore(t)
 	p := []byte(`{"event_id":"e1","note":"see http://192.168.1.1:8080/x and 10.1.2.3:22 open"}`)
-	b, _ := buildOne(t, s, testPolicy(), p)
+	b, issued, _ := buildOne(t, s, testPolicy(), p)
 	raw, _ := json.Marshal(b)
 	ser := string(b.EventsJSON)
 	if !strings.Contains(ser, ":8080") || !strings.Contains(ser, ":22") {
 		t.Fatalf("ports must survive beside tokens: %s", ser)
 	}
-	if hits, _ := ScanOutboundLeaks(raw); len(hits) != 0 {
+	if hits, _ := ScanOutboundLeaks(raw, issued, nil); len(hits) != 0 {
 		t.Fatalf("leaks: %v", hits)
 	}
 	var ev []map[string]any
@@ -203,9 +227,9 @@ func TestHostileInputRoundTripsUnmangled(t *testing.T) {
 	s := testStore(t)
 	hostile := "Welcome to \"printer\" <script>alert(1)</script> \x00\x07 nulls"
 	p := []byte(`{"event_id":"e1","host":{"hostname":"printer"},"banner":` + qjson(hostile) + `}`)
-	b, issued := buildOne(t, s, testPolicy(), p)
+	b, issued, _ := buildOne(t, s, testPolicy(), p)
 	ser, _ := json.Marshal(b)
-	if hits, _ := ScanOutboundLeaks(ser); len(hits) != 0 {
+	if hits, _ := ScanOutboundLeaks(ser, issued, nil); len(hits) != 0 {
 		t.Fatalf("leaks: %v", hits)
 	}
 	restored := Restore(string(ser), issued)
@@ -228,7 +252,7 @@ func TestTruncationRuneBound(t *testing.T) {
 	s := testStore(t)
 	long := strings.Repeat("é", 300) + " 192.168.9.9 tail"
 	p := []byte(`{"event_id":"e1","banner":` + qjson(long) + `}`)
-	b, issued := buildOne(t, s, testPolicy(), p)
+	b, issued, _ := buildOne(t, s, testPolicy(), p)
 	var ev []map[string]any
 	if err := json.Unmarshal(b.EventsJSON, &ev); err != nil {
 		t.Fatal(err)
@@ -241,15 +265,14 @@ func TestTruncationRuneBound(t *testing.T) {
 		t.Fatalf("truncation must be marked: %q", banner[len(banner)-20:])
 	}
 	ser, _ := json.Marshal(b)
-	if hits, _ := ScanOutboundLeaks(ser); len(hits) != 0 {
+	if hits, _ := ScanOutboundLeaks(ser, issued, nil); len(hits) != 0 {
 		t.Fatalf("leaks after truncation: %v", hits)
 	}
-	_ = issued
 }
 
 func TestRedactionOffPassthrough(t *testing.T) {
 	s := testStore(t)
-	b, issued := buildOne(t, s, Policy{Enabled: false}, payload(t, richHost, ""))
+	b, issued, _ := buildOne(t, s, Policy{Enabled: false}, payload(t, richHost, ""))
 	if len(issued) != 0 {
 		t.Fatalf("disabled redaction must issue nothing, got %v", issued)
 	}
@@ -260,7 +283,7 @@ func TestRedactionOffPassthrough(t *testing.T) {
 
 func TestBatchRestore(t *testing.T) {
 	s := testStore(t)
-	_, issued := buildOne(t, s, testPolicy(), payload(t, richHost, ""))
+	_, issued, _ := buildOne(t, s, testPolicy(), payload(t, richHost, ""))
 	var toks []string
 	for tok := range issued {
 		toks = append(toks, tok)
@@ -285,7 +308,7 @@ func TestBatchRestore(t *testing.T) {
 
 func TestAnchorTokenized(t *testing.T) {
 	s := testStore(t)
-	b, _ := buildOne(t, s, testPolicy(), payload(t, richHost, ""))
+	b, _, _ := buildOne(t, s, testPolicy(), payload(t, richHost, ""))
 	if strings.Contains(b.Anchor, "Printer") || strings.Contains(b.Anchor, "printer") {
 		t.Fatalf("anchor leaks hostname: %q", b.Anchor)
 	}
@@ -298,7 +321,7 @@ func TestAnchorTokenized(t *testing.T) {
 func TestGoldenBundle(t *testing.T) {
 	s := testStore(t)
 	p := []byte(`{"event_id":"e1","event_key":"k","event_type":"host.changed","host":{"ip":"10.1.2.3","hostname":"db-primary","mac":"02:42:AC:11:00:02"},"changes":[{"field":"ports","before":"","after":"5432/open"}]}`)
-	b, _, err := BuildBundle(context.Background(), s, BundleInput{
+	b, _, _, err := BuildBundle(context.Background(), s, BundleInput{
 		GroupID: "grp-golden", Anchor: "host:db-primary", Target: "10.1.0.0/16",
 		Baseline: "high",
 		Events:   []InputEvent{{EventID: "e1", EventType: "host.changed", Payload: p}},
@@ -358,7 +381,7 @@ func BenchmarkBuildBundle(b *testing.B) {
 	in := BundleInput{GroupID: "g", Anchor: "host:host-0", Target: "192.168.0.0/24", Baseline: "medium", Events: events}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, _, err := BuildBundle(context.Background(), st, in, testPolicy()); err != nil {
+		if _, _, _, err := BuildBundle(context.Background(), st, in, testPolicy()); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -368,6 +391,18 @@ func FuzzTokenizeRestore(f *testing.F) {
 	f.Add("see printer-2 at AA:BB:CC:DD:EE:FF via http://192.168.1.1:8080/x")
 	f.Add("fe80::1%eth0 and 2001:db8::/32 plus aabb.ccdd.eeff and deadbeefcafe")
 	f.Add("Linux 5.15.0-generic build 1.2.3 no addresses here")
+	// H4 rows and the dotted-port hole as seeds: the oracle must hold
+	// on every row the fixtures pin, in both directions.
+	f.Add("moved to 192.168.1.5.")
+	f.Add("see http://192.168.1.5/admin")
+	f.Add("range 10.0.0.5-10.0.0.9 done")
+	f.Add("moved to 192.168.001.001.")
+	f.Add("dev_10.0.0.5 here")
+	f.Add("got fe80::1x.")
+	f.Add("netstat 192.168.1.5.443 ok")
+	f.Add("firmware 1.2.3.4.5 ok")
+	f.Add("550e8400-e29b-41d4-a716-446655440000")
+	f.Add("0.0.00.0")
 	f.Fuzz(func(t *testing.T, text string) {
 		// Fake token assignment through the REAL replaceSpans path: the
 		// fuzz harness cannot drift from production by construction.
@@ -380,37 +415,30 @@ func FuzzTokenizeRestore(f *testing.F) {
 			toks[tok] = norm
 			return tok
 		})
-		// Fail-closed contract: tokenization must replace every span
-		// it safely can. Spans it deliberately keeps literal (a token
-		// there would glue to a word char and become unrestorable)
-		// stay raw in the output, and the leak scan must flag exactly
-		// those — that flag is what rejects the bundle upstream.
-		var kept int
-		visitSpans(tokenized, func(glo, ghi int, _ discovered, emit bool) {
-			span := tokenized[glo:ghi]
-			if !emit {
-				kept++
-				return
-			}
-			// A surviving span that already embeds an issued token
-			// (e.g. "::0%IP_1": the zone re-parse absorbs the token)
-			// is partially tokenized and untouchable — re-tokenizing
-			// it would corrupt the token. The leak scan still flags
-			// it, so the bundle is rejected fail-closed upstream.
-			for _, tok := range tokenRe.FindAllString(span, -1) {
-				if _, ok := toks[tok]; ok {
-					kept++
-					return
-				}
-			}
-			t.Fatalf("emittable span survived tokenize: %q in %q", span, tokenized)
-		})
-		hits, err := ScanOutboundLeaks(mustJSON(tokenized))
+		// Fail-closed contract: no post-hoc walk over the OUTPUT can
+		// demand more tokenization. The shared walk is position-sensitive
+		// by design (guard context): a span it skips in the input
+		// (e.g. "::000000000000" swallowed into an invalid zone-glued
+		// run) may match once an emitted token precedes it, and a span
+		// embedding an issued token ("::0%IP_1") is untouchable —
+		// re-tokenizing it would corrupt the token. Either way the
+		// identical walk inside ScanOutboundLeaks flags the leftover,
+		// so the disagreement can only reject the bundle upstream,
+		// never leak through it. The fuzz pins that direction: every
+		// hit must be leg-explainable, and clean output must restore.
+		hits, err := ScanOutboundLeaks(mustJSON(tokenized), toks, nil)
 		if err != nil {
 			t.Fatalf("leak scan error: %v", err)
 		}
-		if (len(hits) != 0) != (kept != 0) {
-			t.Fatalf("leak scan disagrees with tokenize: hits=%v kept=%d in %q", hits, kept, tokenized)
+		// Soundness: every hit must be explainable by one leg — a
+		// validated leftover, an eager shape the validator rejects, or
+		// a surviving issued value. Unexplained hits mean a blind spot
+		// the legs don't cover.
+		if len(hits) != 0 && !leakValidated(tokenized) && !leakEager(tokenized) && !leakValue(tokenized, toks) {
+			t.Fatalf("unexplained leak hit: hits=%v in %q", hits, tokenized)
+		}
+		if len(hits) == 0 {
+			oracleNoLiteralAddress(t, tokenized)
 		}
 		if err := ValidateTokens(tokenized, toks); err != nil {
 			t.Fatalf("own output invalid: %v", err)
@@ -432,4 +460,398 @@ func FuzzTokenizeRestore(f *testing.F) {
 func mustJSON(s string) []byte {
 	b, _ := json.Marshal(map[string]string{"s": s})
 	return b
+}
+
+// stripLeadingZeros folds one quad for the fuzz oracle: "001" reads as
+// "1", so a validator-rejected form still counts as an address. A
+// "/bits" suffix is folded the same way and reattached.
+func stripLeadingZeros(quad string) string {
+	suffix := ""
+	if i := strings.Index(quad, "/"); i >= 0 {
+		suffix, quad = quad[i:], quad[:i]
+		suffix = strings.TrimLeft(suffix[1:], "0")
+		if suffix == "" {
+			suffix = "0"
+		}
+		suffix = "/" + suffix
+	}
+	parts := strings.Split(quad, ".")
+	for i, p := range parts {
+		// Empty parts (leading/trailing dots) stay empty so they can
+		// never parse: folding them to "0" would manufacture an
+		// address from dot fragments (".0.001." must not read as
+		// "0.0.1.0").
+		if p == "" {
+			continue
+		}
+		if s := strings.TrimLeft(p, "0"); s != "" {
+			parts[i] = s
+		} else {
+			parts[i] = "0"
+		}
+	}
+	return strings.Join(parts, ".") + suffix
+}
+
+var (
+	// Independent shapes for the fuzz oracle: deliberately not the
+	// redactor's regexes, so a shared typo cannot blind both the legs
+	// and the check. Token spans are blanked before scanning.
+	oracleTokenRe = regexp.MustCompile(`\b(?:IP|MAC|HOST|NET)_[0-9]+\b`)
+	oracleHexRe   = regexp.MustCompile(`[0-9A-Fa-f]+`)
+	oracleRunRe   = regexp.MustCompile(`[0-9./]{7,}`)
+	oracleV6Re    = regexp.MustCompile(`[0-9A-Fa-f:.]{7,}`)
+)
+
+// oracleNoLiteralAddress fails when a scan-clean output still contains
+// an identifying address the legs missed: every digit/dot/slash run of
+// 7+ chars is windowed 7..15 and parsed (quads via ParseAddr, prefixes
+// via ParsePrefix, both after per-octet zero stripping), and every 12+
+// hex run is flagged MAC-shaped. The unspecified address is exempt: it
+// carries no identity.
+//
+// False-positive policy: this runs in the fuzzer only, where a flag is
+// a triage case, never a production outage. Token spans are blanked so
+// a token number glued to version dots ("IP_1.5") cannot read as an
+// octet; everything else that parses is fail-closed by design.
+func oracleNoLiteralAddress(t *testing.T, tokenized string) {
+	t.Helper()
+	scrubbed := oracleTokenRe.ReplaceAllString(tokenized, " ")
+	for _, run := range oracleRunRe.FindAllString(scrubbed, -1) {
+		for i := 0; i+7 <= len(run); i++ {
+			for j := i + 7; j <= len(run) && j <= i+15; j++ {
+				sub := run[i:j]
+				// Octets past 3 digits are malformed beyond trivial
+				// zero-padding: no parser reads them, and the repair
+				// (which digit to drop) is ambiguous. The legs cover
+				// ≤3-digit forms; longer runs are noise, not identity.
+				// The check runs on the address core: a "/bits" suffix
+				// must not count toward octet length, or the prefix
+				// leg below would be dead code.
+				core := sub
+				if k := strings.Index(core, "/"); k >= 0 {
+					core = core[:k]
+				}
+				skip := false
+				for _, part := range strings.Split(core, ".") {
+					if len(part) > 3 {
+						skip = true
+						break
+					}
+				}
+				if skip {
+					continue
+				}
+				sub = stripLeadingZeros(sub)
+				if addr, err := netip.ParseAddr(sub); err == nil && !addr.IsUnspecified() {
+					t.Fatalf("scan-clean output parses as an address: %q in %q", run[i:j], tokenized)
+				}
+				if pfx, err := netip.ParsePrefix(sub); err == nil && !pfx.Addr().IsUnspecified() {
+					t.Fatalf("scan-clean output parses as a prefix: %q in %q", run[i:j], tokenized)
+				}
+			}
+		}
+	}
+	// IPv6: the quad pass above cannot see colon forms, so the leak
+	// scanner's v6 legs would otherwise go unchecked. Windows are wider
+	// (longest textual form is 45 chars); only colon runs are examined,
+	// since bare quads belong to the pass above. Zones break the run at
+	// "%", matching what the tokenizer can consume.
+	for _, run := range oracleV6Re.FindAllString(scrubbed, -1) {
+		if !strings.Contains(run, ":") {
+			continue
+		}
+		// Like the zone leg, require a decimal digit: digit-less
+		// colon runs are code-like prose ("std::fmt", "AAAAA::A"),
+		// not addresses. A mnemonic address without a single digit
+		// ("cafe::cafe") is vanishingly rare next to C++ in banners.
+		if !strings.ContainsAny(run, "0123456789") {
+			continue
+		}
+		for i := 0; i+7 <= len(run); i++ {
+			for j := i + 7; j <= len(run) && j <= i+45; j++ {
+				if addr, err := netip.ParseAddr(run[i:j]); err == nil && !addr.IsUnspecified() {
+					t.Fatalf("scan-clean output parses as an IPv6 address: %q in %q", run[i:j], tokenized)
+				}
+			}
+		}
+	}
+	// MAC-shaped runs must be exactly 12 hex digits: longer runs are
+	// the deliberate shredding fragments (the tokenizer keeps them
+	// whole, the scan agrees), and all-zeros runs carry no identity.
+	// A surviving exact-12 run is guard-disputed — the tokenizer takes
+	// unguarded bare-12 aggressively, and the eager leg no longer
+	// exempts trailing colons — so reaching here means a leg regressed,
+	// and the tripwire fires.
+	for _, m := range oracleHexRe.FindAllString(scrubbed, -1) {
+		if len(m) != 12 || strings.TrimLeft(m, "0") == "" {
+			continue
+		}
+		t.Fatalf("scan-clean output holds a MAC-shaped run: %q in %q", m, tokenized)
+	}
+}
+
+// bundleBanner builds a one-event bundle from a banner string with no
+// anchor or target, so numbering restarts at IP_1/HOST_1 every call.
+func bundleBanner(t *testing.T, banner string) ([]byte, TokenMap, TokenMap) {
+	t.Helper()
+	s := testStore(t)
+	p := []byte(`{"event_id":"e1","banner":` + qjson(banner) + `}`)
+	b, issued, display, err := BuildBundle(context.Background(), s, BundleInput{
+		GroupID: "g", Baseline: "low",
+		Events: []InputEvent{{EventID: "e1", EventType: "host.appeared", Payload: p}},
+	}, testPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ser, _ := json.Marshal(b)
+	return ser, issued, display
+}
+
+func mustClean(t *testing.T, ser []byte, issued TokenMap) {
+	t.Helper()
+	if hits, err := ScanOutboundLeaks(ser, issued, nil); err != nil || len(hits) != 0 {
+		t.Fatalf("leaks: %v %v", hits, err)
+	}
+}
+
+// Pro event IDs are dashed UUIDs (sha256-derived, opaque). They ride the
+// bundle envelope, so the scan must know them: without the skip-set every
+// real bundle fails closed on its own IDs and the provider never fires.
+func TestUUIDEventIDsAreNotLeaks(t *testing.T) {
+	s := testStore(t)
+	p := []byte(`{"event_id":"550e8400-e29b-41d4-a716-446655440000","host":{"ip":"10.9.9.9","hostname":"db-1"}}`)
+	b, issued, _, err := BuildBundle(context.Background(), s, BundleInput{
+		GroupID: "g", Baseline: "low", Anchor: "host:db-1",
+		Events: []InputEvent{{EventID: "550e8400-e29b-41d4-a716-446655440000", EventType: "host.appeared", Payload: p}},
+	}, testPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ser, _ := json.Marshal(b)
+	if hits, err := ScanOutboundLeaks(ser, issued, b.EventIDs); err != nil || len(hits) != 0 {
+		t.Fatalf("own event IDs must not fail the scan: %v %v", hits, err)
+	}
+	// The ID must survive verbatim in the bundle: tokenizing its tail
+	// as MAC_n would corrupt the envelope and mint a phantom row.
+	if !strings.Contains(string(ser), "550e8400-e29b-41d4-a716-446655440000") {
+		t.Fatalf("event ID mangled in bundle: %s", ser)
+	}
+	for tok := range issued {
+		if strings.HasPrefix(tok, "MAC_") {
+			t.Fatalf("UUID tail must not mint a MAC token: %v", issued)
+		}
+	}
+}
+
+// A UUID-shaped string that is NOT a known event ID is still scanned:
+// the skip-set is exact membership, not a shape exemption.
+func TestUnknownUUIDShapeStillScanned(t *testing.T) {
+	other := "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+	ser := mustJSON(other)
+	if hits, err := ScanOutboundLeaks(ser, TokenMap{}, []string{"550e8400-e29b-41d4-a716-446655440000"}); err != nil || len(hits) == 0 {
+		t.Fatalf("unlisted UUID shape must still hit the scan: %v %v", hits, err)
+	}
+}
+
+// The anchor is bridge-derived from untrusted payload fields: a hostile
+// hostname literally shaped like a token must fail the bundle closed,
+// not ride the anchor past the spoof verdict.
+func TestTokenShapedAnchorFailsClosed(t *testing.T) {
+	s := testStore(t)
+	p := []byte(`{"event_id":"e1","host":{"ip":"10.9.9.9"}}`)
+	_, _, _, err := BuildBundle(context.Background(), s, BundleInput{
+		GroupID: "g", Baseline: "low", Anchor: "host:IP_1",
+		Events: []InputEvent{{EventID: "e1", EventType: "host.appeared", Payload: p}},
+	}, testPolicy())
+	if err == nil || !strings.Contains(err.Error(), "token-shaped") {
+		t.Fatalf("token-shaped anchor must fail closed, got: %v", err)
+	}
+}
+
+// H4 glue rows: trailing punctuation, paths and ranges tokenize with the
+// glue left literal; versions stay whole and clean.
+func TestGluePositionsTokenize(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string // required in output
+		gone []string // must be absent from output
+	}{
+		{"sentence dot", "moved to 192.168.1.5.", []string{"IP_1."}, []string{"192.168.1.5"}},
+		{"url path", "see http://192.168.1.5/admin", []string{"http://IP_1/admin"}, []string{"192.168.1.5"}},
+		{"range", "range 10.0.0.5-10.0.0.9 done", []string{"IP_1-IP_2"}, []string{"10.0.0.5", "10.0.0.9"}},
+		{"v6 sentence dot", "watch fe80::1.", []string{"IP_1."}, []string{"fe80::1"}},
+		// Dotted ports tokenize like socket ports; versions tokenize the
+		// same way and restore exactly — no literal quad survives.
+		{"dotted port", "netstat 192.168.1.5.443 ok", []string{"IP_1.443"}, []string{"192.168.1.5"}},
+		{"version tokenized", "firmware 1.2.3.4.5 ok", []string{"IP_1.5"}, []string{"firmware 1.2.3.4.5"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ser, issued, _ := bundleBanner(t, tc.in)
+			mustClean(t, ser, issued)
+			for _, w := range tc.want {
+				if !strings.Contains(string(ser), w) {
+					t.Fatalf("want %q in %s", w, ser)
+				}
+			}
+			for _, g := range tc.gone {
+				if strings.Contains(string(ser), g) {
+					t.Fatalf("raw value %q survived in %s", g, ser)
+				}
+			}
+		})
+	}
+}
+
+// H4 must-block rows: shapes the validator rejects but a human would
+// read as an address fail the scan instead of reaching the provider.
+func TestValidatorBlindSpotsBlocked(t *testing.T) {
+	for _, in := range []string{
+		"moved to 192.168.001.001.", // leading zeros
+		"dev_10.0.0.5 here",         // underscore-glued
+		"ip10.0.0.5 seen",           // letter-glued
+		"got fe80::1x.",             // letter-glued v6 tail
+		"xdeadbeefcafe: tag",        // letter-glued MAC with a bare trailing colon
+		"xdeadbeefcafe:",            // same, at end of string
+	} {
+		t.Run(in, func(t *testing.T) {
+			ser, issued, _ := bundleBanner(t, in)
+			if hits, _ := ScanOutboundLeaks(ser, issued, nil); len(hits) == 0 {
+				t.Fatalf("validator blind spot passed clean: %s", ser)
+			}
+		})
+	}
+}
+
+// H4 keys: an address-shaped object key tokenizes like a value, so the
+// key-walking scan leg never sees it.
+func TestAddressKeyTokenized(t *testing.T) {
+	s := testStore(t)
+	p := []byte(`{"event_id":"e1","hosts":{"192.168.1.1":"open"}}`)
+	b, issued, _, err := BuildBundle(context.Background(), s, BundleInput{
+		GroupID: "g", Baseline: "low",
+		Events: []InputEvent{{EventID: "e1", EventType: "host.appeared", Payload: p}},
+	}, testPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ser, _ := json.Marshal(b)
+	mustClean(t, ser, issued)
+	if strings.Contains(string(ser), "192.168.1.1") {
+		t.Fatalf("address key survived: %s", ser)
+	}
+}
+
+// H5: a non-ASCII hostname redacts everywhere, including free text, and
+// restores with its exact display spelling.
+func TestCyrillicHostnameRoundTrip(t *testing.T) {
+	s := testStore(t)
+	p := []byte(`{"event_id":"e1","hostname":"Олексій-ПК","banner":"saw Олексій-ПК join"}`)
+	b, issued, display, err := BuildBundle(context.Background(), s, BundleInput{
+		GroupID: "g", Baseline: "low",
+		Events: []InputEvent{{EventID: "e1", EventType: "host.appeared", Payload: p}},
+	}, testPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ser, _ := json.Marshal(b)
+	mustClean(t, ser, issued)
+	var tok string
+	for k := range issued {
+		tok = k
+	}
+	if len(issued) != 1 || display[tok] != "Олексій-ПК" {
+		t.Fatalf("display must keep original spelling, got %v", display)
+	}
+	if got := Restore(string(ser), display); !strings.Contains(got, "Олексій-ПК") {
+		t.Fatalf("display restore lost original spelling: %q", got)
+	}
+}
+
+// H5: short names still redact everywhere (no free-text length floor —
+// the floor would leak); prose garbling is the documented cost.
+func TestShortHostnameRedacts(t *testing.T) {
+	s := testStore(t)
+	p := []byte(`{"event_id":"e1","hostname":"tv","banner":"bought a new tv"}`)
+	b, issued2, _, err := BuildBundle(context.Background(), s, BundleInput{
+		GroupID: "g", Baseline: "low",
+		Events: []InputEvent{{EventID: "e1", EventType: "host.appeared", Payload: p}},
+	}, testPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(b)
+	mustClean(t, raw, issued2)
+	if strings.Contains(string(raw), "tv") {
+		t.Fatalf("short hostname survived: %s", raw)
+	}
+}
+
+// H5: an over-long hostname fails the bundle closed, never skipped.
+func TestOverlongHostnameFailsClosed(t *testing.T) {
+	s := testStore(t)
+	p := []byte(`{"event_id":"e1","hostname":` + qjson(strings.Repeat("h", 300)) + `}`)
+	_, _, _, err := BuildBundle(context.Background(), s, BundleInput{
+		GroupID: "g", Baseline: "low",
+		Events: []InputEvent{{EventID: "e1", EventType: "host.appeared", Payload: p}},
+	}, testPolicy())
+	if err == nil {
+		t.Fatal("over-long hostname must fail the bundle closed")
+	}
+}
+
+// H6: token-shaped input fails closed — a model echo would otherwise
+// restore another host's address into this briefing.
+func TestTokenSpoofFailsClosed(t *testing.T) {
+	s := testStore(t)
+	p := []byte(`{"event_id":"e1","banner":"see IP_1 here","host":{"ip":"10.0.0.9"}}`)
+	_, _, _, err := BuildBundle(context.Background(), s, BundleInput{
+		GroupID: "g", Baseline: "low",
+		Events: []InputEvent{{EventID: "e1", EventType: "host.appeared", Payload: p}},
+	}, testPolicy())
+	if err == nil {
+		t.Fatal("token-shaped input must fail the bundle closed")
+	}
+}
+
+// H6: Restore is single-pass — a restored value that itself contains a
+// token shape is never re-substituted.
+func TestRestoreNoResubstitution(t *testing.T) {
+	issued := TokenMap{"HOST_1": "x IP_1 y", "IP_1": "10.0.0.1"}
+	if got := Restore("see HOST_1!", issued); got != "see x IP_1 y!" {
+		t.Fatalf("re-substituted: %q", got)
+	}
+}
+
+// H6: display restore shows first-seen spelling, not the folded form.
+func TestDisplayRestoresOriginalCase(t *testing.T) {
+	s := testStore(t)
+	p := []byte(`{"event_id":"e1","hostname":"Printer-2","host":{"ip":"192.168.0.5","mac":"AA:BB:CC:DD:EE:FF"}}`)
+	b, issued, display, err := BuildBundle(context.Background(), s, BundleInput{
+		GroupID: "g", Baseline: "low",
+		Events: []InputEvent{{EventID: "e1", EventType: "host.appeared", Payload: p}},
+	}, testPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ser, _ := json.Marshal(b)
+	mustClean(t, ser, issued)
+	var hostTok, macTok string
+	for tok, norm := range issued {
+		switch norm {
+		case "printer-2":
+			hostTok = tok
+		case "aa:bb:cc:dd:ee:ff":
+			macTok = tok
+		}
+	}
+	if display[hostTok] != "Printer-2" || display[macTok] != "AA:BB:CC:DD:EE:FF" {
+		t.Fatalf("display must keep first-seen spelling, got %v", display)
+	}
+	restored := Restore(string(ser), display)
+	if !strings.Contains(restored, "Printer-2") || !strings.Contains(restored, "AA:BB:CC:DD:EE:FF") {
+		t.Fatalf("display restore lost spelling: %q", restored)
+	}
 }

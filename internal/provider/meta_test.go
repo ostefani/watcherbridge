@@ -51,7 +51,7 @@ func TestMetaBriefSendsBundleVerbatim(t *testing.T) {
 	}}
 	a := testAdapter(t, stub, 64<<10)
 	bundle := []byte(`{"group":"g1","events":[{"s":"IP_1"}]}`)
-	raw, err := a.Brief(t.Context(), bundle, map[string]string{"IP_1": "10.0.0.1"})
+	raw, err := a.Brief(t.Context(), bundle, map[string]struct{}{"IP_1": {}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestMetaRepairSendsCorrectionOnly(t *testing.T) {
 		return okResponse(`{}`), nil
 	}}
 	a := testAdapter(t, stub, 64<<10)
-	_, err := a.Repair(t.Context(), "rejected (missing field)", map[string]string{"IP_1": "10.0.0.1"})
+	_, err := a.Repair(t.Context(), "rejected (missing field)", map[string]struct{}{"IP_1": {}})
 	if err != nil {
 		t.Fatal(err)
 	}
