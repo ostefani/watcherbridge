@@ -288,8 +288,12 @@ func releaseOrPark(ctx context.Context, d Deps, taken store.TakenGroup, reason s
 // attempt never really ran (saturated writer, shutdown, dead context),
 // so it must not burn the retry budget.
 func releaseTransient(ctx context.Context, d Deps, taken store.TakenGroup) bool {
+	// The backoff escalates on the refund count, not the take count: a
+	// refund unhappens the take, so retry counts would retry flat out
+	// (4s every cycle) and 20 refunds would span ~80s instead of the
+	// ~10 minutes the cap budgets.
 	matched, err := retryReleaseOnSaturated(ctx, func(ctx context.Context) (bool, error) {
-		return d.Store.ReleaseGroupTransient(ctx, taken.GroupID, releaseBackoff(taken.RetryCount))
+		return d.Store.ReleaseGroupTransient(ctx, taken.GroupID, releaseBackoff(taken.TransientRefunds))
 	})
 	if err != nil {
 		log.Printf("briefing: group %s transient release: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
@@ -299,7 +303,7 @@ func releaseTransient(ctx context.Context, d Deps, taken store.TakenGroup) bool 
 		return false
 	}
 	if st, _ := d.Store.GroupStatus(ctx, taken.GroupID); st == "failed" {
-		log.Printf("briefing: group %s parked failed (transient refund cap) after %d attempts", taken.GroupID, taken.RetryCount)
+		log.Printf("briefing: group %s parked failed (transient refund cap) after %d refunds", taken.GroupID, taken.TransientRefunds+1)
 	}
 	return true
 }

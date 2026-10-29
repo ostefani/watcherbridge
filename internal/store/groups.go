@@ -39,7 +39,11 @@ type TakenGroup struct {
 	Anchor     string
 	OpenedAt   time.Time
 	RetryCount int // see LastAttempt
-	Events     []RawEvent
+	// TransientRefunds counts takes forgiven for transient store
+	// pressure. The worker drives its release backoff from this, so
+	// repeated saturation escalates instead of retrying flat out.
+	TransientRefunds int
+	Events           []RawEvent
 }
 
 // LastAttempt reports whether this take is the final try before the retry
@@ -68,7 +72,7 @@ func (s *Store) TakeGroup(ctx context.Context, groupID string) (TakenGroup, erro
 		}
 		taken.GroupID = groupID
 		var openedNanos int64
-		if err := tx.QueryRow(`SELECT host_anchor_key, opened_at, retry_count FROM active_groups WHERE group_id = ?`, groupID).Scan(&taken.Anchor, &openedNanos, &taken.RetryCount); err != nil {
+		if err := tx.QueryRow(`SELECT host_anchor_key, opened_at, retry_count, transient_refunds FROM active_groups WHERE group_id = ?`, groupID).Scan(&taken.Anchor, &openedNanos, &taken.RetryCount, &taken.TransientRefunds); err != nil {
 			return err
 		}
 		taken.OpenedAt = fromNanos(openedNanos)
@@ -228,10 +232,10 @@ func (s *Store) CloseDue(ctx context.Context, now time.Time) ([]string, error) {
 const maxGroupRetries = 5
 
 // maxTransientRefunds bounds takes forgiven for transient store pressure.
-// The backoff between refunds already spaces them (2s doubling to 30s),
-// so 20 refunds span roughly ten minutes of persistent saturation —
-// generous for incidents, bounded for runaways. The cap counts refunds,
-// not takes: real outcomes still park at maxGroupRetries.
+// The worker drives the release backoff from the refund count (2s doubling
+// to the 30s cap), so 20 refunds span roughly ten minutes of persistent
+// saturation — generous for incidents, bounded for runaways. The cap counts
+// refunds, not takes: real outcomes still park at maxGroupRetries.
 const maxTransientRefunds = 20
 
 // ReleaseGroup returns a processing group to closed for a later retry. It

@@ -235,17 +235,6 @@ func migrateV5(tx *sql.Tx) error {
 	return nil
 }
 
-// migrateV7: groups gain transient_refunds, counting takes forgiven for
-// transient store pressure (saturated queue, shutdown, dead context).
-// Without a bound a persistently saturated store would requeue the same
-// group forever, each cycle costing a provider call after the model
-// already ran. At maxTransientRefunds the next refund parks failed
-// instead — the one terminal state that stops the spend.
-func migrateV7(tx *sql.Tx) error {
-	_, err := tx.Exec(`ALTER TABLE active_groups ADD COLUMN transient_refunds INTEGER NOT NULL DEFAULT 0`)
-	return err
-}
-
 // migrateV6: groups gain total_bytes, a running payload-byte counter so
 // the in-persist byte cap needs no per-event SUM. The backfill covers
 // open groups only: closed groups take no more joins, so their counter
@@ -256,5 +245,16 @@ func migrateV6(tx *sql.Tx) error {
 		return err
 	}
 	_, err := tx.Exec(`UPDATE active_groups SET total_bytes = COALESCE((SELECT SUM(LENGTH(CAST(re.payload AS BLOB))) FROM raw_events re JOIN group_events ge ON ge.event_id = re.event_id WHERE ge.group_id = active_groups.group_id), 0) WHERE status = 'open'`)
+	return err
+}
+
+// migrateV7: groups gain transient_refunds, counting takes forgiven for
+// transient store pressure (saturated queue, shutdown, dead context).
+// Without a bound a persistently saturated store would requeue the same
+// group forever, each cycle costing a provider call after the model
+// already ran. At maxTransientRefunds the next refund parks failed
+// instead — the one terminal state that stops the spend.
+func migrateV7(tx *sql.Tx) error {
+	_, err := tx.Exec(`ALTER TABLE active_groups ADD COLUMN transient_refunds INTEGER NOT NULL DEFAULT 0`)
 	return err
 }

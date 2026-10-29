@@ -83,14 +83,15 @@ func fileURIPath(path string) string {
 // busy timeout, foreign keys, immediate write transactions, and NORMAL
 // synchronous (acknowledged events survive a process crash; a power
 // loss may drop the last frames — see Designv5 §5).
-func dsnForPath(path string) string {
+func dsnForPath(path string) (string, error) {
 	// Absolutize here too, so the helper is total: openStore already
 	// passes an absolute path, but a relative input must resolve
 	// against the working directory — never the filesystem root.
-	if abs, err := filepath.Abs(path); err == nil {
-		path = abs
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve database path: %w", err)
 	}
-	u := &url.URL{Scheme: "file", Path: fileURIPath(path)}
+	u := &url.URL{Scheme: "file", Path: fileURIPath(abs)}
 	q := u.Query()
 	q.Set("_journal_mode", "WAL")
 	q.Set("_busy_timeout", "5000")
@@ -98,7 +99,7 @@ func dsnForPath(path string) string {
 	q.Set("_txlock", "immediate")
 	q.Set("_synchronous", "NORMAL")
 	u.RawQuery = q.Encode()
-	return u.String()
+	return u.String(), nil
 }
 
 // Open creates (0600 file in a 0700 directory) or opens the database at path,
@@ -189,7 +190,11 @@ func openStore(path string, opts ...Option) (*Store, error) {
 	} else {
 		return nil, fmt.Errorf("stat database file: %w", err)
 	}
-	db, err := sql.Open("sqlite3", dsnForPath(path))
+	dsn, err := dsnForPath(path)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}

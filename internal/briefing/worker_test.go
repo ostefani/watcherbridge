@@ -84,6 +84,42 @@ func TestRetryReleaseOnSaturated(t *testing.T) {
 	}
 }
 
+// The transient-release backoff must escalate on the refund count, not
+// the take count: refunds unhappen takes, so retry counts would retry
+// flat out and the runaway cap would cover minutes, not ~80s.
+func TestTransientRefundBackoffEscalates(t *testing.T) {
+	s := openWorkerStore(t)
+	ctx := context.Background()
+	gid := seedGroup(t, s, "host:esc", "evt-esc", "host.appeared", `{"event_id":"e"}`)
+	for i := 0; i < 5; i++ {
+		if _, err := s.TakeGroup(ctx, gid); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ReleaseGroupTransient(ctx, gid, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	taken, err := s.TakeGroup(ctx, gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if taken.TransientRefunds != 5 {
+		t.Fatalf("take must expose the refund count, got %d", taken.TransientRefunds)
+	}
+	if !releaseTransient(ctx, testDeps(t, s), taken) {
+		t.Fatal("transient release must move the group")
+	}
+	// releaseBackoff(5) caps at 30s: due long after a retry-counted
+	// delay (retry counts stay at 1 through refunds) would land.
+	now := time.Now().UTC()
+	if needs, err := s.NeedsBriefing(ctx, 64, now.Add(5*time.Second)); err != nil || len(needs) != 0 {
+		t.Fatalf("escalated refund must hide the group at +5s: %v %v", needs, err)
+	}
+	if needs, err := s.NeedsBriefing(ctx, 64, now.Add(31*time.Second)); err != nil || len(needs) != 1 {
+		t.Fatalf("escalated refund must elapse by +31s: %v %v", needs, err)
+	}
+}
+
 func TestWorkerDrainWritesMinimalBriefing(t *testing.T) {
 	s := openWorkerStore(t)
 	gid := seedGroup(t, s, "host:w", "evt-w1", "host.changed", changedPayload("", `{"number":22,"protocol":"tcp","state":"open"}`))

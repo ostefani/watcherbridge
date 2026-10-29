@@ -1297,7 +1297,10 @@ func TestDSNPinsPragmas(t *testing.T) {
 		if got := fileURIPath(path); got != want {
 			t.Fatalf("fileURIPath(%q) = %q, want %q", path, got, want)
 		}
-		dsn := dsnForPath(path)
+		dsn, err := dsnForPath(path)
+		if err != nil {
+			t.Fatal(err)
+		}
 		// url.URL would otherwise read "C:" as the authority (rejected
 		// by SQLite) or resolve "rel" at the filesystem root: both must
 		// render as file:/// with an absolute path.
