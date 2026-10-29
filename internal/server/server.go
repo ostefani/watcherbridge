@@ -95,6 +95,12 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 	s.viewer = viewer.New(events, nil)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook", s.handleWebhook)
+	// GET needs an explicit route: the viewer's "GET /" catch-all would
+	// otherwise serve the index with 200. Every other non-POST method
+	// 405s through the mux's own method mismatch.
+	mux.HandleFunc("GET /webhook", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	})
 	s.viewer.Attach(mux)
 	s.http = &http.Server{
 		Addr:              cfg.Bind,
@@ -159,8 +165,8 @@ func (s *Server) writeSaturated(w http.ResponseWriter, msg string) {
 }
 
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
-	// Non-POST methods never reach here: the "POST /webhook" pattern
-	// makes the mux answer 405 itself.
+	// Only POST reaches here ("POST /webhook" pattern; GET has its own
+	// explicit 405 above, anything else mismatches in the mux).
 	select {
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
