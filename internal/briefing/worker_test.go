@@ -51,6 +51,39 @@ func changedPayload(prevPorts, curPorts string) string {
 	return `{"event_id":"e1","previous":{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[` + prevPorts + `]},"current":{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[` + curPorts + `]}}`
 }
 
+// A saturated release write retries instead of burning the take: two
+// saturated attempts then success reports the success; a non-saturation
+// error returns at once; a dead context breaks the wait.
+func TestRetryReleaseOnSaturated(t *testing.T) {
+	calls := 0
+	matched, err := retryReleaseOnSaturated(context.Background(), func(context.Context) (bool, error) {
+		calls++
+		if calls < 3 {
+			return false, store.ErrQueueSaturated
+		}
+		return true, nil
+	})
+	if err != nil || !matched || calls != 3 {
+		t.Fatalf("saturated release must retry to success: %v %v %d", matched, err, calls)
+	}
+
+	calls = 0
+	if _, err := retryReleaseOnSaturated(context.Background(), func(context.Context) (bool, error) {
+		calls++
+		return false, sql.ErrNoRows
+	}); !errors.Is(err, sql.ErrNoRows) || calls != 1 {
+		t.Fatalf("non-saturation error must return at once: %v %d", err, calls)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := retryReleaseOnSaturated(ctx, func(context.Context) (bool, error) {
+		return false, store.ErrQueueSaturated
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("dead context must break the wait: %v", err)
+	}
+}
+
 func TestWorkerDrainWritesMinimalBriefing(t *testing.T) {
 	s := openWorkerStore(t)
 	gid := seedGroup(t, s, "host:w", "evt-w1", "host.changed", changedPayload("", `{"number":22,"protocol":"tcp","state":"open"}`))

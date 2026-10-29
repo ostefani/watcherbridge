@@ -262,7 +262,13 @@ func (s *Store) releaseDelayed(ctx context.Context, groupID string, delay time.D
 		var res sql.Result
 		var err error
 		if refund {
-			res, err = tx.Exec(`UPDATE active_groups SET status = CASE WHEN retry_count >= ? THEN 'failed' ELSE 'closed' END, processing_since = NULL, next_attempt_at = ?, retry_count = CASE WHEN retry_count >= ? THEN retry_count WHEN retry_count > 0 THEN retry_count - 1 ELSE 0 END WHERE group_id = ? AND status = 'processing'`, maxGroupRetries, due, maxGroupRetries, groupID)
+			// A transient failure (saturated queue, shutdown, dead
+			// context) is never the group's fault, so a refund always
+			// requeues with the take unhappened — even at the retry
+			// cap. Parking failed is reserved for real outcomes (the
+			// non-refund branch below), which still converge poison
+			// groups without a briefing.
+			res, err = tx.Exec(`UPDATE active_groups SET status = 'closed', processing_since = NULL, next_attempt_at = ?, retry_count = CASE WHEN retry_count > 0 THEN retry_count - 1 ELSE 0 END WHERE group_id = ? AND status = 'processing'`, due, groupID)
 		} else {
 			res, err = tx.Exec(`UPDATE active_groups SET status = CASE WHEN retry_count >= ? THEN 'failed' ELSE 'closed' END, processing_since = NULL, next_attempt_at = ? WHERE group_id = ? AND status = 'processing'`, maxGroupRetries, due, groupID)
 		}

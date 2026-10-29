@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,17 +65,28 @@ func fromNanos(n int64) time.Time {
 	return time.Unix(0, n).UTC()
 }
 
-// Open creates (0600 file in a 0700 directory) or opens the database at path,
-// runs migrations, and starts the writer goroutine.
 // dsnForPath builds the sqlite file: DSN with the pragmas the store
 // depends on: WAL so readers never block the single writer, a bounded
 // busy timeout, foreign keys, immediate write transactions, and NORMAL
 // synchronous (acknowledged events survive a process crash; a power
-// loss may drop the last frames — see Designv5 §5). ToSlash keeps the
-// DSN valid on Windows, where volume paths carry backslashes that
-// url.URL would otherwise escape.
+// loss may drop the last frames — see Designv5 §5). ToSlash plus the
+// forced leading slash keeps the DSN valid on Windows: without it a
+// volume path renders as file://C:/... (authority "C:", rejected) or a
+// relative path as file://rel/... (host "rel"); with it both render as
+// file:///... with an absolute path.
 func dsnForPath(path string) string {
-	u := &url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
+	// Absolutize here too, so the helper is total: openStore already
+	// passes an absolute path, but a relative input must resolve
+	// against the working directory — never the filesystem root, which
+	// the forced slash below would otherwise produce.
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	p := filepath.ToSlash(path)
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	u := &url.URL{Scheme: "file", Path: p}
 	q := u.Query()
 	q.Set("_journal_mode", "WAL")
 	q.Set("_busy_timeout", "5000")
@@ -84,6 +97,8 @@ func dsnForPath(path string) string {
 	return u.String()
 }
 
+// Open creates (0600 file in a 0700 directory) or opens the database at path,
+// runs migrations, and starts the writer goroutine.
 func Open(path string, opts ...Option) (*Store, error) { return openStore(path, opts...) }
 
 func openStore(path string, opts ...Option) (*Store, error) {
@@ -115,10 +130,14 @@ func openStore(path string, opts ...Option) (*Store, error) {
 	// replacement files. The sticky bit (e.g. /tmp) still counts as
 	// safe — only the owner can rename inside it. A directory this call
 	// created is 0700 by construction and passes.
-	if info, err := os.Stat(dir); err != nil {
-		return nil, fmt.Errorf("stat data directory: %w", err)
-	} else if info.Mode().Perm()&0o022 != 0 && info.Mode()&os.ModeSticky == 0 {
-		return nil, fmt.Errorf("refusing group/world-writable data directory %s without the sticky bit", dir)
+	// Windows reports synthesized modes with no sticky bit, and its
+	// permission bits are meaningless anyway, so the check is Unix-only.
+	if runtime.GOOS != "windows" {
+		if info, err := os.Stat(dir); err != nil {
+			return nil, fmt.Errorf("stat data directory: %w", err)
+		} else if info.Mode().Perm()&0o022 != 0 && info.Mode()&os.ModeSticky == 0 {
+			return nil, fmt.Errorf("refusing group/world-writable data directory %s without the sticky bit", dir)
+		}
 	}
 	// Lstat first: a planted symlink must never be followed — payloads
 	// would land in (or be read from) the link target. O_EXCL closes
@@ -151,6 +170,18 @@ func openStore(path string, opts ...Option) (*Store, error) {
 			return nil, fmt.Errorf("create database file: %w", err)
 		}
 		f.Close()
+		// Fresh file, but the sidecars may predate it in a sticky
+		// directory: a planted symlink at either path is refused before
+		// SQLite ever opens it.
+		for _, sidecar := range []string{path + "-wal", path + "-shm"} {
+			if sfi, serr := os.Lstat(sidecar); serr == nil {
+				if sfi.Mode()&os.ModeSymlink != 0 {
+					return nil, fmt.Errorf("refusing symlinked sidecar %s", sidecar)
+				}
+			} else if !os.IsNotExist(serr) {
+				return nil, fmt.Errorf("stat sidecar: %w", serr)
+			}
+		}
 	} else {
 		return nil, fmt.Errorf("stat database file: %w", err)
 	}

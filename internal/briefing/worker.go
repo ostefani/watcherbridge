@@ -235,6 +235,32 @@ func briefOne(ctx context.Context, d Deps, groupID string) (progressed bool) {
 	return true
 }
 
+// retryReleaseOnSaturated runs one release write until it succeeds,
+// fails with anything but a saturated queue, or runs out of tries. A
+// release that follows a saturated store write (the fallback path after
+// a saturated insert) would otherwise fail in the same window, leaving
+// the group processing until the lease reaps it without a refund — one
+// burned take per incident. Only ErrQueueSaturated retries, bounded and
+// ctx-aware, so a saturated window costs milliseconds, not budget.
+func retryReleaseOnSaturated(ctx context.Context, attempt func(context.Context) (bool, error)) (bool, error) {
+	const tries = 3
+	const pause = 50 * time.Millisecond
+	var matched bool
+	var err error
+	for i := 0; i < tries; i++ {
+		matched, err = attempt(ctx)
+		if !errors.Is(err, store.ErrQueueSaturated) || i == tries-1 {
+			return matched, err
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(pause):
+		}
+	}
+	return matched, err
+}
+
 // releaseOrPark requeues with a bounded backoff, or parks failed at the
 // cap. Failed groups carry no invented priority; the log line is the
 // record. Reports whether the group moved.
@@ -242,7 +268,9 @@ func releaseOrPark(ctx context.Context, d Deps, taken store.TakenGroup, reason s
 	if ctx.Err() != nil {
 		return false
 	}
-	matched, err := d.Store.ReleaseGroupDelayed(ctx, taken.GroupID, releaseBackoff(taken.RetryCount))
+	matched, err := retryReleaseOnSaturated(ctx, func(ctx context.Context) (bool, error) {
+		return d.Store.ReleaseGroupDelayed(ctx, taken.GroupID, releaseBackoff(taken.RetryCount))
+	})
 	if err != nil {
 		log.Printf("briefing: group %s release: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
 		return false
@@ -260,7 +288,9 @@ func releaseOrPark(ctx context.Context, d Deps, taken store.TakenGroup, reason s
 // attempt never really ran (saturated writer, shutdown, dead context),
 // so it must not burn the retry budget.
 func releaseTransient(ctx context.Context, d Deps, taken store.TakenGroup) bool {
-	matched, err := d.Store.ReleaseGroupTransient(ctx, taken.GroupID, releaseBackoff(taken.RetryCount))
+	matched, err := retryReleaseOnSaturated(ctx, func(ctx context.Context) (bool, error) {
+		return d.Store.ReleaseGroupTransient(ctx, taken.GroupID, releaseBackoff(taken.RetryCount))
+	})
 	if err != nil {
 		log.Printf("briefing: group %s transient release: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
 		return false

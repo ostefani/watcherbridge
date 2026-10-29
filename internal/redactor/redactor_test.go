@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -367,6 +369,18 @@ func FuzzTokenizeRestore(f *testing.F) {
 	f.Add("see printer-2 at AA:BB:CC:DD:EE:FF via http://192.168.1.1:8080/x")
 	f.Add("fe80::1%eth0 and 2001:db8::/32 plus aabb.ccdd.eeff and deadbeefcafe")
 	f.Add("Linux 5.15.0-generic build 1.2.3 no addresses here")
+	// H4 rows and the dotted-port hole as seeds: the oracle must hold
+	// on every row the fixtures pin, in both directions.
+	f.Add("moved to 192.168.1.5.")
+	f.Add("see http://192.168.1.5/admin")
+	f.Add("range 10.0.0.5-10.0.0.9 done")
+	f.Add("moved to 192.168.001.001.")
+	f.Add("dev_10.0.0.5 here")
+	f.Add("got fe80::1x.")
+	f.Add("netstat 192.168.1.5.443 ok")
+	f.Add("firmware 1.2.3.4.5 ok")
+	f.Add("550e8400-e29b-41d4-a716-446655440000")
+	f.Add("0.0.00.0")
 	f.Fuzz(func(t *testing.T, text string) {
 		// Fake token assignment through the REAL replaceSpans path: the
 		// fuzz harness cannot drift from production by construction.
@@ -401,6 +415,9 @@ func FuzzTokenizeRestore(f *testing.F) {
 		if len(hits) != 0 && !leakValidated(tokenized) && !leakEager(tokenized) && !leakValue(tokenized, toks) {
 			t.Fatalf("unexplained leak hit: hits=%v in %q", hits, tokenized)
 		}
+		if len(hits) == 0 {
+			oracleNoLiteralAddress(t, tokenized)
+		}
 		if err := ValidateTokens(tokenized, toks); err != nil {
 			t.Fatalf("own output invalid: %v", err)
 		}
@@ -421,6 +438,103 @@ func FuzzTokenizeRestore(f *testing.F) {
 func mustJSON(s string) []byte {
 	b, _ := json.Marshal(map[string]string{"s": s})
 	return b
+}
+
+// stripLeadingZeros folds one quad for the fuzz oracle: "001" reads as
+// "1", so a validator-rejected form still counts as an address. A
+// "/bits" suffix is folded the same way and reattached.
+func stripLeadingZeros(quad string) string {
+	suffix := ""
+	if i := strings.Index(quad, "/"); i >= 0 {
+		suffix, quad = quad[i:], quad[:i]
+		suffix = strings.TrimLeft(suffix[1:], "0")
+		if suffix == "" {
+			suffix = "0"
+		}
+		suffix = "/" + suffix
+	}
+	parts := strings.Split(quad, ".")
+	for i, p := range parts {
+		// Empty parts (leading/trailing dots) stay empty so they can
+		// never parse: folding them to "0" would manufacture an
+		// address from dot fragments (".0.001." must not read as
+		// "0.0.1.0").
+		if p == "" {
+			continue
+		}
+		if s := strings.TrimLeft(p, "0"); s != "" {
+			parts[i] = s
+		} else {
+			parts[i] = "0"
+		}
+	}
+	return strings.Join(parts, ".") + suffix
+}
+
+var (
+	// Independent shapes for the fuzz oracle: deliberately not the
+	// redactor's regexes, so a shared typo cannot blind both the legs
+	// and the check. Token spans are blanked before scanning.
+	oracleTokenRe = regexp.MustCompile(`\b(?:IP|MAC|HOST|NET)_[0-9]+\b`)
+	oracleHexRe   = regexp.MustCompile(`[0-9A-Fa-f]+`)
+	oracleRunRe   = regexp.MustCompile(`[0-9./]{7,}`)
+)
+
+// oracleNoLiteralAddress fails when a scan-clean output still contains
+// an identifying address the legs missed: every digit/dot/slash run of
+// 7+ chars is windowed 7..15 and parsed (quads via ParseAddr, prefixes
+// via ParsePrefix, both after per-octet zero stripping), and every 12+
+// hex run is flagged MAC-shaped. The unspecified address is exempt: it
+// carries no identity.
+//
+// False-positive policy: this runs in the fuzzer only, where a flag is
+// a triage case, never a production outage. Token spans are blanked so
+// a token number glued to version dots ("IP_1.5") cannot read as an
+// octet; everything else that parses is fail-closed by design.
+func oracleNoLiteralAddress(t *testing.T, tokenized string) {
+	t.Helper()
+	scrubbed := oracleTokenRe.ReplaceAllString(tokenized, " ")
+	for _, run := range oracleRunRe.FindAllString(scrubbed, -1) {
+		for i := 0; i+7 <= len(run); i++ {
+			for j := i + 7; j <= len(run) && j <= i+15; j++ {
+				sub := run[i:j]
+				// Octets past 3 digits are malformed beyond trivial
+				// zero-padding: no parser reads them, and the repair
+				// (which digit to drop) is ambiguous. The legs cover
+				// ≤3-digit forms; longer runs are noise, not identity.
+				skip := false
+				for _, part := range strings.Split(strings.TrimSuffix(sub, "/"), ".") {
+					if len(part) > 3 {
+						skip = true
+						break
+					}
+				}
+				if skip {
+					continue
+				}
+				sub = stripLeadingZeros(sub)
+				if addr, err := netip.ParseAddr(sub); err == nil && !addr.IsUnspecified() {
+					t.Fatalf("scan-clean output parses as an address: %q in %q", run[i:j], tokenized)
+				}
+				if pfx, err := netip.ParsePrefix(sub); err == nil && !pfx.Addr().IsUnspecified() {
+					t.Fatalf("scan-clean output parses as a prefix: %q in %q", run[i:j], tokenized)
+				}
+			}
+		}
+	}
+	// MAC-shaped runs must be exactly 12 hex digits: longer runs are
+	// the deliberate shredding fragments (the tokenizer keeps them
+	// whole, the scan agrees), and all-zeros runs carry no identity.
+	// A surviving exact-12 run is guard-disputed — the tokenizer takes
+	// unguarded bare-12 aggressively, and the eager leg no longer
+	// exempts trailing colons — so reaching here means a leg regressed,
+	// and the tripwire fires.
+	for _, m := range oracleHexRe.FindAllString(scrubbed, -1) {
+		if len(m) != 12 || strings.TrimLeft(m, "0") == "" {
+			continue
+		}
+		t.Fatalf("scan-clean output holds a MAC-shaped run: %q in %q", m, tokenized)
+	}
 }
 
 // bundleBanner builds a one-event bundle from a banner string with no
@@ -545,6 +659,8 @@ func TestValidatorBlindSpotsBlocked(t *testing.T) {
 		"dev_10.0.0.5 here",         // underscore-glued
 		"ip10.0.0.5 seen",           // letter-glued
 		"got fe80::1x.",             // letter-glued v6 tail
+		"xdeadbeefcafe: tag",        // letter-glued MAC with a bare trailing colon
+		"xdeadbeefcafe:",            // same, at end of string
 	} {
 		t.Run(in, func(t *testing.T) {
 			ser, issued, _ := bundleBanner(t, in)

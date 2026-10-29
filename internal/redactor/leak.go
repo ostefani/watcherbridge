@@ -142,11 +142,17 @@ func leakEagerQuad(s string) bool {
 	return false
 }
 
-// leakEagerMAC reports a MAC-shaped run that is not glued to a longer
-// hex/colon fragment.
+// leakEagerMAC reports a MAC-shaped run that continues into a longer
+// hex run (the shredding case: an IPv6 fragment the tokenizer keeps
+// whole). A trailing colon does not exempt: the tokenizer mints
+// unguarded bare-12 cores regardless of what follows the run
+// ("deadbeefcafe:80" becomes MAC_1:80, "deadbeefcafe::1" is also
+// zone-flagged), so a surviving literal with a trailing colon is a
+// glued run the tokenizer refused — fail it closed instead of letting a
+// glued MAC ride to the provider.
 func leakEagerMAC(s string) bool {
 	for _, loc := range eagerMACRe.FindAllStringIndex(s, -1) {
-		if loc[1] < len(s) && (isHexByte(s[loc[1]]) || s[loc[1]] == ':') {
+		if loc[1] < len(s) && isHexByte(s[loc[1]]) {
 			continue
 		}
 		return true

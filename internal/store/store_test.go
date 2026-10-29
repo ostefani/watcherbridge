@@ -910,6 +910,55 @@ func TestReleaseBackoffRefundAndDueGuard(t *testing.T) {
 	}
 }
 
+// A transient failure on the fifth take (retry_count at the cap) still
+// refunds: the take is unhappened and the group requeues closed instead
+// of parking failed with no briefing. Only real outcomes park at the cap.
+func TestTransientRefundAtCapRequeues(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	ev := RawEvent{EventID: "evt-cap", EventKey: "k", EventType: "host.appeared", OccurredAt: now, Cycle: 1, Payload: []byte(`{}`), ReceivedAt: now, SignatureTimestamp: now}
+	res, err := s.PersistEventAndGroup(ctx, ev, "host:cap", GroupPolicy{QuietWindow: time.Millisecond, MaxWindow: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CloseDue(ctx, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	gid := res.GroupID
+	var taken TakenGroup
+	for want := 1; want <= maxGroupRetries; want++ {
+		taken, err = s.TakeGroup(ctx, gid)
+		if err != nil || taken.RetryCount != want {
+			t.Fatalf("take %d: %+v %v", want, taken, err)
+		}
+		if want < maxGroupRetries {
+			if _, err := s.ReleaseGroup(ctx, gid); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// Fifth take fails transiently (saturated queue, shutdown, dead
+	// context): refund, don't park.
+	if matched, err := s.ReleaseGroupTransient(ctx, gid, 0); err != nil || !matched {
+		t.Fatalf("cap refund: %v %v", matched, err)
+	}
+	if st, _ := s.GroupStatus(ctx, gid); st != "closed" {
+		t.Fatalf("refunded cap take must requeue closed, got %q", st)
+	}
+	taken, err = s.TakeGroup(ctx, gid)
+	if err != nil || taken.RetryCount != maxGroupRetries {
+		t.Fatalf("refunded take must not burn budget: %+v %v", taken, err)
+	}
+	// A real failure on the same take still parks failed.
+	if _, err := s.ReleaseGroup(ctx, gid); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := s.GroupStatus(ctx, gid); st != "failed" {
+		t.Fatalf("real failure at cap must park failed, got %q", st)
+	}
+}
+
 // H2/migration v5: a v4 database gains next_attempt_at on open, with
 // NULL (due immediately) for pre-existing rows.
 func TestMigrationV4ToV5KeepsBackoffNull(t *testing.T) {
@@ -1161,16 +1210,41 @@ func TestOpenRefusesWritableDir(t *testing.T) {
 	s.Close()
 }
 
+// H10: a relative database path resolves against the working
+// directory: the create, Lstat and DSN steps in Open all run on the
+// absolutized path, so SQLite can never open a different file (or fail
+// at the filesystem root) while the helpers touch the local one.
+func TestOpenRelativePathStaysLocal(t *testing.T) {
+	relDir := t.TempDir()
+	t.Chdir(relDir)
+	s, err := Open("rel.db")
+	if err != nil {
+		t.Fatalf("open with relative path: %v", err)
+	}
+	s.Close()
+	if _, err := os.Stat(filepath.Join(relDir, "rel.db")); err != nil {
+		t.Fatalf("relative database must be created in the working directory: %v", err)
+	}
+}
+
 // H10: the DSN pins the pragmas the store depends on, so a dropped
 // setting fails here instead of degrading silently at runtime.
 func TestDSNPinsPragmas(t *testing.T) {
-	dsn := dsnForPath(filepath.Join("some", "dir", "bridge.db"))
-	for _, want := range []string{
-		"file:", "_journal_mode=WAL", "_busy_timeout=5000",
-		"_foreign_keys=on", "_txlock=immediate", "_synchronous=NORMAL",
-	} {
-		if !strings.Contains(dsn, want) {
-			t.Fatalf("DSN must pin %q, got %q", want, dsn)
+	for _, path := range []string{filepath.Join("some", "dir", "bridge.db"), `C:/x/y.db`} {
+		dsn := dsnForPath(path)
+		// url.URL would otherwise read "C:" as the authority (rejected
+		// by SQLite) or resolve "rel" at the filesystem root: both must
+		// render as file:/// with an absolute path.
+		if !strings.HasPrefix(dsn, "file:///") {
+			t.Fatalf("DSN must be file:/// with an absolute path, got %q", dsn)
+		}
+		for _, want := range []string{
+			"_journal_mode=WAL", "_busy_timeout=5000",
+			"_foreign_keys=on", "_txlock=immediate", "_synchronous=NORMAL",
+		} {
+			if !strings.Contains(dsn, want) {
+				t.Fatalf("DSN must pin %q, got %q", want, dsn)
+			}
 		}
 	}
 }
