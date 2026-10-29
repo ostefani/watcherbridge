@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 6
+const supportedSchemaVersion = 7
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -105,6 +105,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 5, migrateV5)
 		case 5:
 			err = applyMigration(db, 6, migrateV6)
+		case 6:
+			err = applyMigration(db, 7, migrateV7)
 		}
 		if err != nil {
 			return err
@@ -231,6 +233,17 @@ func migrateV5(tx *sql.Tx) error {
 		}
 	}
 	return nil
+}
+
+// migrateV7: groups gain transient_refunds, counting takes forgiven for
+// transient store pressure (saturated queue, shutdown, dead context).
+// Without a bound a persistently saturated store would requeue the same
+// group forever, each cycle costing a provider call after the model
+// already ran. At maxTransientRefunds the next refund parks failed
+// instead — the one terminal state that stops the spend.
+func migrateV7(tx *sql.Tx) error {
+	_, err := tx.Exec(`ALTER TABLE active_groups ADD COLUMN transient_refunds INTEGER NOT NULL DEFAULT 0`)
+	return err
 }
 
 // migrateV6: groups gain total_bytes, a running payload-byte counter so

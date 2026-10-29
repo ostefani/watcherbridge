@@ -227,6 +227,13 @@ func (s *Store) CloseDue(ctx context.Context, now time.Time) ([]string, error) {
 // can check it without importing the sqlite driver. See limits.MaxGroupBytes.
 const maxGroupRetries = 5
 
+// maxTransientRefunds bounds takes forgiven for transient store pressure.
+// The backoff between refunds already spaces them (2s doubling to 30s),
+// so 20 refunds span roughly ten minutes of persistent saturation —
+// generous for incidents, bounded for runaways. The cap counts refunds,
+// not takes: real outcomes still park at maxGroupRetries.
+const maxTransientRefunds = 20
+
 // ReleaseGroup returns a processing group to closed for a later retry. It
 // never increments the counter — takes own counting. At maxGroupRetries the
 // group is parked in 'failed' instead, so a poison group cannot loop forever.
@@ -263,12 +270,13 @@ func (s *Store) releaseDelayed(ctx context.Context, groupID string, delay time.D
 		var err error
 		if refund {
 			// A transient failure (saturated queue, shutdown, dead
-			// context) is never the group's fault, so a refund always
+			// context) is never the group's fault, so a refund
 			// requeues with the take unhappened — even at the retry
 			// cap. Parking failed is reserved for real outcomes (the
-			// non-refund branch below), which still converge poison
-			// groups without a briefing.
-			res, err = tx.Exec(`UPDATE active_groups SET status = 'closed', processing_since = NULL, next_attempt_at = ?, retry_count = CASE WHEN retry_count > 0 THEN retry_count - 1 ELSE 0 END WHERE group_id = ? AND status = 'processing'`, due, groupID)
+			// non-refund branch below) and for a refund runaway: past
+			// maxTransientRefunds the group parks failed instead of
+			// retrying forever, which stops the provider spend.
+			res, err = tx.Exec(`UPDATE active_groups SET status = CASE WHEN transient_refunds + 1 > ? THEN 'failed' ELSE 'closed' END, processing_since = NULL, next_attempt_at = ?, retry_count = CASE WHEN retry_count > 0 THEN retry_count - 1 ELSE 0 END, transient_refunds = transient_refunds + 1 WHERE group_id = ? AND status = 'processing'`, maxTransientRefunds, due, groupID)
 		} else {
 			res, err = tx.Exec(`UPDATE active_groups SET status = CASE WHEN retry_count >= ? THEN 'failed' ELSE 'closed' END, processing_since = NULL, next_attempt_at = ? WHERE group_id = ? AND status = 'processing'`, maxGroupRetries, due, groupID)
 		}

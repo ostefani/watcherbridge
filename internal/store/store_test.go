@@ -709,6 +709,9 @@ func TestMigrateV3ToV4WithData(t *testing.T) {
 	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN total_bytes`); err != nil {
 		t.Fatalf("drop v6 column: %v", err)
 	}
+	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN transient_refunds`); err != nil {
+		t.Fatalf("drop v7 column: %v", err)
+	}
 	if _, err := db.Exec(`PRAGMA user_version = 3`); err != nil {
 		t.Fatal(err)
 	}
@@ -959,6 +962,46 @@ func TestTransientRefundAtCapRequeues(t *testing.T) {
 	}
 }
 
+// Persistent saturation must not retry forever: past maxTransientRefunds
+// the next refund parks failed instead of requeueing, which stops the
+// provider spend. Each cycle is one take plus one refund.
+func TestTransientRefundRunawayParks(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	ev := RawEvent{EventID: "evt-run", EventKey: "k", EventType: "host.appeared", OccurredAt: now, Cycle: 1, Payload: []byte(`{}`), ReceivedAt: now, SignatureTimestamp: now}
+	res, err := s.PersistEventAndGroup(ctx, ev, "host:run", GroupPolicy{QuietWindow: time.Millisecond, MaxWindow: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CloseDue(ctx, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	gid := res.GroupID
+	for i := 1; i <= maxTransientRefunds; i++ {
+		if _, err := s.TakeGroup(ctx, gid); err != nil {
+			t.Fatalf("take %d: %v", i, err)
+		}
+		matched, err := s.ReleaseGroupTransient(ctx, gid, 0)
+		if err != nil || !matched {
+			t.Fatalf("refund %d: %v %v", i, matched, err)
+		}
+		if st, _ := s.GroupStatus(ctx, gid); st != "closed" {
+			t.Fatalf("refund %d must requeue closed, got %q", i, st)
+		}
+	}
+	if _, err := s.TakeGroup(ctx, gid); err != nil {
+		t.Fatal(err)
+	}
+	matched, err := s.ReleaseGroupTransient(ctx, gid, 0)
+	if err != nil || !matched {
+		t.Fatalf("cap refund: %v %v", matched, err)
+	}
+	if st, _ := s.GroupStatus(ctx, gid); st != "failed" {
+		t.Fatalf("refund past the cap must park failed, got %q", st)
+	}
+}
+
 // H2/migration v5: a v4 database gains next_attempt_at on open, with
 // NULL (due immediately) for pre-existing rows.
 func TestMigrationV4ToV5KeepsBackoffNull(t *testing.T) {
@@ -993,6 +1036,9 @@ func TestMigrationV4ToV5KeepsBackoffNull(t *testing.T) {
 	}
 	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN total_bytes`); err != nil {
 		t.Fatalf("drop v6 column: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN transient_refunds`); err != nil {
+		t.Fatalf("drop v7 column: %v", err)
 	}
 	if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
 		t.Fatal(err)
@@ -1134,13 +1180,16 @@ func TestMigrationV5ToV6KeepsByteCounter(t *testing.T) {
 	}
 	s.Close()
 
-	// Rewind to v5: drop the v6 column, keeping the data.
+	// Rewind to v5: drop the v6 and v7 columns, keeping the data.
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN total_bytes`); err != nil {
 		t.Fatalf("drop v6 column: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN transient_refunds`); err != nil {
+		t.Fatalf("drop v7 column: %v", err)
 	}
 	if _, err := db.Exec(`PRAGMA user_version = 5`); err != nil {
 		t.Fatal(err)
@@ -1153,8 +1202,8 @@ func TestMigrationV5ToV6KeepsByteCounter(t *testing.T) {
 	}
 	defer s2.Close()
 	var version int
-	if err := s2.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 6 {
-		t.Fatalf("want user_version 6, got %d %v", version, err)
+	if err := s2.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != supportedSchemaVersion {
+		t.Fatalf("want user_version %d, got %d %v", supportedSchemaVersion, version, err)
 	}
 	var total int64
 	if err := s2.db.QueryRow(`SELECT total_bytes FROM active_groups WHERE host_anchor_key = 'host:v5'`).Scan(&total); err != nil {
@@ -1222,15 +1271,32 @@ func TestOpenRelativePathStaysLocal(t *testing.T) {
 		t.Fatalf("open with relative path: %v", err)
 	}
 	s.Close()
-	if _, err := os.Stat(filepath.Join(relDir, "rel.db")); err != nil {
+	// Non-empty proves SQLite opened this file, not just that openStore
+	// created it: the migration DDL lands in the opened database, so a
+	// wrong-location open would leave a zero-byte file behind.
+	fi, err := os.Stat(filepath.Join(relDir, "rel.db"))
+	if err != nil {
 		t.Fatalf("relative database must be created in the working directory: %v", err)
+	}
+	if fi.Size() == 0 {
+		t.Fatal("relative database must hold the migrated schema, got an empty file")
 	}
 }
 
 // H10: the DSN pins the pragmas the store depends on, so a dropped
 // setting fails here instead of degrading silently at runtime.
 func TestDSNPinsPragmas(t *testing.T) {
-	for _, path := range []string{filepath.Join("some", "dir", "bridge.db"), `C:/x/y.db`} {
+	// The Windows branch is pinned directly on the pure helper: through
+	// dsnForPath a volume path would first run through Abs, which on
+	// Linux resolves it under the working directory and never reaches
+	// the forced slash.
+	for path, want := range map[string]string{
+		filepath.Join("some", "dir", "bridge.db"): "/some/dir/bridge.db",
+		`C:/x/y.db`: "/C:/x/y.db",
+	} {
+		if got := fileURIPath(path); got != want {
+			t.Fatalf("fileURIPath(%q) = %q, want %q", path, got, want)
+		}
 		dsn := dsnForPath(path)
 		// url.URL would otherwise read "C:" as the authority (rejected
 		// by SQLite) or resolve "rel" at the filesystem root: both must

@@ -295,7 +295,13 @@ func releaseTransient(ctx context.Context, d Deps, taken store.TakenGroup) bool 
 		log.Printf("briefing: group %s transient release: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
 		return false
 	}
-	return matched
+	if !matched {
+		return false
+	}
+	if st, _ := d.Store.GroupStatus(ctx, taken.GroupID); st == "failed" {
+		log.Printf("briefing: group %s parked failed (transient refund cap) after %d attempts", taken.GroupID, taken.RetryCount)
+	}
+	return true
 }
 
 // parkFailed moves a processing group straight to failed with a sanitized

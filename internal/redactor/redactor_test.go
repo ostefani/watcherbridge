@@ -478,6 +478,7 @@ var (
 	oracleTokenRe = regexp.MustCompile(`\b(?:IP|MAC|HOST|NET)_[0-9]+\b`)
 	oracleHexRe   = regexp.MustCompile(`[0-9A-Fa-f]+`)
 	oracleRunRe   = regexp.MustCompile(`[0-9./]{7,}`)
+	oracleV6Re    = regexp.MustCompile(`[0-9A-Fa-f:.]{7,}`)
 )
 
 // oracleNoLiteralAddress fails when a scan-clean output still contains
@@ -502,8 +503,15 @@ func oracleNoLiteralAddress(t *testing.T, tokenized string) {
 				// zero-padding: no parser reads them, and the repair
 				// (which digit to drop) is ambiguous. The legs cover
 				// ≤3-digit forms; longer runs are noise, not identity.
+				// The check runs on the address core: a "/bits" suffix
+				// must not count toward octet length, or the prefix
+				// leg below would be dead code.
+				core := sub
+				if k := strings.Index(core, "/"); k >= 0 {
+					core = core[:k]
+				}
 				skip := false
-				for _, part := range strings.Split(strings.TrimSuffix(sub, "/"), ".") {
+				for _, part := range strings.Split(core, ".") {
 					if len(part) > 3 {
 						skip = true
 						break
@@ -518,6 +526,30 @@ func oracleNoLiteralAddress(t *testing.T, tokenized string) {
 				}
 				if pfx, err := netip.ParsePrefix(sub); err == nil && !pfx.Addr().IsUnspecified() {
 					t.Fatalf("scan-clean output parses as a prefix: %q in %q", run[i:j], tokenized)
+				}
+			}
+		}
+	}
+	// IPv6: the quad pass above cannot see colon forms, so the leak
+	// scanner's v6 legs would otherwise go unchecked. Windows are wider
+	// (longest textual form is 45 chars); only colon runs are examined,
+	// since bare quads belong to the pass above. Zones break the run at
+	// "%", matching what the tokenizer can consume.
+	for _, run := range oracleV6Re.FindAllString(scrubbed, -1) {
+		if !strings.Contains(run, ":") {
+			continue
+		}
+		// Like the zone leg, require a decimal digit: digit-less
+		// colon runs are code-like prose ("std::fmt", "AAAAA::A"),
+		// not addresses. A mnemonic address without a single digit
+		// ("cafe::cafe") is vanishingly rare next to C++ in banners.
+		if !strings.ContainsAny(run, "0123456789") {
+			continue
+		}
+		for i := 0; i+7 <= len(run); i++ {
+			for j := i + 7; j <= len(run) && j <= i+45; j++ {
+				if addr, err := netip.ParseAddr(run[i:j]); err == nil && !addr.IsUnspecified() {
+					t.Fatalf("scan-clean output parses as an IPv6 address: %q in %q", run[i:j], tokenized)
 				}
 			}
 		}

@@ -65,28 +65,32 @@ func fromNanos(n int64) time.Time {
 	return time.Unix(0, n).UTC()
 }
 
-// dsnForPath builds the sqlite file: DSN with the pragmas the store
-// depends on: WAL so readers never block the single writer, a bounded
-// busy timeout, foreign keys, immediate write transactions, and NORMAL
-// synchronous (acknowledged events survive a process crash; a power
-// loss may drop the last frames — see Designv5 §5). ToSlash plus the
-// forced leading slash keeps the DSN valid on Windows: without it a
-// volume path renders as file://C:/... (authority "C:", rejected) or a
-// relative path as file://rel/... (host "rel"); with it both render as
-// file:///... with an absolute path.
-func dsnForPath(path string) string {
-	// Absolutize here too, so the helper is total: openStore already
-	// passes an absolute path, but a relative input must resolve
-	// against the working directory — never the filesystem root, which
-	// the forced slash below would otherwise produce.
-	if abs, err := filepath.Abs(path); err == nil {
-		path = abs
-	}
+// fileURIPath renders one filesystem path as the path part of a file:
+// URI. ToSlash plus the forced leading slash keeps the DSN valid on
+// Windows: without it a volume path renders as file://C:/...
+// (authority "C:", rejected by SQLite). Pure and platform-independent,
+// so tests pin it directly on both POSIX and Windows inputs.
+func fileURIPath(path string) string {
 	p := filepath.ToSlash(path)
 	if !strings.HasPrefix(p, "/") {
 		p = "/" + p
 	}
-	u := &url.URL{Scheme: "file", Path: p}
+	return p
+}
+
+// dsnForPath builds the sqlite file: DSN with the pragmas the store
+// depends on: WAL so readers never block the single writer, a bounded
+// busy timeout, foreign keys, immediate write transactions, and NORMAL
+// synchronous (acknowledged events survive a process crash; a power
+// loss may drop the last frames — see Designv5 §5).
+func dsnForPath(path string) string {
+	// Absolutize here too, so the helper is total: openStore already
+	// passes an absolute path, but a relative input must resolve
+	// against the working directory — never the filesystem root.
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	u := &url.URL{Scheme: "file", Path: fileURIPath(path)}
 	q := u.Query()
 	q.Set("_journal_mode", "WAL")
 	q.Set("_busy_timeout", "5000")
