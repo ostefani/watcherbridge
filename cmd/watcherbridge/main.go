@@ -51,18 +51,18 @@ func main() {
 	cfg := config.Default()
 	cfg.Bind = *bind
 	cfg.Mode = *mode
-	cfg.Secret = firstNonEmpty(*secret, os.Getenv("WEBHOOK_SECRET"))
+	cfg.Secret = config.Secret(firstNonEmpty(*secret, os.Getenv("WEBHOOK_SECRET")))
 	cfg.SecretFile = *secretFile
 	cfg.ScanRelayURL = *relay
-	cfg.ForwardBearerToken = firstNonEmpty(*forwardBearer, os.Getenv("FORWARD_BEARER_TOKEN"))
-	cfg.ForwardAPIKey = firstNonEmpty(*forwardKey, os.Getenv("FORWARD_API_KEY"))
+	cfg.ForwardBearerToken = config.Secret(firstNonEmpty(*forwardBearer, os.Getenv("FORWARD_BEARER_TOKEN")))
+	cfg.ForwardAPIKey = config.Secret(firstNonEmpty(*forwardKey, os.Getenv("FORWARD_API_KEY")))
 	cfg.GroupQuietWindow = *quiet
 	cfg.GroupMaxWindow = *maxWindow
 	cfg.GrouperTick = *tick
 	cfg.ProcessingLease = *lease
 	cfg.ModelProvider = *modelProvider
 	cfg.ModelID = *modelID
-	cfg.ModelAPIKey = firstNonEmpty(*modelKey, os.Getenv("MODEL_API_KEY"))
+	cfg.ModelAPIKey = config.Secret(firstNonEmpty(*modelKey, os.Getenv("MODEL_API_KEY")))
 	cfg.ModelAPIKeyFile = *modelKeyFile
 	cfg.ModelBaseURL = *modelURL
 	cfg.ProviderTimeout = *modelTimeout
@@ -109,7 +109,7 @@ func main() {
 	if cfg.ScanRelayURL != "" {
 		timeout := cfg.ProxyForwardTimeout
 		pub = viewer.NewPublisher(cfg.ScanRelayURL+"/api/annotations",
-			cfg.ForwardBearerToken, cfg.ForwardAPIKey, cfg.ForwardAPIKeyHeader, timeout, nil)
+			string(cfg.ForwardBearerToken), string(cfg.ForwardAPIKey), cfg.ForwardAPIKeyHeader, timeout, nil)
 		pub.Start()
 		defer pub.Stop()
 	} else {

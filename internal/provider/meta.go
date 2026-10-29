@@ -70,7 +70,7 @@ func NewMetaAdapter(baseURL, modelID, apiKey string, client *http.Client, maxByt
 func (a *MetaAdapter) Name() string { return "meta" }
 
 // Brief implements Provider.
-func (a *MetaAdapter) Brief(ctx context.Context, bundle []byte, _ map[string]string) (RawBriefing, error) {
+func (a *MetaAdapter) Brief(ctx context.Context, bundle []byte, _ map[string]struct{}) (RawBriefing, error) {
 	body, err := MarshalBundleRequest(a.modelID, bundle)
 	if err != nil {
 		return RawBriefing{}, fmt.Errorf("encode bundle request: %w", err)
@@ -79,7 +79,7 @@ func (a *MetaAdapter) Brief(ctx context.Context, bundle []byte, _ map[string]str
 }
 
 // Repair implements Provider.
-func (a *MetaAdapter) Repair(ctx context.Context, correction string, _ map[string]string) (RawBriefing, error) {
+func (a *MetaAdapter) Repair(ctx context.Context, correction string, _ map[string]struct{}) (RawBriefing, error) {
 	body, err := MarshalRepairRequest(a.modelID, correction)
 	if err != nil {
 		return RawBriefing{}, fmt.Errorf("encode repair request: %w", err)

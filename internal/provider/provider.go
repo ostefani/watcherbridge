@@ -26,11 +26,14 @@ type RawBriefing struct {
 type Provider interface {
 	Name() string
 	// Brief sends the bundle and returns the model's briefing object.
-	Brief(ctx context.Context, bundle []byte, issued map[string]string) (RawBriefing, error)
+	// validTokens is the set of token names the model may echo — never
+	// the token-to-value map. Adapters must never see cleartext: token
+	// restoration stays in the briefing layer, which owns the map.
+	Brief(ctx context.Context, bundle []byte, validTokens map[string]struct{}) (RawBriefing, error)
 	// Repair sends a short correction prompt (schema error text only, no
 	// bundle content) after a validation failure. Exactly one repair per
 	// group is attempted, on the same ctx budget as the initial call.
-	Repair(ctx context.Context, correction string, issued map[string]string) (RawBriefing, error)
+	Repair(ctx context.Context, correction string, validTokens map[string]struct{}) (RawBriefing, error)
 }
 
 // bundleRequest is the Meta wire body: the model ID plus the redacted

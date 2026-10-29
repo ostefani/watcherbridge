@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -336,7 +337,7 @@ func TestReopenRecoversExpiredGroupAndSidecarPerms(t *testing.T) {
 	if err != nil || len(closed) != 1 {
 		t.Fatalf("recover after reopen: %v %v", closed, err)
 	}
-	needs, err := s2.NeedsBriefing(context.Background(), 64)
+	needs, err := s2.NeedsBriefing(context.Background(), 64, time.Now())
 	if err != nil || len(needs) != 1 {
 		t.Fatalf("needs briefing: %v %v", needs, err)
 	}
@@ -610,7 +611,7 @@ func TestTickQueriesUseIndexes(t *testing.T) {
 	check("close-due", `SELECT group_id FROM active_groups WHERE status = 'open' AND deadline_at <= 1`)
 	check("release-stale", `SELECT group_id FROM active_groups WHERE status = 'processing' AND processing_since IS NOT NULL AND processing_since <= 1`)
 	check("take-events", `SELECT e.event_id FROM group_events ge JOIN raw_events e ON e.event_id = ge.event_id WHERE ge.group_id = 'x'`)
-	check("needs-briefing", `SELECT group_id FROM active_groups WHERE status = 'closed' AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id)`)
+	check("needs-briefing", `SELECT group_id FROM active_groups WHERE status = 'closed' AND (next_attempt_at IS NULL OR next_attempt_at <= 1) AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id)`)
 }
 
 func TestIdleTickWith100kHistoricalGroups(t *testing.T) {
@@ -688,13 +689,25 @@ func TestMigrateV3ToV4WithData(t *testing.T) {
 	}
 	s.Close()
 
-	// Rewind to v3: drop the v4 column and version, keeping the data.
+	// Rewind to v3: drop the v4, v5, and v6 columns and the v5 index,
+	// keeping the data. The reopen replays 3->4->5->6. The rewind must
+	// cover every later column or the forward migration re-adds an
+	// existing one.
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`ALTER TABLE briefings DROP COLUMN baseline_rule`); err != nil {
 		t.Fatalf("drop v4 column: %v", err)
+	}
+	if _, err := db.Exec(`DROP INDEX IF EXISTS groups_closed_next_attempt`); err != nil {
+		t.Fatalf("drop v5 index: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN next_attempt_at`); err != nil {
+		t.Fatalf("drop v5 column: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN total_bytes`); err != nil {
+		t.Fatalf("drop v6 column: %v", err)
 	}
 	if _, err := db.Exec(`PRAGMA user_version = 3`); err != nil {
 		t.Fatal(err)
@@ -703,7 +716,7 @@ func TestMigrateV3ToV4WithData(t *testing.T) {
 
 	s2, err := Open(path)
 	if err != nil {
-		t.Fatalf("migrate 3->4: %v", err)
+		t.Fatalf("migrate 3->5: %v", err)
 	}
 	defer s2.Close()
 	got, err := s2.BriefingForGroup(context.Background(), res.GroupID)
@@ -753,5 +766,411 @@ func TestPurgeFailedGroupEvents(t *testing.T) {
 	}
 	if _, err := s.GroupStatus(context.Background(), res.GroupID); err == nil {
 		t.Fatal("failed group row must be deleted with its events")
+	}
+}
+
+// H1: shutdown answers every queued job. A slow write occupies the
+// writer while Background-context callers queue behind it; Close must
+// release them all with ErrStoreClosed instead of hanging them forever.
+func TestCloseDrainsQueuedJobs(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "drain.db"), WithQueueCap(16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	slowDone := make(chan error, 1)
+	go func() {
+		slowDone <- s.write(context.Background(), func(tx *sql.Tx) error {
+			<-release
+			return nil
+		})
+	}()
+	// Let the slow job reach the writer before queuing behind it.
+	time.Sleep(100 * time.Millisecond)
+	const waiters = 8
+	got := make(chan error, waiters)
+	for i := 0; i < waiters; i++ {
+		go func(i int) {
+			_, err := s.GetOrAssignPseudonym(context.Background(), "ip", fmt.Sprintf("10.9.9.%d", i))
+			got <- err
+		}(i)
+	}
+	// All waiters must be queued (not saturated) before Close drains.
+	time.Sleep(200 * time.Millisecond)
+	// Close waits for the in-flight slow job by design (graceful
+	// shutdown), so engage it in the background and release the job
+	// concurrently — serial order would deadlock the test itself.
+	closed := make(chan error, 1)
+	go func() { closed <- s.Close() }()
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close hung with a drained queue")
+	}
+	// The in-flight write either committed before quit won the race
+	// (nil) or lost it (closed): both are honest outcomes, since the
+	// caller treats a close as "unknown, retry safely".
+	if err := <-slowDone; err != nil && !errors.Is(err, ErrStoreClosed) {
+		t.Fatalf("in-flight write: %v", err)
+	}
+	// Every queued waiter must RETURN — hanging is the H1 bug. A waiter
+	// the writer picked before noticing quit ran normally (nil); the
+	// rest were answered by the drain (closed).
+	for i := 0; i < waiters; i++ {
+		select {
+		case err := <-got:
+			if err != nil && !errors.Is(err, ErrStoreClosed) {
+				t.Fatalf("queued write: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("queued write hung across Close")
+		}
+	}
+	// A submit after Close must fail fast, never hang or panic. The
+	// read path hits the closed pool first, so any prompt error
+	// satisfies the contract — in-flight calls are the ones owed
+	// ErrStoreClosed, and they were answered above.
+	if _, err := s.GetOrAssignPseudonym(context.Background(), "ip", "10.9.9.99"); err == nil {
+		t.Fatal("post-close submit must fail fast")
+	}
+}
+
+// H2: releases park a bounded backoff the briefing queue honors, takes
+// refuse not-due groups, and transient refunds do not burn the budget.
+func TestReleaseBackoffRefundAndDueGuard(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	pol := GroupPolicy{QuietWindow: time.Millisecond, MaxWindow: time.Hour}
+	mk := func(id, anchor string) string {
+		ev := RawEvent{EventID: id, EventKey: "k", EventType: "host.appeared", OccurredAt: now, Cycle: 1, Payload: []byte(`{}`), ReceivedAt: now, SignatureTimestamp: now}
+		res, err := s.PersistEventAndGroup(ctx, ev, anchor, pol)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.CloseDue(ctx, now.Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		return res.GroupID
+	}
+	gid := mk("evt-b1", "host:b")
+
+	taken, err := s.TakeGroup(ctx, gid)
+	if err != nil || taken.RetryCount != 1 {
+		t.Fatalf("first take: %+v %v", taken, err)
+	}
+	// Transient refund: the take is forgiven, the group requeues closed.
+	matched, err := s.ReleaseGroupTransient(ctx, gid, 0)
+	if err != nil || !matched {
+		t.Fatalf("transient release: %v %v", matched, err)
+	}
+	taken, err = s.TakeGroup(ctx, gid)
+	if err != nil || taken.RetryCount != 1 {
+		t.Fatalf("refunded take must not burn budget: %+v %v", taken, err)
+	}
+	// Backed-off groups leave the queue and refuse takes until due.
+	if _, err := s.ReleaseGroupDelayed(ctx, gid, 300*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if needs, err := s.NeedsBriefing(ctx, 64, now); err != nil || len(needs) != 0 {
+		t.Fatalf("backed-off group must leave the queue: %v %v", needs, err)
+	}
+	// Poll past the backoff: the group becomes due and takes again.
+	// (Takes use the store clock, so elapse is real time, short by design.)
+	took := false
+	for i := 0; i < 100 && !took; i++ {
+		if _, err := s.TakeGroup(ctx, gid); err == nil {
+			took = true
+		} else if !errors.Is(err, ErrGroupNotClosed) {
+			t.Fatal(err)
+		} else {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	if !took {
+		t.Fatal("take after backoff elapse must succeed")
+	}
+	// A long backoff refuses takes and hides the group until due.
+	if _, err := s.ReleaseGroupDelayed(ctx, gid, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if needs, err := s.NeedsBriefing(ctx, 64, now); err != nil || len(needs) != 0 {
+		t.Fatalf("backed-off group must leave the queue: %v %v", needs, err)
+	}
+	if needs, err := s.NeedsBriefing(ctx, 64, now.Add(2*time.Hour)); err != nil || len(needs) != 1 {
+		t.Fatalf("backoff must elapse: %v %v", needs, err)
+	}
+	if _, err := s.TakeGroup(ctx, gid); !errors.Is(err, ErrGroupNotClosed) {
+		t.Fatalf("not-due take must refuse: %v", err)
+	}
+}
+
+// H2/migration v5: a v4 database gains next_attempt_at on open, with
+// NULL (due immediately) for pre-existing rows.
+func TestMigrationV4ToV5KeepsBackoffNull(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v4.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	ev := RawEvent{EventID: "evt-v4", EventKey: "k", EventType: "host.appeared", OccurredAt: now, Cycle: 1, Payload: []byte(`{}`), ReceivedAt: now, SignatureTimestamp: now}
+	res, err := s.PersistEventAndGroup(context.Background(), ev, "host:v4", GroupPolicy{QuietWindow: time.Millisecond, MaxWindow: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CloseDue(context.Background(), now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	// Rewind to v4: drop the v5 and v6 columns and version, keeping the
+	// data. The rewind must cover every later column or the forward
+	// migration re-adds an existing one.
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP INDEX IF EXISTS groups_closed_next_attempt`); err != nil {
+		t.Fatalf("drop v5 index: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN next_attempt_at`); err != nil {
+		t.Fatalf("drop v5 column: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN total_bytes`); err != nil {
+		t.Fatalf("drop v6 column: %v", err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("migrate 4->5: %v", err)
+	}
+	defer s2.Close()
+	var version int
+	if err := s2.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != supportedSchemaVersion {
+		t.Fatalf("want user_version %d, got %d %v", supportedSchemaVersion, version, err)
+	}
+	// The pre-v5 group has no backoff: due immediately.
+	needs, err := s2.NeedsBriefing(context.Background(), 64, now.Add(time.Second))
+	if err != nil || len(needs) != 1 || needs[0] != res.GroupID {
+		t.Fatalf("migrated group must be due: %v %v", needs, err)
+	}
+}
+
+// H10: a pre-existing 0644 database (and its sidecars, which hold raw
+// payloads) is tightened to 0600 before SQLite opens it; new sidecars
+// created under WAL inherit the tightened mode.
+func TestSidecarsTightenedTo0600(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "perm.db")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if mode := statMode(t, path); mode != 0o600 {
+		t.Fatalf("database file must be tightened to 0600, got %o", mode)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	ev := RawEvent{EventID: "evt-perm", EventKey: "k", EventType: "host.appeared", OccurredAt: now, Cycle: 1, Payload: []byte(`{"host":{"ip":"10.9.9.9"}}`), ReceivedAt: now, SignatureTimestamp: now}
+	if _, err := s.PersistEventAndGroup(context.Background(), ev, "host:perm", GroupPolicy{QuietWindow: time.Millisecond, MaxWindow: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	// Stat before Close: the WAL frames still live in the sidecars.
+	for _, sidecar := range []string{path + "-wal", path + "-shm"} {
+		if _, err := os.Stat(sidecar); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if mode := statMode(t, sidecar); mode != 0o600 {
+			t.Fatalf("sidecar %s must be 0600, got %o", sidecar, mode)
+		}
+	}
+}
+
+func statMode(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.Mode().Perm()
+}
+
+// v6: the crossing event founds the next group (strict byte bound), and a
+// replayed event_id moves neither counter.
+func TestByteCapRolloverAndReplayIdempotent(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	pol := GroupPolicy{QuietWindow: time.Millisecond, MaxWindow: time.Hour, MaxEvents: 1000}
+	mk := func(id string, size int) PersistResult {
+		ev := RawEvent{EventID: id, EventKey: "k", EventType: "host.appeared", OccurredAt: now, Cycle: 1, Payload: bytes.Repeat([]byte("x"), size), ReceivedAt: now, SignatureTimestamp: now}
+		res, err := s.PersistEventAndGroup(ctx, ev, "host:roll", pol)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !res.Inserted {
+			t.Fatalf("event %s must insert", id)
+		}
+		return res
+	}
+	// 6 MiB + 3 MiB crosses the 8 MiB cap: the second event founds a group.
+	r1 := mk("evt-r1", 6<<20)
+	r2 := mk("evt-r2", 3<<20)
+	if r2.GroupID == r1.GroupID {
+		t.Fatal("crossing event must found a new group")
+	}
+	// Closed reports the count cap on the new group (still open here);
+	// the byte-cap rollover is reported through ClosedGroupIDs.
+	if r2.Closed {
+		t.Fatal("new group must stay open after a byte-cap rollover")
+	}
+	if len(r2.ClosedGroupIDs) != 1 || r2.ClosedGroupIDs[0] != r1.GroupID {
+		t.Fatalf("rollover must close the old group: %+v", r2)
+	}
+	var b1, b2 int64
+	if err := s.db.QueryRow(`SELECT total_bytes FROM active_groups WHERE group_id = ?`, r1.GroupID).Scan(&b1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT total_bytes FROM active_groups WHERE group_id = ?`, r2.GroupID).Scan(&b2); err != nil {
+		t.Fatal(err)
+	}
+	if b1 != 6<<20 || b2 != 3<<20 {
+		t.Fatalf("counters must track founders exactly: %d %d", b1, b2)
+	}
+	// Replay of an existing event_id inserts nothing and moves nothing.
+	ev := RawEvent{EventID: "evt-r1", EventKey: "k", EventType: "host.appeared", OccurredAt: now, Cycle: 1, Payload: bytes.Repeat([]byte("x"), 6<<20), ReceivedAt: now, SignatureTimestamp: now}
+	res, err := s.PersistEventAndGroup(ctx, ev, "host:roll", pol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Inserted {
+		t.Fatal("replay must be idempotent")
+	}
+	if err := s.db.QueryRow(`SELECT total_bytes FROM active_groups WHERE group_id = ?`, r1.GroupID).Scan(&b1); err != nil || b1 != 6<<20 {
+		t.Fatalf("replay must not move the counter: %d %v", b1, err)
+	}
+}
+
+// v6 with data: an open group keeps its summed payload bytes through the
+// migration instead of restarting at zero.
+func TestMigrationV5ToV6KeepsByteCounter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v5.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	ev := RawEvent{EventID: "evt-v5", EventKey: "k", EventType: "host.appeared", OccurredAt: now, Cycle: 1, Payload: []byte(`{"host":"v5"}`), ReceivedAt: now, SignatureTimestamp: now}
+	if _, err := s.PersistEventAndGroup(context.Background(), ev, "host:v5", GroupPolicy{QuietWindow: time.Millisecond, MaxWindow: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	// Rewind to v5: drop the v6 column, keeping the data.
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN total_bytes`); err != nil {
+		t.Fatalf("drop v6 column: %v", err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 5`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("migrate 5->6: %v", err)
+	}
+	defer s2.Close()
+	var version int
+	if err := s2.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 6 {
+		t.Fatalf("want user_version 6, got %d %v", version, err)
+	}
+	var total int64
+	if err := s2.db.QueryRow(`SELECT total_bytes FROM active_groups WHERE host_anchor_key = 'host:v5'`).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != int64(len(`{"host":"v5"}`)) {
+		t.Fatalf("backfill must sum stored payloads, got %d", total)
+	}
+}
+
+// H10: a planted symlink at the database path is refused, never
+// followed — payloads must not land in (or be read from) the target.
+func TestOpenRefusesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real.db")
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.db")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(link); err == nil {
+		t.Fatal("symlinked database path must be refused")
+	}
+}
+
+// H10: a group/world-writable directory without the sticky bit is
+// refused; the sticky bit (shared-temp style) still counts as safe.
+func TestOpenRefusesWritableDir(t *testing.T) {
+	writable := filepath.Join(t.TempDir(), "wide")
+	if err := os.Mkdir(writable, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(writable, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(filepath.Join(writable, "bridge.db")); err == nil {
+		t.Fatal("writable directory without sticky bit must be refused")
+	}
+
+	sticky := filepath.Join(t.TempDir(), "sticky")
+	if err := os.Mkdir(sticky, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sticky, 0o777|os.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(filepath.Join(sticky, "bridge.db"))
+	if err != nil {
+		t.Fatalf("sticky directory must be accepted: %v", err)
+	}
+	s.Close()
+}
+
+// H10: the DSN pins the pragmas the store depends on, so a dropped
+// setting fails here instead of degrading silently at runtime.
+func TestDSNPinsPragmas(t *testing.T) {
+	dsn := dsnForPath(filepath.Join("some", "dir", "bridge.db"))
+	for _, want := range []string{
+		"file:", "_journal_mode=WAL", "_busy_timeout=5000",
+		"_foreign_keys=on", "_txlock=immediate", "_synchronous=NORMAL",
+	} {
+		if !strings.Contains(dsn, want) {
+			t.Fatalf("DSN must pin %q, got %q", want, dsn)
+		}
 	}
 }

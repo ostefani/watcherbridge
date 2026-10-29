@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 )
 
 func (s *Store) ForwardState(ctx context.Context, eventID string) (forwarded bool, attempts int, lastErr string, err error) {
@@ -38,19 +39,36 @@ func (s *Store) MarkForwarded(ctx context.Context, eventID string, at time.Time)
 var (
 	urlPattern  = regexp.MustCompile(`https?://\S+`)
 	addrPattern = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}(:\d+)?\b`)
+	// IPv6 shapes in errors: a "::" run or 4+ colon groups. Plain
+	// clock times ("12:30:45", two colons, no hex need) stay literal.
+	v6Pattern  = regexp.MustCompile(`(?i)\b(?:[0-9a-f]*::[0-9a-f:.]*|(?:[0-9a-f]{1,4}:){3,}[0-9a-f:.]*)\b`)
+	macPattern = regexp.MustCompile(`(?i)\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b|\b(?:[0-9a-f]{4}\.){2}[0-9a-f]{4}\b|\b[0-9a-f]{12}\b`)
 )
 
-// SanitizeErrorText strips URLs and IP:port pairs from error text so logs
-// and stored errors carry IDs and statuses, never payload values. Shared by
-// the forwarder receipt path and the briefing worker.
+// SanitizeErrorText strips URLs, IPv4/IPv6, and MACs from error text so
+// logs and stored errors carry IDs and statuses, never payload values,
+// and drops control characters so hostile names cannot smuggle terminal
+// or log-injection text. Shared by the forwarder receipt path and the
+// briefing worker. The control strip mirrors redactor.StripControls;
+// it lives here because store cannot import redactor (import cycle).
 func SanitizeErrorText(s string) string {
 	s = urlPattern.ReplaceAllString(s, "[url]")
 	s = addrPattern.ReplaceAllString(s, "[addr]")
-	if len(s) > 256 {
-		r := []rune(s)
-		if len(r) > 256 {
-			s = string(r[:256])
+	s = v6Pattern.ReplaceAllString(s, "[addr]")
+	s = macPattern.ReplaceAllString(s, "[addr]")
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
 		}
+		if unicode.Is(unicode.Cc, r) || unicode.Is(unicode.Cf, r) ||
+			unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) ||
+			unicode.Is(unicode.Co, r) || unicode.Is(unicode.Cs, r) {
+			return -1
+		}
+		return r
+	}, s)
+	if r := []rune(s); len(r) > 256 {
+		s = string(r[:256])
 	}
 	return s
 }

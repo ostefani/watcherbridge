@@ -6,11 +6,16 @@ package config
 
 import (
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
+
+	"github.com/ostefani/watcherbridge/internal/limits"
 )
 
 // Mode selects tap (persist + 202, all work async) or proxy (persist,
@@ -20,11 +25,44 @@ const (
 	ModeProxy = "proxy"
 )
 
-// minSecretBytes floors the HMAC key length. Short keys verify correctly
-// but brute-force faster; refusing them is a visible startup error, so an
-// operator with an older short secret must rotate it, not wonder why
-// ingest silently changed.
-const minSecretBytes = 16
+// minSecretBytes floors HMAC secret length at 256 bits. Short keys verify
+// correctly but brute-force faster; refusing them is a visible startup
+// error, so an operator with an older short secret must rotate it, not
+// wonder why ingest silently changed. It applies to the webhook HMAC
+// secret only. Provider-issued keys carry their own entropy, which the
+// bridge cannot dictate, so those only refuse empty values.
+const minSecretBytes = 32
+
+// maxInflightBytes caps InFlightCap * MaxBodyBytes: concurrent
+// max-size bodies must fit the process heap budget with room left for
+// the writer queue, the store, and the provider call.
+const maxInflightBytes = 64 << 20
+
+// maxGroupEvents caps the operator's per-group event setting: with the
+// byte budget bounding memory, the count bounds per-group CPU
+// (single-transaction read, decode, tokenize) and bundle size.
+const maxGroupEvents = 128
+
+// Secret is key material that must never appear in logs, errors, or
+// dumps: its formatted forms all render as ***. Convert back to string
+// only at the exact use site (HMAC, outgoing header, provider client).
+type Secret string
+
+// String hides the value in every fmt verb, including %+v dumps.
+func (s Secret) String() string { return "***" }
+
+// GoString hides the value in %#v dumps.
+func (s Secret) GoString() string { return "***" }
+
+// LogValue hides the value from slog's structured logging.
+func (s Secret) LogValue() slog.Value { return slog.StringValue("***") }
+
+// MarshalJSON keeps the value out of JSON dumps (debug endpoints,
+// marshalled configs): the wire form is the same redaction as the logs.
+func (s Secret) MarshalJSON() ([]byte, error) { return []byte(`"***"`), nil }
+
+// MarshalText keeps the value out of text encodings for the same reason.
+func (s Secret) MarshalText() ([]byte, error) { return []byte("***"), nil }
 
 // Config carries the Step 8 receiver settings. Durations are real
 // time.Duration values; callers that read env/flags convert into these.
@@ -33,8 +71,10 @@ type Config struct {
 	Mode string // "tap" or "proxy"
 
 	// Secret material. Exactly one of Secret / SecretFile must be set; the
-	// value is never logged or stored in the DB.
-	Secret     string
+	// value is never logged or stored in the DB. The file form is
+	// preferred: environment values are visible to same-user processes
+	// via /proc, while a 0600 file is readable only by this user.
+	Secret     Secret
 	SecretFile string
 
 	ScanRelayURL string
@@ -43,13 +83,20 @@ type Config struct {
 	// into the outgoing request at send time; never stored or logged.
 	// The Authorization header form is preferred when both are set,
 	// mirroring ScanRelay's own check order.
-	ForwardBearerToken  string
-	ForwardAPIKey       string
+	ForwardBearerToken  Secret
+	ForwardAPIKey       Secret
 	ForwardAPIKeyHeader string
 
 	// ScanRelayTolerance is ScanRelay's own timestamp window. The bridge
 	// must not accept events ScanRelay would reject as stale.
 	ScanRelayTolerance time.Duration
+
+	// ClockSkewAllowance is the assumed worst-case clock difference
+	// between the bridge and ScanRelay hosts. It is added to the live
+	// forward-path inequality, so an event accepted at the tolerance
+	// edge still lands inside ScanRelay's window when the clocks
+	// disagree by up to this much. Zero by default (same host or NTP).
+	ClockSkewAllowance time.Duration
 
 	MaxBodyBytes       int64
 	MaxHeaderBytes     int
@@ -85,8 +132,9 @@ type Config struct {
 	ModelProvider string
 	ModelID       string
 	// Model API key material: exactly one of ModelAPIKey /
-	// ModelAPIKeyFile when the provider is meta. Never logged or stored.
-	ModelAPIKey     string
+	// ModelAPIKeyFile when the provider is meta. Never logged or stored;
+	// the file form is preferred for the same reason as the webhook secret.
+	ModelAPIKey     Secret
 	ModelAPIKeyFile string
 	ModelBaseURL    string // full endpoint to POST the bundle to
 
@@ -116,7 +164,7 @@ func Default() Config {
 		ScanRelayTolerance:  300 * time.Second,
 		MaxBodyBytes:        1 << 20,
 		MaxHeaderBytes:      16 << 10,
-		TimestampTolerance:  300 * time.Second,
+		TimestampTolerance:  240 * time.Second,
 
 		ProxyForwardTimeout: 3 * time.Second,
 		PersistBudget:       500 * time.Millisecond,
@@ -179,12 +227,18 @@ func (c Config) ResolveSecret() (string, error) {
 		return "", fmt.Errorf("set exactly one of secret or secret file")
 	}
 	if c.Secret != "" {
-		return checkSecretLength(c.Secret)
+		s, err := checkSecretLength(c.Secret, "webhook secret")
+		return string(s), err
 	}
 	if c.SecretFile == "" {
 		return "", fmt.Errorf("webhook secret is unset: refusing to start")
 	}
-	return readSecretFile(c.SecretFile, "webhook secret")
+	s, err := readSecretFile(c.SecretFile, "webhook secret")
+	if err != nil {
+		return "", err
+	}
+	floored, err := checkSecretLength(s, "webhook secret")
+	return string(floored), err
 }
 
 // ResolveModelKey returns the model API key from ModelAPIKey or
@@ -195,19 +249,22 @@ func (c Config) ResolveModelKey() (string, error) {
 		return "", fmt.Errorf("set exactly one of model API key or key file")
 	}
 	if c.ModelAPIKey != "" {
-		return checkSecretLength(c.ModelAPIKey)
+		s, err := checkPresent(c.ModelAPIKey, "model API key")
+		return string(s), err
 	}
 	if c.ModelAPIKeyFile == "" {
 		return "", fmt.Errorf("model API key is unset: refusing to start")
 	}
-	return readSecretFile(c.ModelAPIKeyFile, "model API key")
+	s, err := readSecretFile(c.ModelAPIKeyFile, "model API key")
+	return string(s), err
 }
 
 // readSecretFile enforces the secret-file rules: it must be a regular file
 // with no group/other permission bits; a single trailing newline is
-// trimmed. The handle is opened before stat so the checks apply to the
-// file actually read.
-func readSecretFile(path, what string) (string, error) {
+// trimmed. Everything — open, stat, and read — goes through the one
+// handle, so the checks apply to the file actually read and a second
+// open cannot slip a different file in between.
+func readSecretFile(path, what string) (Secret, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("open %s file: %w", what, err)
@@ -223,23 +280,91 @@ func readSecretFile(path, what string) (string, error) {
 	if fi.Mode().Perm()&0o077 != 0 {
 		return "", fmt.Errorf("%s file %s must have no group/other permission bits", what, path)
 	}
-	raw, err := os.ReadFile(path)
+	// LimitReader caps the read itself: a multi-kilobyte file is a
+	// mispointed path (a certificate, a keyring), and truncating it
+	// would fail loudly as auth mismatches — refuse it instead of
+	// buffering it. One byte over the cap is enough to tell.
+	raw, err := io.ReadAll(io.LimitReader(f, 4097))
 	if err != nil {
 		return "", fmt.Errorf("read %s file: %w", what, err)
+	}
+	if len(raw) > 4096 {
+		return "", fmt.Errorf("%s file %s is too large to be a secret", what, path)
 	}
 	secret := strings.TrimSuffix(string(raw), "\n")
 	secret = strings.TrimSuffix(secret, "\r")
 	if secret == "" {
 		return "", fmt.Errorf("%s is empty: refusing to start", what)
 	}
-	return checkSecretLength(secret)
+	return Secret(secret), nil
 }
 
-func checkSecretLength(secret string) (string, error) {
+func checkSecretLength(secret Secret, what string) (Secret, error) {
 	if len(secret) < minSecretBytes {
-		return "", fmt.Errorf("webhook secret must be at least %d bytes", minSecretBytes)
+		return "", fmt.Errorf("%s must be at least %d bytes", what, minSecretBytes)
 	}
 	return secret, nil
+}
+
+// checkPresent refuses an empty provider-issued key without dictating
+// its length: bearer-key entropy is the provider's business.
+func checkPresent(secret Secret, what string) (Secret, error) {
+	if secret == "" {
+		return "", fmt.Errorf("%s is empty: refusing to start", what)
+	}
+	return secret, nil
+}
+
+// loopbackOrHTTPS requires an endpoint that carries secrets or signed
+// events to be either encrypted or loopback-local: https anywhere, or
+// http only to loopback. "localhost" is matched literally; anything else
+// must parse as a loopback IP.
+func loopbackOrHTTPS(raw, what string) error {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("%s must be a valid http(s) endpoint, got %q", what, raw)
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if host := u.Hostname(); host == "localhost" {
+		return nil
+	} else if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("%s must be https or loopback http, got %q", what, raw)
+}
+
+// hopByHopHeaders can never carry credentials: intermediaries may strip
+// or rewrite them, and Authorization is the bearer slot.
+var hopByHopHeaders = map[string]bool{
+	"connection": true, "keep-alive": true, "proxy-authenticate": true,
+	"proxy-authorization": true, "te": true, "trailer": true,
+	"transfer-encoding": true, "upgrade": true, "authorization": true,
+}
+
+// headerNameRe is the RFC 9110 token rule for field names.
+var headerNameRe = regexp.MustCompile(`^[A-Za-z0-9!#$%&'*+\-.^_` + "`" + `|~]+$`)
+
+// checkForwardHeader keeps endpoint credentials out of signature and
+// framing headers: X-SubnetLens-* is Pro's signature slot, hop-by-hop
+// names are rewritten in transit, and anything else must be a valid
+// field name.
+func checkForwardHeader(name string) error {
+	if name == "" {
+		return fmt.Errorf("forward API key header must name a header")
+	}
+	if !headerNameRe.MatchString(name) {
+		return fmt.Errorf("forward API key header %q is not a valid header name", name)
+	}
+	lower := strings.ToLower(name)
+	if strings.HasPrefix(lower, "x-subnetlens-") {
+		return fmt.Errorf("forward API key header %q collides with the signature headers", name)
+	}
+	if hopByHopHeaders[lower] {
+		return fmt.Errorf("forward API key header %q must not be a hop-by-hop or authorization header", name)
+	}
+	return nil
 }
 
 // Validate checks every cross-field inequality the ingest path depends on.
@@ -255,10 +380,15 @@ func (c Config) Validate() error {
 	if c.Mode != ModeTap && c.Mode != ModeProxy {
 		return fmt.Errorf("mode must be %q or %q", ModeTap, ModeProxy)
 	}
-	if c.Mode == ModeProxy {
-		u, err := url.Parse(c.ScanRelayURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return fmt.Errorf("proxy mode requires a valid http(s) ScanRelay URL, got %q", c.ScanRelayURL)
+	if c.Mode == ModeProxy && c.ScanRelayURL == "" {
+		return fmt.Errorf("proxy mode requires a ScanRelay URL")
+	}
+	// The annotation publisher forwards credentials whenever they are
+	// set, in tap mode too — so any configured relay URL must be
+	// loopback or encrypted, not just the proxy one.
+	if c.ScanRelayURL != "" {
+		if err := loopbackOrHTTPS(c.ScanRelayURL, "ScanRelay URL"); err != nil {
+			return err
 		}
 	}
 	if c.MaxBodyBytes <= 0 {
@@ -277,9 +407,20 @@ func (c Config) Validate() error {
 		return fmt.Errorf("bridge tolerance %v must not exceed ScanRelay's %v, or forwarded events get rejected as stale",
 			c.TimestampTolerance, c.ScanRelayTolerance)
 	}
+	// The live forward path costs up to a full handler deadline after
+	// acceptance, plus clock disagreement between the hosts: an event
+	// accepted at the tolerance edge would arrive past ScanRelay's
+	// window and fail forever on every Pro retry.
+	if c.ClockSkewAllowance < 0 {
+		return fmt.Errorf("clock skew allowance must not be negative")
+	}
+	if c.TimestampTolerance+c.HandlerDeadline+c.ClockSkewAllowance > c.ScanRelayTolerance {
+		return fmt.Errorf("bridge tolerance %v plus handler deadline %v plus skew %v must fit inside ScanRelay's %v, or edge events can never be delivered",
+			c.TimestampTolerance, c.HandlerDeadline, c.ClockSkewAllowance, c.ScanRelayTolerance)
+	}
 	want := c.ProxyForwardTimeout + c.PersistBudget + c.Margin
-	if c.HandlerDeadline != want {
-		return fmt.Errorf("handler deadline %v must equal proxy %v + persist %v + margin %v = %v",
+	if c.HandlerDeadline < want {
+		return fmt.Errorf("handler deadline %v must cover proxy %v + persist %v + margin %v = %v, with room for operator slack above",
 			c.HandlerDeadline, c.ProxyForwardTimeout, c.PersistBudget, c.Margin, want)
 	}
 	if c.WriteTimeout <= c.HandlerDeadline {
@@ -311,6 +452,18 @@ func (c Config) Validate() error {
 	if c.InFlightCap <= 0 || c.WriterQueueCap <= 0 {
 		return fmt.Errorf("in-flight and writer-queue caps must be positive")
 	}
+	if product := int64(c.InFlightCap) * c.MaxBodyBytes; product > maxInflightBytes {
+		return fmt.Errorf("in-flight cap %d x max body %d = %d bytes exceeds the %d-byte ingest budget",
+			c.InFlightCap, c.MaxBodyBytes, product, maxInflightBytes)
+	}
+	if c.ForwardAPIKeyHeader == "" && c.ForwardAPIKey != "" {
+		return fmt.Errorf("forward API key is set but no header names it")
+	}
+	if c.ForwardAPIKeyHeader != "" {
+		if err := checkForwardHeader(c.ForwardAPIKeyHeader); err != nil {
+			return err
+		}
+	}
 	if c.RetryAfterSecs <= 0 {
 		return fmt.Errorf("retry-after seconds must be positive")
 	}
@@ -332,8 +485,23 @@ func (c Config) Validate() error {
 	if c.GroupQuietWindow <= 0 {
 		return fmt.Errorf("group quiet window must be positive")
 	}
-	if c.GroupMaxWindow > 0 && c.GroupMaxWindow < c.GroupQuietWindow {
+	// Bounded on both axes: the count caps per-group CPU (TakeGroup reads
+	// every payload in one write transaction) and the byte counter caps
+	// memory; the window caps group lifetime so briefings stay fresh and
+	// retention can proceed. A trickle feed with no time cap would hold
+	// a group open for hours.
+	if c.GroupMaxEvents < 1 || c.GroupMaxEvents > maxGroupEvents {
+		return fmt.Errorf("group max events must be between 1 and %d", maxGroupEvents)
+	}
+	if c.GroupMaxWindow <= 0 {
+		return fmt.Errorf("group max window must be positive")
+	}
+	if c.GroupMaxWindow < c.GroupQuietWindow {
 		return fmt.Errorf("group max window must be >= quiet window")
+	}
+	if c.MaxBodyBytes > limits.MaxGroupBytes {
+		return fmt.Errorf("max body bytes %d must fit the %d-byte group budget, or a single event never fits a fresh group",
+			c.MaxBodyBytes, limits.MaxGroupBytes)
 	}
 	if c.GrouperTick <= 0 {
 		return fmt.Errorf("grouper tick must be positive")
@@ -368,9 +536,10 @@ func (c Config) Validate() error {
 		if c.ModelID == "" {
 			return fmt.Errorf("model ID is required with the meta provider")
 		}
-		u, err := url.Parse(c.ModelBaseURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return fmt.Errorf("model base URL must be a valid http(s) endpoint, got %q", c.ModelBaseURL)
+		// The API key and the bundle travel together: http is allowed
+		// only to loopback, never across the network in cleartext.
+		if err := loopbackOrHTTPS(c.ModelBaseURL, "model base URL"); err != nil {
+			return err
 		}
 		if c.ModelAPIKey == "" && c.ModelAPIKeyFile == "" {
 			return fmt.Errorf("model API key is unset: refusing to start")

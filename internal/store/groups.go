@@ -14,7 +14,7 @@ const DefaultBriefingPage = 64
 type GroupPolicy struct {
 	QuietWindow time.Duration // debounce: group closes this long after last event
 	MaxWindow   time.Duration // hard cap from first event
-	MaxEvents   int           // size cap; 0 = unlimited
+	MaxEvents   int           // size cap; config requires 1..128, store treats <= 0 as unlimited
 }
 
 type PersistResult struct {
@@ -58,7 +58,8 @@ func (s *Store) TakeGroup(ctx context.Context, groupID string) (TakenGroup, erro
 		// here, so a crash between take and briefing still counts and a
 		// poison group cannot crash-loop forever. Release paths never
 		// increment; they only park at the cap.
-		res, err := tx.Exec(`UPDATE active_groups SET status = 'processing', processing_since = ?, retry_count = retry_count + 1 WHERE group_id = ? AND status = 'closed'`, nanos(s.now()), groupID)
+		now := nanos(s.now())
+		res, err := tx.Exec(`UPDATE active_groups SET status = 'processing', processing_since = ?, retry_count = retry_count + 1 WHERE group_id = ? AND status = 'closed' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)`, now, groupID, now)
 		if err != nil {
 			return err
 		}
@@ -120,7 +121,9 @@ func (s *Store) ReleaseStale(ctx context.Context, now time.Time, maxAge time.Dur
 			return err
 		}
 		for _, id := range ids {
-			if _, err := tx.Exec(`UPDATE active_groups SET status = CASE WHEN retry_count >= ? THEN 'failed' ELSE 'closed' END, processing_since = NULL WHERE group_id = ? AND status = 'processing'`, maxGroupRetries, id); err != nil {
+			// The lease already waited out maxAge: the group is due
+			// immediately, so any stale backoff is cleared.
+			if _, err := tx.Exec(`UPDATE active_groups SET status = CASE WHEN retry_count >= ? THEN 'failed' ELSE 'closed' END, processing_since = NULL, next_attempt_at = NULL WHERE group_id = ? AND status = 'processing'`, maxGroupRetries, id); err != nil {
 				return err
 			}
 		}
@@ -220,15 +223,49 @@ func (s *Store) CloseDue(ctx context.Context, now time.Time) ([]string, error) {
 	return ids, nil
 }
 
+// The group byte budget lives in internal/limits so config validation
+// can check it without importing the sqlite driver. See limits.MaxGroupBytes.
 const maxGroupRetries = 5
 
 // ReleaseGroup returns a processing group to closed for a later retry. It
 // never increments the counter — takes own counting. At maxGroupRetries the
 // group is parked in 'failed' instead, so a poison group cannot loop forever.
+// The immediate variant clears any backoff: callers that converge to a
+// terminal state (parkFailed) must not be gated by a previous delay.
 func (s *Store) ReleaseGroup(ctx context.Context, groupID string) (bool, error) {
+	return s.releaseDelayed(ctx, groupID, 0, false)
+}
+
+// ReleaseGroupDelayed requeues with a not-before delay: the group stays
+// closed but leaves the briefing queue until the backoff elapses, so a
+// failure cannot be retried hot inside the same drain pass. A zero delay
+// requeues immediately.
+func (s *Store) ReleaseGroupDelayed(ctx context.Context, groupID string, delay time.Duration) (bool, error) {
+	return s.releaseDelayed(ctx, groupID, delay, false)
+}
+
+// ReleaseGroupTransient refunds one take and requeues with a delay. Use it
+// when the attempt never really ran — writer saturation, shutdown, or a
+// cancelled context: transient store pressure must not burn the retry
+// budget that poison groups are capped by.
+func (s *Store) ReleaseGroupTransient(ctx context.Context, groupID string, delay time.Duration) (bool, error) {
+	return s.releaseDelayed(ctx, groupID, delay, true)
+}
+
+func (s *Store) releaseDelayed(ctx context.Context, groupID string, delay time.Duration, refund bool) (bool, error) {
 	matched := false
 	err := s.write(ctx, func(tx *sql.Tx) error {
-		res, err := tx.Exec(`UPDATE active_groups SET status = CASE WHEN retry_count >= ? THEN 'failed' ELSE 'closed' END, processing_since = NULL WHERE group_id = ? AND status = 'processing'`, maxGroupRetries, groupID)
+		due := sql.NullInt64{}
+		if delay > 0 {
+			due = sql.NullInt64{Int64: nanos(s.now().Add(delay)), Valid: true}
+		}
+		var res sql.Result
+		var err error
+		if refund {
+			res, err = tx.Exec(`UPDATE active_groups SET status = CASE WHEN retry_count >= ? THEN 'failed' ELSE 'closed' END, processing_since = NULL, next_attempt_at = ?, retry_count = CASE WHEN retry_count >= ? THEN retry_count WHEN retry_count > 0 THEN retry_count - 1 ELSE 0 END WHERE group_id = ? AND status = 'processing'`, maxGroupRetries, due, maxGroupRetries, groupID)
+		} else {
+			res, err = tx.Exec(`UPDATE active_groups SET status = CASE WHEN retry_count >= ? THEN 'failed' ELSE 'closed' END, processing_since = NULL, next_attempt_at = ? WHERE group_id = ? AND status = 'processing'`, maxGroupRetries, due, groupID)
+		}
 		if err != nil {
 			return err
 		}
@@ -242,14 +279,16 @@ func (s *Store) ReleaseGroup(ctx context.Context, groupID string) (bool, error) 
 	return matched, nil
 }
 
-// NeedsBriefing lists closed groups with no briefing row yet, oldest first,
-// at most limit rows. A non-positive limit selects the default page.
-func (s *Store) NeedsBriefing(ctx context.Context, limit int) ([]string, error) {
+// NeedsBriefing lists closed groups with no briefing row yet whose backoff
+// (if any) has elapsed, oldest first, at most limit rows. A non-positive
+// limit selects the default page.
+func (s *Store) NeedsBriefing(ctx context.Context, limit int, now time.Time) ([]string, error) {
 	if limit <= 0 {
 		limit = DefaultBriefingPage
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT group_id FROM active_groups WHERE status = 'closed'
-		AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id) ORDER BY opened_at LIMIT ?`, limit)
+		AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+		AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id) ORDER BY opened_at LIMIT ?`, nanos(now), limit)
 	if err != nil {
 		return nil, err
 	}

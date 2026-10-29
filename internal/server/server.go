@@ -370,9 +370,9 @@ func (s *Server) forwardOne(ctx context.Context, body []byte, src map[string]str
 	// Forward credentials are injected here at send time, never stored:
 	// the whitelist keeps them out of headers_json by construction.
 	if s.cfg.ForwardBearerToken != "" {
-		out.Header.Set("Authorization", "Bearer "+s.cfg.ForwardBearerToken)
+		out.Header.Set("Authorization", "Bearer "+string(s.cfg.ForwardBearerToken))
 	} else if s.cfg.ForwardAPIKey != "" {
-		out.Header.Set(s.cfg.ForwardAPIKeyHeader, s.cfg.ForwardAPIKey)
+		out.Header.Set(s.cfg.ForwardAPIKeyHeader, string(s.cfg.ForwardAPIKey))
 	}
 	resp, err := s.proxy.Do(out)
 	if err != nil {

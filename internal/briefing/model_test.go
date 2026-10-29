@@ -42,9 +42,9 @@ func hostChangedGroup(t tb, s *store.Store) string {
 		changedPayload("", `{"number":22,"protocol":"tcp","state":"open"}`))
 }
 
-func sortedTokensWithPrefix(issued map[string]string, prefix string) []string {
+func sortedTokensWithPrefix(toks map[string]struct{}, prefix string) []string {
 	var out []string
-	for tok := range issued {
+	for tok := range toks {
 		if strings.HasPrefix(tok, prefix) {
 			out = append(out, tok)
 		}
@@ -54,10 +54,11 @@ func sortedTokensWithPrefix(issued map[string]string, prefix string) []string {
 }
 
 // validAnswer builds a schema-valid model answer from the live bundle:
-// group event IDs parsed from the payload, host and references from
-// issued tokens. usedHost reports the chosen host token and its value so
-// tests assert restoration without hardcoding token numbers.
-func validAnswer(t tb, payload []byte, issued map[string]string, suggestion *string, usedHost *string, usedValue *string) []byte {
+// group event IDs parsed from the payload, host and references from the
+// valid token-name set. The fake never sees values, so usedHost reports
+// the chosen host token and tests resolve its value from the store.
+// Tests assert restoration without hardcoding token numbers.
+func validAnswer(t tb, payload []byte, toks map[string]struct{}, suggestion *string, usedHost *string) []byte {
 	t.Helper()
 	var bundle struct {
 		EventIDs []string `json:"event_ids"`
@@ -65,26 +66,23 @@ func validAnswer(t tb, payload []byte, issued map[string]string, suggestion *str
 	if err := json.Unmarshal(payload, &bundle); err != nil {
 		t.Fatalf("fake received undecodable bundle: %v", err)
 	}
-	hosts := sortedTokensWithPrefix(issued, "HOST_")
+	hosts := sortedTokensWithPrefix(toks, "HOST_")
 	host := ""
 	if len(hosts) > 0 {
 		host = hosts[0]
 	} else {
-		for tok := range issued {
+		for tok := range toks {
 			host = tok
 			break
 		}
 	}
-	ips := sortedTokensWithPrefix(issued, "IP_")
+	ips := sortedTokensWithPrefix(toks, "IP_")
 	what := "observed activity"
 	if len(ips) > 0 {
 		what = "traffic from " + ips[0]
 	}
 	if usedHost != nil {
 		*usedHost = host
-	}
-	if usedValue != nil {
-		*usedValue = issued[host]
 	}
 	m := map[string]any{
 		"event_ids": bundle.EventIDs, "host": host, "what_changed": what,
@@ -105,7 +103,7 @@ func briefed(t tb, s *store.Store, gid string) store.Briefing {
 	if st, _ := s.GroupStatus(context.Background(), gid); st != "done" {
 		t.Fatalf("group must be done, got %q", st)
 	}
-	if needs, err := s.NeedsBriefing(context.Background(), 64); err != nil || len(needs) != 0 {
+	if needs, err := s.NeedsBriefing(context.Background(), 64, time.Now()); err != nil || len(needs) != 0 {
 		t.Fatalf("queue must drain: %v %v", needs, err)
 	}
 	b, err := s.BriefingForGroup(context.Background(), gid)
@@ -119,12 +117,12 @@ func TestModelPathStoresResolvedBriefing(t *testing.T) {
 	s := openWorkerStore(t)
 	gid := hostChangedGroup(t, s)
 	fake := provider.NewFake()
-	var usedHost, usedValue string
-	fake.Handle = func(repair bool, payload []byte, issued map[string]string) (provider.RawBriefing, error) {
+	var usedHost string
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
 		if repair {
 			t.Fatal("valid answer must not trigger repair")
 		}
-		return provider.RawBriefing{JSON: validAnswer(t, payload, issued, strptr("critical"), &usedHost, &usedValue)}, nil
+		return provider.RawBriefing{JSON: validAnswer(t, payload, valid, strptr("critical"), &usedHost)}, nil
 	}
 	briefOne(context.Background(), modelDeps(t, s, fake), gid)
 	b := briefed(t, s, gid)
@@ -143,7 +141,13 @@ func TestModelPathStoresResolvedBriefing(t *testing.T) {
 	if !strings.Contains(b.WhatChanged, "192.168.0.5") {
 		t.Fatalf("IP not restored in %q", b.WhatChanged)
 	}
-	if b.Context != "context for "+usedValue {
+	// The expected value comes from the store, not the fake: the
+	// provider layer never sees it.
+	wantHost, _, found, err := s.RestorePseudonym(context.Background(), usedHost)
+	if err != nil || !found {
+		t.Fatalf("used host token must resolve in the store: %s %v", usedHost, err)
+	}
+	if b.Context != "context for "+wantHost {
 		t.Fatalf("host not restored: %q (token %s)", b.Context, usedHost)
 	}
 	if b.ModelRawJSON == "" || strings.Contains(b.ModelRawJSON, "192.168.0.5") {
@@ -155,6 +159,45 @@ func TestModelPathStoresResolvedBriefing(t *testing.T) {
 	}
 }
 
+// An oversize serialized bundle never reaches the provider — redacted
+// or passthrough, the group degrades to the deterministic fallback with
+// the bundle-cap reason (distinct from the scan-block and model-failure
+// reasons, so the viewer can tell them apart).
+func TestOversizeBundleFallsBackWithDistinctReason(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		s := openWorkerStore(t)
+		gid := seedGroup(t, s, "host:big", "evt-big", "host.appeared", `{"event_id":"e"}`)
+		taken, err := s.TakeGroup(context.Background(), gid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// One 300 KiB banner with a wide field cap: the serialized
+		// bundle must exceed the 256 KiB ceiling.
+		big := strings.Repeat("x", 300<<10)
+		taken.Events = []store.RawEvent{{
+			EventID: "evt-big", EventType: "host.appeared",
+			Payload: []byte(`{"event_id":"evt-big","banner":"` + big + `"}`),
+		}}
+		fake := provider.NewFake()
+		fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+			t.Fatal("provider must not be called for an oversize bundle")
+			return provider.RawBriefing{}, nil
+		}
+		d := modelDeps(t, s, fake)
+		d.Redaction = redactor.Policy{Enabled: enabled, MaxFieldChars: 1 << 20}
+		if !briefWithModel(context.Background(), d, taken, Outcome{Level: Low, RuleID: "TEST"}) {
+			t.Fatalf("enabled=%v: oversize bundle must store a fallback", enabled)
+		}
+		b := briefed(t, s, gid)
+		if !b.FallbackUsed || !strings.Contains(b.Context, "bundle exceeds size cap") {
+			t.Fatalf("enabled=%v: distinct bundle-cap reason required: %+v", enabled, b)
+		}
+		if fake.Briefs != 0 {
+			t.Fatalf("enabled=%v: provider called %d times", enabled, fake.Briefs)
+		}
+	}
+}
+
 func TestModelRepairThenSuccess(t *testing.T) {
 	s := openWorkerStore(t)
 	gid := hostChangedGroup(t, s)
@@ -162,7 +205,7 @@ func TestModelRepairThenSuccess(t *testing.T) {
 	// Repair payload is correction text, not a bundle: stash the bundle
 	// from the first call for the valid answer.
 	var bundle []byte
-	fake.Handle = func(repair bool, payload []byte, issued map[string]string) (provider.RawBriefing, error) {
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
 		if !repair {
 			bundle = append([]byte(nil), payload...)
 			return provider.RawBriefing{JSON: []byte(`{"bogus":true}`)}, nil
@@ -170,7 +213,7 @@ func TestModelRepairThenSuccess(t *testing.T) {
 		if !strings.Contains(string(payload), "unknown field") {
 			t.Fatalf("correction must cite the schema error, got %q", payload)
 		}
-		return provider.RawBriefing{JSON: validAnswer(t, bundle, issued, strptr("medium"), nil, nil)}, nil
+		return provider.RawBriefing{JSON: validAnswer(t, bundle, valid, strptr("medium"), nil)}, nil
 	}
 	briefOne(context.Background(), modelDeps(t, s, fake), gid)
 	b := briefed(t, s, gid)
@@ -243,8 +286,8 @@ func TestModelClampNeedsNoRepair(t *testing.T) {
 	s := openWorkerStore(t)
 	gid := hostChangedGroup(t, s)
 	fake := provider.NewFake()
-	fake.Handle = func(repair bool, payload []byte, issued map[string]string) (provider.RawBriefing, error) {
-		return provider.RawBriefing{JSON: validAnswer(t, payload, issued, strptr("low"), nil, nil)}, nil
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		return provider.RawBriefing{JSON: validAnswer(t, payload, valid, strptr("low"), nil)}, nil
 	}
 	briefOne(context.Background(), modelDeps(t, s, fake), gid)
 	b := briefed(t, s, gid)
@@ -261,10 +304,10 @@ func TestModelInventedTokenRepaired(t *testing.T) {
 	gid := hostChangedGroup(t, s)
 	fake := provider.NewFake()
 	var bundle []byte
-	fake.Handle = func(repair bool, payload []byte, issued map[string]string) (provider.RawBriefing, error) {
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
 		if !repair {
 			bundle = append([]byte(nil), payload...)
-			forged := validAnswer(t, payload, issued, strptr("high"), nil, nil)
+			forged := validAnswer(t, payload, valid, strptr("high"), nil)
 			var m map[string]any
 			if err := json.Unmarshal(forged, &m); err != nil {
 				t.Fatal(err)
@@ -273,7 +316,7 @@ func TestModelInventedTokenRepaired(t *testing.T) {
 			fixed, _ := json.Marshal(m)
 			return provider.RawBriefing{JSON: fixed}, nil
 		}
-		return provider.RawBriefing{JSON: validAnswer(t, bundle, issued, strptr("high"), nil, nil)}, nil
+		return provider.RawBriefing{JSON: validAnswer(t, bundle, valid, strptr("high"), nil)}, nil
 	}
 	briefOne(context.Background(), modelDeps(t, s, fake), gid)
 	b := briefed(t, s, gid)
@@ -289,8 +332,8 @@ func TestModelAbstainKeepsBaselineWithModelText(t *testing.T) {
 	s := openWorkerStore(t)
 	gid := hostChangedGroup(t, s)
 	fake := provider.NewFake()
-	fake.Handle = func(repair bool, payload []byte, issued map[string]string) (provider.RawBriefing, error) {
-		return provider.RawBriefing{JSON: validAnswer(t, payload, issued, nil, nil, nil)}, nil
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		return provider.RawBriefing{JSON: validAnswer(t, payload, valid, nil, nil)}, nil
 	}
 	briefOne(context.Background(), modelDeps(t, s, fake), gid)
 	b := briefed(t, s, gid)
@@ -347,9 +390,9 @@ func TestRedactionOffPassesRawWithWarning(t *testing.T) {
 	s := openWorkerStore(t)
 	gid := hostChangedGroup(t, s)
 	fake := provider.NewFake()
-	fake.Handle = func(repair bool, payload []byte, issued map[string]string) (provider.RawBriefing, error) {
-		if len(issued) != 0 {
-			t.Fatalf("redaction off issues no tokens, got %v", issued)
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		if len(valid) != 0 {
+			t.Fatalf("redaction off issues no tokens, got %v", valid)
 		}
 		var bundle struct {
 			EventIDs []string `json:"event_ids"`
@@ -387,8 +430,8 @@ func BenchmarkBriefOneValid(b *testing.B) {
 	}
 	b.Cleanup(func() { _ = s.Close() })
 	fake := provider.NewFake()
-	fake.Handle = func(repair bool, payload []byte, issued map[string]string) (provider.RawBriefing, error) {
-		return provider.RawBriefing{JSON: validAnswer(b, payload, issued, strptr("high"), nil, nil)}, nil
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		return provider.RawBriefing{JSON: validAnswer(b, payload, valid, strptr("high"), nil)}, nil
 	}
 	d := testDeps(b, s)
 	d.Provider = fake
@@ -410,8 +453,8 @@ func TestOnBriefingFiresWithEventIDs(t *testing.T) {
 	s := openWorkerStore(t)
 	gid := hostChangedGroup(t, s)
 	fake := provider.NewFake()
-	fake.Handle = func(repair bool, payload []byte, issued map[string]string) (provider.RawBriefing, error) {
-		return provider.RawBriefing{JSON: validAnswer(t, payload, issued, strptr("high"), nil, nil)}, nil
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		return provider.RawBriefing{JSON: validAnswer(t, payload, valid, strptr("high"), nil)}, nil
 	}
 	var got []store.Briefing
 	d := modelDeps(t, s, fake)

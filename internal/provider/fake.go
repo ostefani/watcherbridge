@@ -22,9 +22,9 @@ type FakeAdapter struct {
 	script []FakeStep
 	// Handle, when non-nil, answers dynamically instead of the script:
 	// repair reports a correction attempt, payload is the bundle (or the
-	// correction text), issued is the bundle's token map — everything a
-	// test needs to echo issued tokens back.
-	Handle    func(repair bool, payload []byte, issued map[string]string) (RawBriefing, error)
+	// correction text), valid is the bundle's token-name set — everything
+	// a test needs to echo tokens back, and nothing that maps to values.
+	Handle    func(repair bool, payload []byte, valid map[string]struct{}) (RawBriefing, error)
 	Briefs    int
 	Repairs   int
 	Received  [][]byte
@@ -41,16 +41,16 @@ func NewFake(script ...FakeStep) *FakeAdapter {
 func (f *FakeAdapter) Name() string { return "fake" }
 
 // Brief implements Provider.
-func (f *FakeAdapter) Brief(ctx context.Context, bundle []byte, issued map[string]string) (RawBriefing, error) {
-	return f.next(ctx, false, bundle, issued)
+func (f *FakeAdapter) Brief(ctx context.Context, bundle []byte, valid map[string]struct{}) (RawBriefing, error) {
+	return f.next(ctx, false, bundle, valid)
 }
 
 // Repair implements Provider.
-func (f *FakeAdapter) Repair(ctx context.Context, correction string, issued map[string]string) (RawBriefing, error) {
-	return f.next(ctx, true, []byte(correction), issued)
+func (f *FakeAdapter) Repair(ctx context.Context, correction string, valid map[string]struct{}) (RawBriefing, error) {
+	return f.next(ctx, true, []byte(correction), valid)
 }
 
-func (f *FakeAdapter) next(ctx context.Context, repair bool, payload []byte, issued map[string]string) (RawBriefing, error) {
+func (f *FakeAdapter) next(ctx context.Context, repair bool, payload []byte, valid map[string]struct{}) (RawBriefing, error) {
 	f.mu.Lock()
 	step := FakeStep{}
 	if len(f.script) > 0 {
@@ -73,7 +73,7 @@ func (f *FakeAdapter) next(ctx context.Context, repair bool, payload []byte, iss
 	}
 	f.mu.Unlock()
 	if handle != nil {
-		return handle(repair, payload, issued)
+		return handle(repair, payload, valid)
 	}
 	if step.Hang {
 		<-ctx.Done()
