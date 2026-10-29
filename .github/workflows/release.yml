@@ -1,6 +1,8 @@
 name: release
 
 # Cut a release: git tag v0.1.0 && git push origin v0.1.0
+# Binaries are built natively per runner (CGO cannot cross-compile);
+# GoReleaser owns the build flags, archives, and checksums from one config.
 on:
   push:
     tags: ['v*']
@@ -14,31 +16,37 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
+            artifact: watcherbridge-linux-amd64
           - os: ubuntu-24.04-arm
-            goos: linux
-            goarch: arm64
+            artifact: watcherbridge-linux-arm64
           - os: macos-latest
-            goos: darwin
-            goarch: arm64
+            artifact: watcherbridge-darwin-arm64
     runs-on: ${{ matrix.os }}
-    env:
-      CGO_ENABLED: 1 # native builds only: GOOS/GOARCH always match the runner
-      GOOS: ${{ matrix.goos }}
-      GOARCH: ${{ matrix.goarch }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # changelog needs full history
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - name: build
-        run: go build -trimpath -o watcherbridge-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/watcherbridge
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: stage binary
+        shell: bash
+        run: |
+          bin=$(find dist -type f -name 'watcherbridge' | head -1)
+          test -n "$bin"
+          mkdir -p staged && cp "$bin" "staged/${{ matrix.artifact }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: watcherbridge-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: watcherbridge-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: ${{ matrix.artifact }}
+          path: staged/${{ matrix.artifact }}
           if-no-files-found: error
 
   publish:
@@ -49,6 +57,14 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: checksum and archive
+        run: |
+          cd dist
+          sha256sum watcherbridge-* > checksums.txt
+          for b in watcherbridge-*; do
+            case "$b" in checksums.txt) continue;; esac
+            tar -czf "$b.tar.gz" "$b"
+          done
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
