@@ -11,7 +11,7 @@ BIN="$ROOT/.e2e-bin"
 DATA="$(mktemp -d "${TMPDIR:-/tmp}/wb-e2e.XXXXXX")"
 BRIDGE_PORT=18081
 STUB_PORT=18080
-SECRET="e2e-secret-0123456789abcdef"
+SECRET="e2e-secret-0123456789abcdef0123456789"
 
 BRIDGE_PID=""; STUB_PID=""
 # Kills are routine here (case teardown, kill -9 test); wait reaps each
