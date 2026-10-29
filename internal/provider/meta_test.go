@@ -2,9 +2,11 @@ package provider
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -46,8 +48,9 @@ func testAdapter(t *testing.T, stub *stubTripper, maxBytes int64) *MetaAdapter {
 }
 
 func TestMetaBriefSendsBundleVerbatim(t *testing.T) {
+	const briefing = `{"event_ids":["e1"],"host":"HOST_1","what_changed":"w","context":"c","model_suggestion":"high","priority_reason":"r","recommended_check":"k"}`
 	stub := &stubTripper{respond: func(*http.Request) (*http.Response, error) {
-		return okResponse(`{"event_ids":["e1"],"host":"HOST_1","what_changed":"w","context":"c","model_suggestion":"high","priority_reason":"r","recommended_check":"k"}`), nil
+		return okResponse(`{"output":[{"type":"message","content":[{"type":"output_text","text":` + strconv.Quote(briefing) + `}]}]}`), nil
 	}}
 	a := testAdapter(t, stub, 64<<10)
 	bundle := []byte(`{"group":"g1","events":[{"s":"IP_1"}]}`)
@@ -65,13 +68,37 @@ func TestMetaBriefSendsBundleVerbatim(t *testing.T) {
 	if ct := req.Header.Get("Content-Type"); ct != "application/json" {
 		t.Fatalf("content type %q", ct)
 	}
-	// The bundle crosses the boundary byte-identical to the leak-scanned
-	// input: the adapter embeds it raw, never re-serializes prose.
-	if !bytes.Contains(stub.bodies[0], bundle) {
-		t.Fatalf("bundle not embedded verbatim in %s", stub.bodies[0])
+	// Responses API shape: one user message, input_text, no streaming.
+	for _, want := range []string{`"role":"user"`, `"type":"input_text"`, `"stream":false`} {
+		if !bytes.Contains(stub.bodies[0], []byte(want)) {
+			t.Fatalf("Responses shape missing %s in %s", want, stub.bodies[0])
+		}
 	}
-	if len(raw.JSON) == 0 {
-		t.Fatal("empty briefing returned")
+	// The bundle crosses the boundary byte-identical to the leak-scanned
+	// input: inside the JSON string it is escaped, so decode the envelope
+	// and compare the text suffix exactly — string conversion, never
+	// re-serialization.
+	text := requestText(t, stub.bodies[0])
+	if !strings.HasSuffix(text, string(bundle)) {
+		t.Fatalf("bundle not embedded verbatim, text ends: %.60q", text)
+	}
+	// The briefing is the envelope's message text, not the envelope.
+	if string(raw.JSON) != briefing {
+		t.Fatalf("briefing not extracted: %s", raw.JSON)
+	}
+}
+
+func TestMetaNoTextOutputFails(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty output": `{"output":[]}`,
+		"no text":      `{"output":[{"type":"message","content":[{"type":"output_text","text":""}]}]}`,
+		"error shape":  `{"error":{"message":"bad key"}}`,
+	} {
+		stub := &stubTripper{respond: func(*http.Request) (*http.Response, error) { return okResponse(body), nil }}
+		a := testAdapter(t, stub, 64<<10)
+		if _, err := a.Brief(t.Context(), []byte(`{}`), nil); err == nil {
+			t.Fatalf("%s: expected error", name)
+		}
 	}
 }
 
@@ -113,7 +140,7 @@ func TestMetaResponseCapEnforced(t *testing.T) {
 func TestMetaRepairSendsCorrectionOnly(t *testing.T) {
 	var got []byte
 	stub := &stubTripper{respond: func(*http.Request) (*http.Response, error) {
-		return okResponse(`{}`), nil
+		return okResponse(`{"output":[{"type":"message","content":[{"type":"output_text","text":"{}"}]}]}`), nil
 	}}
 	a := testAdapter(t, stub, 64<<10)
 	_, err := a.Repair(t.Context(), "rejected (missing field)", map[string]struct{}{"IP_1": {}})
@@ -127,9 +154,33 @@ func TestMetaRepairSendsCorrectionOnly(t *testing.T) {
 	if bytes.Contains(got, []byte("10.0.0.1")) {
 		t.Fatalf("repair leaked bundle values: %s", got)
 	}
-	if bytes.Contains(got, []byte("bundle")) {
-		t.Fatalf("repair must not carry a bundle: %s", got)
+	// The repair carries the correction under the repair instruction,
+	// never the bundle instruction or bundle content.
+	text := requestText(t, got)
+	if strings.Contains(text, "Redacted bundle follows") {
+		t.Fatalf("repair must not carry a bundle: %.80q", text)
 	}
+}
+
+// requestText decodes a Responses API request body and returns its input
+// text, so tests assert on the model-visible string instead of the
+// JSON-escaped wire bytes.
+func requestText(t *testing.T, body []byte) string {
+	t.Helper()
+	var req struct {
+		Input []struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"input"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatalf("request not Responses-shaped: %v", err)
+	}
+	if len(req.Input) != 1 || len(req.Input[0].Content) != 1 {
+		t.Fatalf("one message, one part expected: %s", body)
+	}
+	return req.Input[0].Content[0].Text
 }
 
 func TestNewMetaAdapterValidates(t *testing.T) {

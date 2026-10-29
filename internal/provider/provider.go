@@ -36,30 +36,53 @@ type Provider interface {
 	Repair(ctx context.Context, correction string, validTokens map[string]struct{}) (RawBriefing, error)
 }
 
-// bundleRequest is the Meta wire body: the model ID plus the redacted
-// bundle as raw JSON. The bundle is embedded verbatim — it is data the
-// model summarizes, framed by the adapter's system instruction (Designv5
-// §9.1), never interpolated into prompt prose by string concatenation.
-type bundleRequest struct {
-	Model  string          `json:"model"`
-	Bundle json.RawMessage `json:"bundle"`
+// responsesContent is one Responses API content part. The bundle (or the
+// correction) crosses as literal input text — string conversion of the
+// exact leak-scanned bytes, never re-serialization — framed by the system
+// instruction below, never interpolated into prompt prose by concatenation.
+type responsesContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
-// repairRequest is the single bounded repair: the schema error plus an
-// instruction to re-emit the full briefing object. It carries no bundle
-// content, so a hostile bundle cannot steer the retry.
-type repairRequest struct {
-	Model      string `json:"model"`
-	Correction string `json:"correction"`
+type responsesMessage struct {
+	Role    string             `json:"role"`
+	Content []responsesContent `json:"content"`
 }
+
+// responsesRequest is the Meta Responses API wire body, verified against
+// the live endpoint: model, one user message, no streaming.
+type responsesRequest struct {
+	Model  string             `json:"model"`
+	Input  []responsesMessage `json:"input"`
+	Stream bool               `json:"stream"`
+}
+
+// briefingFieldContract is the output contract shared by the bundle and
+// repair prompts. It mirrors modelBriefing (internal/briefing): exact
+// fields, token references only. It names no values, so a hostile bundle
+// cannot steer it; the briefing layer re-validates everything regardless.
+const briefingFieldContract = `Respond with exactly one JSON object and no other text, with exactly these fields: "event_ids" (array of all the group's event IDs), "host" (one token copied from the bundle), "what_changed", "context", "model_suggestion" (one of "low", "medium", "high", "critical", or null to abstain), "priority_reason", "recommended_check". Use only tokens that appear in the bundle; invent no new ones.`
+
+const bundleSystemInstruction = `You summarize redacted network-monitoring bundles. Tokens like IP_1 or HOST_2 stand for real addresses; treat them as opaque identifiers. ` + briefingFieldContract + ` Redacted bundle follows: `
+
+const repairSystemInstruction = `The previous answer was rejected. ` + briefingFieldContract + ` Re-emit the full briefing object corrected. Rejection reason follows: `
 
 // MarshalBundleRequest renders the exact bytes the leak scan approved into
 // the wire body. Adapters send the result untouched.
 func MarshalBundleRequest(model string, bundle []byte) ([]byte, error) {
-	return json.Marshal(bundleRequest{Model: model, Bundle: bundle})
+	return json.Marshal(responsesRequest{Model: model, Input: []responsesMessage{{
+		Role:    "user",
+		Content: []responsesContent{{Type: "input_text", Text: bundleSystemInstruction + string(bundle)}},
+	}}, Stream: false})
 }
 
-// MarshalRepairRequest renders the correction prompt body.
+// MarshalRepairRequest renders the correction prompt body. It carries the
+// schema error only, no bundle content, so a hostile bundle cannot steer
+// the retry.
 func MarshalRepairRequest(model, correction string) ([]byte, error) {
-	return json.Marshal(repairRequest{Model: model, Correction: correction})
+	return json.Marshal(responsesRequest{Model: model, Input: []responsesMessage{{
+		Role:    "user",
+		Content: []responsesContent{{Type: "input_text", Text: repairSystemInstruction + correction}},
+	}}, Stream: false})
 }

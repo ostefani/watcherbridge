@@ -3,10 +3,12 @@ package provider
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 // noRedirect refuses redirects: a 3xx from the model endpoint is a failure,
@@ -114,5 +116,46 @@ func (a *MetaAdapter) post(ctx context.Context, body []byte) (RawBriefing, error
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return RawBriefing{}, fmt.Errorf("provider returned an empty body")
 	}
-	return RawBriefing{JSON: raw}, nil
+	text, err := extractResponseText(raw)
+	if err != nil {
+		return RawBriefing{}, err
+	}
+	return RawBriefing{JSON: text}, nil
+}
+
+// responsesOutputContent is one text part of a Responses API output item.
+type responsesOutputContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type responsesOutputItem struct {
+	Type    string                   `json:"type"`
+	Content []responsesOutputContent `json:"content"`
+}
+
+// responsesEnvelope is the Responses API result body. Only the message
+// text is briefing content; everything else is transport.
+type responsesEnvelope struct {
+	Output []responsesOutputItem `json:"output"`
+}
+
+// extractResponseText returns the model's message text: the first
+// non-empty content text in the output array. An envelope with no text
+// (an error shape, an empty finish) is a provider failure, never a
+// briefing — the worker falls back and the log names this cause.
+func extractResponseText(raw []byte) ([]byte, error) {
+	var env responsesEnvelope
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if err := dec.Decode(&env); err != nil {
+		return nil, fmt.Errorf("decode provider envelope: %v", strings.TrimSpace(err.Error()))
+	}
+	for _, item := range env.Output {
+		for _, c := range item.Content {
+			if c.Text != "" {
+				return []byte(c.Text), nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("provider returned no text output")
 }
