@@ -1,0 +1,50 @@
+# GoReleaser config (v2). CGO (mattn/go-sqlite3) cannot cross-compile,
+# so CI runs one native build per runner OS/arch via
+# `goreleaser build --single-target`; each runner builds exactly the
+# stanza matching its own platform.
+version: 2
+
+project_name: watcherbridge
+
+builds:
+  - id: watcherbridge-linux-amd64
+    main: ./cmd/watcherbridge
+    binary: watcherbridge
+    goos: [linux]
+    goarch: [amd64]
+    env: [CGO_ENABLED=1]
+    flags: [-trimpath]
+  - id: watcherbridge-linux-arm64
+    main: ./cmd/watcherbridge
+    binary: watcherbridge
+    goos: [linux]
+    goarch: [arm64]
+    env: [CGO_ENABLED=1]
+    flags: [-trimpath]
+  - id: watcherbridge-darwin-arm64
+    main: ./cmd/watcherbridge
+    binary: watcherbridge
+    goos: [darwin]
+    goarch: [arm64]
+    env: [CGO_ENABLED=1]
+    flags: [-trimpath]
+
+archives:
+  - name_template: "{{ .ProjectName }}-{{ .Os }}-{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  use: github
+
+release:
+  github:
+    owner: ostefani
+    name: watcherbridge
+  draft: false

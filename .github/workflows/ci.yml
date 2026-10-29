@@ -1,0 +1,41 @@
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  build-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: 1 # mattn/go-sqlite3 requires cgo; runners ship a C toolchain
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build ./...
+      - name: test
+        run: go test ./... -count=1
+      - name: race (touched packages)
+        run: go test -race ./internal/store/ ./internal/redactor/ ./internal/briefing/ ./internal/server/ ./internal/config/ ./internal/forwarder/ ./internal/provider/ ./internal/viewer/ -count=1
+
+  e2e:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: three-process tap/proxy smoke (builds into .e2e-bin)
+        run: ./e2e/run.sh
