@@ -27,7 +27,7 @@ func host(m map[string]string, ports string) string {
 }
 
 func openPort(n int) string {
-	return `{"number":` + itoa(n) + `,"protocol":"tcp","state":"open"}`
+	return `{"number":` + strconv.Itoa(n) + `,"protocol":"tcp","state":"open"}`
 }
 
 func changedEv(prev, cur string) GroupEvent {
@@ -70,7 +70,7 @@ func TestBaselineMatrix(t *testing.T) {
 		},
 		"two sensitive kinds without opens is high": {
 			[]GroupEvent{changedEv(host(mergeHost(stable, map[string]string{"os": "Debian 11"}), ""), host(mergeHost(stable, map[string]string{"os": "Debian 12", "mac": "aa:bb:cc:dd:ee:02"}), ""))},
-			High, RuleHighNewService,
+			High, RuleHighMultiSensitive,
 		},
 		"new strong identity is medium": {
 			[]GroupEvent{appearedEv(host(strongBase(""), openPort(443)))},

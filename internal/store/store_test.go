@@ -290,6 +290,44 @@ func TestPseudonymNormalizationAndCounters(t *testing.T) {
 	}
 }
 
+// Batch assignment crosses the IN-chunk boundary deterministically: one call
+// with more than a chunk of values numbers tokens in input order, folds a
+// case-variant duplicate onto one token, and re-reads stably.
+func TestPseudonymsBatchAcrossChunks(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	const n = 2*pseudonymLookupBatch + 7
+	vals := make([]string, 0, n+1)
+	for i := 0; i < n; i++ {
+		vals = append(vals, fmt.Sprintf("AA:BB:CC:%02X:%02X:%02X", i>>16, (i>>8)&0xFF, i&0xFF))
+	}
+	vals = append(vals, strings.ToLower(vals[3])) // duplicate, different case
+	got, err := s.GetOrAssignPseudonyms(ctx, "mac", vals...)
+	if err != nil {
+		t.Fatalf("batch assign: %v", err)
+	}
+	if len(got) != len(vals) {
+		t.Fatalf("batch result covers every input: got %d want %d", len(got), len(vals))
+	}
+	for k := 0; k < n; k++ {
+		if want := fmt.Sprintf("MAC_%d", k+1); got[vals[k]] != want {
+			t.Fatalf("token order: vals[%d] = %q want %q", k, got[vals[k]], want)
+		}
+	}
+	if got[vals[n]] != got[vals[3]] {
+		t.Fatalf("case-variant duplicate must share a token: %q vs %q", got[vals[n]], got[vals[3]])
+	}
+	again, err := s.GetOrAssignPseudonyms(ctx, "mac", vals...)
+	if err != nil {
+		t.Fatalf("batch re-read: %v", err)
+	}
+	for _, v := range vals {
+		if again[v] != got[v] {
+			t.Fatalf("re-read unstable for %q: %q vs %q", v, again[v], got[v])
+		}
+	}
+}
+
 func TestForwardState(t *testing.T) {
 	s := openTestStore(t)
 	now := time.Now().UTC().Truncate(time.Second)
@@ -910,6 +948,59 @@ func TestReleaseBackoffRefundAndDueGuard(t *testing.T) {
 	}
 	if _, err := s.TakeGroup(ctx, gid); !errors.Is(err, ErrGroupNotClosed) {
 		t.Fatalf("not-due take must refuse: %v", err)
+	}
+}
+
+// Same-instant events take in event_id order, so the baseline subject
+// (the last event) is deterministic on received_at ties instead of
+// depending on SQLite's rowid order.
+func TestTakeGroupOrdersTiesByEventID(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	var gid string
+	for _, id := range []string{"evt-b", "evt-a"} {
+		ev := RawEvent{EventID: id, EventKey: "k", EventType: "host.appeared", OccurredAt: now, Cycle: 1, Payload: []byte(`{}`), ReceivedAt: now, SignatureTimestamp: now}
+		res, err := s.PersistEventAndGroup(ctx, ev, "host:tie", GroupPolicy{QuietWindow: time.Millisecond, MaxWindow: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		gid = res.GroupID
+	}
+	if _, err := s.CloseDue(ctx, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := s.TakeGroup(ctx, gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(taken.Events) != 2 || taken.Events[0].EventID != "evt-a" || taken.Events[1].EventID != "evt-b" {
+		t.Fatalf("ties must take in event_id order: %+v", taken.Events)
+	}
+}
+
+// Concurrent closes serialize: every caller waits out the one shutdown and
+// receives the same result, instead of a second caller returning early.
+func TestCloseConcurrentWaits(t *testing.T) {
+	s := openTestStore(t)
+	const n = 8
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = s.Close()
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("close %d: %v", i, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("sequential second close: %v", err)
 	}
 }
 

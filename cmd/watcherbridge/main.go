@@ -32,6 +32,7 @@ func main() {
 	secret := fs.String("secret", "", "webhook HMAC secret (or WEBHOOK_SECRET)")
 	secretFile := fs.String("secret-file", "", "file holding the webhook secret")
 	relay := fs.String("scanrelay-url", def.ScanRelayURL, "ScanRelay base URL; empty disables proxy and publisher")
+	skew := fs.Duration("clock-skew-allowance", def.ClockSkewAllowance, "assumed worst-case clock difference with the ScanRelay host")
 	forwardBearer := fs.String("forward-bearer", "", "bearer injected into ScanRelay forwards/annotations (or FORWARD_BEARER_TOKEN)")
 	forwardKey := fs.String("forward-api-key", "", "API key injected into ScanRelay forwards/annotations (or FORWARD_API_KEY)")
 	quiet := fs.Duration("group-quiet-window", def.GroupQuietWindow, "grouping quiet window")
@@ -54,6 +55,7 @@ func main() {
 	cfg.Secret = config.Secret(firstNonEmpty(*secret, os.Getenv("WEBHOOK_SECRET")))
 	cfg.SecretFile = *secretFile
 	cfg.ScanRelayURL = *relay
+	cfg.ClockSkewAllowance = *skew
 	cfg.ForwardBearerToken = config.Secret(firstNonEmpty(*forwardBearer, os.Getenv("FORWARD_BEARER_TOKEN")))
 	cfg.ForwardAPIKey = config.Secret(firstNonEmpty(*forwardKey, os.Getenv("FORWARD_API_KEY")))
 	cfg.GroupQuietWindow = *quiet

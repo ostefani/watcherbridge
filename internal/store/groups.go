@@ -77,7 +77,7 @@ func (s *Store) TakeGroup(ctx context.Context, groupID string) (TakenGroup, erro
 		}
 		taken.OpenedAt = fromNanos(openedNanos)
 		rows, err := tx.Query(`SELECT e.event_id, e.event_key, e.event_type, e.occurred_at, e.cycle, COALESCE(e.target,''), e.payload, e.headers_json, e.received_at, e.signature_timestamp
-			FROM group_events ge JOIN raw_events e ON e.event_id = ge.event_id WHERE ge.group_id = ? ORDER BY e.received_at`, groupID)
+			FROM group_events ge JOIN raw_events e ON e.event_id = ge.event_id WHERE ge.group_id = ? ORDER BY e.received_at, e.event_id`, groupID)
 		if err != nil {
 			return err
 		}

@@ -78,6 +78,28 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+// Integers past float64's exact range (2^53) must survive the bundle
+// byte-identical: the builder decodes with UseNumber, so the model sees the
+// counter the device sent, not an exponent-mangled approximation.
+func TestBigIntegersSurviveBundle(t *testing.T) {
+	s := testStore(t)
+	const big = `12345678901234567890`
+	pay := []byte(`{"event_id":"e-big","event_key":"k","event_type":"host.changed","host":{"ip":"192.168.0.5"},"rx_bytes":` + big + `}`)
+	for _, p := range []Policy{testPolicy(), {Enabled: false}} {
+		b, _, _, err := BuildBundle(context.Background(), s, BundleInput{
+			GroupID: "grp-big", Anchor: "ip:192.168.0.5", Target: "192.168.0.0/24",
+			Baseline: "low",
+			Events:   []InputEvent{{EventID: "e-big", EventType: "host.changed", Payload: pay}},
+		}, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b.EventsJSON), big) {
+			t.Fatalf("big integer mangled (enabled=%v): %s", p.Enabled, b.EventsJSON)
+		}
+	}
+}
+
 func TestElevenIPsTwoDigitTokens(t *testing.T) {
 	s := testStore(t)
 	var parts []string

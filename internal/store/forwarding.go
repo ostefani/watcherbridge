@@ -80,6 +80,9 @@ func (s *Store) RecordForwardFailure(ctx context.Context, eventID, errText strin
 	})
 }
 
+// SweepCandidates returns unforwarded events still fresh enough to forward
+// (signature_timestamp within tolerance-margin); older ones are the caller's
+// to mark via MarkStaleSweep.
 func (s *Store) SweepCandidates(ctx context.Context, now time.Time, tolerance, margin time.Duration, limit int) ([]RawEvent, error) {
 	if margin >= tolerance {
 		return nil, fmt.Errorf("sweep margin must be smaller than tolerance")
@@ -127,7 +130,11 @@ func (s *Store) MarkStaleSweep(ctx context.Context, now time.Time, tolerance, ma
 	return affected, nil
 }
 
-// purgeFloor is the youngest age PurgeRawEvents will ever accept.
+// WhitelistForwardHeaders reduces a header set to what proxy forwarding may
+// store and replay: Pro signature headers plus Content-Type. Endpoint
+// credentials are never persisted. Keys are compared case-insensitively
+// because Go canonicalizes header names (X-SubnetLens-* arrives as
+// X-Subnetlens-*).
 func WhitelistForwardHeaders(headers map[string]string) map[string]string {
 	out := map[string]string{}
 	for k, v := range headers {
@@ -162,5 +169,3 @@ func validateHeadersJSON(headersJSON string) error {
 	}
 	return nil
 }
-
-// RestorePseudonym returns the original (display) value for a token.

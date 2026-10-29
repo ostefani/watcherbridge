@@ -7,9 +7,11 @@
 package redactor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/netip"
 	"regexp"
 	"sort"
@@ -613,8 +615,15 @@ func BuildBundle(ctx context.Context, st *store.Store, in BundleInput, pol Polic
 	display := TokenMap{}
 	decode := func(id string, payload []byte) (any, error) {
 		var v any
-		if err := json.Unmarshal(payload, &v); err != nil {
+		dec := json.NewDecoder(bytes.NewReader(payload))
+		dec.UseNumber() // keep integers exact: float64 would mangle
+		// integers past 2^53 when the bundle re-marshals for the model
+		if err := dec.Decode(&v); err != nil {
 			return nil, fmt.Errorf("decode event %s: %w", id, err)
+		}
+		var extra any
+		if err := dec.Decode(&extra); err != io.EOF {
+			return nil, fmt.Errorf("decode event %s: trailing data", id)
 		}
 		return v, nil
 	}

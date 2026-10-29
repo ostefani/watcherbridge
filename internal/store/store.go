@@ -55,7 +55,9 @@ type Store struct {
 	jobs     chan writeJob // never closed; quit signals shutdown
 	quit     chan struct{}
 	wg       sync.WaitGroup
-	once     sync.Once
+	closeMu  sync.Mutex
+	closed   bool
+	closeErr error
 	groupSeq atomic.Int64
 	now      func() time.Time
 }
@@ -308,17 +310,19 @@ func (s *Store) enqueue(ctx context.Context, job writeJob) error {
 	}
 }
 
+// Close shuts the store down once and reports the result to every caller.
+// A concurrent second caller blocks on the mutex until the first shutdown
+// finishes, then receives the same error — nobody returns early while the
+// writer is still draining.
 func (s *Store) Close() error {
-	var err error
-	s.once.Do(func() {
-		close(s.quit) // never close s.jobs: a blocked sender must not panic
-		s.wg.Wait()
-		err = s.db.Close()
-	})
-	return err
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if s.closed {
+		return s.closeErr
+	}
+	s.closed = true
+	close(s.quit) // never close s.jobs: a blocked sender must not panic
+	s.wg.Wait()
+	s.closeErr = s.db.Close()
+	return s.closeErr
 }
-
-// PersistEventAndGroup stores the event and joins the anchor's open group in
-// one transaction. The deadline extends on every join:
-// min(last_event+QuietWindow, opened+MaxWindow). Reaching MaxEvents closes
-// the group (result.Closed) so the next event opens a fresh one.

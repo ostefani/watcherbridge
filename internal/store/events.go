@@ -22,6 +22,10 @@ type RawEvent struct {
 	SignatureTimestamp time.Time
 }
 
+// PersistEventAndGroup stores the event and joins the anchor's open group in
+// one transaction. The deadline extends on every join:
+// min(last_event+QuietWindow, opened+MaxWindow). Reaching MaxEvents closes
+// the group (result.Closed) so the next event opens a fresh one.
 func (s *Store) PersistEventAndGroup(ctx context.Context, ev RawEvent, anchor string, pol GroupPolicy) (PersistResult, error) {
 	if ev.EventID == "" || ev.EventKey == "" || ev.EventType == "" || len(ev.Payload) == 0 {
 		return PersistResult{}, fmt.Errorf("event_id, event_key, event_type and payload are required")
