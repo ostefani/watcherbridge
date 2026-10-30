@@ -1033,3 +1033,113 @@ func TestRegisterOnShutdownRunsHooks(t *testing.T) {
 		t.Fatalf("shutdown hooks ran %d/2", calls)
 	}
 }
+
+// The Host allowlist gates viewer routes only: a foreign Host is 403 on
+// /api/*, while /webhook keeps its own contract (405 on wrong method,
+// 401 on bad signature, never 403). Built directly, bind-free.
+func TestViewerHostGateLeavesWebhookAlone(t *testing.T) {
+	cfg := config.Default()
+	cfg.Mode = config.ModeTap
+	cfg.Secret = "test-secret-long-enough-01234567"
+	st, err := store.Open(filepath.Join(t.TempDir(), "bridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	srv, err := New(cfg, st, forwarder.NewGate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serve := func(method, target, host string, headers map[string]string, body string) *httptest.ResponseRecorder {
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req := httptest.NewRequest(method, target, rdr)
+		req.Host = host
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := serve("GET", "/api/groups", "evil.example:8081", nil, ""); rec.Code != 403 {
+		t.Fatalf("foreign host on viewer route = %d, want 403", rec.Code)
+	}
+	if rec := serve("GET", "/api/groups", "127.0.0.1:8081", nil, ""); rec.Code != 200 {
+		t.Fatalf("loopback host on viewer route = %d, want 200", rec.Code)
+	}
+	if rec := serve("GET", "/webhook", "evil.example:8081", nil, ""); rec.Code != 405 {
+		t.Fatalf("foreign host on GET /webhook = %d, want 405", rec.Code)
+	}
+	sig := map[string]string{
+		"Content-Type":                     "application/json",
+		"X-SubnetLens-Signature-Timestamp": fmt.Sprintf("%d", time.Now().Unix()),
+		"X-SubnetLens-Event-ID":            "evt-x",
+		"X-SubnetLens-Event-Key":           "k",
+		"X-SubnetLens-Event-Type":          "host.appeared",
+		"X-SubnetLens-Signature-256":       "deadbeef",
+	}
+	if rec := serve("POST", "/webhook", "evil.example:8081", sig, `{}`); rec.Code != 401 {
+		t.Fatalf("foreign host on POST /webhook = %d, want 401", rec.Code)
+	}
+}
+
+// Mux-generated responses carry the header set too: the viewer mount
+// heads its own 405s, and the outer wrapper heads clean-path redirects
+// and unknown paths (which stay ungated, outside the viewer subtree).
+func TestMuxResponsesCarryHeaders(t *testing.T) {
+	cfg := config.Default()
+	cfg.Mode = config.ModeTap
+	cfg.Secret = "test-secret-long-enough-01234567"
+	st, err := store.Open(filepath.Join(t.TempDir(), "bridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	srv, err := New(cfg, st, forwarder.NewGate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serve := func(method, target, host string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+	headed := func(rec *httptest.ResponseRecorder) {
+		t.Helper()
+		if got := rec.Header().Get("Content-Security-Policy"); got == "" {
+			t.Fatalf("missing CSP on %d", rec.Code)
+		}
+		if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Fatalf("missing nosniff on %d", rec.Code)
+		}
+	}
+	if rec := serve("POST", "/api/groups", "127.0.0.1:8081"); rec.Code != 405 {
+		t.Fatalf("POST on a GET route = %d, want 405", rec.Code)
+	} else {
+		headed(rec)
+	}
+	if rec := serve("POST", "/api/groups", "evil.example:8081"); rec.Code != 403 {
+		t.Fatalf("foreign host on mux 405 = %d, want 403", rec.Code)
+	}
+	// Go's mux redirects unclean paths with 307 (method-preserving).
+	if rec := serve("GET", "/api//groups", "127.0.0.1:8081"); rec.Code != 307 {
+		t.Fatalf("unclean path = %d, want 307", rec.Code)
+	} else {
+		headed(rec)
+	}
+	// Unknown GET paths fall through to the viewer subtree's SPA shell
+	// ("GET /" is a subtree wildcard), headed like any viewer response.
+	if rec := serve("GET", "/nope", "127.0.0.1:8081"); rec.Code != 200 {
+		t.Fatalf("unknown path = %d, want 200", rec.Code)
+	} else {
+		headed(rec)
+		if ct := rec.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
+			t.Fatalf("SPA shell content type = %q", ct)
+		}
+	}
+}

@@ -2,7 +2,9 @@ package viewer
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -204,8 +206,8 @@ func TestBriefingEndpointsShapeAndHeaders(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 		t.Fatalf("briefings content type = %q", ct)
 	}
-	if csp := rec.Header().Get("Content-Security-Policy"); csp != "default-src 'self'" {
-		t.Fatalf("briefings CSP = %q", csp)
+	if got := rec.Header().Get("Content-Security-Policy"); got != csp {
+		t.Fatalf("briefings CSP = %q, want %q", got, csp)
 	}
 	var rows []map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil || len(rows) != 1 {
@@ -311,7 +313,7 @@ func TestStaticAssetsHeaders(t *testing.T) {
 		if got := rec.Header().Get("Content-Type"); got != ct {
 			t.Fatalf("%s content type = %q", path, got)
 		}
-		if got := rec.Header().Get("Content-Security-Policy"); got != "default-src 'self'" {
+		if got := rec.Header().Get("Content-Security-Policy"); got != csp {
 			t.Fatalf("%s CSP = %q", path, got)
 		}
 	}
@@ -752,6 +754,235 @@ func TestReplayAbortsOnMidReplayClose(t *testing.T) {
 	}
 }
 
+// withHost returns the viewer with an allowlist for tests, plus the
+// handler the browser would talk to: mounted exactly like the server
+// mounts it, so mux-generated responses go through the same gate.
+func withHost(t *testing.T, s *store.Store, hosts ...string) (*Viewer, http.Handler) {
+	t.Helper()
+	v := New(s, NewHub())
+	v.AllowedHosts = hosts
+	mux := http.NewServeMux()
+	mux.Handle("/", v.Handler())
+	return v, mux
+}
+
+func serveMux(mux http.Handler, method, target, host string, headers map[string]string, body string) *httptest.ResponseRecorder {
+	var rdr io.Reader
+	if body != "" {
+		rdr = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, target, rdr)
+	req.Host = host
+	req.URL.Host = host
+	for k, val := range headers {
+		req.Header.Set(k, val)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
+func assertViewerHeaders(t *testing.T, h http.Header) {
+	t.Helper()
+	if got := h.Get("Content-Security-Policy"); got != csp {
+		t.Fatalf("CSP = %q", got)
+	}
+	if got := h.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("nosniff = %q", got)
+	}
+	if got := h.Get("Referrer-Policy"); got != "no-referrer" {
+		t.Fatalf("referrer = %q", got)
+	}
+}
+
+func TestHostAllowlist(t *testing.T) {
+	s := openViewerStore(t)
+	seedBriefing(t, s, "host:h", "evt-h")
+	_, mux := withHost(t, s, "127.0.0.1:8081", "localhost:8081", "[::1]:8081")
+	for _, tc := range []struct {
+		host string
+		code int
+	}{
+		{"127.0.0.1:8081", 200},
+		{"LOCALHOST:8081", 200}, // matching is case-insensitive
+		{"[::1]:8081", 200},
+		{"evil.example:8081", 403},
+		{"127.0.0.1:9999", 403}, // wrong port is foreign
+		{"", 403},               // missing Host is refused
+	} {
+		rec := serveMux(mux, "GET", "/api/groups", tc.host, nil, "")
+		if rec.Code != tc.code {
+			t.Fatalf("host %q = %d, want %d", tc.host, rec.Code, tc.code)
+		}
+		if tc.code == 403 {
+			assertViewerHeaders(t, rec.Header())
+		}
+	}
+}
+
+// An unset allowlist denies everything: the gate fails closed and only
+// the server wiring (derived from the loopback bind) opens it.
+func TestHostAllowlistDenyByDefault(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	mux := http.NewServeMux()
+	mux.Handle("/", v.Handler())
+	rec := serveMux(mux, "GET", "/api/groups", "127.0.0.1:8081", nil, "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("empty allowlist = %d, want 403", rec.Code)
+	}
+}
+
+// LoopbackHosts covers the bind IP plus the names a local browser sends.
+func TestLoopbackHosts(t *testing.T) {
+	got := LoopbackHosts("8081")
+	want := []string{"127.0.0.1:8081", "localhost:8081", "[::1]:8081"}
+	if len(got) != len(want) {
+		t.Fatalf("hosts = %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("hosts = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestViewerSecurityHeaders(t *testing.T) {
+	s := openViewerStore(t)
+	seedBriefing(t, s, "host:sec", "evt-sec")
+	_, mux := withHost(t, s, "127.0.0.1:8081")
+	for _, target := range []string{"/", "/app.js", "/api/briefings", "/api/groups", "/api/overview"} {
+		rec := serveMux(mux, "GET", target, "127.0.0.1:8081", nil, "")
+		if rec.Code != 200 {
+			t.Fatalf("%s = %d", target, rec.Code)
+		}
+		assertViewerHeaders(t, rec.Header())
+	}
+	// Errors carry the headers too.
+	rec := serveMux(mux, "GET", "/api/briefings?limit=12abc", "127.0.0.1:8081", nil, "")
+	if rec.Code != 400 {
+		t.Fatalf("garbage limit = %d", rec.Code)
+	}
+	assertViewerHeaders(t, rec.Header())
+}
+
+func TestPostGuard(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	v.AllowedHosts = []string{"127.0.0.1:8081"}
+	ok := v.guardStateChanging(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		writeJSON(w, map[string]string{"ok": "true"})
+	})
+	post := func(headers map[string]string, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/api/decisions", strings.NewReader(body))
+		req.Host = "127.0.0.1:8081"
+		for k, val := range headers {
+			req.Header.Set(k, val)
+		}
+		rec := httptest.NewRecorder()
+		ok(rec, req)
+		return rec
+	}
+	jsonCT := map[string]string{"Content-Type": "application/json"}
+	// Wrong method, wrong content type, cross-site, missing and foreign origins.
+	if rec := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest("GET", "/api/decisions", nil)
+		req.Host = "127.0.0.1:8081"
+		rec := httptest.NewRecorder()
+		ok(rec, req)
+		return rec
+	}(); rec.Code != 405 {
+		t.Fatalf("GET = %d, want 405", rec.Code)
+	}
+	if rec := post(map[string]string{"Content-Type": "text/plain", "Origin": "http://127.0.0.1:8081"}, "{}"); rec.Code != 415 {
+		t.Fatalf("text/plain = %d, want 415", rec.Code)
+	}
+	if rec := post(map[string]string{"Content-Type": "application/json", "Origin": "http://127.0.0.1:8081", "Sec-Fetch-Site": "cross-site"}, "{}"); rec.Code != 403 {
+		t.Fatalf("cross-site = %d, want 403", rec.Code)
+	}
+	if rec := post(jsonCT, "{}"); rec.Code != 403 {
+		t.Fatalf("missing origin = %d, want 403", rec.Code)
+	}
+	if rec := post(map[string]string{"Content-Type": "application/json", "Origin": "http://evil.example/"}, "{}"); rec.Code != 403 {
+		t.Fatalf("foreign origin = %d, want 403", rec.Code)
+	}
+	// Same-origin JSON passes and keeps the header set.
+	rec := post(map[string]string{
+		"Content-Type": "application/json", "Origin": "http://127.0.0.1:8081", "Sec-Fetch-Site": "same-origin",
+	}, `{"decision":"expected"}`)
+	if rec.Code != 200 {
+		t.Fatalf("same-origin = %d", rec.Code)
+	}
+	assertViewerHeaders(t, rec.Header())
+	// Bodies past 8 KiB cannot be read through the guard.
+	big := strings.Repeat("x", (8<<10)+1)
+	req := httptest.NewRequest("POST", "/api/decisions", strings.NewReader(`{"pad":"`+big+`"}`))
+	req.Host = "127.0.0.1:8081"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://127.0.0.1:8081")
+	capped := v.guardStateChanging(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.ReadAll(r.Body); err == nil {
+			t.Error("over-cap body read must fail")
+		}
+	})
+	capped(httptest.NewRecorder(), req)
+}
+
+func TestSameOriginBinding(t *testing.T) {
+	v := New(nil, NewHub())
+	v.AllowedHosts = []string{"127.0.0.1:8081"}
+	plain := httptest.NewRequest("POST", "/api/decisions", nil)
+	plain.Host = "127.0.0.1:8081"
+	for _, tc := range []struct {
+		origin string
+		want   bool
+	}{
+		{"http://127.0.0.1:8081", true},
+		{"http://localhost:8081", false},      // allowed host, different origin
+		{"https://127.0.0.1:8081", false},     // scheme follows the connection
+		{"http://user@127.0.0.1:8081", false}, // userinfo is not a serialized origin
+		{"http://127.0.0.1:8081/x", false},    // paths are not a serialized origin
+		{"http://127.0.0.1:8081/?x=1", false}, // queries are not a serialized origin
+		{"http://127.0.0.1:8081#x", false},    // fragments are not a serialized origin
+		{"http://127.0.0.1:9999", false},      // port must match the request
+		{"ftp://127.0.0.1:8081", false},       // HTTP(S) only
+		{"null", false},                       // sandboxed iframes never pass
+		{"", false},                           // missing origin is refused
+		{"http://[::1]:8081", false},          // must equal r.Host, not just the list
+	} {
+		if got := v.sameOrigin(tc.origin, plain); got != tc.want {
+			t.Fatalf("origin %q = %v, want %v", tc.origin, got, tc.want)
+		}
+	}
+	// An https request accepts only the https twin of its own host.
+	tlsReq := httptest.NewRequest("POST", "https://127.0.0.1:8081/api/decisions", nil)
+	tlsReq.Host = "127.0.0.1:8081"
+	tlsReq.TLS = &tls.ConnectionState{}
+	if !v.sameOrigin("https://127.0.0.1:8081", tlsReq) {
+		t.Fatal("https twin of the request host must pass")
+	}
+	if v.sameOrigin("http://127.0.0.1:8081", tlsReq) {
+		t.Fatal("http origin on a TLS request must fail")
+	}
+}
+
+// Router-generated viewer responses go through the same gate and headers:
+// a method mismatch is 405 (not a headerless mux default) and still
+// refuses foreign hosts.
+func TestMuxResponsesGatedAndHeaded(t *testing.T) {
+	s := openViewerStore(t)
+	_, h := withHost(t, s, "127.0.0.1:8081")
+	rec := serveMux(h, "POST", "/api/groups", "127.0.0.1:8081", nil, "")
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST on a GET route = %d, want 405", rec.Code)
+	}
+	assertViewerHeaders(t, rec.Header())
+	if rec := serveMux(h, "POST", "/api/groups", "evil.example:8081", nil, ""); rec.Code != 403 {
+		t.Fatalf("foreign host on mux 405 = %d, want 403", rec.Code)
+	}
+}
+
 func TestOverviewStubShape(t *testing.T) {
 	s := openViewerStore(t)
 	v := New(s, NewHub())
@@ -769,7 +1000,7 @@ func TestOverviewStubShape(t *testing.T) {
 	if body["verdict"] == "quiet" || body["verdict"] == "review" || body["verdict"] == "act" {
 		t.Fatalf("stub must never claim a computed verdict: %v", body["verdict"])
 	}
-	if rec.Header().Get("Content-Security-Policy") != "default-src 'self'" {
+	if rec.Header().Get("Content-Security-Policy") != csp {
 		t.Fatalf("overview CSP = %q", rec.Header().Get("Content-Security-Policy"))
 	}
 }

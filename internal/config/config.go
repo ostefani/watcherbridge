@@ -117,6 +117,11 @@ type Config struct {
 	WriterQueueCap int // enforced by the writer queue depth; overflow is 503
 	RetryAfterSecs int
 
+	// ViewerAllowedHosts overrides the viewer Host allowlist. Empty
+	// (default) derives 127.0.0.1/localhost/[::1] + bind port, so only a
+	// browser pointed at this machine's loopback passes.
+	ViewerAllowedHosts []string
+
 	SSEHeartbeat      time.Duration // SSE comment ping; also dead-peer detection
 	SSEReplayMax      int           // replay cap per reconnect; over it is resync, never partial
 	SSEWriteTimeout   time.Duration // per-write bound on streams; a stalled peer fails fast
@@ -476,6 +481,11 @@ func (c Config) Validate() error {
 	}
 	if c.RetryAfterSecs <= 0 {
 		return fmt.Errorf("retry-after seconds must be positive")
+	}
+	for _, h := range c.ViewerAllowedHosts {
+		if strings.TrimSpace(h) == "" {
+			return fmt.Errorf("viewer allowed hosts must not contain blank entries")
+		}
 	}
 	if c.SSEHeartbeat <= 0 {
 		return fmt.Errorf("SSE heartbeat must be positive")

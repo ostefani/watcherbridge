@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -106,18 +107,37 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 	s.viewer.ReplayMax = cfg.SSEReplayMax
 	s.viewer.WriteTimeout = cfg.SSEWriteTimeout
 	s.viewer.MaxSubscribers = cfg.SSEMaxSubscribers
+	hosts := cfg.ViewerAllowedHosts
+	if len(hosts) == 0 {
+		// Validate already refused non-loopback and malformed binds.
+		_, port, err := net.SplitHostPort(cfg.Bind)
+		if err != nil {
+			return nil, fmt.Errorf("invalid bind %q: %w", cfg.Bind, err)
+		}
+		hosts = viewer.LoopbackHosts(port)
+	}
+	s.viewer.AllowedHosts = hosts
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook", s.handleWebhook)
-	// GET needs an explicit route: the viewer's "GET /" catch-all would
-	// otherwise serve the index with 200. Every other non-POST method
-	// 405s through the mux's own method mismatch.
+	// GET needs an explicit route: without it the viewer mount below
+	// answers with its own 404 instead of the webhook's 405.
 	mux.HandleFunc("GET /webhook", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	})
-	s.viewer.Attach(mux)
+	// The viewer subtree carries its own Host gate (applied before its
+	// mux-generated 405s and redirects); exact webhook patterns win over
+	// the "/" mount, so /webhook keeps its HMAC behavior.
+	mux.Handle("/", s.viewer.Handler())
+	// Headers cover even responses the outer mux generates itself
+	// (clean-path redirects, unknown paths). No Host gate here: that
+	// stays inside the viewer mount.
+	root := mux
 	s.http = &http.Server{
-		Addr:              cfg.Bind,
-		Handler:           mux,
+		Addr: cfg.Bind,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			viewer.SetSecurityHeaders(w)
+			root.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,

@@ -126,6 +126,7 @@ func TestValidateRejects(t *testing.T) {
 		"zero SSE write timeout":  func(c *Config) { c.SSEWriteTimeout = 0 },
 		"SSE write over grace":    func(c *Config) { c.SSEWriteTimeout = c.ShutdownGrace },
 		"zero SSE subscribers":    func(c *Config) { c.SSEMaxSubscribers = 0 },
+		"blank viewer host":       func(c *Config) { c.ViewerAllowedHosts = []string{"127.0.0.1:8081", " "} },
 		"zero quiet window":       func(c *Config) { c.GroupQuietWindow = 0 },
 		"max window below quiet":  func(c *Config) { c.GroupMaxWindow = time.Second },
 		"group max below quiet":   func(c *Config) { c.GroupMaxWindow = c.GroupQuietWindow - time.Second },

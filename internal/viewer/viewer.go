@@ -12,8 +12,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"mime"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,9 +27,27 @@ import (
 //go:embed web/index.html web/app.js web/style.css
 var assets embed.FS
 
-// csp is the restrictive policy on every viewer response (Designv5 §9.2):
-// same-origin only, no inline scripts or styles.
-const csp = "default-src 'self'"
+// csp is the restrictive policy on every viewer response (Designv8 §2.4):
+// same-origin only, no framing, no base hijack, no form exfiltration, no
+// inline scripts or styles.
+const csp = "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+
+// SetSecurityHeaders applies the Step 16 header set to every viewer
+// response. Cache policy stays per-handler. Exported so the server can
+// cover mux-generated responses outside the viewer subtree (clean-path
+// redirects, unknown paths) without duplicating the values.
+func SetSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Security-Policy", csp)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+}
+
+// writeViewerError answers a viewer error with the security headers set:
+// header-bearing failures must not skip them.
+func writeViewerError(w http.ResponseWriter, msg string, code int) {
+	SetSecurityHeaders(w)
+	http.Error(w, msg, code)
+}
 
 // Event is one SSE message: the stream name plus the JSON payload. ID
 // carries the briefing seq for `briefing` events (the SSE `id:` field,
@@ -158,6 +179,13 @@ type Viewer struct {
 	// answers 503. Zero means unbounded (tests).
 	MaxSubscribers int
 
+	// AllowedHosts gates every viewer route (Designv8 §2.4): r.Host must
+	// match an entry exactly (case-insensitive) or the answer is 403.
+	// Empty denies all — the server always derives it from the loopback
+	// bind, so an unset list fails closed, never open. /webhook is
+	// HMAC-protected and stays outside this gate.
+	AllowedHosts []string
+
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -179,8 +207,10 @@ func (v *Viewer) Close() {
 // Hub exposes the event hub for the briefing worker callbacks.
 func (v *Viewer) Hub() *Hub { return v.hub }
 
-// Attach registers the viewer routes on mux. The ingest mux owns the
-// loopback bind; the viewer adds no listener and no auth beyond it.
+// Attach registers the plain viewer routes on mux. Use Handler for the
+// production mount: it applies Host validation and headers before any
+// mux-generated response (405s, clean-path redirects), which per-handler
+// wrapping cannot reach.
 func (v *Viewer) Attach(mux *http.ServeMux) {
 	mux.HandleFunc("GET /", v.handleIndex)
 	mux.HandleFunc("GET /app.js", v.serveAsset("web/app.js", "text/javascript; charset=utf-8"))
@@ -190,6 +220,119 @@ func (v *Viewer) Attach(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/briefing", v.handleBriefing)
 	mux.HandleFunc("GET /api/groups", v.handleGroups)
 	mux.HandleFunc("GET /api/overview", v.handleOverview)
+}
+
+// Handler returns the viewer subtree with Host validation applied ahead
+// of routing, so mux-generated responses (method mismatches,
+// clean-path redirects) are gated and headed like handler responses.
+// Mount it on "/" beside the exact webhook routes: Go prefers the
+// longer method-qualified webhook patterns, so /webhook keeps its
+// separate HMAC behavior while everything else falls through here.
+func (v *Viewer) Handler() http.Handler {
+	mux := http.NewServeMux()
+	v.Attach(mux)
+	return v.requireLocalHost(mux.ServeHTTP)
+}
+
+// allowedHost reports whether an r.Host value may use viewer routes.
+// Matching is case-insensitive; a missing or foreign host is refused, so
+// a DNS-rebinding page cannot read the loopback viewer.
+func (v *Viewer) allowedHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	host = strings.ToLower(host)
+	for _, h := range v.AllowedHosts {
+		if host == strings.ToLower(h) {
+			return true
+		}
+	}
+	return false
+}
+
+func (v *Viewer) requireLocalHost(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !v.allowedHost(r.Host) {
+			writeViewerError(w, "foreign host", http.StatusForbidden)
+			return
+		}
+		// Headers go on before routing so mux-generated responses carry
+		// them too; handlers re-assert the same values.
+		SetSecurityHeaders(w)
+		next(w, r)
+	}
+}
+
+// sameOrigin enforces a valid serialized HTTP(S) origin exactly matching
+// the request: scheme follows the connection (https only with TLS),
+// userinfo, path, query and fragment are rejected (a serialized origin
+// carries none), the host must equal r.Host, and r.Host must additionally
+// clear the allowlist (kept as a separate check). Without the r.Host
+// binding, an allowed-but-different origin (localhost vs 127.0.0.1)
+// would pass on a Fetch-Metadata-less request despite being
+// cross-origin.
+func (v *Viewer) sameOrigin(origin string, r *http.Request) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if u.User != nil || u.Opaque != "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.Host == "" {
+		return false
+	}
+	wantScheme := "http"
+	if r.TLS != nil {
+		wantScheme = "https"
+	}
+	if !strings.EqualFold(u.Scheme, wantScheme) {
+		return false
+	}
+	if !strings.EqualFold(u.Host, r.Host) {
+		return false
+	}
+	return v.allowedHost(r.Host)
+}
+
+// LoopbackHosts derives the viewer allowlist from a bind port: the
+// loopback IP the server binds, plus the two names a local browser may
+// send. The server refuses non-loopback binds at startup, so deriving
+// from the bind cannot open a LAN interface.
+func LoopbackHosts(port string) []string {
+	return []string{"127.0.0.1:" + port, "localhost:" + port, "[::1]:" + port}
+}
+
+// maxPostBytes caps state-changing bodies (Designv8 §2.4: 8 KiB).
+const maxPostBytes = 8 << 10
+
+// guardStateChanging enforces the Step 16 POST contract for decision and
+// rule routes (first used in Step 25): POST with a JSON body of at most 8
+// KiB, an Origin equal to an allowed host, and — when the header is
+// present — Sec-Fetch-Site: same-origin. curl without an Origin is
+// refused: browsers always send one on POST.
+func (v *Viewer) guardStateChanging(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		SetSecurityHeaders(w)
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+			http.Error(w, "content type must be application/json", http.StatusUnsupportedMediaType)
+			return
+		}
+		if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" {
+			http.Error(w, "cross-site request refused", http.StatusForbidden)
+			return
+		}
+		if !v.sameOrigin(r.Header.Get("Origin"), r) {
+			http.Error(w, "foreign origin", http.StatusForbidden)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxPostBytes)
+		next(w, r)
+	}
 }
 
 // overviewStub is the Step 15 placeholder for GET /api/overview and the
@@ -222,7 +365,7 @@ func (v *Viewer) serveAsset(name, contentType string) func(http.ResponseWriter, 
 		panic(fmt.Sprintf("viewer: embedded asset %s missing: %v", name, err))
 	}
 	return func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Security-Policy", csp)
+		SetSecurityHeaders(w)
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write(raw)
@@ -234,7 +377,7 @@ func (v *Viewer) handleIndex(w http.ResponseWriter, _ *http.Request) {
 	if err != nil {
 		panic(fmt.Sprintf("viewer: embedded asset web/index.html missing: %v", err))
 	}
-	w.Header().Set("Content-Security-Policy", csp)
+	SetSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(raw)
@@ -294,7 +437,7 @@ func parseLastEventID(s string) (int64, bool) {
 // client upserts by briefing_id. Over the subscriber cap the handler
 // answers 503, never queuing behind the ingest path.
 func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Security-Policy", csp)
+	SetSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -361,7 +504,7 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	sub, unsub, ok := v.hub.TrySubscribe(32, v.MaxSubscribers)
 	if !ok {
-		http.Error(w, "too many stream subscribers", http.StatusServiceUnavailable)
+		writeViewerError(w, "too many stream subscribers", http.StatusServiceUnavailable)
 		return
 	}
 	defer unsub()
@@ -533,7 +676,7 @@ func groupWireOf(groups []store.GroupSnapshot) []groupWire {
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Security-Policy", csp)
+	SetSecurityHeaders(w)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(v)
@@ -548,19 +691,19 @@ func (v *Viewer) handleBriefings(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	after, err := parseCursor(q.Get("after"))
 	if err != nil {
-		http.Error(w, "invalid after", http.StatusBadRequest)
+		writeViewerError(w, "invalid after", http.StatusBadRequest)
 		return
 	}
 	before, err := parseCursor(q.Get("before"))
 	if err != nil {
-		http.Error(w, "invalid before", http.StatusBadRequest)
+		writeViewerError(w, "invalid before", http.StatusBadRequest)
 		return
 	}
 	limit := 50
 	if s := q.Get("limit"); s != "" {
 		n, err := strconv.Atoi(s)
 		if err != nil || n <= 0 || n > 500 {
-			http.Error(w, "invalid limit", http.StatusBadRequest)
+			writeViewerError(w, "invalid limit", http.StatusBadRequest)
 			return
 		}
 		limit = n
@@ -594,7 +737,7 @@ func parseCursor(s string) (int64, error) {
 func (v *Viewer) handleBriefing(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
+		writeViewerError(w, "missing id", http.StatusBadRequest)
 		return
 	}
 	b, err := v.store.BriefingForGroup(r.Context(), id)
@@ -646,5 +789,5 @@ func writeError(w http.ResponseWriter, err error) {
 	// Store errors carry IDs and constraints, never raw values; still,
 	// only the kind crosses into HTTP responses.
 	log.Printf("viewer: %s", store.SanitizeErrorText(err.Error()))
-	http.Error(w, "lookup failed", http.StatusInternalServerError)
+	writeViewerError(w, "lookup failed", http.StatusInternalServerError)
 }
