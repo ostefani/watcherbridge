@@ -252,7 +252,7 @@ func (v *Viewer) allowedHost(host string) bool {
 
 func (v *Viewer) requireLocalHost(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !v.allowedHost(r.Host) {
+		if !v.AllowedHost(r.Host) {
 			writeViewerError(w, "foreign host", http.StatusForbidden)
 			return
 		}
@@ -262,6 +262,12 @@ func (v *Viewer) requireLocalHost(next http.HandlerFunc) http.HandlerFunc {
 		next(w, r)
 	}
 }
+
+// AllowedHost reports whether a Host value may use viewer routes.
+// Exported so the server enforces the policy before outer-mux
+// canonicalization (which otherwise redirects before routing ever
+// reaches the mount); the mount re-checks it after routing.
+func (v *Viewer) AllowedHost(host string) bool { return v.allowedHost(host) }
 
 // sameOrigin enforces a valid serialized HTTP(S) origin exactly matching
 // the request: scheme follows the connection (https only with TLS),

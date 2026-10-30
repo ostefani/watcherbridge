@@ -1132,6 +1132,18 @@ func TestMuxResponsesCarryHeaders(t *testing.T) {
 	} else {
 		headed(rec)
 	}
+	// The redirect happens before routing, so the Host policy must apply
+	// first: a foreign Host gets no redirect.
+	if rec := serve("GET", "/api//groups", "evil.example:8081"); rec.Code != 403 {
+		t.Fatalf("foreign host on redirect = %d, want 403", rec.Code)
+	}
+	// Webhook dispatch covers every method: never the viewer gate.
+	if rec := serve("PUT", "/webhook", "127.0.0.1:8081"); rec.Code != 405 {
+		t.Fatalf("PUT /webhook = %d, want 405", rec.Code)
+	}
+	if rec := serve("PUT", "/webhook", "evil.example:8081"); rec.Code != 405 {
+		t.Fatalf("foreign PUT /webhook = %d, want 405", rec.Code)
+	}
 	// Unknown GET paths fall through to the viewer subtree's SPA shell
 	// ("GET /" is a subtree wildcard), headed like any viewer response.
 	if rec := serve("GET", "/nope", "127.0.0.1:8081"); rec.Code != 200 {

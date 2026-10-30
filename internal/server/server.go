@@ -124,18 +124,29 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 	mux.HandleFunc("GET /webhook", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	})
+	// Every other method on the webhook path stays in webhook dispatch
+	// (405), never falling through to the viewer mount.
+	mux.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	})
 	// The viewer subtree carries its own Host gate (applied before its
 	// mux-generated 405s and redirects); exact webhook patterns win over
 	// the "/" mount, so /webhook keeps its HMAC behavior.
 	mux.Handle("/", s.viewer.Handler())
-	// Headers cover even responses the outer mux generates itself
-	// (clean-path redirects, unknown paths). No Host gate here: that
-	// stays inside the viewer mount.
 	root := mux
 	s.http = &http.Server{
 		Addr: cfg.Bind,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			viewer.SetSecurityHeaders(w)
+			// Host policy applies before outer-mux canonicalization, so
+			// a foreign Host cannot pull a redirect out of the router.
+			// The webhook path is exempt and keeps HMAC dispatch for
+			// every method. Headers are already set above, also for the
+			// 403 itself.
+			if r.URL.Path != "/webhook" && !s.viewer.AllowedHost(r.Host) {
+				http.Error(w, "foreign host", http.StatusForbidden)
+				return
+			}
 			root.ServeHTTP(w, r)
 		}),
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
