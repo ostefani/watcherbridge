@@ -661,6 +661,21 @@ func TestLaggedSubscriberGetsResync(t *testing.T) {
 	<-done
 }
 
+// A closed viewer replays nothing and returns: the connect sequence and
+// replay reads inherit a context cancelled by Close, and the emit loop
+// checks it between records, so shutdown never waits out a long replay.
+func TestReplayObservesClose(t *testing.T) {
+	s := openViewerStore(t)
+	seedBriefing(t, s, "host:rc1", "evt-rc1")
+	seedBriefing(t, s, "host:rc2", "evt-rc2")
+	v := New(s, NewHub())
+	v.Close()
+	body := streamCase(t, v, map[string]string{"Last-Event-ID": "0"}, "event: overview")
+	if strings.Contains(body, "event: briefing") {
+		t.Fatalf("closed viewer must not replay, body:\n%s", body)
+	}
+}
+
 func TestOverviewStubShape(t *testing.T) {
 	s := openViewerStore(t)
 	v := New(s, NewHub())

@@ -136,6 +136,108 @@
     if (state.selected === b.briefing_id) selectBriefing(b.briefing_id);
   }
 
+  var src = null;
+  var streamGen = 0;
+  var lastEventId = "";
+  // pendingGap is a resync gap being paged in: {cursor, boundary, liveMax,
+  // running, timer}. Live events upsert data but never move lastEventId
+  // past the unrecovered range; the loop owns the cursor until the
+  // boundary (the resync max_seq) is reached.
+  var pendingGap = null;
+
+  // runGapFill pages ?after= toward the resync boundary, a calm page at a
+  // time. Failures keep the gap pending and retry with backoff; a newer
+  // resync or a reset replaces it, and reconnect resumes it via onopen.
+  function runGapFill() {
+    if (!pendingGap || pendingGap.running) return;
+    var myGen = streamGen;
+    var gap = pendingGap;
+    gap.running = true;
+    fetch("/api/briefings?after=" + encodeURIComponent(gap.cursor) + "&limit=50")
+      .then(function (r) { if (!r.ok) throw new Error("briefings " + r.status); return r.json(); })
+      .then(function (rows) {
+        if (!pendingGap || myGen !== streamGen) return;
+        rows = rows || [];
+        rows.forEach(upsertBriefing);
+        renderBriefs();
+        if (rows.length) gap.cursor = String(rows[rows.length - 1].seq);
+        gap.running = false;
+        if (rows.length < 50 || Number(gap.cursor) >= gap.boundary) {
+          lastEventId = String(Math.max(Number(gap.cursor), gap.liveMax || 0));
+          pendingGap = null;
+        } else {
+          gap.timer = setTimeout(runGapFill, 100);
+        }
+      })
+      .catch(function () {
+        if (!pendingGap || myGen !== streamGen) return;
+        gap.running = false;
+        gap.timer = setTimeout(runGapFill, 3000);
+      });
+  }
+
+  // doReset handles an invalid cursor (a restored database ends below it,
+  // or more was missed than the client holds): replace state with the
+  // latest page, reset the cursor to the resync maximum, and reopen the
+  // stream so the browser's own reconnect cursor cannot stay stale.
+  function doReset(maxSeq) {
+    if (pendingGap && pendingGap.timer) clearTimeout(pendingGap.timer);
+    pendingGap = null;
+    fetch("/api/briefings?limit=50")
+      .then(function (r) { if (!r.ok) throw new Error("briefings " + r.status); return r.json(); })
+      .then(function (rows) {
+        state.briefings = [];
+        (rows || []).forEach(upsertBriefing);
+        renderBriefs();
+        lastEventId = String(maxSeq);
+        connect();
+      })
+      .catch(function () { /* the next resync or reconnect retries the reset */ });
+  }
+
+  function onResync(ev) {
+    var max = NaN;
+    try { max = Number(JSON.parse(ev.data).max_seq); } catch (e) { /* keep NaN */ }
+    if (isNaN(max)) max = 0;
+    var cur = Number(lastEventId) || 0;
+    if (!lastEventId || max <= cur || max - cur > 500) {
+      doReset(max);
+      return;
+    }
+    pendingGap = {cursor: lastEventId, boundary: max, liveMax: 0, running: false, timer: 0};
+    runGapFill();
+  }
+
+  function connect() {
+    if (src) { try { src.close(); } catch (e) {} }
+    streamGen++;
+    src = new EventSource("/events");
+    src.onopen = function () {
+      connEl.textContent = "live"; connEl.className = "conn live";
+      if (pendingGap) runGapFill();
+    };
+    src.onerror = function () { connEl.textContent = "reconnecting"; connEl.className = "conn"; };
+    src.addEventListener("briefing", function (ev) {
+      try {
+        upsertBriefing(JSON.parse(ev.data));
+        var seq = ev.lastEventId ? Number(ev.lastEventId) : NaN;
+        if (pendingGap) {
+          if (!isNaN(seq)) pendingGap.liveMax = Math.max(pendingGap.liveMax || 0, seq);
+        } else if (ev.lastEventId) {
+          lastEventId = ev.lastEventId;
+        }
+      } catch (e) { /* keep old state */ }
+    });
+    src.addEventListener("overview", function () { /* Step 20 renders this; the stub carries no state */ });
+    src.addEventListener("resync", onResync);
+    src.addEventListener("group", function (ev) {
+      try {
+        state.groups = JSON.parse(ev.data) || [];
+        renderGroups();
+      } catch (e) { /* keep old state */ }
+    });
+  }
+
   function boot() {
     ["filter-priority", "filter-host", "filter-text"].forEach(function (id) {
       document.getElementById(id).addEventListener("input", renderBriefs);
@@ -145,35 +247,7 @@
       state.briefings = rows || [];
       renderBriefs();
     }).catch(function () { /* SSE will fill in */ });
-    var src = new EventSource("/events");
-    var lastEventId = "";
-    src.onopen = function () { connEl.textContent = "live"; connEl.className = "conn live"; };
-    src.onerror = function () { connEl.textContent = "reconnecting"; connEl.className = "conn"; };
-    src.addEventListener("briefing", function (ev) {
-      try {
-        upsertBriefing(JSON.parse(ev.data));
-        if (ev.lastEventId) lastEventId = ev.lastEventId;
-      } catch (e) { /* keep old state */ }
-    });
-    src.addEventListener("overview", function () { /* Step 20 renders this; the stub carries no state */ });
-    src.addEventListener("resync", function () {
-      // The server skipped history (slow subscriber, over-cap replay, or
-      // reset database). Refetch everything newer than the last id seen;
-      // the upsert makes overlap with live events harmless.
-      var url = lastEventId ? "/api/briefings?after=" + encodeURIComponent(lastEventId) : "/api/briefings?limit=50";
-      fetch(url).then(function (r) { return r.json(); }).then(function (rows) {
-        (rows || []).forEach(upsertBriefing);
-        if (rows && rows.length && rows[rows.length - 1].seq) {
-          lastEventId = String(rows[rows.length - 1].seq);
-        }
-      }).catch(function () { /* next resync or reconnect retries */ });
-    });
-    src.addEventListener("group", function (ev) {
-      try {
-        state.groups = JSON.parse(ev.data) || [];
-        renderGroups();
-      } catch (e) { /* keep old state */ }
-    });
+    connect();
   }
 
   if (document.readyState === "loading") {

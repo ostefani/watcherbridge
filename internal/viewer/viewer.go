@@ -7,6 +7,7 @@
 package viewer
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -298,6 +299,22 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+	// streamCtx cancels the request context when the viewer closes, so the
+	// connect sequence and replay reads never outlive shutdown: a slow
+	// peer with per-write progress could otherwise stretch them past the
+	// drain. The watcher goroutine exits at stream end either way.
+	streamCtx, stopStream := func() (context.Context, context.CancelFunc) {
+		ctx, stop := context.WithCancel(r.Context())
+		go func() {
+			select {
+			case <-v.done:
+				stop()
+			case <-ctx.Done():
+			}
+		}()
+		return ctx, stop
+	}()
+	defer stopStream()
 	rc := http.NewResponseController(w)
 	wto := v.WriteTimeout
 	if wto <= 0 {
@@ -331,7 +348,7 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	defer unsub()
 
-	if groups, err := v.store.OpenGroupSnapshots(r.Context()); err == nil {
+	if groups, err := v.store.OpenGroupSnapshots(streamCtx); err == nil {
 		if !write(Event{Name: "group", Data: mustJSON(groupWireOf(groups))}) {
 			return
 		}
@@ -341,7 +358,7 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if !write(Event{Name: "overview", Data: mustJSON(stubOverview())}) {
 		return
 	}
-	if !v.replay(w, r, replayMax, write) {
+	if !v.replay(streamCtx, w, r, replayMax, write) {
 		return
 	}
 
@@ -379,12 +396,12 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 // rows): no count/fetch race can slip an over-cap replay past the check.
 // A store failure resyncs instead of streaming on silently — the client
 // must refetch, never advance its cursor past missed history.
-func (v *Viewer) replay(w http.ResponseWriter, r *http.Request, replayMax int, write func(Event) bool) bool {
+func (v *Viewer) replay(ctx context.Context, w http.ResponseWriter, r *http.Request, replayMax int, write func(Event) bool) bool {
 	last, ok := parseLastEventID(r.Header.Get("Last-Event-ID"))
 	if !ok {
 		return true
 	}
-	maxSeq, err := v.store.MaxSeq(r.Context())
+	maxSeq, err := v.store.MaxSeq(ctx)
 	if err != nil {
 		log.Printf("viewer: replay max seq: %s", store.SanitizeErrorText(err.Error()))
 		return v.emitResync(w, r, write)
@@ -392,7 +409,7 @@ func (v *Viewer) replay(w http.ResponseWriter, r *http.Request, replayMax int, w
 	if last > maxSeq {
 		return v.emitResync(w, r, write)
 	}
-	rows, err := v.store.ReplayAfter(r.Context(), last, replayMax+1)
+	rows, err := v.store.ReplayAfter(ctx, last, replayMax+1)
 	if err != nil {
 		log.Printf("viewer: replay fetch: %s", store.SanitizeErrorText(err.Error()))
 		return v.emitResync(w, r, write)
@@ -401,6 +418,14 @@ func (v *Viewer) replay(w http.ResponseWriter, r *http.Request, replayMax int, w
 		return v.emitResync(w, r, write)
 	}
 	for _, b := range rows {
+		// Shutdown is observed between records: each write gets a fresh
+		// deadline, so without this a merely slow peer could stretch
+		// replay past the whole shutdown grace.
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
 		if !write(Event{Name: "briefing", ID: strconv.FormatInt(b.Seq, 10), Data: mustJSON(viewOf(b))}) {
 			return false
 		}
