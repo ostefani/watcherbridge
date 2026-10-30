@@ -45,7 +45,9 @@ type Deps struct {
 
 // notifyBriefing fans a stored briefing out to the observer. Event IDs
 // come from the taken events (the insert already proved them equal to
-// the derived set), sorted to match the stored order.
+// the derived set), sorted to match the stored order. The writer assigns
+// seq inside the insert transaction, so the stored row is re-read for the
+// cursor the SSE id: field carries; on a read error the fanout still runs.
 func notifyBriefing(d Deps, taken store.TakenGroup, b store.Briefing) {
 	if d.OnBriefing == nil {
 		return
@@ -56,6 +58,11 @@ func notifyBriefing(d Deps, taken store.TakenGroup, b store.Briefing) {
 	}
 	sort.Strings(ids)
 	b.EventIDs = ids
+	if stored, err := d.Store.BriefingForGroup(context.Background(), taken.GroupID); err == nil {
+		b.Seq = stored.Seq
+	} else {
+		log.Printf("briefing: group %s reread for seq: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
+	}
 	d.OnBriefing(b)
 }
 

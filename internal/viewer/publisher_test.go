@@ -217,7 +217,7 @@ func TestFanoutToPublisherAndHub(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		select {
-		case ev := <-ch:
+		case ev := <-ch.C:
 			got.Store(ev)
 		case <-time.After(3 * time.Second):
 		}

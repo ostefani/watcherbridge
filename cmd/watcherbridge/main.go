@@ -86,6 +86,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("server: %v", err)
 	}
+	srv.RegisterOnShutdown(srv.Viewer().Close)
 	hub := srv.Viewer().Hub()
 
 	var prov provider.Provider

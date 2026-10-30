@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 7
+const supportedSchemaVersion = 8
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -107,6 +107,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 6, migrateV6)
 		case 6:
 			err = applyMigration(db, 7, migrateV7)
+		case 7:
+			err = applyMigration(db, 8, migrateV8)
 		}
 		if err != nil {
 			return err
@@ -257,4 +259,51 @@ func migrateV6(tx *sql.Tx) error {
 func migrateV7(tx *sql.Tx) error {
 	_, err := tx.Exec(`ALTER TABLE active_groups ADD COLUMN transient_refunds INTEGER NOT NULL DEFAULT 0`)
 	return err
+}
+
+// migrateV8: briefings gain seq, the resumable-stream cursor (Designv8
+// §2.2). Assigned by the writer as COALESCE(MAX(seq),0)+1 inside the
+// briefing-insert transaction, so the single writer makes it race-free.
+// Backfill orders by (created_at, rowid): rowid breaks created_at ties
+// deterministically. Purge leaves gaps; replay by seq > last is
+// unaffected. A rebuild (not ADD COLUMN) enforces NOT NULL at the
+// schema level — ADD COLUMN cannot add the constraint afterwards, and a
+// UNIQUE index alone still admits multiple NULLs.
+func migrateV8(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE briefings_v8 (
+			briefing_id TEXT PRIMARY KEY,
+			group_id TEXT NOT NULL REFERENCES active_groups(group_id),
+			host_anchor_key TEXT NOT NULL,
+			baseline TEXT NOT NULL CHECK(baseline IN ('low','medium','high','critical')),
+			model_suggestion TEXT CHECK(model_suggestion IS NULL OR model_suggestion IN ('low','medium','high','critical')),
+			priority TEXT NOT NULL CHECK(priority IN ('low','medium','high','critical')),
+			priority_reason TEXT NOT NULL,
+			baseline_rule TEXT,
+			clamped INTEGER NOT NULL DEFAULT 0,
+			fallback_used INTEGER NOT NULL DEFAULT 0,
+			what_changed TEXT NOT NULL,
+			context TEXT NOT NULL,
+			recommended_check TEXT NOT NULL,
+			model_raw_json TEXT,
+			created_at INTEGER NOT NULL,
+			event_ids_json TEXT NOT NULL DEFAULT '[]',
+			seq INTEGER NOT NULL
+		)`,
+		`INSERT INTO briefings_v8 (briefing_id, group_id, host_anchor_key, baseline, model_suggestion, priority, priority_reason, baseline_rule, clamped, fallback_used, what_changed, context, recommended_check, model_raw_json, created_at, event_ids_json, seq)
+			SELECT briefing_id, group_id, host_anchor_key, baseline, model_suggestion, priority, priority_reason, baseline_rule, clamped, fallback_used, what_changed, context, recommended_check, model_raw_json, created_at, event_ids_json,
+				(SELECT COUNT(*) FROM briefings b2 WHERE (b2.created_at, b2.rowid) <= (briefings.created_at, briefings.rowid))
+			FROM briefings`,
+		`DROP TABLE briefings`,
+		`ALTER TABLE briefings_v8 RENAME TO briefings`,
+		`CREATE UNIQUE INDEX one_briefing_per_group ON briefings(group_id)`,
+		`CREATE INDEX IF NOT EXISTS briefings_created ON briefings(created_at)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS briefings_seq ON briefings(seq)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }

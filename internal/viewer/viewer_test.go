@@ -77,7 +77,7 @@ func TestHubBroadcastAndSlowSkip(t *testing.T) {
 	n := 0
 	for {
 		select {
-		case ev := <-fast:
+		case ev := <-fast.C:
 			if ev.Name != "briefing" {
 				t.Fatalf("event name = %q", ev.Name)
 			}
@@ -93,7 +93,12 @@ drained:
 	if d := h.Dropped(); d == 0 {
 		t.Fatal("slow subscriber must be skipped, never waited on")
 	}
-	_ = slow
+	if !slow.Lagged() {
+		t.Fatal("skipped subscriber must be flagged lagged for resync")
+	}
+	if !slow.ConsumeLagged() || slow.Lagged() {
+		t.Fatal("ConsumeLagged must return and clear the flag")
+	}
 	unsubSlow()
 	if got := h.SubscriberCount(); got != 1 {
 		t.Fatalf("unsubscribe leaking: %d", got)
@@ -161,7 +166,10 @@ func TestSSEOnlyEmitsBridgeNames(t *testing.T) {
 		t.Fatalf("no group snapshot on connect: %q", body)
 	}
 	for _, line := range strings.Split(body, "\n") {
-		if strings.HasPrefix(line, "event: ") && line != "event: group" && line != "event: briefing" {
+		// The bridge stream carries briefing, group, overview and resync;
+		// annotation belongs to ScanRelay's stream and must never appear.
+		if strings.HasPrefix(line, "event: ") && line != "event: group" && line != "event: briefing" &&
+			line != "event: overview" && line != "event: resync" {
 			t.Fatalf("foreign event name on bridge stream: %q", line)
 		}
 	}
@@ -221,6 +229,54 @@ func TestBriefingEndpointsShapeAndHeaders(t *testing.T) {
 	_ = groups
 }
 
+func TestBriefingsCursorPaging(t *testing.T) {
+	s := openViewerStore(t)
+	seedBriefing(t, s, "host:pg1", "evt-pg1")
+	seedBriefing(t, s, "host:pg2", "evt-pg2")
+	v := New(s, NewHub())
+	serve := func(path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		v.handleBriefings(rec, httptest.NewRequest("GET", path, nil))
+		return rec
+	}
+	decode := func(rec *httptest.ResponseRecorder) []map[string]any {
+		t.Helper()
+		var rows []map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+			t.Fatalf("briefings = %q, err %v", rec.Body.String(), err)
+		}
+		return rows
+	}
+	// Default: latest page, ascending seq.
+	rows := decode(serve("/api/briefings"))
+	if len(rows) != 2 || rows[0]["seq"] != 1.0 || rows[1]["seq"] != 2.0 {
+		t.Fatalf("default page = %v", rows)
+	}
+	// Gap-fill newer than seq 1.
+	rows = decode(serve("/api/briefings?after=1"))
+	if len(rows) != 1 || rows[0]["seq"] != 2.0 {
+		t.Fatalf("after=1 = %v", rows)
+	}
+	// Older history before seq 2.
+	rows = decode(serve("/api/briefings?before=2&limit=10"))
+	if len(rows) != 1 || rows[0]["seq"] != 1.0 {
+		t.Fatalf("before=2 = %v", rows)
+	}
+	// Garbage, negative and out-of-range params are 400, never silent.
+	for _, path := range []string{
+		"/api/briefings?after=12abc",
+		"/api/briefings?after=-1",
+		"/api/briefings?before=1.5",
+		"/api/briefings?limit=12abc",
+		"/api/briefings?limit=0",
+		"/api/briefings?limit=501",
+	} {
+		if rec := serve(path); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s = %d, want 400", path, rec.Code)
+		}
+	}
+}
+
 func TestStaticAssetsHeaders(t *testing.T) {
 	v := New(openViewerStore(t), NewHub())
 	for path, ct := range map[string]string{
@@ -277,7 +333,7 @@ func TestFanoutNamesAndShapes(t *testing.T) {
 	got := map[string]json.RawMessage{}
 	for i := 0; i < 2; i++ {
 		select {
-		case ev := <-ch:
+		case ev := <-ch.C:
 			got[ev.Name] = ev.Data
 		case <-time.After(2 * time.Second):
 			t.Fatal("fanout did not deliver")
@@ -327,5 +383,255 @@ func TestHostileStringsSurviveAsInertText(t *testing.T) {
 	}
 	if groups[0]["anchor"] != "host:"+evil {
 		t.Fatalf("anchor mangled: %v", groups[0]["anchor"])
+	}
+}
+
+func TestParseLastEventID(t *testing.T) {
+	for _, tc := range []struct {
+		in    string
+		want  int64
+		valid bool
+	}{
+		{"", 0, false},
+		{"abc", 0, false},
+		{"12abc", 0, false},
+		{"-1", 0, false},
+		{"1.5", 0, false},
+		{"0", 0, true},
+		{"42", 42, true},
+		{"4611686018427387904", 1 << 62, true}, // exactly 2^62: valid
+		{"4611686018427387905", 0, false},      // 2^62+1: no replay
+		{"18446744073709551615", 0, false},     // max uint64: no replay
+	} {
+		got, ok := parseLastEventID(tc.in)
+		if ok != tc.valid || (ok && got != tc.want) {
+			t.Fatalf("parseLastEventID(%q) = %d, %v; want %d, %v", tc.in, got, ok, tc.want, tc.valid)
+		}
+	}
+}
+
+// streamCase runs handleEvents until body contains want (or timeout), then
+// cancels and returns the full body. The recorder is mutex-guarded: the
+// handler writes while the test polls.
+func streamCase(t *testing.T, v *Viewer, headers map[string]string, want string) string {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest("GET", "/events", nil)
+	for k, val := range headers {
+		req.Header.Set(k, val)
+	}
+	req = req.WithContext(ctx)
+	rec := &syncRecorder{rec: httptest.NewRecorder()}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.handleEvents(rec, req)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if strings.Contains(rec.body(), want) {
+			cancel()
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("stream never contained %q; body:\n%s", want, rec.body())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	<-done
+	return rec.body()
+}
+
+func TestHandleEventsReplay(t *testing.T) {
+	s := openViewerStore(t)
+	seedBriefing(t, s, "host:re1", "evt-re1")
+	seedBriefing(t, s, "host:re2", "evt-re2")
+	v := New(s, NewHub())
+
+	// Valid id replays newer briefings with id: lines, ascending.
+	body := streamCase(t, v, map[string]string{"Last-Event-ID": "1"}, "id: 2")
+	if strings.Count(body, "event: briefing") != 1 {
+		t.Fatalf("want exactly the seq-2 replay, body:\n%s", body)
+	}
+	if !strings.Contains(body, "event: group") || !strings.Contains(body, "event: overview") {
+		t.Fatalf("connect must send snapshot and overview first, body:\n%s", body)
+	}
+
+	// Garbage replays nothing: snapshot and overview only, no id: lines.
+	body = streamCase(t, v, map[string]string{"Last-Event-ID": "12abc"}, "event: overview")
+	if strings.Contains(body, "id: ") || strings.Contains(body, "event: briefing") {
+		t.Fatalf("garbage Last-Event-ID must replay nothing, body:\n%s", body)
+	}
+
+	// Future id (restored database) resyncs with the current maximum.
+	body = streamCase(t, v, map[string]string{"Last-Event-ID": "9999"}, "event: resync")
+	if strings.Contains(body, "event: briefing") {
+		t.Fatalf("future Last-Event-ID must not replay, body:\n%s", body)
+	}
+	if !strings.Contains(body, `"max_seq":2`) {
+		t.Fatalf("resync must carry max_seq 2, body:\n%s", body)
+	}
+
+	// Over the replay cap: resync, never a partial replay.
+	v.ReplayMax = 1
+	body = streamCase(t, v, map[string]string{"Last-Event-ID": "0"}, "event: resync")
+	if strings.Contains(body, "event: briefing") {
+		t.Fatalf("over-cap replay must send resync only, body:\n%s", body)
+	}
+}
+
+// deadlineRecorder proves handleEvents clears WRITE_TIMEOUT for the stream:
+// the controller's SetWriteDeadline must be called once with the zero time.
+type deadlineRecorder struct {
+	*syncRecorder
+	mu        sync.Mutex
+	deadlines []time.Time
+}
+
+func (d *deadlineRecorder) SetWriteDeadline(t time.Time) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.deadlines = append(d.deadlines, t)
+	return nil
+}
+
+func TestHandleEventsClearsWriteDeadline(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest("GET", "/events", nil).WithContext(ctx)
+	rec := &deadlineRecorder{syncRecorder: &syncRecorder{rec: httptest.NewRecorder()}}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.handleEvents(rec, req)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		rec.mu.Lock()
+		n := len(rec.deadlines)
+		rec.mu.Unlock()
+		if n > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.deadlines) != 1 || !rec.deadlines[0].IsZero() {
+		t.Fatalf("SetWriteDeadline calls = %v, want exactly one zero time", rec.deadlines)
+	}
+}
+
+func TestHandleEventsHeartbeat(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	v.Heartbeat = 10 * time.Millisecond
+	body := streamCase(t, v, nil, ": ping")
+	if strings.Count(body, ": ping") < 1 {
+		t.Fatalf("no heartbeat comments, body:\n%s", body)
+	}
+}
+
+func TestViewerCloseUnblocksStream(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest("GET", "/events", nil).WithContext(ctx)
+	rec := &syncRecorder{rec: httptest.NewRecorder()}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.handleEvents(rec, req)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if strings.Contains(rec.body(), "event: overview") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stream never sent the connect sequence")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	v.Close()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not unblock the stream handler")
+	}
+	v.Close() // idempotent: shutdown paths may race
+}
+
+func TestLaggedSubscriberGetsResync(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest("GET", "/events", nil).WithContext(ctx)
+	rec := &syncRecorder{rec: httptest.NewRecorder()}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.handleEvents(rec, req)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if strings.Contains(rec.body(), "event: overview") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stream never sent the connect sequence")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// White-box: flag the handler's subscription lagged, then deliver one
+	// live event. The loop must answer resync, never a partial replay.
+	v.hub.mu.Lock()
+	for sub := range v.hub.subs {
+		sub.lagged.Store(true)
+	}
+	v.hub.mu.Unlock()
+	v.hub.Broadcast("group", map[string]string{"note": "live"})
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		if strings.Contains(rec.body(), "event: resync") {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("lagged subscriber got no resync, body:\n%s", rec.body())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+}
+
+func TestOverviewStubShape(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	rec := httptest.NewRecorder()
+	v.handleOverview(rec, httptest.NewRequest("GET", "/api/overview", nil))
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("overview = %q", rec.Body.String())
+	}
+	for _, key := range []string{"verdict", "headline", "receipts", "coverage", "liveness", "attention", "digest"} {
+		if _, ok := body[key]; !ok {
+			t.Fatalf("overview stub missing frozen key %q: %v", key, body)
+		}
+	}
+	if body["verdict"] == "quiet" || body["verdict"] == "review" || body["verdict"] == "act" {
+		t.Fatalf("stub must never claim a computed verdict: %v", body["verdict"])
+	}
+	if rec.Header().Get("Content-Security-Policy") != "default-src 'self'" {
+		t.Fatalf("overview CSP = %q", rec.Header().Get("Content-Security-Policy"))
 	}
 }

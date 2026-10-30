@@ -78,14 +78,17 @@ func TestViewerFeeds(t *testing.T) {
 	if err != nil || len(snaps) != 1 || snaps[0].Anchor != "host:c" {
 		t.Fatalf("after brief: %+v %v", snaps, err)
 	}
-	rows, err := s.RecentBriefings(context.Background(), 10)
+	rows, err := s.BriefingsPage(context.Background(), 0, 0, 10)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("recent = %+v %v", rows, err)
 	}
 	if rows[0].GroupID != g1 || len(rows[0].EventIDs) != 1 || rows[0].EventIDs[0] != "evt-a1" {
 		t.Fatalf("row = %+v", rows[0])
 	}
-	if got, _ := s.RecentBriefings(context.Background(), 0); len(got) != 1 {
+	if rows[0].Seq != 1 {
+		t.Fatalf("first briefing seq = %d, want 1", rows[0].Seq)
+	}
+	if got, _ := s.BriefingsPage(context.Background(), 0, 0, 0); len(got) != 1 {
 		t.Fatalf("zero limit must default, got %d", len(got))
 	}
 }
@@ -94,6 +97,8 @@ func TestViewerFeedQueriesUseIndexes(t *testing.T) {
 	s := openTestStore(t)
 	for _, q := range []string{
 		`EXPLAIN QUERY PLAN SELECT briefing_id FROM briefings ORDER BY created_at DESC LIMIT 10`,
+		`EXPLAIN QUERY PLAN SELECT briefing_id FROM briefings WHERE seq > 5 ORDER BY seq ASC LIMIT 10`,
+		`EXPLAIN QUERY PLAN SELECT briefing_id FROM briefings WHERE seq < 5 ORDER BY seq DESC LIMIT 10`,
 		`EXPLAIN QUERY PLAN SELECT ag.group_id FROM active_groups ag LEFT JOIN group_events ge ON ge.group_id = ag.group_id WHERE ag.status = 'open' GROUP BY ag.group_id ORDER BY ag.deadline_at`,
 	} {
 		rows, err := s.db.Query(q)
@@ -1302,6 +1307,158 @@ func TestMigrationV5ToV6KeepsByteCounter(t *testing.T) {
 	}
 	if total != int64(len(`{"host":"v5"}`)) {
 		t.Fatalf("backfill must sum stored payloads, got %d", total)
+	}
+}
+
+// briefGroup seeds one event group and stores its briefing with an
+// explicit creation time, returning the group ID.
+func briefGroup(t *testing.T, s *Store, anchor, eventID string, created time.Time) string {
+	t.Helper()
+	gid := seedFeedGroup(t, s, anchor, eventID)
+	if _, err := s.CloseDue(context.Background(), time.Now().UTC().Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := s.TakeGroup(context.Background(), gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertBriefing(context.Background(), Briefing{
+		BriefingID: "brf-" + taken.GroupID, GroupID: taken.GroupID, HostAnchorKey: anchor,
+		Baseline: "low", Priority: "low", PriorityReason: "r",
+		WhatChanged: "w", Context: "c", RecommendedCheck: "k", CreatedAt: created,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return gid
+}
+
+// Migration v8: the writer assigns seq 1, 2, 3 in insert order, and
+// MaxSeq tracks the maximum.
+func TestBriefingSeqAssignedInOrder(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC()
+	for i, a := range []string{"host:s1", "host:s2", "host:s3"} {
+		briefGroup(t, s, a, fmt.Sprintf("evt-s%d", i+1), now.Add(time.Duration(i)*time.Minute))
+	}
+	page, err := s.BriefingsPage(context.Background(), 0, 0, 10)
+	if err != nil || len(page) != 3 {
+		t.Fatalf("page = %+v %v", page, err)
+	}
+	for i, b := range page {
+		if b.Seq != int64(i+1) {
+			t.Fatalf("page[%d].Seq = %d, want %d", i, b.Seq, i+1)
+		}
+	}
+	if max, err := s.MaxSeq(context.Background()); err != nil || max != 3 {
+		t.Fatalf("max seq = %d, err %v", max, err)
+	}
+	got, err := s.BriefingForGroup(context.Background(), page[1].GroupID)
+	if err != nil || got.Seq != 2 {
+		t.Fatalf("single briefing seq = %+v %v", got, err)
+	}
+}
+
+// BriefingsPage: after selects newer rows ascending, before pages older
+// history ascending, the default is the latest page, and negative
+// cursors are errors.
+func TestBriefingsPageCursors(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC()
+	for i := 0; i < 5; i++ {
+		briefGroup(t, s, fmt.Sprintf("host:p%d", i), fmt.Sprintf("evt-p%d", i), now.Add(time.Duration(i)*time.Minute))
+	}
+	// Gap-fill newer than seq 2.
+	rows, err := s.BriefingsPage(context.Background(), 2, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 || rows[0].Seq != 3 || rows[2].Seq != 5 {
+		t.Fatalf("after=2 = %+v", rows)
+	}
+	// Older history before seq 5, capped at 2: the two latest below 5.
+	rows, err = s.BriefingsPage(context.Background(), 0, 5, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].Seq != 3 || rows[1].Seq != 4 {
+		t.Fatalf("before=5 limit 2 = %+v", rows)
+	}
+	// Bounded window: 2 < seq < 5.
+	rows, err = s.BriefingsPage(context.Background(), 2, 5, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].Seq != 3 || rows[1].Seq != 4 {
+		t.Fatalf("after=2 before=5 = %+v", rows)
+	}
+	// Default latest page.
+	rows, err = s.BriefingsPage(context.Background(), 0, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].Seq != 4 || rows[1].Seq != 5 {
+		t.Fatalf("latest page = %+v", rows)
+	}
+	for _, tc := range [][2]int64{{-1, 0}, {0, -1}} {
+		if _, err := s.BriefingsPage(context.Background(), tc[0], tc[1], 10); err == nil {
+			t.Fatalf("negative cursor %+v must fail", tc)
+		}
+	}
+}
+
+// Migration v8 rewind: dropping back to v7 (index first, then the
+// column) replays the backfill ordered by (created_at, rowid), not by
+// insert order. The second-inserted briefing has the earlier timestamp
+// and must take seq 1.
+func TestMigrateV8BackfillsByCreatedAt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v8.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	briefGroup(t, s, "host:late", "evt-late", now)
+	briefGroup(t, s, "host:early", "evt-early", now.Add(-time.Hour))
+	s.Close()
+
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`DROP INDEX briefings_seq`,
+		`ALTER TABLE briefings DROP COLUMN seq`,
+		`PRAGMA user_version = 7`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	db.Close()
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("migrate 7->8: %v", err)
+	}
+	defer s2.Close()
+	var version int
+	if err := s2.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != supportedSchemaVersion {
+		t.Fatalf("want user_version %d, got %d %v", supportedSchemaVersion, version, err)
+	}
+	rows, err := s2.BriefingsPage(context.Background(), 0, 0, 10)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("page = %+v %v", rows, err)
+	}
+	// Ascending: earlier timestamp first regardless of insert order.
+	if rows[0].Seq != 1 || rows[1].Seq != 2 {
+		t.Fatalf("seqs = %d, %d", rows[0].Seq, rows[1].Seq)
+	}
+	if rows[0].HostAnchorKey != "host:early" || rows[1].HostAnchorKey != "host:late" {
+		t.Fatalf("backfill order wrong: %+v", rows)
+	}
+	if !rows[0].CreatedAt.Before(rows[1].CreatedAt) {
+		t.Fatalf("backfill ignored created_at: %+v", rows)
 	}
 }
 

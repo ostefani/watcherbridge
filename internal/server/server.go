@@ -65,6 +65,15 @@ type Server struct {
 	sweepCtx    context.Context // created in New so Shutdown is safe before Start
 	sweepCancel context.CancelFunc
 	sweepDone   chan struct{}
+
+	onShutdown []func() // hooks run at shutdown start, before handlers drain
+}
+
+// RegisterOnShutdown registers f to run when Shutdown starts, before the
+// HTTP server drains handlers. The viewer registers Close so open SSE tabs
+// stop blocking shutdown.
+func (s *Server) RegisterOnShutdown(f func()) {
+	s.onShutdown = append(s.onShutdown, f)
 }
 
 // New builds a Server. It resolves the secret, validates the config, and
@@ -93,6 +102,8 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 		sweepCtx: sweepCtx, sweepCancel: sweepCancel, sweepDone: make(chan struct{}),
 	}
 	s.viewer = viewer.New(events, nil)
+	s.viewer.Heartbeat = cfg.SSEHeartbeat
+	s.viewer.ReplayMax = cfg.SSEReplayMax
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook", s.handleWebhook)
 	// GET needs an explicit route: the viewer's "GET /" catch-all would
@@ -142,6 +153,9 @@ func (s *Server) Start() error {
 // can still commit its receipt.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.sweepCancel()
+	for _, f := range s.onShutdown {
+		f()
+	}
 	err := s.http.Shutdown(ctx)
 	select {
 	case <-s.sweepDone:

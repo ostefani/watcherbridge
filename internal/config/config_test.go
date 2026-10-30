@@ -120,6 +120,8 @@ func TestValidateRejects(t *testing.T) {
 		"zero provider timeout":   func(c *Config) { c.ProviderTimeout = 0 },
 		"zero response cap":       func(c *Config) { c.MaxModelResponseBytes = 0 },
 		"lease below 2x provider": func(c *Config) { c.ProcessingLease = 2*c.ProviderTimeout + c.Margin },
+		"zero SSE heartbeat":      func(c *Config) { c.SSEHeartbeat = 0 },
+		"zero SSE replay cap":     func(c *Config) { c.SSEReplayMax = 0 },
 		"zero quiet window":       func(c *Config) { c.GroupQuietWindow = 0 },
 		"max window below quiet":  func(c *Config) { c.GroupMaxWindow = time.Second },
 		"group max below quiet":   func(c *Config) { c.GroupMaxWindow = c.GroupQuietWindow - time.Second },

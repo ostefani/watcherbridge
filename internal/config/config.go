@@ -117,6 +117,9 @@ type Config struct {
 	WriterQueueCap int // enforced by the writer queue depth; overflow is 503
 	RetryAfterSecs int
 
+	SSEHeartbeat time.Duration // SSE comment ping; also dead-peer detection
+	SSEReplayMax int           // replay cap per reconnect; over it is resync, never partial
+
 	SweepSafetyMargin time.Duration
 	SweepBatch        int
 	SweepWorkers      int // must be 1: a single worker keeps the sweep bounded
@@ -180,6 +183,9 @@ func Default() Config {
 		InFlightCap:    16,
 		WriterQueueCap: 64,
 		RetryAfterSecs: 2,
+
+		SSEHeartbeat: 15 * time.Second,
+		SSEReplayMax: 200,
 
 		SweepSafetyMargin: 30 * time.Second,
 		SweepBatch:        20,
@@ -466,6 +472,12 @@ func (c Config) Validate() error {
 	}
 	if c.RetryAfterSecs <= 0 {
 		return fmt.Errorf("retry-after seconds must be positive")
+	}
+	if c.SSEHeartbeat <= 0 {
+		return fmt.Errorf("SSE heartbeat must be positive")
+	}
+	if c.SSEReplayMax <= 0 {
+		return fmt.Errorf("SSE replay cap must be positive")
 	}
 	if c.SweepSafetyMargin <= 0 {
 		return fmt.Errorf("sweep safety margin must be positive")

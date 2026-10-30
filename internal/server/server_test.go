@@ -987,3 +987,49 @@ func FuzzParseAndValidate(f *testing.F) {
 		}
 	})
 }
+
+// RegisterOnShutdown hooks run when Shutdown starts, so open SSE tabs stop
+// blocking the drain. The server is built directly (no fake relay), so the
+// test needs no socket: Start either blocks in ListenAndServe or fails
+// fast on bind, and Shutdown must run the hooks and return either way.
+func TestRegisterOnShutdownRunsHooks(t *testing.T) {
+	cfg := config.Default()
+	cfg.Mode = config.ModeTap
+	cfg.Secret = "test-secret-long-enough-01234567"
+	st, err := store.Open(filepath.Join(t.TempDir(), "bridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	srv, err := New(cfg, st, forwarder.NewGate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	calls := 0
+	hook := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+	}
+	srv.RegisterOnShutdown(hook)
+	srv.RegisterOnShutdown(hook)
+	startDone := make(chan error, 1)
+	go func() { startDone <- srv.Start() }()
+	time.Sleep(200 * time.Millisecond) // Start blocks in ListenAndServe or fails fast
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	select {
+	case <-startDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after Shutdown")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("shutdown hooks ran %d/2", calls)
+	}
+}
