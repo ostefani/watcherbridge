@@ -321,12 +321,30 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 		wto = defaultSSEWriteTimeout
 	}
 	write := func(ev Event) bool {
+		// No new write starts after shutdown: at most the one in-flight
+		// write runs to its deadline. v.done is checked directly because
+		// Close() closes it synchronously, while the streamCtx
+		// cancellation propagates through a watcher goroutine.
+		select {
+		case <-v.done:
+			return false
+		case <-streamCtx.Done():
+			return false
+		default:
+		}
 		// Best-effort on recorders and middleware that don't implement
 		// deadlines; enforced on real connections.
 		_ = rc.SetWriteDeadline(time.Now().Add(wto))
 		return sseWrite(w, ev)
 	}
 	comment := func() bool {
+		select {
+		case <-v.done:
+			return false
+		case <-streamCtx.Done():
+			return false
+		default:
+		}
 		_ = rc.SetWriteDeadline(time.Now().Add(wto))
 		return sseComment(w)
 	}
@@ -366,15 +384,14 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 		if sub.ConsumeLagged() {
 			// A slow subscriber missed broadcasts; never a partial
 			// replay — the client refetches overview and the latest page.
-			if !v.emitResync(w, r, write) {
+			if !v.emitResync(streamCtx, w, write) {
 				return
 			}
 			continue
 		}
 		select {
-		case <-r.Context().Done():
-			return
-		case <-v.done:
+		case <-streamCtx.Done():
+			// Covers both client disconnect and viewer Close.
 			return
 		case <-hbTicker.C:
 			if !comment() {
@@ -404,24 +421,28 @@ func (v *Viewer) replay(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	maxSeq, err := v.store.MaxSeq(ctx)
 	if err != nil {
 		log.Printf("viewer: replay max seq: %s", store.SanitizeErrorText(err.Error()))
-		return v.emitResync(w, r, write)
+		return v.emitResync(ctx, w, write)
 	}
 	if last > maxSeq {
-		return v.emitResync(w, r, write)
+		return v.emitResync(ctx, w, write)
 	}
 	rows, err := v.store.ReplayAfter(ctx, last, replayMax+1)
 	if err != nil {
 		log.Printf("viewer: replay fetch: %s", store.SanitizeErrorText(err.Error()))
-		return v.emitResync(w, r, write)
+		return v.emitResync(ctx, w, write)
 	}
 	if len(rows) > replayMax {
-		return v.emitResync(w, r, write)
+		return v.emitResync(ctx, w, write)
 	}
 	for _, b := range rows {
 		// Shutdown is observed between records: each write gets a fresh
 		// deadline, so without this a merely slow peer could stretch
-		// replay past the whole shutdown grace.
+		// replay past the whole shutdown grace. v.done is checked
+		// directly — Close() closes it synchronously, while the ctx
+		// cancellation propagates through a watcher goroutine.
 		select {
+		case <-v.done:
+			return false
 		case <-ctx.Done():
 			return false
 		default:
@@ -442,8 +463,8 @@ type resyncBody struct {
 // emitResync sends `event: resync`. A store failure still resyncs (with
 // max_seq 0, so the client refetches the latest page); the live stream
 // continues afterwards.
-func (v *Viewer) emitResync(w http.ResponseWriter, r *http.Request, write func(Event) bool) bool {
-	maxSeq, err := v.store.MaxSeq(r.Context())
+func (v *Viewer) emitResync(ctx context.Context, w http.ResponseWriter, write func(Event) bool) bool {
+	maxSeq, err := v.store.MaxSeq(ctx)
 	if err != nil {
 		log.Printf("viewer: resync max seq: %s", store.SanitizeErrorText(err.Error()))
 	}

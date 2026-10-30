@@ -661,18 +661,94 @@ func TestLaggedSubscriberGetsResync(t *testing.T) {
 	<-done
 }
 
-// A closed viewer replays nothing and returns: the connect sequence and
-// replay reads inherit a context cancelled by Close, and the emit loop
-// checks it between records, so shutdown never waits out a long replay.
+// A closed viewer replays nothing and returns promptly: snapshot and
+// replay reads inherit a context cancelled by Close, and no new write
+// starts after it — the handler may end with zero bytes written.
 func TestReplayObservesClose(t *testing.T) {
 	s := openViewerStore(t)
 	seedBriefing(t, s, "host:rc1", "evt-rc1")
 	seedBriefing(t, s, "host:rc2", "evt-rc2")
 	v := New(s, NewHub())
 	v.Close()
-	body := streamCase(t, v, map[string]string{"Last-Event-ID": "0"}, "event: overview")
-	if strings.Contains(body, "event: briefing") {
-		t.Fatalf("closed viewer must not replay, body:\n%s", body)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req := httptest.NewRequest("GET", "/events", nil)
+	req.Header.Set("Last-Event-ID", "0")
+	req = req.WithContext(ctx)
+	rec := &syncRecorder{rec: httptest.NewRecorder()}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.handleEvents(rec, req)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("closed viewer did not end the stream")
+	}
+	if strings.Contains(rec.body(), "event: briefing") {
+		t.Fatalf("closed viewer must not replay, body:\n%s", rec.body())
+	}
+}
+
+// gateWriter blocks one numbered stream write until released, so the test
+// can close the viewer mid-replay: the handler must abort promptly
+// instead of emitting the remaining rows.
+type gateWriter struct {
+	*syncRecorder
+	mu      sync.Mutex
+	n       int
+	blockOn int
+	release chan struct{}
+	started chan struct{}
+}
+
+func (g *gateWriter) Write(b []byte) (int, error) {
+	g.mu.Lock()
+	g.n++
+	fire := g.n == g.blockOn
+	g.mu.Unlock()
+	if fire {
+		close(g.started)
+		<-g.release
+	}
+	return g.syncRecorder.Write(b)
+}
+
+func TestReplayAbortsOnMidReplayClose(t *testing.T) {
+	s := openViewerStore(t)
+	seedBriefing(t, s, "host:mc1", "evt-mc1")
+	seedBriefing(t, s, "host:mc2", "evt-mc2")
+	v := New(s, NewHub())
+	v.ReplayMax = 100
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest("GET", "/events", nil)
+	req.Header.Set("Last-Event-ID", "0")
+	req = req.WithContext(ctx)
+	rec := &gateWriter{syncRecorder: &syncRecorder{rec: httptest.NewRecorder()},
+		blockOn: 3, release: make(chan struct{}), started: make(chan struct{})}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.handleEvents(rec, req)
+	}()
+	select {
+	case <-rec.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("replay never reached the first row")
+	}
+	v.Close()
+	close(rec.release)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("mid-replay Close did not abort the handler")
+	}
+	// Writes 1-2 are the snapshot and overview; the blocked replay row
+	// was in flight. Nothing after it may be emitted once closed.
+	if n := strings.Count(rec.body(), "event: briefing"); n != 1 {
+		t.Fatalf("replay continued after Close: %d briefing events", n)
 	}
 }
 
