@@ -104,6 +104,8 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 	s.viewer = viewer.New(events, nil)
 	s.viewer.Heartbeat = cfg.SSEHeartbeat
 	s.viewer.ReplayMax = cfg.SSEReplayMax
+	s.viewer.WriteTimeout = cfg.SSEWriteTimeout
+	s.viewer.MaxSubscribers = cfg.SSEMaxSubscribers
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook", s.handleWebhook)
 	// GET needs an explicit route: the viewer's "GET /" catch-all would

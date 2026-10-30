@@ -146,10 +146,27 @@
       renderBriefs();
     }).catch(function () { /* SSE will fill in */ });
     var src = new EventSource("/events");
+    var lastEventId = "";
     src.onopen = function () { connEl.textContent = "live"; connEl.className = "conn live"; };
     src.onerror = function () { connEl.textContent = "reconnecting"; connEl.className = "conn"; };
     src.addEventListener("briefing", function (ev) {
-      try { upsertBriefing(JSON.parse(ev.data)); } catch (e) { /* keep old state */ }
+      try {
+        upsertBriefing(JSON.parse(ev.data));
+        if (ev.lastEventId) lastEventId = ev.lastEventId;
+      } catch (e) { /* keep old state */ }
+    });
+    src.addEventListener("overview", function () { /* Step 20 renders this; the stub carries no state */ });
+    src.addEventListener("resync", function () {
+      // The server skipped history (slow subscriber, over-cap replay, or
+      // reset database). Refetch everything newer than the last id seen;
+      // the upsert makes overlap with live events harmless.
+      var url = lastEventId ? "/api/briefings?after=" + encodeURIComponent(lastEventId) : "/api/briefings?limit=50";
+      fetch(url).then(function (r) { return r.json(); }).then(function (rows) {
+        (rows || []).forEach(upsertBriefing);
+        if (rows && rows.length && rows[rows.length - 1].seq) {
+          lastEventId = String(rows[rows.length - 1].seq);
+        }
+      }).catch(function () { /* next resync or reconnect retries */ });
     });
     src.addEventListener("group", function (ev) {
       try {

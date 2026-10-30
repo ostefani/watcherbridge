@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 8
+const supportedSchemaVersion = 9
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -109,6 +109,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 7, migrateV7)
 		case 7:
 			err = applyMigration(db, 8, migrateV8)
+		case 8:
+			err = applyMigration(db, 9, migrateV9)
 		}
 		if err != nil {
 			return err
@@ -292,13 +294,35 @@ func migrateV8(tx *sql.Tx) error {
 		)`,
 		`INSERT INTO briefings_v8 (briefing_id, group_id, host_anchor_key, baseline, model_suggestion, priority, priority_reason, baseline_rule, clamped, fallback_used, what_changed, context, recommended_check, model_raw_json, created_at, event_ids_json, seq)
 			SELECT briefing_id, group_id, host_anchor_key, baseline, model_suggestion, priority, priority_reason, baseline_rule, clamped, fallback_used, what_changed, context, recommended_check, model_raw_json, created_at, event_ids_json,
-				(SELECT COUNT(*) FROM briefings b2 WHERE (b2.created_at, b2.rowid) <= (briefings.created_at, briefings.rowid))
+				ROW_NUMBER() OVER (ORDER BY created_at, rowid)
 			FROM briefings`,
 		`DROP TABLE briefings`,
 		`ALTER TABLE briefings_v8 RENAME TO briefings`,
 		`CREATE UNIQUE INDEX one_briefing_per_group ON briefings(group_id)`,
 		`CREATE INDEX IF NOT EXISTS briefings_created ON briefings(created_at)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS briefings_seq ON briefings(seq)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV9: seq gets a durable high-water mark independent of retained
+// briefing rows. MAX(seq)+1 reuses ids after a purge deletes the maximum
+// (or everything), and a client holding an old cursor would then silently
+// skip new briefings on reconnect. seq_state survives purges; the insert
+// path bumps it in the same transaction (UPDATE ... RETURNING), so ids
+// stay monotonic across purges and restarts under the single writer.
+func migrateV9(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE seq_state (
+			id INTEGER PRIMARY KEY CHECK(id = 0),
+			next_seq INTEGER NOT NULL
+		)`,
+		`INSERT INTO seq_state (id, next_seq) SELECT 0, COALESCE(MAX(seq), 0) + 1 FROM briefings`,
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt); err != nil {

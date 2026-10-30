@@ -100,6 +100,17 @@ drained:
 		t.Fatal("ConsumeLagged must return and clear the flag")
 	}
 	unsubSlow()
+	// One slot taken (fast): max 2 admits one more, then refuses, and the
+	// check-and-insert holds the hub lock so the cap cannot be raced past.
+	extra, unsubExtra, ok := h.TrySubscribe(8, 2)
+	if !ok {
+		t.Fatal("one free slot must admit a subscriber")
+	}
+	_ = extra
+	if _, _, ok := h.TrySubscribe(8, 2); ok {
+		t.Fatal("a full hub must refuse, so the handler can answer 503")
+	}
+	unsubExtra()
 	if got := h.SubscriberCount(); got != 1 {
 		t.Fatalf("unsubscribe leaking: %d", got)
 	}
@@ -482,8 +493,8 @@ func TestHandleEventsReplay(t *testing.T) {
 	}
 }
 
-// deadlineRecorder proves handleEvents clears WRITE_TIMEOUT for the stream:
-// the controller's SetWriteDeadline must be called once with the zero time.
+// deadlineRecorder records every SetWriteDeadline the stream sets, so the
+// test proves each write carries a bound (a stalled peer fails fast).
 type deadlineRecorder struct {
 	*syncRecorder
 	mu        sync.Mutex
@@ -497,9 +508,11 @@ func (d *deadlineRecorder) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func TestHandleEventsClearsWriteDeadline(t *testing.T) {
+func TestHandleEventsBoundsEveryWrite(t *testing.T) {
 	s := openViewerStore(t)
 	v := New(s, NewHub())
+	v.WriteTimeout = 5 * time.Second
+	start := time.Now()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req := httptest.NewRequest("GET", "/events", nil).WithContext(ctx)
@@ -509,12 +522,13 @@ func TestHandleEventsClearsWriteDeadline(t *testing.T) {
 		defer close(done)
 		v.handleEvents(rec, req)
 	}()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := start.Add(3 * time.Second)
 	for {
 		rec.mu.Lock()
 		n := len(rec.deadlines)
 		rec.mu.Unlock()
-		if n > 0 || time.Now().After(deadline) {
+		// Connect sequence alone performs two writes (group, overview).
+		if n >= 2 || time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -523,8 +537,41 @@ func TestHandleEventsClearsWriteDeadline(t *testing.T) {
 	<-done
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	if len(rec.deadlines) != 1 || !rec.deadlines[0].IsZero() {
-		t.Fatalf("SetWriteDeadline calls = %v, want exactly one zero time", rec.deadlines)
+	if len(rec.deadlines) < 2 {
+		t.Fatalf("only %d writes carried a deadline", len(rec.deadlines))
+	}
+	for _, d := range rec.deadlines {
+		if d.IsZero() || d.Before(start) || d.After(start.Add(10*time.Second)) {
+			t.Fatalf("unbounded stream write, deadlines = %v", rec.deadlines)
+		}
+	}
+}
+
+// A refused subscription answers 503 without touching the store: the
+// ingest path never queues behind stream demand.
+func TestHandleEventsSubscriberCap(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	v.MaxSubscribers = 1
+	_, unsub := v.hub.Subscribe(8)
+	defer unsub()
+	rec := httptest.NewRecorder()
+	v.handleEvents(rec, httptest.NewRequest("GET", "/events", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("over-cap subscriber = %d, want 503", rec.Code)
+	}
+}
+
+// A replay-path store failure resyncs instead of streaming on silently:
+// the client must refetch, never advance its cursor past missed history.
+func TestHandleEventsReplayErrorResyncs(t *testing.T) {
+	s := openViewerStore(t)
+	seedBriefing(t, s, "host:rx", "evt-rx")
+	s.Close()
+	v := New(s, NewHub())
+	body := streamCase(t, v, map[string]string{"Last-Event-ID": "0"}, "event: resync")
+	if strings.Contains(body, "event: briefing") {
+		t.Fatalf("failed replay must not emit briefings, body:\n%s", body)
 	}
 }
 

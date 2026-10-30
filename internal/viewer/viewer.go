@@ -67,19 +67,31 @@ func NewHub() *Hub { return &Hub{subs: map[*Subscription]struct{}{}} }
 // Subscribe registers a buffered SSE feed; call unsubscribe when the
 // connection ends or the subscriber leaks.
 func (h *Hub) Subscribe(buf int) (*Subscription, func()) {
+	sub, unsub, _ := h.TrySubscribe(buf, 0)
+	return sub, unsub
+}
+
+// TrySubscribe registers a feed unless max subscribers are already
+// attached (max <= 0 means unbounded). The check and insert hold the hub
+// lock, so the cap cannot be raced past. A refused subscriber means the
+// handler answers 503, never blocks the ingest path.
+func (h *Hub) TrySubscribe(buf, max int) (*Subscription, func(), bool) {
 	if buf <= 0 {
 		buf = 32
 	}
 	ch := make(chan Event, buf)
 	sub := &Subscription{C: ch, ch: ch}
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if max > 0 && len(h.subs) >= max {
+		return nil, nil, false
+	}
 	h.subs[sub] = struct{}{}
-	h.mu.Unlock()
 	return sub, func() {
 		h.mu.Lock()
 		delete(h.subs, sub)
 		h.mu.Unlock()
-	}
+	}, true
 }
 
 // Broadcast encodes payload once and queues it on every subscriber without
@@ -123,8 +135,9 @@ func (h *Hub) SubscriberCount() int {
 // Stream defaults mirror Designv8 §10; the server overwrites them from
 // config, tests leave them zero.
 const (
-	defaultSSEHeartbeat = 15 * time.Second
-	defaultSSEReplayMax = 200
+	defaultSSEHeartbeat    = 15 * time.Second
+	defaultSSEReplayMax    = 200
+	defaultSSEWriteTimeout = 5 * time.Second
 )
 
 // Viewer serves the UI, JSON, and SSE from one store and hub.
@@ -136,6 +149,13 @@ type Viewer struct {
 	// ReplayMax caps replay per reconnect; over it is resync.
 	Heartbeat time.Duration
 	ReplayMax int
+	// WriteTimeout bounds every individual stream write. A peer that
+	// stops reading fails its next write instead of wedging the handler
+	// (and, through it, graceful shutdown) forever.
+	WriteTimeout time.Duration
+	// MaxSubscribers caps concurrent streams; over it the handler
+	// answers 503. Zero means unbounded (tests).
+	MaxSubscribers int
 
 	done      chan struct{}
 	closeOnce sync.Once
@@ -264,20 +284,35 @@ func parseLastEventID(s string) (int64, bool) {
 	return int64(n), true
 }
 
-// handleEvents streams briefing and group updates. The stream never
-// inherits WRITE_TIMEOUT (cleared per handler, best-effort: recorders and
-// middleware that don't implement it still stream). On connect the client
-// gets, in order: the group snapshot, a freshly computed overview stub,
-// then the Last-Event-ID replay-or-resync, then live events. Overlap
-// between replay and live is harmless: the client upserts by briefing_id.
+// handleEvents streams briefing and group updates. Every write carries
+// its own deadline: a peer that stops reading fails the next write
+// instead of wedging the handler (and, through it, graceful shutdown)
+// forever. On connect the client gets, in order: the group snapshot, a
+// freshly computed overview stub, then the Last-Event-ID replay-or-resync,
+// then live events. Overlap between replay and live is harmless: the
+// client upserts by briefing_id. Over the subscriber cap the handler
+// answers 503, never queuing behind the ingest path.
 func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Security-Policy", csp)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	// A dead peer surfaces as a write error on the next heartbeat.
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+	rc := http.NewResponseController(w)
+	wto := v.WriteTimeout
+	if wto <= 0 {
+		wto = defaultSSEWriteTimeout
+	}
+	write := func(ev Event) bool {
+		// Best-effort on recorders and middleware that don't implement
+		// deadlines; enforced on real connections.
+		_ = rc.SetWriteDeadline(time.Now().Add(wto))
+		return sseWrite(w, ev)
+	}
+	comment := func() bool {
+		_ = rc.SetWriteDeadline(time.Now().Add(wto))
+		return sseComment(w)
+	}
 	hb := v.Heartbeat
 	if hb <= 0 {
 		hb = defaultSSEHeartbeat
@@ -289,20 +324,24 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	hbTicker := time.NewTicker(hb)
 	defer hbTicker.Stop()
 
-	sub, unsub := v.hub.Subscribe(32)
+	sub, unsub, ok := v.hub.TrySubscribe(32, v.MaxSubscribers)
+	if !ok {
+		http.Error(w, "too many stream subscribers", http.StatusServiceUnavailable)
+		return
+	}
 	defer unsub()
 
 	if groups, err := v.store.OpenGroupSnapshots(r.Context()); err == nil {
-		if !sseWrite(w, Event{Name: "group", Data: mustJSON(groupWireOf(groups))}) {
+		if !write(Event{Name: "group", Data: mustJSON(groupWireOf(groups))}) {
 			return
 		}
 	} else {
 		log.Printf("viewer: initial group snapshot: %s", store.SanitizeErrorText(err.Error()))
 	}
-	if !sseWrite(w, Event{Name: "overview", Data: mustJSON(stubOverview())}) {
+	if !write(Event{Name: "overview", Data: mustJSON(stubOverview())}) {
 		return
 	}
-	if !v.replay(w, r, replayMax) {
+	if !v.replay(w, r, replayMax, write) {
 		return
 	}
 
@@ -310,7 +349,7 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 		if sub.ConsumeLagged() {
 			// A slow subscriber missed broadcasts; never a partial
 			// replay — the client refetches overview and the latest page.
-			if !v.emitResync(w, r) {
+			if !v.emitResync(w, r, write) {
 				return
 			}
 			continue
@@ -321,11 +360,11 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-v.done:
 			return
 		case <-hbTicker.C:
-			if !sseComment(w) {
+			if !comment() {
 				return
 			}
 		case ev := <-sub.C:
-			if !sseWrite(w, ev) {
+			if !write(ev) {
 				return
 			}
 		}
@@ -336,8 +375,11 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 // (the client loads state as on first load); a valid id at or below max
 // seq replays seq > last ascending, at most replayMax rows — over the cap
 // sends resync and replays nothing; above max seq (restored database)
-// sends resync.
-func (v *Viewer) replay(w http.ResponseWriter, r *http.Request, replayMax int) bool {
+// sends resync. The verdict comes from a single bounded fetch (replayMax+1
+// rows): no count/fetch race can slip an over-cap replay past the check.
+// A store failure resyncs instead of streaming on silently — the client
+// must refetch, never advance its cursor past missed history.
+func (v *Viewer) replay(w http.ResponseWriter, r *http.Request, replayMax int, write func(Event) bool) bool {
 	last, ok := parseLastEventID(r.Header.Get("Last-Event-ID"))
 	if !ok {
 		return true
@@ -345,26 +387,21 @@ func (v *Viewer) replay(w http.ResponseWriter, r *http.Request, replayMax int) b
 	maxSeq, err := v.store.MaxSeq(r.Context())
 	if err != nil {
 		log.Printf("viewer: replay max seq: %s", store.SanitizeErrorText(err.Error()))
-		return true
+		return v.emitResync(w, r, write)
 	}
 	if last > maxSeq {
-		return v.emitResync(w, r)
+		return v.emitResync(w, r, write)
 	}
-	n, err := v.store.CountAfter(r.Context(), last)
+	rows, err := v.store.ReplayAfter(r.Context(), last, replayMax+1)
 	if err != nil {
-		log.Printf("viewer: replay count: %s", store.SanitizeErrorText(err.Error()))
-		return true
+		log.Printf("viewer: replay fetch: %s", store.SanitizeErrorText(err.Error()))
+		return v.emitResync(w, r, write)
 	}
-	if n > int64(replayMax) {
-		return v.emitResync(w, r)
-	}
-	rows, err := v.store.BriefingsPage(r.Context(), last, 0, replayMax+1)
-	if err != nil {
-		log.Printf("viewer: replay page: %s", store.SanitizeErrorText(err.Error()))
-		return true
+	if len(rows) > replayMax {
+		return v.emitResync(w, r, write)
 	}
 	for _, b := range rows {
-		if !sseWrite(w, Event{Name: "briefing", ID: strconv.FormatInt(b.Seq, 10), Data: mustJSON(viewOf(b))}) {
+		if !write(Event{Name: "briefing", ID: strconv.FormatInt(b.Seq, 10), Data: mustJSON(viewOf(b))}) {
 			return false
 		}
 	}
@@ -380,12 +417,12 @@ type resyncBody struct {
 // emitResync sends `event: resync`. A store failure still resyncs (with
 // max_seq 0, so the client refetches the latest page); the live stream
 // continues afterwards.
-func (v *Viewer) emitResync(w http.ResponseWriter, r *http.Request) bool {
+func (v *Viewer) emitResync(w http.ResponseWriter, r *http.Request, write func(Event) bool) bool {
 	maxSeq, err := v.store.MaxSeq(r.Context())
 	if err != nil {
 		log.Printf("viewer: resync max seq: %s", store.SanitizeErrorText(err.Error()))
 	}
-	return sseWrite(w, Event{Name: "resync", Data: mustJSON(resyncBody{MaxSeq: maxSeq})})
+	return write(Event{Name: "resync", Data: mustJSON(resyncBody{MaxSeq: maxSeq})})
 }
 
 func mustJSON(v any) []byte {

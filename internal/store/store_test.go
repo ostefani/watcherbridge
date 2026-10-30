@@ -98,6 +98,7 @@ func TestViewerFeedQueriesUseIndexes(t *testing.T) {
 	for _, q := range []string{
 		`EXPLAIN QUERY PLAN SELECT briefing_id FROM briefings ORDER BY created_at DESC LIMIT 10`,
 		`EXPLAIN QUERY PLAN SELECT briefing_id FROM briefings WHERE seq > 5 ORDER BY seq ASC LIMIT 10`,
+		`EXPLAIN QUERY PLAN SELECT briefing_id, group_id FROM briefings WHERE seq > 5 ORDER BY seq ASC LIMIT 11`,
 		`EXPLAIN QUERY PLAN SELECT briefing_id FROM briefings WHERE seq < 5 ORDER BY seq DESC LIMIT 10`,
 		`EXPLAIN QUERY PLAN SELECT ag.group_id FROM active_groups ag LEFT JOIN group_events ge ON ge.group_id = ag.group_id WHERE ag.status = 'open' GROUP BY ag.group_id ORDER BY ag.deadline_at`,
 	} {
@@ -733,7 +734,7 @@ func TestMigrateV3ToV4WithData(t *testing.T) {
 	s.Close()
 
 	// Rewind to v3: drop the v4, v5, and v6 columns and the v5 index,
-	// keeping the data. The reopen replays 3->4->5->6. The rewind must
+	// keeping the data. The reopen replays 3->4->5->6->7->8->9. The rewind must
 	// cover every later column or the forward migration re-adds an
 	// existing one.
 	db, err := sql.Open("sqlite3", path)
@@ -754,6 +755,15 @@ func TestMigrateV3ToV4WithData(t *testing.T) {
 	}
 	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN transient_refunds`); err != nil {
 		t.Fatalf("drop v7 column: %v", err)
+	}
+	if _, err := db.Exec(`DROP INDEX IF EXISTS briefings_seq`); err != nil {
+		t.Fatalf("drop v8 index: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE briefings DROP COLUMN seq`); err != nil {
+		t.Fatalf("drop v8 column: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS seq_state`); err != nil {
+		t.Fatalf("drop v9 state: %v", err)
 	}
 	if _, err := db.Exec(`PRAGMA user_version = 3`); err != nil {
 		t.Fatal(err)
@@ -1136,6 +1146,15 @@ func TestMigrationV4ToV5KeepsBackoffNull(t *testing.T) {
 	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN transient_refunds`); err != nil {
 		t.Fatalf("drop v7 column: %v", err)
 	}
+	if _, err := db.Exec(`DROP INDEX IF EXISTS briefings_seq`); err != nil {
+		t.Fatalf("drop v8 index: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE briefings DROP COLUMN seq`); err != nil {
+		t.Fatalf("drop v8 column: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS seq_state`); err != nil {
+		t.Fatalf("drop v9 state: %v", err)
+	}
 	if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
 		t.Fatal(err)
 	}
@@ -1276,7 +1295,8 @@ func TestMigrationV5ToV6KeepsByteCounter(t *testing.T) {
 	}
 	s.Close()
 
-	// Rewind to v5: drop the v6 and v7 columns, keeping the data.
+	// Rewind to v5: drop the v6 and v7 columns, the v8 column and index,
+	// and the v9 state, keeping the data.
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		t.Fatal(err)
@@ -1286,6 +1306,15 @@ func TestMigrationV5ToV6KeepsByteCounter(t *testing.T) {
 	}
 	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN transient_refunds`); err != nil {
 		t.Fatalf("drop v7 column: %v", err)
+	}
+	if _, err := db.Exec(`DROP INDEX IF EXISTS briefings_seq`); err != nil {
+		t.Fatalf("drop v8 index: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE briefings DROP COLUMN seq`); err != nil {
+		t.Fatalf("drop v8 column: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS seq_state`); err != nil {
+		t.Fatalf("drop v9 state: %v", err)
 	}
 	if _, err := db.Exec(`PRAGMA user_version = 5`); err != nil {
 		t.Fatal(err)
@@ -1307,6 +1336,17 @@ func TestMigrationV5ToV6KeepsByteCounter(t *testing.T) {
 	}
 	if total != int64(len(`{"host":"v5"}`)) {
 		t.Fatalf("backfill must sum stored payloads, got %d", total)
+	}
+}
+
+// waitNextSecond blocks until the wall clock crosses a second boundary
+// (at most ~1s). Group ids embed the received second, so a test that
+// reopens the store and founds another group in the same second would
+// reuse an id: the in-memory counter restarts at zero on every Open.
+func waitNextSecond() {
+	cur := time.Now().UTC().Truncate(time.Second)
+	for time.Now().UTC().Before(cur.Add(time.Second)) {
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -1429,6 +1469,7 @@ func TestMigrateV8BackfillsByCreatedAt(t *testing.T) {
 	for _, stmt := range []string{
 		`DROP INDEX briefings_seq`,
 		`ALTER TABLE briefings DROP COLUMN seq`,
+		`DROP TABLE seq_state`,
 		`PRAGMA user_version = 7`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
@@ -1459,6 +1500,76 @@ func TestMigrateV8BackfillsByCreatedAt(t *testing.T) {
 	}
 	if !rows[0].CreatedAt.Before(rows[1].CreatedAt) {
 		t.Fatalf("backfill ignored created_at: %+v", rows)
+	}
+}
+
+// Purging the maximum (or every) briefing must not recycle ids: the
+// high-water mark lives in seq_state, outside the purged rows. A client
+// holding an old cursor would otherwise skip the new rows on reconnect.
+func TestSeqMonotonicAcrossPurge(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC()
+	briefGroup(t, s, "host:doomed1", "evt-doomed1", now.Add(-72*time.Hour))
+	briefGroup(t, s, "host:doomed2", "evt-doomed2", now.Add(-71*time.Hour))
+	if n, err := s.PurgeBriefings(context.Background(), now, now.Add(-48*time.Hour)); err != nil || n != 2 {
+		t.Fatalf("purge = %d, %v", n, err)
+	}
+	gid := briefGroup(t, s, "host:after", "evt-after", now)
+	got, err := s.BriefingForGroup(context.Background(), gid)
+	if err != nil || got.Seq != 3 {
+		t.Fatalf("post-purge briefing seq = %+v %v; id reuse would skip it on reconnect", got, err)
+	}
+	if max, err := s.MaxSeq(context.Background()); err != nil || max != 3 {
+		t.Fatalf("max seq = %d, %v", max, err)
+	}
+}
+
+// Migration v9 reseed: dropping back to v8 (no seq_state) replays the
+// seed from MAX(seq), so a new briefing continues the old numbering
+// instead of restarting at 1.
+func TestMigrateV9ReseedsHighWater(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v9.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	briefGroup(t, s, "host:v9a", "evt-v9a", now)
+	briefGroup(t, s, "host:v9b", "evt-v9b", now.Add(time.Minute))
+	s.Close()
+
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`DROP TABLE seq_state`,
+		`PRAGMA user_version = 8`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	db.Close()
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("migrate 8->9: %v", err)
+	}
+	defer s2.Close()
+	var version int
+	if err := s2.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != supportedSchemaVersion {
+		t.Fatalf("want user_version %d, got %d %v", supportedSchemaVersion, version, err)
+	}
+	// Group ids carry the received second plus a process-local counter
+	// that restarts at zero on reopen: wait for the next second so the
+	// post-reopen group cannot reuse a pre-reopen id.
+	waitNextSecond()
+	gid := briefGroup(t, s2, "host:v9c", "evt-v9c", now.Add(2*time.Minute))
+	got, err := s2.BriefingForGroup(context.Background(), gid)
+	if err != nil || got.Seq != 3 {
+		t.Fatalf("post-reseed briefing seq = %+v %v", got, err)
 	}
 }
 

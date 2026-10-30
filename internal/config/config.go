@@ -117,8 +117,10 @@ type Config struct {
 	WriterQueueCap int // enforced by the writer queue depth; overflow is 503
 	RetryAfterSecs int
 
-	SSEHeartbeat time.Duration // SSE comment ping; also dead-peer detection
-	SSEReplayMax int           // replay cap per reconnect; over it is resync, never partial
+	SSEHeartbeat      time.Duration // SSE comment ping; also dead-peer detection
+	SSEReplayMax      int           // replay cap per reconnect; over it is resync, never partial
+	SSEWriteTimeout   time.Duration // per-write bound on streams; a stalled peer fails fast
+	SSEMaxSubscribers int           // concurrent stream cap; over it is 503
 
 	SweepSafetyMargin time.Duration
 	SweepBatch        int
@@ -184,8 +186,10 @@ func Default() Config {
 		WriterQueueCap: 64,
 		RetryAfterSecs: 2,
 
-		SSEHeartbeat: 15 * time.Second,
-		SSEReplayMax: 200,
+		SSEHeartbeat:      15 * time.Second,
+		SSEReplayMax:      200,
+		SSEWriteTimeout:   5 * time.Second,
+		SSEMaxSubscribers: 32,
 
 		SweepSafetyMargin: 30 * time.Second,
 		SweepBatch:        20,
@@ -478,6 +482,21 @@ func (c Config) Validate() error {
 	}
 	if c.SSEReplayMax <= 0 {
 		return fmt.Errorf("SSE replay cap must be positive")
+	}
+	// The replay fetch is replayMax+1 rows; above the UI page clamp a
+	// permitted replay would silently truncate instead of resyncing.
+	if c.SSEReplayMax > 500 {
+		return fmt.Errorf("SSE replay cap %d exceeds the 500-row briefing page", c.SSEReplayMax)
+	}
+	if c.SSEWriteTimeout <= 0 {
+		return fmt.Errorf("SSE write timeout must be positive")
+	}
+	if c.SSEWriteTimeout >= c.ShutdownGrace {
+		return fmt.Errorf("SSE write timeout %v must stay below shutdown grace %v, or a stalled peer consumes the whole drain",
+			c.SSEWriteTimeout, c.ShutdownGrace)
+	}
+	if c.SSEMaxSubscribers <= 0 {
+		return fmt.Errorf("SSE subscriber cap must be positive")
 	}
 	if c.SweepSafetyMargin <= 0 {
 		return fmt.Errorf("sweep safety margin must be positive")

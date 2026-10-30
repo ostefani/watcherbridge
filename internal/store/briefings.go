@@ -78,15 +78,33 @@ func (s *Store) MaxSeq(ctx context.Context) (int64, error) {
 	return max.Int64, nil
 }
 
-// CountAfter counts briefings newer than seq, so the replay path can tell
-// "fits under the cap" from "resync" without loading the rows first. The
+// ReplayAfter fetches at most limit briefings newer than seq, ascending.
+// The replay path asks for replayMax+1 and resyncs (replaying nothing)
+// when the extra row is present — one bounded query, so no count/fetch
+// race and no silent truncation. Unlike BriefingsPage it takes no clamp:
+// callers pass replayMax+1 with replayMax validated at startup. The
 // briefings_seq index serves the range.
-func (s *Store) CountAfter(ctx context.Context, seq int64) (int64, error) {
-	var n int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM briefings WHERE seq > ?`, seq).Scan(&n); err != nil {
-		return 0, err
+func (s *Store) ReplayAfter(ctx context.Context, seq int64, limit int) ([]Briefing, error) {
+	if seq < 0 {
+		return nil, fmt.Errorf("negative briefing cursor")
 	}
-	return n, nil
+	if limit <= 0 {
+		return nil, fmt.Errorf("replay limit must be positive")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+briefingColumns+` FROM briefings WHERE seq > ? ORDER BY seq ASC LIMIT ?`, seq, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Briefing
+	for rows.Next() {
+		var b Briefing
+		if err := scanBriefing(rows, &b); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
 }
 
 // BriefingsPage returns one cursor page of briefings, always in ascending
@@ -192,11 +210,15 @@ func (s *Store) InsertBriefing(ctx context.Context, b Briefing) error {
 		if rule != "" {
 			ruleArg = rule
 		}
-		// The resumable-stream cursor: single writer, same transaction as
-		// the insert, so MAX+1 is race-free. Purge may leave gaps later;
-		// replay compares by seq > last, never by contiguity.
+		// The resumable-stream cursor: bumped from the durable high-water
+		// mark in the same transaction, so ids stay monotonic across
+		// purges and restarts under the single writer. MAX(seq)+1 would
+		// reuse ids after a purge deletes the maximum. Gaps from purged
+		// rows are fine: replay compares by seq > last, never by
+		// contiguity. A missing state row fails the insert loudly rather
+		// than reusing an id.
 		var seq int64
-		if err := tx.QueryRow(`SELECT COALESCE(MAX(seq), 0) + 1 FROM briefings`).Scan(&seq); err != nil {
+		if err := tx.QueryRow(`UPDATE seq_state SET next_seq = next_seq + 1 WHERE id = 0 RETURNING next_seq - 1`).Scan(&seq); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`INSERT INTO briefings (briefing_id, group_id, host_anchor_key, baseline, model_suggestion, priority, priority_reason, baseline_rule, clamped, fallback_used, what_changed, context, recommended_check, model_raw_json, created_at, event_ids_json, seq)
