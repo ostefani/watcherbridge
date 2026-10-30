@@ -217,6 +217,8 @@
         rows = rows || [];
         state.briefings = [];
         upsertMany(rows);
+        renderBriefs(); // replacement renders even when empty: no stale rows survive
+        reconcileSelection();
         var pageMax = 0;
         rows.forEach(function (b) { if (b && b.seq > pageMax) pageMax = b.seq; });
         op.running = false;
@@ -257,9 +259,15 @@
     src = new EventSource("/events");
     src.onopen = function () {
       connEl.textContent = "live"; connEl.className = "conn live";
-      if (pending && !pending.running) {
-        if (pending.kind === "gap") runGapFill(pending); else runReset(pending);
-      }
+      // The server subscribes before flushing its first byte, so onopen
+      // is the earliest moment a snapshot read is ordered after the
+      // subscription: anything committed before it is in the snapshot,
+      // anything after arrives live, and the tail covers the overlap.
+      // Starting the boot snapshot here (rather than right after
+      // connect()) closes the subscribe-before-snapshot race.
+      if (!pending || pending.running) return;
+      if (pending.awaitOpen) pending.awaitOpen = false;
+      if (pending.kind === "gap") runGapFill(pending); else runReset(pending);
     };
     src.onerror = function () { connEl.textContent = "reconnecting"; connEl.className = "conn"; };
     src.addEventListener("briefing", function (ev) {
@@ -283,15 +291,29 @@
     });
   }
 
+  // reconcileSelection clears the detail pane when its briefing is gone
+  // from the replaced state; selectBriefing shows the hint for unknown ids.
+  function reconcileSelection() {
+    var found = false;
+    state.briefings.forEach(function (b) { if (b.briefing_id === state.selected) found = true; });
+    if (!found) selectBriefing(null);
+  }
+
   function boot() {
     ["filter-priority", "filter-host", "filter-text"].forEach(function (id) {
       document.getElementById(id).addEventListener("input", renderBriefs);
     });
     setInterval(tickCountdowns, 1000);
-    fetch("/api/briefings?limit=50").then(function (r) { return r.json(); }).then(function (rows) {
-      state.briefings = rows || [];
-      renderBriefs();
-    }).catch(function () { /* SSE will fill in */ });
+    // Initialization runs through the same snapshot/tail recovery as a
+    // reset, with operation ownership and retry: a standalone fetch could
+    // resolve after live events arrived and wipe them, with the cursor
+    // already past the snapshot. The snapshot does not start here:
+    // connect() only opens the stream, and onopen starts the fetch once
+    // the server-side subscription is established. Live events can only
+    // arrive after that point, so they accumulate into liveMax during
+    // the fetch and the tail covers them.
+    pending = {id: ++opSeq, kind: "reset", boundary: 0, liveMax: 0,
+      running: false, timer: 0, awaitOpen: true};
     connect();
   }
 
