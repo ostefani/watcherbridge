@@ -28,6 +28,7 @@ func main() {
 	fs := flag.NewFlagSet("watcherbridge", flag.ExitOnError)
 	bind := fs.String("bind", def.Bind, "loopback bind address")
 	mode := fs.String("mode", def.Mode, "tap or proxy")
+	sourceID := fs.String("source-id", "", "authenticated scanner deployment ID scoping reported references (or SOURCE_ID)")
 	db := fs.String("db", "watcherbridge.db", "sqlite path (0600)")
 	secret := fs.String("secret", "", "webhook HMAC secret (or WEBHOOK_SECRET)")
 	secretFile := fs.String("secret-file", "", "file holding the webhook secret")
@@ -53,6 +54,7 @@ func main() {
 	cfg := config.Default()
 	cfg.Bind = *bind
 	cfg.Mode = *mode
+	cfg.SourceID = firstNonEmpty(*sourceID, os.Getenv("SOURCE_ID"), def.SourceID)
 	cfg.Secret = config.Secret(firstNonEmpty(*secret, os.Getenv("WEBHOOK_SECRET")))
 	cfg.SecretFile = *secretFile
 	cfg.ScanRelayURL = *relay
@@ -76,6 +78,12 @@ func main() {
 	st, err := store.Open(*db)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
+	}
+	// Single-source binding: refuse to serve a database that already
+	// holds another deployment's scoped receipts instead of mixing
+	// their subjects. Pre-scope rows carry '' and stay adoptable.
+	if err := st.BindSourceScope(context.Background(), cfg.SourceID); err != nil {
+		log.Fatalf("source scope: %v", err)
 	}
 	// Shutdown closes the store last, after the worker and publisher.
 	defer func() {
@@ -127,7 +135,8 @@ func main() {
 	workerDone := make(chan error, 1)
 	go func() {
 		workerDone <- briefing.Run(ctx, briefing.Deps{
-			Store: st,
+			Store:       st,
+			SourceScope: cfg.SourceID,
 			Groups: store.GroupPolicy{QuietWindow: cfg.GroupQuietWindow,
 				MaxWindow: cfg.GroupMaxWindow, MaxEvents: cfg.GroupMaxEvents},
 			Tick:  cfg.GrouperTick,

@@ -52,12 +52,43 @@ func (g TakenGroup) LastAttempt() bool { return g.RetryCount >= maxGroupRetries-
 
 var ErrGroupNotClosed = errors.New("group is not closed")
 
+// ErrGroupNotReady reports a closed group whose events are not all
+// projected yet. The worker skips it without burning a take: the next
+// projection pass makes it eligible. This gates briefing associations
+// on completed projection, so inserts never copy a partial link set.
+var ErrGroupNotReady = errors.New("group is not fully projected")
+
+// groupFullyProjected reports whether every event of a group has a
+// completed projection. Briefing eligibility requires this: copying
+// links early would permanently omit subjects projected later, and
+// nothing repairs briefing relations after the insert.
+// queryRower is the read half shared by *sql.DB and *sql.Tx.
+type queryRower interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func groupFullyProjected(ctx context.Context, q queryRower, groupID string) (bool, error) {
+	var unprojected int64
+	err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM group_events ge
+		LEFT JOIN projection_progress p ON p.event_id = ge.event_id
+		WHERE ge.group_id = ? AND (p.event_id IS NULL OR p.state <> 'done')`, groupID).Scan(&unprojected)
+	return unprojected == 0, err
+}
+
 // TakeGroup atomically moves a closed group -> processing and reads the
 // group and its events in the same transaction, so a failure cannot strand
-// the group in processing. Only closed groups may be taken.
+// the group in processing. Only closed, fully projected groups may be
+// taken; anything earlier returns a sentinel without touching state.
 func (s *Store) TakeGroup(ctx context.Context, groupID string) (TakenGroup, error) {
 	var taken TakenGroup
 	err := s.write(ctx, func(tx *sql.Tx) error {
+		ready, err := groupFullyProjected(ctx, tx, groupID)
+		if err != nil {
+			return err
+		}
+		if !ready {
+			return ErrGroupNotReady
+		}
 		// The take is the attempt: the counter advances here and only
 		// here, so a crash between take and briefing still counts and a
 		// poison group cannot crash-loop forever. Release paths never
@@ -306,7 +337,11 @@ func (s *Store) NeedsBriefing(ctx context.Context, limit int, now time.Time) ([]
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT group_id FROM active_groups WHERE status = 'closed'
 		AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-		AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id) ORDER BY opened_at LIMIT ?`, nanos(now), limit)
+		AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id)
+		AND NOT EXISTS (SELECT 1 FROM group_events ge
+			LEFT JOIN projection_progress p ON p.event_id = ge.event_id
+			WHERE ge.group_id = active_groups.group_id AND (p.event_id IS NULL OR p.state <> 'done'))
+		ORDER BY opened_at LIMIT ?`, nanos(now), limit)
 	if err != nil {
 		return nil, err
 	}

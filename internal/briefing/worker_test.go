@@ -18,11 +18,12 @@ import (
 func testDeps(t tb, s *store.Store) Deps {
 	t.Helper()
 	return Deps{
-		Store:  s,
-		Groups: store.GroupPolicy{QuietWindow: time.Minute, MaxWindow: time.Hour, MaxEvents: 10},
-		Tick:   10 * time.Millisecond,
-		Lease:  time.Minute,
-		Now:    time.Now,
+		Store:       s,
+		SourceScope: "test-scope",
+		Groups:      store.GroupPolicy{QuietWindow: time.Minute, MaxWindow: time.Hour, MaxEvents: 10},
+		Tick:        10 * time.Millisecond,
+		Lease:       time.Minute,
+		Now:         time.Now,
 		Policy: Policy{
 			EstablishedAge:   time.Hour,
 			StrongHistoryAge: 24 * time.Hour,
@@ -39,6 +40,11 @@ func seedGroup(t tb, s *store.Store, anchor, eventID, eventType, payload string)
 		OccurredAt: now, Payload: []byte(payload), ReceivedAt: now, SignatureTimestamp: now,
 	}, anchor, store.GroupPolicy{QuietWindow: time.Millisecond, MaxWindow: time.Hour})
 	if err != nil {
+		t.Fatal(err)
+	}
+	// Mirror production order: the projector runs before groups close and
+	// are taken, so seeded groups are fully projected and briefable.
+	if _, err := s.ProjectReported(context.Background(), "test-scope", 64); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.CloseDue(context.Background(), now.Add(time.Second)); err != nil {

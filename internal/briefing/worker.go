@@ -31,6 +31,10 @@ type Deps struct {
 	Lease  time.Duration
 	Now    func() time.Time
 	Policy Policy
+	// SourceScope identifies the authenticated scanner deployment for
+	// reported-context projection. Empty skips projection (tests that
+	// do not exercise it); production always sets it from config.
+	SourceScope string
 
 	Provider     provider.Provider
 	Redaction    redactor.Policy
@@ -122,6 +126,15 @@ func publishGroups(ctx context.Context, d Deps) {
 }
 
 func drainOnce(ctx context.Context, d Deps, now time.Time) {
+	// Project reported context before closing anything: briefing
+	// inserts copy group_subjects, so subjects must already be linked
+	// when a group is taken. Bounded per tick; leftovers resume next
+	// tick or after a restart via the progress table.
+	if d.SourceScope != "" {
+		if _, err := d.Store.ProjectReported(ctx, d.SourceScope, 256); err != nil {
+			log.Printf("briefing: project reported: %s", store.SanitizeErrorText(err.Error()))
+		}
+	}
 	if _, err := d.Store.CloseDue(ctx, now); err != nil {
 		log.Printf("briefing: close-due: %s", store.SanitizeErrorText(err.Error()))
 	}
@@ -213,10 +226,10 @@ func briefOne(ctx context.Context, d Deps, groupID string) (progressed bool) {
 	}()
 	taken, err := d.Store.TakeGroup(ctx, groupID)
 	if err != nil {
-		if !errors.Is(err, store.ErrGroupNotClosed) {
+		if !errors.Is(err, store.ErrGroupNotClosed) && !errors.Is(err, store.ErrGroupNotReady) {
 			log.Printf("briefing: group %s take: %s", groupID, store.SanitizeErrorText(err.Error()))
 		}
-		return false // lost race or store hiccup; next tick retries
+		return false // lost race, unprojected group, or store hiccup; next tick retries
 	}
 	// The claim committed: publish before any provider work, so a group
 	// that waits on the model is visible as processing (and the groups

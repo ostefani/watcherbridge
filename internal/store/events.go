@@ -20,6 +20,10 @@ type RawEvent struct {
 	HeadersJSON        string // forwarded headers (incl. Pro signature), JSON object
 	ReceivedAt         time.Time
 	SignatureTimestamp time.Time
+	// SourceScope records which configured scanner deployment accepted
+	// the event. The server sets it from config; empty means accepted
+	// before scopes existed and is adopted once at projection.
+	SourceScope string
 }
 
 // StoredEvent returns the retained original bytes and envelope metadata
@@ -65,9 +69,9 @@ func (s *Store) PersistEventAndGroup(ctx context.Context, ev RawEvent, anchor st
 	var result PersistResult
 	err := s.write(ctx, func(tx *sql.Tx) error {
 		res, err := tx.Exec(`INSERT INTO raw_events
-			(event_id, event_key, event_type, occurred_at, cycle, target, payload, headers_json, received_at, signature_timestamp)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(event_id) DO NOTHING`,
-			ev.EventID, ev.EventKey, ev.EventType, nanos(ev.OccurredAt), ev.Cycle, ev.Target, ev.Payload, ev.HeadersJSON, nanos(ev.ReceivedAt), nanos(ev.SignatureTimestamp))
+			(event_id, event_key, event_type, occurred_at, cycle, target, payload, headers_json, received_at, signature_timestamp, source_scope)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(event_id) DO NOTHING`,
+			ev.EventID, ev.EventKey, ev.EventType, nanos(ev.OccurredAt), ev.Cycle, ev.Target, ev.Payload, ev.HeadersJSON, nanos(ev.ReceivedAt), nanos(ev.SignatureTimestamp), ev.SourceScope)
 		if err != nil {
 			return err
 		}
@@ -75,6 +79,14 @@ func (s *Store) PersistEventAndGroup(ctx context.Context, ev RawEvent, anchor st
 			return nil // duplicate: result.Inserted stays false
 		}
 		result.Inserted = true
+		// Queue the event for reported-context projection in the same
+		// transaction: only freshly accepted events need work, so a
+		// duplicate repost never requeues. The projector deletes the
+		// row when the event's projection commits.
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO projection_pending (event_id, received_at) VALUES (?, ?)`,
+			ev.EventID, nanos(ev.ReceivedAt)); err != nil {
+			return err
+		}
 		last := nanos(ev.ReceivedAt)
 		var opened, existingDeadline, existingBytes int64
 		err = tx.QueryRow(`SELECT group_id, opened_at, deadline_at, total_bytes FROM active_groups WHERE host_anchor_key = ? AND status = 'open'`, anchor).Scan(&result.GroupID, &opened, &existingDeadline, &existingBytes)

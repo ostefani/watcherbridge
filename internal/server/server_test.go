@@ -374,7 +374,9 @@ func TestCancelDuringPersistThenRetry(t *testing.T) {
 	if _, _, _, err := h.srv.events.ForwardState(context.Background(), id); err != nil {
 		t.Fatalf("event missing after cancel+retry: %v", err)
 	}
-	groups, err := h.srv.events.GroupEventCount(context.Background(), "host-c")
+	// The body carries no host view, so the event groups event-locally
+	// under its own ID rather than the time-windowed event key.
+	groups, err := h.srv.events.GroupEventCount(context.Background(), "evt:"+id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -705,56 +707,22 @@ func TestShutdownDuringSweepForward(t *testing.T) {
 	}
 }
 
-func TestAnchorDerivation(t *testing.T) {
-	hostBody := func(hostJSON string) []byte {
-		return []byte(fmt.Sprintf(`{"event_id":"e1","event_key":"change:x:20260101T0000Z","event_type":"host.appeared","occurred_at":%q,"host":%s}`,
-			time.Now().UTC().Format(time.RFC3339Nano), hostJSON))
-	}
-	cases := map[string]struct {
-		body string
-		typ  string
-		want string
-		fb   bool
-	}{
-		"mac preferred":           {string(hostBody(`{"mac":"AA:BB:CC:DD:EE:FF","hostname":"pi","ip":"192.168.0.5"}`)), "host.appeared", "mac:aa:bb:cc:dd:ee:ff", false},
-		"randomized mac skipped":  {string(hostBody(`{"mac":"AA:BB:CC:DD:EE:FF","randomized_mac":true,"hostname":"Pixel"}`)), "host.appeared", "host:pixel", false},
-		"hostname only":           {string(hostBody(`{"hostname":"Printer."}`)), "host.disappeared", "host:printer", false},
-		"ip passthrough":          {string(hostBody(`{"ip":"192.168.0.5"}`)), "host.appeared", "ip:192.168.0.5", false},
-		"zero-padded ip rejected": {string(hostBody(`{"ip":"192.168.000.005"}`)), "host.appeared", "change:x:20260101T0000Z", true},
-		"no identifiers":          {string(hostBody(`{"vendor":"acme"}`)), "host.appeared", "change:x:20260101T0000Z", true},
-		"no host object":          {`{"event_id":"e1"}`, "host.appeared", "change:x:20260101T0000Z", true},
-		"garbage ip falls back":   {string(hostBody(`{"ip":"not-an-ip"}`)), "host.appeared", "change:x:20260101T0000Z", true},
-	}
-	for name, tc := range cases {
-		got, fb := anchorForEvent([]byte(tc.body), tc.typ, "change:x:20260101T0000Z")
-		if got != tc.want || fb != tc.fb {
-			t.Errorf("%s: got (%q,%v), want (%q,%v)", name, got, fb, tc.want, tc.fb)
-		}
-	}
-	changed := []byte(`{"event_id":"e1","current":{"ip":"10.0.0.9"},"previous":{"ip":"10.0.0.8"}}`)
-	if got, _ := anchorForEvent(changed, "host.changed", "k"); got != "ip:10.0.0.9" {
-		t.Errorf("changed prefers current: got %q", got)
-	}
-	prevOnly := []byte(`{"event_id":"e1","previous":{"mac":"11:22:33:44:55:66"}}`)
-	if got, _ := anchorForEvent(prevOnly, "host.changed", "k"); got != "mac:11:22:33:44:55:66" {
-		t.Errorf("changed falls back to previous: got %q", got)
-	}
-}
-
 func TestSameHostDifferentWindowsShareAGroup(t *testing.T) {
 	h := newHarness(t, func(c *config.Config) { c.Mode = config.ModeTap })
 	now := time.Now()
+	// A qualified scanner reference groups by exact scoped ID across
+	// time-windowed event keys; bare identifiers no longer merge.
 	for i, key := range []string{"appear:mac-aa:20260101T0000Z", "change:mac-aa:deadbeef:20260102T0000Z"} {
 		id := uniqueID()
-		body := []byte(fmt.Sprintf(`{"event_id":%q,"event_key":%q,"event_type":"host.appeared","occurred_at":%q,"host":{"mac":"AA:BB:CC:DD:EE:01"}}`,
+		body := []byte(fmt.Sprintf(`{"event_id":%q,"event_key":%q,"event_type":"host.appeared","occurred_at":%q,"host":{"mac":"AA:BB:CC:DD:EE:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","identity_confidence":"high"}}`,
 			id, key, now.Format(time.RFC3339Nano)))
 		ts := strconv.FormatInt(now.Unix(), 10)
 		if rec := h.post(t, body, id, key, "host.appeared", now, sign(h.secret, ts, id, key, "host.appeared", body)); rec.Code != http.StatusAccepted {
 			t.Fatalf("event %d: got %d %s", i, rec.Code, rec.Body.String())
 		}
 	}
-	if n, err := h.srv.events.GroupEventCount(context.Background(), "mac:aa:bb:cc:dd:ee:01"); err != nil || n != 2 {
-		t.Fatalf("same host across windows must share one group: count=%d err=%v", n, err)
+	if n, err := h.srv.events.GroupEventCount(context.Background(), "sub:default::mac:aa:bb:cc:dd:ee:01"); err != nil || n != 2 {
+		t.Fatalf("same qualified reference across windows must share one group: count=%d err=%v", n, err)
 	}
 }
 

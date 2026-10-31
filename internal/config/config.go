@@ -82,6 +82,12 @@ type Config struct {
 	Bind string // loopback only; anything else is refused at startup
 	Mode string // "tap" or "proxy"
 
+	// SourceID is the durable receiver-configured ID for the one
+	// authenticated scanner deployment. It scopes every reported
+	// reference and receipt key; it is never derived from payload
+	// content (sender names, hostnames, remote IPs).
+	SourceID string
+
 	// Secret material. Exactly one of Secret / SecretFile must be set; the
 	// value is never logged or stored in the DB. The file form is
 	// preferred: environment values are visible to same-user processes
@@ -182,6 +188,7 @@ func Default() Config {
 	return Config{
 		Bind:                "127.0.0.1:8081",
 		Mode:                ModeTap,
+		SourceID:            "default",
 		ScanRelayURL:        "http://127.0.0.1:8080",
 		ForwardAPIKeyHeader: "X-API-Key",
 		ScanRelayTolerance:  300 * time.Second,
@@ -408,6 +415,19 @@ func (c Config) Validate() error {
 	}
 	if c.Mode != ModeTap && c.Mode != ModeProxy {
 		return fmt.Errorf("mode must be %q or %q", ModeTap, ModeProxy)
+	}
+	if c.SourceID == "" {
+		return fmt.Errorf("source ID must not be empty: it scopes every reported reference")
+	}
+	if len(c.SourceID) > 128 {
+		return fmt.Errorf("source ID must be at most 128 characters")
+	}
+	for i := 0; i < len(c.SourceID); i++ {
+		b := c.SourceID[i]
+		if b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '-' || b == '_' || b == '.' {
+			continue
+		}
+		return fmt.Errorf("source ID must use only letters, digits, '-', '_' and '.'")
 	}
 	if c.Mode == ModeProxy && c.ScanRelayURL == "" {
 		return fmt.Errorf("proxy mode requires a ScanRelay URL")

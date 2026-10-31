@@ -25,7 +25,9 @@ func openTestStore(t *testing.T) *Store {
 	return s
 }
 
-// seedFeedGroup persists one open group and returns its ID.
+// seedFeedGroup persists one open group and returns its ID. The event is
+// projected (persist -> project) so the group is fully projected and
+// briefable, mirroring production order.
 func seedFeedGroup(t *testing.T, s *Store, anchor, eventID string) string {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
@@ -36,7 +38,20 @@ func seedFeedGroup(t *testing.T, s *Store, anchor, eventID string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.ProjectReported(context.Background(), "test-scope", 64); err != nil {
+		t.Fatal(err)
+	}
 	return res.GroupID
+}
+
+// projectAll runs the projector over every pending event, mirroring the
+// worker tick order (persist -> project -> close -> take) so groups under
+// test are fully projected and briefable.
+func projectAll(t *testing.T, s *Store) {
+	t.Helper()
+	if _, err := s.ProjectReported(context.Background(), "test-scope", 1<<20); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestViewerFeeds(t *testing.T) {
@@ -317,6 +332,9 @@ func TestDebounceExtendsAndTakeGroup(t *testing.T) {
 	if !d2.After(d1) || !d2.Equal(now.Add(75*time.Second)) {
 		t.Fatalf("deadline must extend to last+quiet: %v -> %v", d1, d2)
 	}
+	if _, err := s.ProjectReported(context.Background(), "test-scope", 64); err != nil {
+		t.Fatalf("project: %v", err)
+	}
 	if _, err := s.CloseDue(context.Background(), now.Add(200*time.Second)); err != nil {
 		t.Fatalf("close due: %v", err)
 	}
@@ -430,6 +448,7 @@ func TestReopenRecoversExpiredGroupAndSidecarPerms(t *testing.T) {
 	if err != nil || len(closed) != 1 {
 		t.Fatalf("recover after reopen: %v %v", closed, err)
 	}
+	projectAll(t, s2)
 	needs, err := s2.NeedsBriefing(context.Background(), 64, time.Now())
 	if err != nil || len(needs) != 1 {
 		t.Fatalf("needs briefing: %v %v", needs, err)
@@ -530,6 +549,7 @@ func TestPersistReportsOverdueClosedGroupAndStaleRelease(t *testing.T) {
 	if len(r2.ClosedGroupIDs) != 1 || r2.ClosedGroupIDs[0] != r1.GroupID || r2.GroupID == r1.GroupID {
 		t.Fatalf("overdue group must be reported closed and a new one opened: %+v vs %+v", r2, r1)
 	}
+	projectAll(t, s)
 	taken, err := s.TakeGroup(context.Background(), r1.GroupID)
 	if err != nil || len(taken.Events) != 1 {
 		t.Fatalf("take overdue group: %+v %v", taken, err)
@@ -615,6 +635,7 @@ func TestTakeIncrementsOnce(t *testing.T) {
 	if _, err := s.CloseDue(context.Background(), now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	projectAll(t, s)
 	taken, err := s.TakeGroup(context.Background(), res.GroupID)
 	if err != nil || taken.RetryCount != 1 {
 		t.Fatalf("first take must count 1, got %d %v", taken.RetryCount, err)
@@ -641,6 +662,7 @@ func TestReleaseParksAtCapWithoutIncrement(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Drive to cap-1 = 4 through takes; releases must not move the counter.
+	projectAll(t, s)
 	for i := 0; i < 4; i++ {
 		taken, err := s.TakeGroup(ctx, res.GroupID)
 		if err != nil {
@@ -767,6 +789,7 @@ func TestMigrateV3ToV4WithData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	projectAll(t, s)
 	if _, err := s.CloseDue(context.Background(), now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -814,6 +837,7 @@ func TestMigrateV3ToV4WithData(t *testing.T) {
 	if _, err := db.Exec(`DROP TABLE IF EXISTS seq_state`); err != nil {
 		t.Fatalf("drop v9 state: %v", err)
 	}
+	dropProjectionSchema(t, db)
 	if _, err := db.Exec(`PRAGMA user_version = 3`); err != nil {
 		t.Fatal(err)
 	}
@@ -841,6 +865,7 @@ func TestPurgeFailedGroupEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}
+	projectAll(t, s)
 	if _, err := s.CloseDue(context.Background(), now.Add(time.Second)); err != nil {
 		t.Fatalf("close due: %v", err)
 	}
@@ -965,6 +990,7 @@ func TestReleaseBackoffRefundAndDueGuard(t *testing.T) {
 	}
 	gid := mk("evt-b1", "host:b")
 
+	projectAll(t, s)
 	taken, err := s.TakeGroup(ctx, gid)
 	if err != nil || taken.RetryCount != 1 {
 		t.Fatalf("first take: %+v %v", taken, err)
@@ -1034,6 +1060,7 @@ func TestTakeGroupOrdersTiesByEventID(t *testing.T) {
 	if _, err := s.CloseDue(ctx, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	projectAll(t, s)
 	taken, err := s.TakeGroup(ctx, gid)
 	if err != nil {
 		t.Fatal(err)
@@ -1083,6 +1110,7 @@ func TestTransientRefundAtCapRequeues(t *testing.T) {
 	if _, err := s.CloseDue(ctx, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	projectAll(t, s)
 	gid := res.GroupID
 	var taken TakenGroup
 	for want := 1; want <= maxGroupRetries; want++ {
@@ -1132,6 +1160,7 @@ func TestTransientRefundRunawayParks(t *testing.T) {
 	if _, err := s.CloseDue(ctx, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	projectAll(t, s)
 	gid := res.GroupID
 	for i := 1; i <= maxTransientRefunds; i++ {
 		if _, err := s.TakeGroup(ctx, gid); err != nil {
@@ -1204,6 +1233,7 @@ func TestMigrationV4ToV5KeepsBackoffNull(t *testing.T) {
 	if _, err := db.Exec(`DROP TABLE IF EXISTS seq_state`); err != nil {
 		t.Fatalf("drop v9 state: %v", err)
 	}
+	dropProjectionSchema(t, db)
 	if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
 		t.Fatal(err)
 	}
@@ -1219,6 +1249,7 @@ func TestMigrationV4ToV5KeepsBackoffNull(t *testing.T) {
 		t.Fatalf("want user_version %d, got %d %v", supportedSchemaVersion, version, err)
 	}
 	// The pre-v5 group has no backoff: due immediately.
+	projectAll(t, s2)
 	needs, err := s2.NeedsBriefing(context.Background(), 64, now.Add(time.Second))
 	if err != nil || len(needs) != 1 || needs[0] != res.GroupID {
 		t.Fatalf("migrated group must be due: %v %v", needs, err)
@@ -1365,6 +1396,7 @@ func TestMigrationV5ToV6KeepsByteCounter(t *testing.T) {
 	if _, err := db.Exec(`DROP TABLE IF EXISTS seq_state`); err != nil {
 		t.Fatalf("drop v9 state: %v", err)
 	}
+	dropProjectionSchema(t, db)
 	if _, err := db.Exec(`PRAGMA user_version = 5`); err != nil {
 		t.Fatal(err)
 	}
@@ -1525,6 +1557,7 @@ func TestMigrateV8BackfillsByCreatedAt(t *testing.T) {
 			t.Fatalf("%s: %v", stmt, err)
 		}
 	}
+	dropProjectionSchema(t, db)
 	db.Close()
 
 	s2, err := Open(path)
@@ -1600,6 +1633,7 @@ func TestMigrateV9ReseedsHighWater(t *testing.T) {
 			t.Fatalf("%s: %v", stmt, err)
 		}
 	}
+	dropProjectionSchema(t, db)
 	db.Close()
 
 	s2, err := Open(path)

@@ -42,9 +42,9 @@ func newTapHarness(t *testing.T) *harness {
 // exactly once — including unknown and provided-without-contract
 // metadata, which must never be rejected or resolved by guessing.
 // Identity fields below pin the fixtures as qualified references
-// (or explicitly missing ones); grouping keys still follow
-// anchorForEvent until 18c replaces them, so this test pins
-// acceptance, identity fidelity and byte preservation — not anchors.
+// (or explicitly missing ones); grouping keys follow scoped upstream
+// references (Step 18c), so this test pins acceptance, identity
+// fidelity and byte preservation — not anchors.
 func TestProducerContractAcceptance(t *testing.T) {
 	h := newTapHarness(t)
 	now := time.Now()

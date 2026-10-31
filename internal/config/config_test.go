@@ -134,6 +134,10 @@ func TestValidateRejects(t *testing.T) {
 		"zero quiet window":       func(c *Config) { c.GroupQuietWindow = 0 },
 		"max window below quiet":  func(c *Config) { c.GroupMaxWindow = time.Second },
 		"group max below quiet":   func(c *Config) { c.GroupMaxWindow = c.GroupQuietWindow - time.Second },
+		"empty source ID":         func(c *Config) { c.SourceID = "" },
+		"source ID with space":    func(c *Config) { c.SourceID = "lab 1" },
+		"source ID with slash":    func(c *Config) { c.SourceID = "lab/1" },
+		"source ID too long":      func(c *Config) { c.SourceID = strings.Repeat("s", 129) },
 	}
 	for name, mutate := range cases {
 		c := Default()

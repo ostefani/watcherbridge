@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 9
+const supportedSchemaVersion = 11
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -111,6 +111,10 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 8, migrateV8)
 		case 8:
 			err = applyMigration(db, 9, migrateV9)
+		case 9:
+			err = applyMigration(db, 10, migrateV10)
+		case 10:
+			err = applyMigration(db, 11, migrateV11)
 		}
 		if err != nil {
 			return err
@@ -323,6 +327,134 @@ func migrateV9(tx *sql.Tx) error {
 			next_seq INTEGER NOT NULL
 		)`,
 		`INSERT INTO seq_state (id, next_seq) SELECT 0, COALESCE(MAX(seq), 0) + 1 FROM briefings`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV10: reported-context projection tables (Designv9 §4.1). Subjects
+// are opaque read-model rows keyed by exact scoped upstream references,
+// never inferred identities. Observations carry one row per event view;
+// ports hang off observations; group/briefing relations are explicit
+// link rows written in the same transactions as their parents.
+// projection_progress records per-event projection state so restarts and
+// the bounded projector resume without rework, and the purge (Step 18e)
+// can protect unprojected evidence. legacy_profile_state is an empty
+// read-only shelf for pre-Step-18 inferred profiles, if that development
+// line is ever supported; this checkout creates no legacy rows.
+func migrateV10(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE report_sources (
+			source_scope TEXT PRIMARY KEY,
+			configured_identity_namespace TEXT NOT NULL DEFAULT '',
+			capabilities TEXT NOT NULL DEFAULT '',
+			last_report_at INTEGER,
+			heartbeat_enabled INTEGER NOT NULL DEFAULT 0,
+			last_heartbeat_at INTEGER,
+			delivery_status TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE reported_subjects (
+			profile_id TEXT PRIMARY KEY,
+			source_scope TEXT NOT NULL REFERENCES report_sources(source_scope),
+			reference_class TEXT NOT NULL CHECK(reference_class IN ('reported_device','address','event','legacy')),
+			identity_namespace TEXT NOT NULL DEFAULT '',
+			upstream_reference TEXT NOT NULL,
+			reported_identity_source TEXT NOT NULL DEFAULT '',
+			reported_confidence TEXT NOT NULL DEFAULT '',
+			association_status TEXT NOT NULL DEFAULT 'active',
+			operator_label TEXT,
+			first_report_at INTEGER NOT NULL,
+			last_report_at INTEGER NOT NULL,
+			UNIQUE(source_scope, reference_class, identity_namespace, upstream_reference)
+		)`,
+		`CREATE INDEX reported_subjects_scope ON reported_subjects(source_scope, last_report_at)`,
+		`CREATE TABLE reported_observations (
+			observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			event_id TEXT NOT NULL REFERENCES raw_events(event_id),
+			view_role TEXT NOT NULL CHECK(view_role IN ('host','previous','current')),
+			profile_id TEXT NOT NULL REFERENCES reported_subjects(profile_id),
+			reported_at INTEGER NOT NULL,
+			received_at INTEGER NOT NULL,
+			attributes_json TEXT NOT NULL DEFAULT '{}',
+			UNIQUE(event_id, view_role)
+		)`,
+		`CREATE INDEX reported_observations_event ON reported_observations(event_id)`,
+		`CREATE INDEX reported_observations_profile ON reported_observations(profile_id, reported_at)`,
+		`CREATE TABLE reported_ports (
+			observation_id INTEGER NOT NULL REFERENCES reported_observations(observation_id) ON DELETE CASCADE,
+			proto TEXT NOT NULL,
+			port INTEGER NOT NULL,
+			reported_state TEXT NOT NULL DEFAULT '',
+			reported_service TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(observation_id, proto, port)
+		)`,
+		`CREATE TABLE group_subjects (
+			group_id TEXT NOT NULL REFERENCES active_groups(group_id) ON DELETE CASCADE,
+			profile_id TEXT NOT NULL REFERENCES reported_subjects(profile_id),
+			role TEXT NOT NULL,
+			PRIMARY KEY(group_id, profile_id, role)
+		)`,
+		`CREATE INDEX group_subjects_group ON group_subjects(group_id)`,
+		`CREATE TABLE briefing_subjects (
+			briefing_id TEXT NOT NULL REFERENCES briefings(briefing_id) ON DELETE CASCADE,
+			profile_id TEXT NOT NULL REFERENCES reported_subjects(profile_id),
+			role TEXT NOT NULL,
+			PRIMARY KEY(briefing_id, profile_id, role)
+		)`,
+		`CREATE INDEX briefing_subjects_briefing ON briefing_subjects(briefing_id)`,
+		`CREATE TABLE projection_progress (
+			event_id TEXT PRIMARY KEY REFERENCES raw_events(event_id) ON DELETE CASCADE,
+			projection_version INTEGER NOT NULL,
+			state TEXT NOT NULL CHECK(state IN ('pending','done'))
+		)`,
+		`CREATE INDEX projection_progress_state ON projection_progress(state)`,
+		`CREATE TABLE legacy_profile_state (
+			old_device_id TEXT PRIMARY KEY,
+			association_status TEXT NOT NULL DEFAULT '',
+			operator_label TEXT,
+			split_metadata TEXT NOT NULL DEFAULT ''
+		)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV11: source ownership and bounded projection discovery.
+//
+// source_scope records which configured scanner deployment accepted
+// each event, in the same transaction as the event itself. Rows
+// predating scopes keep ” and are adopted once by the single
+// configured scope at projection; rows carrying any other concrete
+// scope fail the startup binding check instead of being reattributed.
+//
+// projection_pending is the indexed pending-work queue. The projector
+// drains it in received order instead of anti-joining retention on
+// every tick, so steady state costs one small indexed read whether
+// ten events or ten million are retained. The migration backfills it
+// from retained events, so pre-projection databases resume without a
+// full-history scan. It lives here rather than in v10 so dev
+// databases created at v10 replay this step instead of silently
+// missing the queue table.
+func migrateV11(tx *sql.Tx) error {
+	if _, err := tx.Exec(`ALTER TABLE raw_events ADD COLUMN source_scope TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	stmts := []string{
+		`CREATE TABLE projection_pending (
+			event_id TEXT PRIMARY KEY REFERENCES raw_events(event_id) ON DELETE CASCADE,
+			received_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX projection_pending_received ON projection_pending(received_at)`,
+		`INSERT INTO projection_pending (event_id, received_at)
+			SELECT event_id, received_at FROM raw_events`,
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt); err != nil {

@@ -35,6 +35,10 @@ func seedOpenGroup(t *testing.T, s *store.Store, anchor, eventID string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Mirror production order (persist -> project -> close -> take).
+	if _, err := s.ProjectReported(context.Background(), "test-scope", 64); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func seedBriefing(t *testing.T, s *store.Store, anchor, eventID string) string {

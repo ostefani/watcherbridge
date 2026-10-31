@@ -277,9 +277,13 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
-	anchor, fallback := anchorForEvent(body, eventType, eventKey)
-	if fallback {
-		log.Printf("ingest: event %s has no host identifier, grouping by event key", eventID)
+	// Grouping keys are exact scoped upstream references, addresses
+	// kept address-scoped, or the event itself when the report carries
+	// no usable reference (Designv9 §1.5). No MAC/hostname/IP
+	// preference heuristic runs here anymore.
+	anchor, eventScoped := store.GroupKeyForEvent(s.cfg.SourceID, eventType, eventID, body)
+	if eventScoped {
+		log.Printf("ingest: event %s has no usable reference, event-local grouping", eventID)
 	}
 	if perr := s.persistAndReply(ctx, w, body, r, eventID, eventKey, eventType, anchor, sigTime); perr != nil {
 		s.reportPersistError(w, eventID, perr)
@@ -320,6 +324,7 @@ func (s *Server) persistAndReply(ctx context.Context, w http.ResponseWriter, bod
 		HeadersJSON:        string(headersJSON),
 		ReceivedAt:         s.now().UTC(),
 		SignatureTimestamp: sigTime,
+		SourceScope:        s.cfg.SourceID,
 	}
 	if ev.OccurredAt.IsZero() {
 		ev.OccurredAt = ev.ReceivedAt

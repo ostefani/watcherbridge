@@ -233,6 +233,15 @@ func (s *Store) InsertBriefing(ctx context.Context, b Briefing) error {
 		if n, _ := res.RowsAffected(); n != 1 {
 			return fmt.Errorf("group %s is not in processing state", b.GroupID)
 		}
+		// Briefing-subject relations copy the group's links: explicit
+		// rows, never timeline joins on current hostname/IP/MAC
+		// ownership. A group with no projected subjects (undecodable
+		// payload, or projection lagging the take) stores no relations
+		// rather than invented ones.
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO briefing_subjects (briefing_id, profile_id, role)
+			SELECT ?, profile_id, role FROM group_subjects WHERE group_id = ?`, b.BriefingID, b.GroupID); err != nil {
+			return err
+		}
 		return nil
 	})
 }
