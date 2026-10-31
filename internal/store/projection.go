@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -74,8 +75,13 @@ type subjectView struct {
 	alive              *bool
 	weak               *bool
 	aliases            []string
+	aliasesCut         bool
 	anchorKeys         []string
+	anchorsCut         bool
 	fingerprint        string
+	livenessCut        bool
+	portsTotal         int
+	portsCut           bool
 	lastSeen           string
 	lastStrongSeen     string
 	lastWeakSeen       string
@@ -87,52 +93,112 @@ type subjectView struct {
 
 // subjectLiveness is one reported liveness entry: who vouches, whether
 // the observation was weak, and when the claim expires ("" = unstated).
+// Weak is tri-state like the view booleans: nil means the report did
+// not state strength, and only an explicit value stores true/false.
 type subjectLiveness struct {
 	source    string
-	weak      bool
+	weak      *bool
 	expiresAt string
+}
+
+// portJSON mirrors one reported port entry.
+type portJSON struct {
+	Number   int    `json:"number"`
+	Protocol string `json:"protocol"`
+	State    string `json:"state"`
+	Service  string `json:"service"`
+}
+
+// livenessJSON mirrors one reported liveness entry. Weak is tri-state:
+// nil means the report did not state strength.
+type livenessJSON struct {
+	Source    string `json:"source"`
+	Weak      *bool  `json:"weak"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// cappedPorts decodes at most maxPortsPerObservation entries while
+// retaining the wire total for ports_total.
+type cappedPorts struct {
+	kept  []portJSON
+	total int
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (c *cappedPorts) UnmarshalJSON(data []byte) error {
+	kept, total, err := decodeCapped[portJSON](data, maxPortsPerObservation)
+	if err != nil {
+		return err
+	}
+	c.kept, c.total = kept, total
+	return nil
+}
+
+// cappedLiveness decodes at most maxAliasEntries entries, flagging a cut.
+type cappedLiveness struct {
+	kept      []livenessJSON
+	truncated bool
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (c *cappedLiveness) UnmarshalJSON(data []byte) error {
+	kept, total, err := decodeCapped[livenessJSON](data, maxAliasEntries)
+	if err != nil {
+		return err
+	}
+	c.kept, c.truncated = kept, total > len(kept)
+	return nil
+}
+
+// cappedStringList decodes at most maxAliasEntries entries, flagging
+// a cut. Alias and anchor-key lists share the design bound.
+type cappedStringList struct {
+	kept      []string
+	truncated bool
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (c *cappedStringList) UnmarshalJSON(data []byte) error {
+	kept, total, err := decodeCapped[string](data, maxAliasEntries)
+	if err != nil {
+		return err
+	}
+	c.kept, c.truncated = kept, total > len(kept)
+	return nil
 }
 
 // hostViewJSON mirrors the producer HostState fields projection reads.
 // Only identity, addressing, enrichment and port fields are decoded;
-// everything else stays in the raw payload.
+// everything else stays in the raw payload. Collections decode capped
+// so oversized arrays stay cheap; totals and cuts ride along.
 type hostViewJSON struct {
-	IP                 string   `json:"ip"`
-	Hostname           string   `json:"hostname"`
-	MAC                string   `json:"mac"`
-	RandomizedMAC      *bool    `json:"randomized_mac"`
-	Vendor             string   `json:"vendor"`
-	OS                 string   `json:"os"`
-	Device             string   `json:"device"`
-	OSEvidence         string   `json:"os_evidence"`
-	DeviceEvidence     string   `json:"device_evidence"`
-	Source             string   `json:"source"`
-	SourceName         string   `json:"source_name"`
-	Alive              *bool    `json:"alive"`
-	Weak               *bool    `json:"weak"`
-	HostID             string   `json:"host_id"`
-	IdentityConfidence string   `json:"identity_confidence"`
-	IdentitySource     string   `json:"identity_source"`
-	IdentityAliases    []string `json:"identity_aliases"`
-	IdentityAnchorKeys []string `json:"identity_anchor_keys"`
-	Fingerprint        string   `json:"evidence_fingerprint"`
-	LastSeenAt         string   `json:"last_seen_at"`
-	LastStrongSeenAt   string   `json:"last_strong_seen_at"`
-	LastWeakSeenAt     string   `json:"last_weak_seen_at"`
-	Liveness           []struct {
-		Source    string `json:"source"`
-		Weak      bool   `json:"weak"`
-		ExpiresAt string `json:"expires_at"`
-	} `json:"liveness"`
-	ConfirmationSource string `json:"confirmation_source"`
-	ConfirmationProto  string `json:"confirmation_proto"`
-	ConfirmationPort   int    `json:"confirmation_port"`
-	Ports              []struct {
-		Number   int    `json:"number"`
-		Protocol string `json:"protocol"`
-		State    string `json:"state"`
-		Service  string `json:"service"`
-	} `json:"ports"`
+	IP                 string           `json:"ip"`
+	Hostname           string           `json:"hostname"`
+	MAC                string           `json:"mac"`
+	RandomizedMAC      *bool            `json:"randomized_mac"`
+	Vendor             string           `json:"vendor"`
+	OS                 string           `json:"os"`
+	Device             string           `json:"device"`
+	OSEvidence         string           `json:"os_evidence"`
+	DeviceEvidence     string           `json:"device_evidence"`
+	Source             string           `json:"source"`
+	SourceName         string           `json:"source_name"`
+	Alive              *bool            `json:"alive"`
+	Weak               *bool            `json:"weak"`
+	HostID             string           `json:"host_id"`
+	IdentityConfidence string           `json:"identity_confidence"`
+	IdentitySource     string           `json:"identity_source"`
+	IdentityAliases    cappedStringList `json:"identity_aliases"`
+	IdentityAnchorKeys cappedStringList `json:"identity_anchor_keys"`
+	Fingerprint        string           `json:"evidence_fingerprint"`
+	LastSeenAt         string           `json:"last_seen_at"`
+	LastStrongSeenAt   string           `json:"last_strong_seen_at"`
+	LastWeakSeenAt     string           `json:"last_weak_seen_at"`
+	Liveness           cappedLiveness   `json:"liveness"`
+	ConfirmationSource string           `json:"confirmation_source"`
+	ConfirmationProto  string           `json:"confirmation_proto"`
+	ConfirmationPort   int              `json:"confirmation_port"`
+	Ports              cappedPorts      `json:"ports"`
 }
 
 type eventViewsJSON struct {
@@ -162,8 +228,11 @@ func toSubjectView(role string, h *hostViewJSON) subjectView {
 	v.sourceName = h.SourceName
 	v.alive = h.Alive
 	v.weak = h.Weak
-	v.aliases = h.IdentityAliases
-	v.anchorKeys = h.IdentityAnchorKeys
+	// Collections arrive decode-capped; the copy only transfers the
+	// kept entries, so the in-memory view stays bounded too. Counts
+	// and cuts ride along for omission flags and ports_total.
+	v.aliases, v.aliasesCut = h.IdentityAliases.kept, h.IdentityAliases.truncated
+	v.anchorKeys, v.anchorsCut = h.IdentityAnchorKeys.kept, h.IdentityAnchorKeys.truncated
 	v.fingerprint = h.Fingerprint
 	v.lastSeen = h.LastSeenAt
 	v.lastStrongSeen = h.LastStrongSeenAt
@@ -171,14 +240,17 @@ func toSubjectView(role string, h *hostViewJSON) subjectView {
 	v.confirmSource = h.ConfirmationSource
 	v.confirmProto = h.ConfirmationProto
 	v.confirmPort = h.ConfirmationPort
-	for _, l := range h.Liveness {
+	for _, l := range h.Liveness.kept {
 		v.liveness = append(v.liveness, subjectLiveness{
 			source:    l.Source,
 			weak:      l.Weak,
 			expiresAt: l.ExpiresAt,
 		})
 	}
-	for _, p := range h.Ports {
+	v.livenessCut = h.Liveness.truncated
+	v.portsTotal = h.Ports.total
+	v.portsCut = h.Ports.total > len(h.Ports.kept)
+	for _, p := range h.Ports.kept {
 		v.ports = append(v.ports, subjectPort{
 			proto:   p.Protocol,
 			number:  p.Number,
@@ -187,6 +259,55 @@ func toSubjectView(role string, h *hostViewJSON) subjectView {
 		})
 	}
 	return v
+}
+
+// groupKeyViewJSON carries only the fields grouping needs. The webhook
+// decodes this synchronously on ingest; enrichment arrays and port
+// lists never allocate there no matter how large the body is.
+type groupKeyViewJSON struct {
+	HostID         string `json:"host_id"`
+	IdentitySource string `json:"identity_source"`
+	IP             string `json:"ip"`
+}
+
+// groupKeyEventJSON mirrors the event envelope without collections.
+type groupKeyEventJSON struct {
+	Host     *groupKeyViewJSON `json:"host"`
+	Previous *groupKeyViewJSON `json:"previous"`
+	Current  *groupKeyViewJSON `json:"current"`
+}
+
+// parseGroupViews extracts role-selected identity fields without
+// decoding collections: grouping keys derive from the reported
+// reference only, so ingest never pays for enrichment parsing.
+func parseGroupViews(payload []byte, eventType string) []subjectView {
+	var env groupKeyEventJSON
+	if err := json.Unmarshal(payload, &env); err != nil {
+		return nil
+	}
+	toView := func(role string, h *groupKeyViewJSON) subjectView {
+		v := subjectView{role: role}
+		if h != nil {
+			v.hostID = h.HostID
+			v.identitySource = h.IdentitySource
+			v.ip = strings.TrimSpace(h.IP)
+		}
+		return v
+	}
+	if eventType == "host.changed" {
+		var out []subjectView
+		if env.Previous != nil {
+			out = append(out, toView("previous", env.Previous))
+		}
+		if env.Current != nil {
+			out = append(out, toView("current", env.Current))
+		}
+		return out
+	}
+	if env.Host == nil {
+		return nil
+	}
+	return []subjectView{toView("host", env.Host)}
 }
 
 // parseEventViews extracts the host views an event type carries: host
@@ -266,7 +387,7 @@ func qualifiedReference(view subjectView) (class, namespace, reference string) {
 // input groups by event ID. The second return reports event-local
 // grouping so the receiver can log it; it is not an error.
 func GroupKeyForEvent(sourceScope, eventType, eventID string, payload []byte) (string, bool) {
-	views := parseEventViews(payload, eventType)
+	views := parseGroupViews(payload, eventType)
 	var v *subjectView
 	if eventType == "host.changed" {
 		for i := range views {
@@ -313,24 +434,75 @@ func capRunes(s string, n int) string {
 	return string(runes[:n])
 }
 
+// decodeCapped decodes a JSON array keeping at most max entries and
+// reporting the wire total. Entries past the cap are consumed
+// token-wise without decoding, so a hostile oversized collection stays
+// cheap: only kept entries allocate. A null array decodes empty; a
+// non-array is invalid input and errors.
+func decodeCapped[T any](data []byte, max int) (kept []T, total int, err error) {
+	if string(bytes.TrimSpace(data)) == "null" {
+		return nil, 0, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, 0, err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '[' {
+		return nil, 0, fmt.Errorf("expected array")
+	}
+	for dec.More() {
+		if len(kept) < max {
+			var v T
+			if err := dec.Decode(&v); err != nil {
+				return nil, 0, err
+			}
+			kept = append(kept, v)
+		} else if err := skipJSONValue(dec); err != nil {
+			return nil, 0, err
+		}
+		total++
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, 0, err
+	}
+	return kept, total, nil
+}
+
+// skipJSONValue consumes one JSON value positioned at the decoder
+// without decoding it: scalars take one token, composites are walked
+// by delimiter depth.
+func skipJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if d, ok := tok.(json.Delim); !ok || (d != '[' && d != '{') {
+		return nil
+	}
+	for depth := 1; depth > 0; {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '[', '{':
+				depth++
+			case ']', '}':
+				depth--
+			}
+		}
+	}
+	return nil
+}
+
 // capRunesFlag caps like capRunes and reports whether content changed.
 func capRunesFlag(s string, n int) (string, bool) {
 	if utf8.RuneCountInString(s) <= n {
 		return s, false
 	}
 	return string([]rune(s)[:n]), true
-}
-
-// capStringList caps entry count and per-entry length, reporting
-// truncation from either cause: an over-long alias in a short list
-// truncates just as much as a 201st entry.
-func capStringList(in []string, maxEntries, maxRunes int) ([]string, bool) {
-	truncated := len(in) > maxEntries
-	if truncated {
-		in = in[:maxEntries]
-	}
-	out, cut := cappedStrings(in, maxRunes)
-	return out, truncated || cut
 }
 
 func cappedStrings(in []string, maxRunes int) ([]string, bool) {
@@ -444,8 +616,13 @@ func (s *Store) ProjectReported(ctx context.Context, defaultScope string, limit 
 		if scope == "" {
 			scope = defaultScope
 		}
+		// Decode outside the writer: parsing never holds the
+		// serialization lock, so one large event cannot delay
+		// unrelated persistence. The idempotency recheck stays
+		// inside the transaction below.
+		views := parseEventViews(ev.payload, ev.eventType)
 		if err := s.write(ctx, func(tx *sql.Tx) error {
-			return projectEvent(tx, scope, ev.eventID, ev.eventType, ev.occurredAt, ev.receivedAt, ev.payload)
+			return projectEvent(tx, scope, ev.eventID, ev.occurredAt, ev.receivedAt, views)
 		}); err != nil {
 			return done, err
 		}
@@ -458,7 +635,9 @@ func (s *Store) ProjectReported(ctx context.Context, defaultScope string, limit 
 // Idempotency is rechecked here, not assumed from the queue: two
 // callers can select the same pending event before either commits,
 // and only the recheck keeps the second replay from mutating state.
-func projectEvent(tx *sql.Tx, sourceScope, eventID, eventType string, occurredAt, receivedAt int64, payload []byte) error {
+// Views arrive decoded: parsing happens outside the writer so it never
+// holds the serialization lock.
+func projectEvent(tx *sql.Tx, sourceScope, eventID string, occurredAt, receivedAt int64, views []subjectView) error {
 	var already int64
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM projection_progress WHERE event_id = ? AND state = 'done'`, eventID).Scan(&already); err != nil {
 		return err
@@ -482,7 +661,7 @@ func projectEvent(tx *sql.Tx, sourceScope, eventID, eventType string, occurredAt
 	if err := tx.QueryRow(`SELECT group_id FROM group_events WHERE event_id = ?`, eventID).Scan(&groupID); err != nil && err != sql.ErrNoRows {
 		return err
 	}
-	for _, view := range parseEventViews(payload, eventType) {
+	for _, view := range views {
 		class, namespace, ref := qualifiedReference(view)
 		var upstreamRef string
 		if class == SubjectEvent {
@@ -586,14 +765,25 @@ func ensureObservation(tx *sql.Tx, eventID, role, profileID string, reportedAt, 
 	return observationID, nil
 }
 
+// capPort bounds one port's display strings, reporting cuts so the
+// snapshot can mark shortened evidence as incomplete. ensurePorts
+// stores through this same helper, so the flag and the row agree.
+func capPort(p subjectPort) (proto, state, service string, cut bool) {
+	var c1, c2, c3 bool
+	proto, c1 = capRunesFlag(p.proto, maxDisplayRunes)
+	state, c2 = capRunesFlag(p.state, maxDisplayRunes)
+	service, c3 = capRunesFlag(p.service, maxDisplayRunes)
+	return proto, state, service, c1 || c2 || c3
+}
+
 // viewAttributes snapshots the reported enrichment a view carried. ID,
 // address, hostname, MAC, tri-state presence and the scanner's own
 // timestamps survive; display strings are capped, alias/liveness lists
 // are capped with omission flags, and attributes_truncated reports any
-// scalar or list capping anywhere in the snapshot. reported_at keeps
-// the enclosing event time; scanner observation times ride as
-// attributes, never substituted. Ports live in reported_ports; only
-// their count and truncation flag ride along here.
+// scalar, list or port-field capping anywhere in the snapshot.
+// reported_at keeps the enclosing event time; scanner observation
+// times ride as attributes, never substituted. Ports live in
+// reported_ports; their count and field truncation flags ride along.
 func viewAttributes(view subjectView) (string, error) {
 	var truncated bool
 	cap := func(s string) string {
@@ -601,10 +791,18 @@ func viewAttributes(view subjectView) (string, error) {
 		truncated = truncated || cut
 		return c
 	}
-	aliases, aliasesTruncated := capStringList(view.aliases, maxAliasEntries, maxDisplayRunes)
-	anchors, anchorsTruncated := capStringList(view.anchorKeys, maxAliasEntries, maxDisplayRunes)
-	liveness, livenessTruncated := capLiveness(view.liveness)
-	truncated = truncated || aliasesTruncated || anchorsTruncated || livenessTruncated
+	aliases, aliasesCut := cappedStrings(view.aliases, maxDisplayRunes)
+	anchors, anchorsCut := cappedStrings(view.anchorKeys, maxDisplayRunes)
+	liveness, livenessCut := capLiveness(view.liveness)
+	var portsCut, portFieldsCut bool
+	for _, p := range view.ports {
+		_, _, _, cut := capPort(p)
+		portFieldsCut = portFieldsCut || cut
+	}
+	portsCut = view.portsCut || portFieldsCut
+	truncated = truncated || view.aliasesCut || aliasesCut ||
+		view.anchorsCut || anchorsCut ||
+		view.livenessCut || livenessCut || portsCut
 	attrs := map[string]any{
 		"host_id":               cap(view.hostID),
 		"identity_source":       cap(view.identitySource),
@@ -623,17 +821,17 @@ func viewAttributes(view subjectView) (string, error) {
 		"alive":                 view.alive,
 		"weak":                  view.weak,
 		"aliases":               aliases,
-		"aliases_truncated":     aliasesTruncated,
+		"aliases_truncated":     view.aliasesCut || aliasesCut,
 		"anchor_keys":           anchors,
-		"anchor_keys_truncated": anchorsTruncated,
-		"ports_total":           len(view.ports),
-		"ports_truncated":       len(view.ports) > maxPortsPerObservation,
+		"anchor_keys_truncated": view.anchorsCut || anchorsCut,
+		"ports_total":           view.portsTotal,
+		"ports_truncated":       portsCut,
 		"evidence_fingerprint":  cap(view.fingerprint),
 		"last_seen_at":          cap(view.lastSeen),
 		"last_strong_seen_at":   cap(view.lastStrongSeen),
 		"last_weak_seen_at":     cap(view.lastWeakSeen),
 		"liveness":              liveness,
-		"liveness_truncated":    livenessTruncated,
+		"liveness_truncated":    view.livenessCut || livenessCut,
 		"confirmation_source":   cap(view.confirmSource),
 		"confirmation_proto":    cap(view.confirmProto),
 		"confirmation_port":     view.confirmPort,
@@ -668,19 +866,18 @@ func capLiveness(in []subjectLiveness) ([]map[string]any, bool) {
 	return out, truncated
 }
 
-// ensurePorts records the reported port states for one observation,
-// capped per observation so one chatty view cannot flood the table.
-// Replays hit the composite primary key and change nothing.
+// ensurePorts records the reported port states for one observation.
+// The view copy is already count-bounded, so one chatty view cannot
+// flood the table; field strings go through capPort, the same helper
+// the snapshot flag uses. Replays hit the composite primary key and
+// change nothing.
 func ensurePorts(tx *sql.Tx, observationID int64, ports []subjectPort) error {
-	if len(ports) > maxPortsPerObservation {
-		ports = ports[:maxPortsPerObservation]
-	}
 	for _, p := range ports {
+		proto, state, service, _ := capPort(p)
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO reported_ports
 			(observation_id, proto, port, reported_state, reported_service)
 			VALUES (?, ?, ?, ?, ?)`,
-			observationID, capRunes(p.proto, maxDisplayRunes), p.number,
-			capRunes(p.state, maxDisplayRunes), capRunes(p.service, maxDisplayRunes)); err != nil {
+			observationID, proto, p.number, state, service); err != nil {
 			return err
 		}
 	}

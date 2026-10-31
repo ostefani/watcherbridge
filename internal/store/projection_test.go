@@ -103,7 +103,7 @@ func TestProjectedTimestampsAndLivenessPreserved(t *testing.T) {
 	body := []byte(`{"event_id":"evt-ts","event_key":"k","event_type":"host.appeared","occurred_at":"2026-10-20T12:00:05Z","cycle":3,
 		"host":{"mac":"10:20:30:40:50:62","host_id":"mac:10:20:30:40:50:62","identity_source":"mac","identity_confidence":"high",
 		"last_seen_at":"2026-10-20T12:00:01Z","last_strong_seen_at":"2026-10-19T12:00:00Z","last_weak_seen_at":"2026-10-20T11:00:00Z",
-		"liveness":[{"source":"arp","weak":false,"expires_at":"2026-10-20T12:05:00Z"}],
+		"liveness":[{"source":"arp","weak":false,"expires_at":"2026-10-20T12:05:00Z"},{"source":"dns"}],
 		"confirmation_source":"arp","confirmation_proto":"tcp","confirmation_port":22,
 		"identity_aliases":["h1","` + longAlias + `"]}}`)
 	persistReported(t, s, "lab", "evt-ts", "k", "host.appeared", body, at)
@@ -136,12 +136,18 @@ func TestProjectedTimestampsAndLivenessPreserved(t *testing.T) {
 		t.Fatalf("confirmation_port = %v, want 22", attrs["confirmation_port"])
 	}
 	live, ok := attrs["liveness"].([]any)
-	if !ok || len(live) != 1 {
-		t.Fatalf("liveness = %v, want one entry", attrs["liveness"])
+	if !ok || len(live) != 2 {
+		t.Fatalf("liveness = %v, want two entries", attrs["liveness"])
 	}
 	entry, ok := live[0].(map[string]any)
 	if !ok || entry["source"] != "arp" || entry["weak"] != false || entry["expires_at"] != "2026-10-20T12:05:00Z" {
 		t.Fatalf("liveness entry = %v", live)
+	}
+	// Missing strength stays null: it must not become an explicit
+	// strong observation.
+	unstated, ok := live[1].(map[string]any)
+	if !ok || unstated["source"] != "dns" || unstated["weak"] != nil {
+		t.Fatalf("unstated strength must stay null: %v", live)
 	}
 	// One over-long alias in a two-entry list must flag truncation even
 	// though the entry count is under the cap (the P3 under-report).
@@ -150,6 +156,121 @@ func TestProjectedTimestampsAndLivenessPreserved(t *testing.T) {
 	}
 	if got := attrs["aliases"].([]any)[1].(string); utf8.RuneCountInString(got) != maxDisplayRunes {
 		t.Fatalf("over-long alias capped to %d runes, got %d", maxDisplayRunes, utf8.RuneCountInString(got))
+	}
+}
+
+// One oversized port service string with a short port list must still
+// flag truncation: ports_truncated covers field cuts, not just entry
+// count, and attributes_truncated includes them.
+func TestPortFieldTruncationReported(t *testing.T) {
+	s := openTestStore(t)
+	at := time.Now().UTC().Truncate(time.Second)
+	longService := strings.Repeat("s", maxDisplayRunes+10)
+	body := []byte(`{"event_id":"evt-pt","event_key":"k","event_type":"host.appeared","occurred_at":"2026-10-20T12:00:05Z","cycle":3,
+		"host":{"mac":"10:20:30:40:50:63","host_id":"mac:10:20:30:40:50:63","identity_source":"mac","identity_confidence":"high",
+		"ports":[{"number":22,"protocol":"tcp","state":"open","service":"` + longService + `"}]}}`)
+	persistReported(t, s, "lab", "evt-pt", "k", "host.appeared", body, at)
+	if _, err := s.ProjectReported(context.Background(), "lab", 64); err != nil {
+		t.Fatal(err)
+	}
+	var attrsJSON string
+	if err := s.db.QueryRow(`SELECT attributes_json FROM reported_observations WHERE event_id = 'evt-pt'`).Scan(&attrsJSON); err != nil {
+		t.Fatal(err)
+	}
+	var attrs map[string]any
+	if err := json.Unmarshal([]byte(attrsJSON), &attrs); err != nil {
+		t.Fatal(err)
+	}
+	if attrs["ports_truncated"] != true || attrs["attributes_truncated"] != true {
+		t.Fatalf("ports_truncated=%v attributes_truncated=%v, want true/true", attrs["ports_truncated"], attrs["attributes_truncated"])
+	}
+	var service string
+	if err := s.db.QueryRow(`SELECT reported_service FROM reported_ports WHERE port = 22`).Scan(&service); err != nil {
+		t.Fatal(err)
+	}
+	if utf8.RuneCountInString(service) != maxDisplayRunes {
+		t.Fatalf("stored service capped to %d runes, got %d", maxDisplayRunes, utf8.RuneCountInString(service))
+	}
+}
+
+// Grouping decodes identity only: enrichment collections never reach
+// the ingest parser, so the key matches the minimal-payload key while
+// the parsed view carries no collections.
+func TestParseGroupViewsIgnoresCollections(t *testing.T) {
+	enriched := []byte(`{"event_id":"evt-g","host":{"mac":"10:20:30:40:50:64","host_id":"mac:10:20:30:40:50:64",
+		"identity_source":"mac","identity_confidence":"high","ip":"192.168.0.64",
+		"ports":[{"number":1,"protocol":"tcp","state":"open","service":"s"}],
+		"identity_aliases":["a"],"liveness":[{"source":"arp","weak":false}]}}`)
+	minimal := []byte(`{"event_id":"evt-g","host":{"mac":"10:20:30:40:50:64","host_id":"mac:10:20:30:40:50:64",
+		"identity_source":"mac","identity_confidence":"high","ip":"192.168.0.64"}}`)
+	keyFull, localFull := GroupKeyForEvent("lab", "host.appeared", "evt-g", enriched)
+	keyMin, localMin := GroupKeyForEvent("lab", "host.appeared", "evt-g", minimal)
+	if keyFull != keyMin || localFull != localMin {
+		t.Fatalf("enriched key = %q/%v, minimal = %q/%v", keyFull, localFull, keyMin, localMin)
+	}
+	for _, v := range parseGroupViews(enriched, "host.appeared") {
+		if len(v.ports) != 0 || len(v.aliases) != 0 || len(v.liveness) != 0 {
+			t.Fatalf("grouping view must carry no collections: %+v", v)
+		}
+		if v.hostID == "" {
+			t.Fatal("grouping view must carry the reported reference")
+		}
+	}
+}
+
+// Oversized collections decode capped: a 600-port report keeps 500
+// rows but records the original total, and a 300-alias list keeps 200
+// entries with both list and aggregate flags set.
+func TestOversizedCollectionsDecodeCapped(t *testing.T) {
+	s := openTestStore(t)
+	at := time.Now().UTC().Truncate(time.Second)
+	var ports strings.Builder
+	for i := 1; i <= 600; i++ {
+		if i > 1 {
+			ports.WriteByte(',')
+		}
+		fmt.Fprintf(&ports, `{"number":%d,"protocol":"tcp","state":"open","service":"s%d"}`, i, i)
+	}
+	var aliases strings.Builder
+	for i := 0; i < 300; i++ {
+		if i > 0 {
+			aliases.WriteByte(',')
+		}
+		fmt.Fprintf(&aliases, `"a%d"`, i)
+	}
+	body := []byte(`{"event_id":"evt-big","event_key":"k","event_type":"host.appeared","occurred_at":"2026-10-20T12:00:05Z","cycle":3,
+		"host":{"mac":"10:20:30:40:50:65","host_id":"mac:10:20:30:40:50:65","identity_source":"mac","identity_confidence":"high",
+		"ports":[` + ports.String() + `],"identity_aliases":[` + aliases.String() + `]}}`)
+	persistReported(t, s, "lab", "evt-big", "k", "host.appeared", body, at)
+	if _, err := s.ProjectReported(context.Background(), "lab", 64); err != nil {
+		t.Fatal(err)
+	}
+	var attrsJSON string
+	var observationID int64
+	err := s.db.QueryRow(`SELECT observation_id, attributes_json FROM reported_observations WHERE event_id = 'evt-big'`).Scan(&observationID, &attrsJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM reported_ports WHERE observation_id = ?`, observationID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != maxPortsPerObservation {
+		t.Fatalf("retained port rows = %d, want %d", rows, maxPortsPerObservation)
+	}
+	var attrs map[string]any
+	if err := json.Unmarshal([]byte(attrsJSON), &attrs); err != nil {
+		t.Fatal(err)
+	}
+	if attrs["ports_total"] != float64(600) {
+		t.Fatalf("ports_total = %v, want 600", attrs["ports_total"])
+	}
+	if attrs["ports_truncated"] != true || attrs["attributes_truncated"] != true || attrs["aliases_truncated"] != true {
+		t.Fatalf("truncation flags = ports %v attributes %v aliases %v, want all true",
+			attrs["ports_truncated"], attrs["attributes_truncated"], attrs["aliases_truncated"])
+	}
+	if got := len(attrs["aliases"].([]any)); got != maxAliasEntries {
+		t.Fatalf("retained aliases = %d, want %d", got, maxAliasEntries)
 	}
 }
 
