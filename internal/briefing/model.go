@@ -114,15 +114,18 @@ func plainText(s string) string {
 const maxRestoredBytes = 256 << 10
 
 // projectedRestoredSize sums the exact restored lengths of the model text
-// fields without building them (redactor.ProjectedRestoreSize is exact, so
-// no allocation can exceed the sum). briefWithModel calls it before any
-// Restore, so the budget check bounds restoration memory too — checking
-// after Restore would protect storage but not the allocation itself. The
-// reason travels raw and contributes its plain length.
-func projectedRestoredSize(m modelBriefing, issued redactor.TokenMap) int {
+// fields without building them (redactor.ProjectedRestoreSize is exact for
+// a given map, so no allocation can exceed the sum). briefWithModel calls
+// it before any Restore, so the budget check bounds restoration memory
+// too — checking after Restore would protect storage but not the
+// allocation itself. The reason travels raw and contributes its plain
+// length. The map must be the effective restoration map (display spellings
+// overriding normalized values): projecting with normalized values while
+// restoring with originals measures a different, shorter string.
+func projectedRestoredSize(m modelBriefing, restored redactor.TokenMap) int {
 	total := len(m.Reason)
 	for _, f := range []string{m.What, m.Context, m.Check} {
-		total += redactor.ProjectedRestoreSize(f, issued)
+		total += redactor.ProjectedRestoreSize(f, restored)
 		if total > maxRestoredBytes {
 			return total
 		}
@@ -267,15 +270,20 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 		s := suggestion.String()
 		sug = &s
 	}
+	// The effective restoration map, built once: display spellings
+	// override normalized values, and projection and restoration must
+	// measure the same map — projecting normalized values while
+	// restoring originals approves strings that exceed the budget.
+	effective := restoreMap(issued, display)
 	// Preflight before allocating: the projection is exact, so nothing
 	// restored can exceed what was just approved.
-	if projectedRestoredSize(m, issued) > maxRestoredBytes {
+	if projectedRestoredSize(m, effective) > maxRestoredBytes {
 		log.Printf("briefing: group %s restored text exceeds the %d-byte budget", taken.GroupID, maxRestoredBytes)
 		return insertFallback(ctx, d, taken, outcome, "restored text exceeds size budget; briefing from deterministic baseline only")
 	}
-	what := plainText(redactor.Restore(m.What, restoreMap(issued, display)))
-	briefCtx := plainText(redactor.Restore(m.Context, restoreMap(issued, display)))
-	check := plainText(redactor.Restore(m.Check, restoreMap(issued, display)))
+	what := plainText(redactor.Restore(m.What, effective))
+	briefCtx := plainText(redactor.Restore(m.Context, effective))
+	check := plainText(redactor.Restore(m.Check, effective))
 	reason := plainText(m.Reason)
 	b := store.Briefing{
 		BriefingID:       "brf-" + taken.GroupID,

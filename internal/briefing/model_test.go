@@ -298,6 +298,60 @@ func TestRestoredBudgetFallsBackWithDistinctReason(t *testing.T) {
 	}
 }
 
+// The budget preflight must measure the effective restoration map, not
+// the normalized one: display holds first-seen originals, which can be
+// far longer (expanded IPv6 is 39 bytes against a 3-byte normalized
+// form). Repeating such a token passes a normalized-only projection yet
+// restores past the budget — the stored row must still fall back.
+func TestRestoredBudgetUsesDisplaySpelling(t *testing.T) {
+	s := openWorkerStore(t)
+	payload := `{"event_id":"e1","host":{"ip":"0000:0000:0000:0000:0000:0000:0000:0001","hostname":"v6host","mac":"aa:bb:cc:dd:ee:09","weak":false,"alive":true,"identity_confidence":"high","ports":[]}}`
+	gid := seedGroup(t, s, "host:v6", "evt-v6", "host.changed", payload)
+	fake := provider.NewFake()
+	fake.Handle = func(repair bool, bundle []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		if repair {
+			t.Fatal("budget rejection is not a schema error: no repair")
+		}
+		ips := sortedTokensWithPrefix(valid, "IP_")
+		if len(ips) == 0 {
+			t.Fatal("bundle must issue an IP token")
+		}
+		host := ""
+		for tok := range valid {
+			host = tok
+			break
+		}
+		var parsed struct {
+			EventIDs []string `json:"event_ids"`
+		}
+		if err := json.Unmarshal(bundle, &parsed); err != nil {
+			t.Fatal(err)
+		}
+		// Short token, long display value: 8000 repeats fit a
+		// normalized-only projection (~32 KiB) but restore past the
+		// budget through the 39-byte original spelling.
+		m := map[string]any{
+			"event_ids": parsed.EventIDs, "host": host,
+			"what_changed": strings.Repeat(ips[0]+" ", 8000),
+			"context":      "context", "model_suggestion": nil,
+			"priority_reason": "because reasons", "recommended_check": "look",
+		}
+		raw, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return provider.RawBriefing{JSON: raw}, nil
+	}
+	briefOne(context.Background(), modelDeps(t, s, fake), gid)
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || !strings.Contains(b.Context, "restored text exceeds size budget") {
+		t.Fatalf("display-spelling expansion must fall back: %+v", b)
+	}
+	if fake.Briefs != 1 || fake.Repairs != 0 {
+		t.Fatalf("provider called once with no repair: briefs=%d repairs=%d", fake.Briefs, fake.Repairs)
+	}
+}
+
 func TestModelRepairThenSuccess(t *testing.T) {
 	s := openWorkerStore(t)
 	gid := hostChangedGroup(t, s)

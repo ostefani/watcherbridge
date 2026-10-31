@@ -9,7 +9,11 @@
   // detached marks a history-shifted window: an explicit older-page load
   // slid the 500-row window down, so Back to live is offered until a
   // reset re-anchors on the latest page.
-  var state = { briefings: [], groups: [], selected: null, groupSkew: 0, detached: false };
+  // winEpoch fences explicit history loads against window replacement:
+  // every reset success and every new recovery bumps it, and a history
+  // response merged after that point would evict newer records and
+  // re-detach a window that no longer exists — so stale ones are dropped.
+  var state = { briefings: [], groups: [], selected: null, groupSkew: 0, detached: false, winEpoch: 0, historyExhausted: false };
   var connEl = document.getElementById("conn");
 
   function el(tag, cls, text) {
@@ -205,6 +209,27 @@
   // toward the resync boundary) or "reset" (latest page replaces state).
   var pending = null;
   var opSeq = 0;
+  // historyOp is the single explicit history slot: at most one older-page
+  // load is in flight. Identity (not just the window epoch) decides every
+  // completion, so a superseded request can neither merge rows nor leave
+  // the button busy — including when a newer history request exists.
+  var historyOp = null;
+
+  // syncHistoryBtn derives the older-page control from the current
+  // history operation and exhaustion state. Callbacks never touch the
+  // button directly: they update state and sync, so a stale completion
+  // cannot enable, disable, or relabel it out from under the live state.
+  function syncHistoryBtn() {
+    var btn = document.getElementById("older");
+    if (!btn) return;
+    if (state.historyExhausted) {
+      btn.textContent = "No older briefings";
+      btn.disabled = true;
+    } else {
+      btn.textContent = "Load older";
+      btn.disabled = !!historyOp;
+    }
+  }
 
   function clearPending(op) {
     if (pending && pending.id === op.id) {
@@ -268,35 +293,43 @@
 
   // loadOlder pages history the 500-row cap evicted: ?before=<oldest seq>
   // returns the next older page ascending, and the merge slides the
-  // window down. A short page means history is exhausted. Guarded against
-  // concurrent recovery: a pending gap-fill owns the list until it lands.
+  // window down. A short page means history is exhausted. Guarded three
+  // ways: a pending recovery or an in-flight history load refuses the
+  // start; the operation identity drops superseded completions outright;
+  // and the window epoch drops completions from before a reset or resync.
+  // Every path funnels through historyOp + syncHistoryBtn, so no callback
+  // — fresh or stale, success or error — can strand the button busy or
+  // relabel it under a newer state.
   function loadOlder() {
-    if (pending) return;
-    var btn = document.getElementById("older");
+    if (pending || historyOp) return;
     var min = Infinity;
     state.briefings.forEach(function (b) {
       if (b && typeof b.seq === "number" && b.seq < min) min = b.seq;
     });
     if (min === Infinity) return;
-    if (btn) btn.disabled = true;
+    var op = {epoch: state.winEpoch};
+    historyOp = op;
+    syncHistoryBtn();
     fetch("/api/briefings?before=" + encodeURIComponent(String(min)) + "&limit=50")
       .then(function (r) { if (!r.ok) throw new Error("briefings " + r.status); return r.json(); })
       .then(function (rows) {
+        if (historyOp !== op) return;
+        historyOp = null;
+        if (op.epoch !== state.winEpoch) { syncHistoryBtn(); return; }
         rows = rows || [];
         var added = upsertHistory(rows);
         if (added > 0) {
           state.detached = true;
           updateLiveBtn();
         }
-        if (btn) {
-          if (rows.length < 50) {
-            btn.textContent = "No older briefings";
-          } else {
-            btn.disabled = false;
-          }
-        }
+        if (rows.length < 50) state.historyExhausted = true;
+        syncHistoryBtn();
       })
-      .catch(function () { if (btn) btn.disabled = false; });
+      .catch(function () {
+        if (historyOp !== op) return;
+        historyOp = null;
+        syncHistoryBtn();
+      });
   }
 
   // backToLive re-anchors the window on the latest page through the same
@@ -355,7 +388,10 @@
         state.briefings = [];
         upsertMany(rows);
         state.detached = false; // a reset re-anchors on the latest page
+        state.winEpoch++; // the window was replaced: stale history out
+        state.historyExhausted = false; // exhaustion applied to the old window
         updateLiveBtn();
+        syncHistoryBtn();
         renderBriefs(); // replacement renders even when empty: no stale rows survive
         reconcileSelection();
         var pageMax = 0;
@@ -382,6 +418,9 @@
     try { max = Number(JSON.parse(ev.data).max_seq); } catch (e) { /* keep NaN */ }
     if (isNaN(max)) max = 0;
     if (pending && pending.timer) clearTimeout(pending.timer);
+    // A new recovery owns the list from here: any explicit history load
+    // still in flight resolves against a window that no longer exists.
+    state.winEpoch++;
     var cur = Number(lastEventId) || 0;
     if (!lastEventId || max <= cur || max - cur > 500) {
       pending = {id: ++opSeq, kind: "reset", boundary: max, liveMax: 0, running: false, timer: 0};
