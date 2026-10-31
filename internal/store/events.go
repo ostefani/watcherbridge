@@ -22,6 +22,23 @@ type RawEvent struct {
 	SignatureTimestamp time.Time
 }
 
+// StoredEvent returns the retained original bytes and envelope metadata
+// for one accepted event. Acceptance tests compare the persisted payload
+// against the submitted body; grouping and briefing layers must never
+// depend on this for hot paths (prefer group-scoped reads).
+func (s *Store) StoredEvent(ctx context.Context, eventID string) (RawEvent, error) {
+	var ev RawEvent
+	var occurred, received, sig int64
+	err := s.db.QueryRowContext(ctx, `SELECT event_id, event_key, event_type, occurred_at, cycle, COALESCE(target,''), payload, headers_json, received_at, signature_timestamp
+		FROM raw_events WHERE event_id = ?`, eventID).Scan(
+		&ev.EventID, &ev.EventKey, &ev.EventType, &occurred, &ev.Cycle, &ev.Target, &ev.Payload, &ev.HeadersJSON, &received, &sig)
+	if err != nil {
+		return RawEvent{}, err
+	}
+	ev.OccurredAt, ev.ReceivedAt, ev.SignatureTimestamp = fromNanos(occurred), fromNanos(received), fromNanos(sig)
+	return ev, nil
+}
+
 // PersistEventAndGroup stores the event and joins the anchor's open group in
 // one transaction. The deadline extends on every join:
 // min(last_event+QuietWindow, opened+MaxWindow). Reaching MaxEvents closes
