@@ -14,11 +14,12 @@ import (
 )
 
 // dropProjectionSchema rewinds the Step-18 schema additions (v10 tables,
-// v11 pending queue and receipt scope column) so migration-chain tests
+// v11 pending queue/receipt scope and v12 grouping provenance) so migration-chain tests
 // that rewind to older versions replay cleanly through the current
 // version on reopen. Children drop before parents.
 func dropProjectionSchema(t *testing.T, db *sql.DB) {
 	t.Helper()
+	dropGroupingProvenance(t, db)
 	for _, stmt := range []string{
 		`DROP TABLE IF EXISTS reported_ports`,
 		`DROP TABLE IF EXISTS reported_observations`,
@@ -37,6 +38,15 @@ func dropProjectionSchema(t *testing.T, db *sql.DB) {
 	}
 }
 
+func dropGroupingProvenance(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, table := range []string{"active_groups", "briefings"} {
+		if _, err := db.Exec(`ALTER TABLE ` + table + ` DROP COLUMN grouping_version`); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // persistReported persists one accepted event the way the server does:
 // grouping key derived from the scoped upstream reference, then
 // PersistEventAndGroup. Returns the joined group ID.
@@ -46,8 +56,8 @@ func persistReported(t *testing.T, s *Store, sourceScope, eventID, eventKey, eve
 	res, err := s.PersistEventAndGroup(context.Background(), RawEvent{
 		EventID: eventID, EventKey: eventKey, EventType: eventType,
 		OccurredAt: at, Cycle: 1, Target: "192.168.0.0/24", Payload: payload,
-		ReceivedAt: at, SignatureTimestamp: at,
-	}, anchor, GroupPolicy{QuietWindow: time.Hour, MaxWindow: 2 * time.Hour})
+		ReceivedAt: at, SignatureTimestamp: at, SourceScope: sourceScope,
+	}, anchor, GroupPolicy{QuietWindow: time.Hour, MaxWindow: 2 * time.Hour, GroupingVersion: GroupingScoped})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -538,13 +548,13 @@ func TestProjectionQueriesUseIndexes(t *testing.T) {
 	}
 }
 
-// Fresh installs land on schema v10 with the projection tables ready;
+// Fresh installs land on the supported schema with projection tables ready;
 // supported version and table set are asserted once, here.
 func TestMigrateV10ProjectionTables(t *testing.T) {
 	s := openTestStore(t)
 	var version int
-	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 11 {
-		t.Fatalf("user_version = %d, %v; want 11", version, err)
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != supportedSchemaVersion {
+		t.Fatalf("user_version = %d, %v; want %d", version, err, supportedSchemaVersion)
 	}
 	var tables int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN

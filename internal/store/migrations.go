@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 11
+const supportedSchemaVersion = 12
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -80,6 +80,19 @@ func migrate(db *sql.DB) error {
 	if version > supportedSchemaVersion {
 		return fmt.Errorf("database schema version %d is newer than supported %d; upgrade the binary", version, supportedSchemaVersion)
 	}
+	// The archived device engine used overlapping version numbers. A
+	// version alone must never admit that incompatible schema lineage.
+	if version >= 10 {
+		var tables int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+			AND name IN ('report_sources', 'reported_subjects', 'projection_progress')`).Scan(&tables); err != nil {
+			return err
+		}
+		if tables != 3 {
+			return fmt.Errorf("unsupported database schema lineage at version %d; archived device databases require a separate upgrade path", version)
+		}
+	}
+	initialVersion := version
 	if version == 0 {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='raw_events'`).Scan(&name)
@@ -115,11 +128,35 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 10, migrateV10)
 		case 10:
 			err = applyMigration(db, 11, migrateV11)
+		case 11:
+			err = applyMigration(db, 12, func(tx *sql.Tx) error {
+				return migrateV12(tx, initialVersion <= 9)
+			})
 		}
 		if err != nil {
 			return err
 		}
 		version++
+	}
+	return nil
+}
+
+// migrateV12 adds grouping provenance without rewriting historical payloads,
+// text, identifiers or sequence values. SQLite's constant column default
+// supplies the historical value without a table-wide UPDATE/rebuild.
+// Phase-5 databases used legacy grouping. Existing v10/v11 databases can
+// contain both algorithms; without a durable marker their origin is unknown.
+// Never recover provenance by interpreting attacker-controlled anchor text.
+func migrateV12(tx *sql.Tx, phase5 bool) error {
+	version := GroupingUnknown
+	if phase5 {
+		version = GroupingLegacy
+	}
+	for _, table := range []string{"active_groups", "briefings"} {
+		stmt := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN grouping_version INTEGER NOT NULL DEFAULT %d CHECK(grouping_version IN (0,1,2))`, table, version)
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
 	}
 	return nil
 }

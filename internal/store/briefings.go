@@ -11,6 +11,7 @@ import (
 )
 
 type Briefing struct {
+	GroupingVersion                              int // copied from the group, never inferred from its anchor
 	BriefingID, GroupID, HostAnchorKey, Baseline string
 	ModelSuggestion                              *string
 	Priority, PriorityReason                     string
@@ -27,7 +28,7 @@ type Briefing struct {
 // seq rides along so the API, the SSE id: field and replay share it.
 const briefingColumns = `briefing_id, group_id, host_anchor_key, baseline, model_suggestion,
 	priority, priority_reason, baseline_rule, clamped, fallback_used, what_changed, context,
-	recommended_check, model_raw_json, created_at, event_ids_json, seq`
+	recommended_check, model_raw_json, created_at, event_ids_json, seq, grouping_version`
 
 func scanBriefing(rows interface {
 	Scan(dest ...any) error
@@ -37,7 +38,7 @@ func scanBriefing(rows interface {
 	var created int64
 	if err := rows.Scan(&b.BriefingID, &b.GroupID, &b.HostAnchorKey, &b.Baseline, &suggestion,
 		&b.Priority, &b.PriorityReason, &rule, &b.Clamped, &b.FallbackUsed, &b.WhatChanged, &b.Context,
-		&b.RecommendedCheck, &b.ModelRawJSON, &created, &eventIDs, &b.Seq); err != nil {
+		&b.RecommendedCheck, &b.ModelRawJSON, &created, &eventIDs, &b.Seq, &b.GroupingVersion); err != nil {
 		return err
 	}
 	if suggestion.Valid {
@@ -186,6 +187,11 @@ func groupEventIDs(tx *sql.Tx, groupID string) ([]string, error) {
 // The one_briefing_per_group unique index makes a second insert fail.
 func (s *Store) InsertBriefing(ctx context.Context, b Briefing) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
+		// The group owns provenance; a caller cannot relabel historical work.
+		var groupingVersion int
+		if err := tx.QueryRow(`SELECT grouping_version FROM active_groups WHERE group_id = ?`, b.GroupID).Scan(&groupingVersion); err != nil {
+			return err
+		}
 		eventIDs := b.EventIDs
 		derived, err := groupEventIDs(tx, b.GroupID)
 		if err != nil {
@@ -221,9 +227,9 @@ func (s *Store) InsertBriefing(ctx context.Context, b Briefing) error {
 		if err := tx.QueryRow(`UPDATE seq_state SET next_seq = next_seq + 1 WHERE id = 0 RETURNING next_seq - 1`).Scan(&seq); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`INSERT INTO briefings (briefing_id, group_id, host_anchor_key, baseline, model_suggestion, priority, priority_reason, baseline_rule, clamped, fallback_used, what_changed, context, recommended_check, model_raw_json, created_at, event_ids_json, seq)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			b.BriefingID, b.GroupID, b.HostAnchorKey, b.Baseline, b.ModelSuggestion, b.Priority, b.PriorityReason, ruleArg, b.Clamped, b.FallbackUsed, b.WhatChanged, b.Context, b.RecommendedCheck, b.ModelRawJSON, nanos(b.CreatedAt), string(eventIDsJSON), seq); err != nil {
+		if _, err := tx.Exec(`INSERT INTO briefings (briefing_id, group_id, host_anchor_key, baseline, model_suggestion, priority, priority_reason, baseline_rule, clamped, fallback_used, what_changed, context, recommended_check, model_raw_json, created_at, event_ids_json, seq, grouping_version)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			b.BriefingID, b.GroupID, b.HostAnchorKey, b.Baseline, b.ModelSuggestion, b.Priority, b.PriorityReason, ruleArg, b.Clamped, b.FallbackUsed, b.WhatChanged, b.Context, b.RecommendedCheck, b.ModelRawJSON, nanos(b.CreatedAt), string(eventIDsJSON), seq, groupingVersion); err != nil {
 			return err
 		}
 		res, err := tx.Exec(`UPDATE active_groups SET status = 'done' WHERE group_id = ? AND status = 'processing'`, b.GroupID)

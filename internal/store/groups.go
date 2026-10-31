@@ -11,10 +11,19 @@ import (
 // pages until empty, checking its context between groups.
 const DefaultBriefingPage = 64
 
+// Grouping provenance describes the algorithm used when a group was formed.
+// Unknown is retained for historical rows whose origin cannot be established.
+const (
+	GroupingUnknown = iota
+	GroupingLegacy
+	GroupingScoped
+)
+
 type GroupPolicy struct {
-	QuietWindow time.Duration // debounce: group closes this long after last event
-	MaxWindow   time.Duration // hard cap from first event
-	MaxEvents   int           // size cap; config requires 1..128, store treats <= 0 as unlimited
+	GroupingVersion int           // caller-declared grouping algorithm; zero means unknown
+	QuietWindow     time.Duration // debounce: group closes this long after last event
+	MaxWindow       time.Duration // hard cap from first event
+	MaxEvents       int           // size cap; config requires 1..128, store treats <= 0 as unlimited
 }
 
 type PersistResult struct {
@@ -35,10 +44,11 @@ func groupDeadline(opened, last int64, pol GroupPolicy) int64 {
 }
 
 type TakenGroup struct {
-	GroupID    string
-	Anchor     string
-	OpenedAt   time.Time
-	RetryCount int // see LastAttempt
+	GroupingVersion int
+	GroupID         string
+	Anchor          string
+	OpenedAt        time.Time
+	RetryCount      int // see LastAttempt
 	// TransientRefunds counts takes forgiven for transient store
 	// pressure. The worker drives its release backoff from this, so
 	// repeated saturation escalates instead of retrying flat out.
@@ -103,7 +113,7 @@ func (s *Store) TakeGroup(ctx context.Context, groupID string) (TakenGroup, erro
 		}
 		taken.GroupID = groupID
 		var openedNanos int64
-		if err := tx.QueryRow(`SELECT host_anchor_key, opened_at, retry_count, transient_refunds FROM active_groups WHERE group_id = ?`, groupID).Scan(&taken.Anchor, &openedNanos, &taken.RetryCount, &taken.TransientRefunds); err != nil {
+		if err := tx.QueryRow(`SELECT host_anchor_key, opened_at, retry_count, transient_refunds, grouping_version FROM active_groups WHERE group_id = ?`, groupID).Scan(&taken.Anchor, &openedNanos, &taken.RetryCount, &taken.TransientRefunds, &taken.GroupingVersion); err != nil {
 			return err
 		}
 		taken.OpenedAt = fromNanos(openedNanos)

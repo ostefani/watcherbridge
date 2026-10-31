@@ -637,6 +637,7 @@ func mustJSON(v any) []byte {
 // briefingView is the machine-and-UI JSON shape: everything the dossier
 // renders, minus the tokenized audit trail, which stays server-side.
 type briefingView struct {
+	GroupingVersion  int      `json:"grouping_version"`
 	BriefingID       string   `json:"briefing_id"`
 	GroupID          string   `json:"group_id"`
 	Host             string   `json:"host"`
@@ -657,7 +658,8 @@ type briefingView struct {
 
 func viewOf(b store.Briefing) briefingView {
 	return briefingView{
-		BriefingID: b.BriefingID, GroupID: b.GroupID, Host: b.HostAnchorKey,
+		GroupingVersion: b.GroupingVersion,
+		BriefingID:      b.BriefingID, GroupID: b.GroupID, Host: b.HostAnchorKey,
 		Baseline: b.Baseline, ModelSuggestion: b.ModelSuggestion, Priority: b.Priority,
 		PriorityReason: b.PriorityReason, BaselineRule: b.BaselineRule, Clamped: b.Clamped,
 		FallbackUsed: b.FallbackUsed, WhatChanged: b.WhatChanged, Context: b.Context,

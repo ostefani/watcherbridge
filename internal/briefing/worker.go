@@ -65,6 +65,7 @@ func notifyBriefing(d Deps, taken store.TakenGroup, b store.Briefing) {
 	}
 	sort.Strings(ids)
 	b.EventIDs = ids
+	b.GroupingVersion = taken.GroupingVersion
 	if stored, err := d.Store.BriefingForGroup(context.Background(), taken.GroupID); err == nil {
 		b.Seq = stored.Seq
 	} else {

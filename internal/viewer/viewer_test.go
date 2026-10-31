@@ -225,6 +225,9 @@ func TestBriefingEndpointsShapeAndHeaders(t *testing.T) {
 	if rows[0]["host"] != "host:api" || rows[0]["priority"] != "high" {
 		t.Fatalf("row = %v", rows[0])
 	}
+	if rows[0]["grouping_version"] != float64(store.GroupingUnknown) {
+		t.Fatalf("grouping provenance missing from list: %v", rows[0])
+	}
 
 	rec = serve(v.handleBriefing, "/api/briefing?id="+gid)
 	var one map[string]any
@@ -233,6 +236,9 @@ func TestBriefingEndpointsShapeAndHeaders(t *testing.T) {
 	}
 	if one["group_id"] != gid {
 		t.Fatalf("wrong briefing: %v", one)
+	}
+	if one["grouping_version"] != rows[0]["grouping_version"] {
+		t.Fatalf("detail/list grouping provenance disagree: %v", one)
 	}
 	if rec := serve(v.handleBriefing, "/api/briefing"); rec.Code != http.StatusBadRequest {
 		t.Fatalf("missing id = %d", rec.Code)

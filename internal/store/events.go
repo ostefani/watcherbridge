@@ -63,6 +63,9 @@ func (s *Store) PersistEventAndGroup(ctx context.Context, ev RawEvent, anchor st
 	if pol.MaxEvents < 0 {
 		return PersistResult{}, fmt.Errorf("group policy MaxEvents must not be negative")
 	}
+	if pol.GroupingVersion < GroupingUnknown || pol.GroupingVersion > GroupingScoped {
+		return PersistResult{}, fmt.Errorf("unsupported grouping version")
+	}
 	if err := validateHeadersJSON(ev.HeadersJSON); err != nil {
 		return PersistResult{}, err
 	}
@@ -89,14 +92,15 @@ func (s *Store) PersistEventAndGroup(ctx context.Context, ev RawEvent, anchor st
 		}
 		last := nanos(ev.ReceivedAt)
 		var opened, existingDeadline, existingBytes int64
-		err = tx.QueryRow(`SELECT group_id, opened_at, deadline_at, total_bytes FROM active_groups WHERE host_anchor_key = ? AND status = 'open'`, anchor).Scan(&result.GroupID, &opened, &existingDeadline, &existingBytes)
+		var existingVersion int
+		err = tx.QueryRow(`SELECT group_id, opened_at, deadline_at, total_bytes, grouping_version FROM active_groups WHERE host_anchor_key = ? AND status = 'open'`, anchor).Scan(&result.GroupID, &opened, &existingDeadline, &existingBytes, &existingVersion)
 		// existingBytes > 0 keeps a lone oversize payload on a fresh
 		// group: closing an empty group would park it failed with no
 		// events. Config refuses such bodies at startup; this is the
 		// backstop for callers that bypass validation.
-		if err == nil && (existingDeadline <= last || (existingBytes > 0 && existingBytes+int64(len(ev.Payload)) > limits.MaxGroupBytes)) {
-			// Window expired (quiet or hard cap), or the group is byte-
-			// full: a late or oversize event must not join it. Close it
+		if err == nil && (existingVersion != pol.GroupingVersion || existingDeadline <= last || (existingBytes > 0 && existingBytes+int64(len(ev.Payload)) > limits.MaxGroupBytes)) {
+			// The algorithm changed, the window expired, or the group is
+			// byte-full: the crossing event must not join it. Close it
 			// here and open a fresh one — the crossing event founds the
 			// next group, so the cap is a strict bound and rollover
 			// reuses the expired-group path (the unique open-group index
@@ -113,8 +117,8 @@ func (s *Store) PersistEventAndGroup(ctx context.Context, ev RawEvent, anchor st
 			deadline := groupDeadline(opened, last, pol)
 			// Seed zero: the group_events join below adds this event's
 			// bytes and count, so founding and joining share one path.
-			if _, err := tx.Exec(`INSERT INTO active_groups (group_id, host_anchor_key, opened_at, last_event_at, deadline_at, status, total_bytes) VALUES (?, ?, ?, ?, ?, 'open', 0)`,
-				result.GroupID, anchor, opened, last, deadline); err != nil {
+			if _, err := tx.Exec(`INSERT INTO active_groups (group_id, host_anchor_key, opened_at, last_event_at, deadline_at, status, total_bytes, grouping_version) VALUES (?, ?, ?, ?, ?, 'open', 0, ?)`,
+				result.GroupID, anchor, opened, last, deadline, pol.GroupingVersion); err != nil {
 				return err
 			}
 		} else if err != nil {

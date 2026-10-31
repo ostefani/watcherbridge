@@ -1,10 +1,12 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -16,9 +18,8 @@ import (
 // repurposed by any runtime path, and databases newer than the
 // supported schema are refused unchanged rather than opened.
 
-// Opening a database from a newer development line (v12-v14) or any
-// future version must fail before any migration runs, leaving the
-// file exactly as found.
+// A newer version must fail before migration dispatch and preserve its
+// user_version. This does not assert byte identity of SQLite's files.
 func TestOpenRefusesNewerVersion(t *testing.T) {
 	for _, version := range []int{supportedSchemaVersion + 1, 99} {
 		path := filepath.Join(t.TempDir(), "bridge.db")
@@ -51,10 +52,9 @@ func TestOpenRefusesNewerVersion(t *testing.T) {
 	}
 }
 
-// A pre-existing legacy profile row survives every runtime path
-// byte-identical and is never consulted: recovery, projection,
-// briefing and purge neither read it nor derive new identity from it,
-// and a fresh flow writes no legacy rows at all.
+// A legacy row remains unchanged through recovery, projection, briefing
+// and purge. A real reported subject and its briefing relations exist
+// before checking that legacy labels and IDs were not transferred.
 func TestLegacyProfileStateQuarantined(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -64,11 +64,24 @@ func TestLegacyProfileStateQuarantined(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Truncate(time.Second)
-	gid := seedFeedGroup(t, s, "host:leg", "evt-leg")
+	const ref = "mac:10:20:30:40:50:60"
+	body := producerPayload("evt-leg", "k", "host.appeared",
+		`{"host_id":"mac:10:20:30:40:50:60","identity_source":"mac","identity_confidence":"high","hostname":"operator name"}`)
+	gid := persistReported(t, s, "lab", "evt-leg", "k", "host.appeared", body, now)
 	if _, err := s.Recover(ctx, now); err != nil {
 		t.Fatal(err)
 	}
-	projectAll(t, s)
+	if _, err := s.ProjectReported(ctx, "lab", 64); err != nil {
+		t.Fatal(err)
+	}
+	profileID := subjectProfileID(t, s, "lab", SubjectReportedDevice, "", ref)
+	var label sql.NullString
+	if err := s.db.QueryRow(`SELECT operator_label FROM reported_subjects WHERE profile_id = ?`, profileID).Scan(&label); err != nil {
+		t.Fatal(err)
+	}
+	if profileID == oldID || label.Valid {
+		t.Fatal("reported subject inherited a legacy identity or operator label")
+	}
 	if _, err := s.CloseDue(ctx, now.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
@@ -77,14 +90,38 @@ func TestLegacyProfileStateQuarantined(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := s.InsertBriefing(ctx, Briefing{
-		BriefingID: "brf-" + taken.GroupID, GroupID: taken.GroupID, HostAnchorKey: "host:leg",
+		GroupingVersion: GroupingLegacy, // caller-supplied provenance must not override the group
+		BriefingID:      "brf-" + taken.GroupID, GroupID: taken.GroupID, HostAnchorKey: taken.Anchor,
 		Baseline: "low", Priority: "low", PriorityReason: "r",
 		WhatChanged: "w", Context: "c", RecommendedCheck: "k", CreatedAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PurgeBriefings(ctx, now.Add(200*time.Hour), now.Add(time.Hour)); err != nil {
-		t.Fatal(err)
+	for _, query := range []string{
+		`SELECT COUNT(*) FROM group_subjects WHERE group_id = ? AND profile_id = ? AND role = 'host'`,
+		`SELECT COUNT(*) FROM briefing_subjects bs JOIN briefings b ON b.briefing_id = bs.briefing_id
+		 WHERE b.group_id = ? AND bs.profile_id = ? AND bs.role = 'host'`,
+	} {
+		var links int
+		if err := s.db.QueryRow(query, gid, profileID).Scan(&links); err != nil || links != 1 {
+			t.Fatalf("expected one reported-subject relation before purge, got %d: %v", links, err)
+		}
+	}
+	var legacyRefs int
+	if err := s.db.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM reported_subjects WHERE upstream_reference = ? OR profile_id = ? OR operator_label = ?)
+		+ (SELECT COUNT(*) FROM group_subjects WHERE profile_id = ?)
+		+ (SELECT COUNT(*) FROM briefing_subjects WHERE profile_id = ?)
+		+ (SELECT COUNT(*) FROM briefings WHERE host_anchor_key = ?)`,
+		oldID, oldID, oldLabel, oldID, oldID, oldID).Scan(&legacyRefs); err != nil || legacyRefs != 0 {
+		t.Fatalf("legacy identity/label leaked into current associations: %d, %v", legacyRefs, err)
+	}
+	stored, err := s.BriefingForGroup(ctx, gid)
+	if err != nil || stored.GroupingVersion != GroupingScoped || taken.GroupingVersion != GroupingScoped {
+		t.Fatalf("scoped provenance was not preserved: %+v, %v", stored, err)
+	}
+	if count, err := s.PurgeBriefings(ctx, now.Add(200*time.Hour), now.Add(time.Hour)); err != nil || count != 1 {
+		t.Fatalf("purged %d briefings, want 1: %v", count, err)
 	}
 	var gotID, gotStatus, gotLabel, gotSplit string
 	err = s.db.QueryRow(`SELECT old_device_id, association_status, operator_label, split_metadata
@@ -95,13 +132,182 @@ func TestLegacyProfileStateQuarantined(t *testing.T) {
 	if gotID != oldID || gotStatus != "kept" || gotLabel != oldLabel || gotSplit != oldSplit {
 		t.Fatalf("legacy row must survive untouched, got %q %q %q %q", gotID, gotStatus, gotLabel, gotSplit)
 	}
-	var legacyRefs int
-	err = s.db.QueryRow(`SELECT (SELECT COUNT(*) FROM reported_subjects WHERE upstream_reference = ?)
-		+ (SELECT COUNT(*) FROM briefings WHERE host_anchor_key = ?)`, oldID, oldID).Scan(&legacyRefs)
+	var legacyRows int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM legacy_profile_state`).Scan(&legacyRows); err != nil || legacyRows != 1 {
+		t.Fatalf("legacy rows changed: %d, %v", legacyRows, err)
+	}
+}
+
+// Version 12 overlaps the archived device line. Its schema is refused
+// even though the reported-context line now supports the same number.
+func TestOpenRefusesArchivedDeviceSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "archived.db")
+	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if legacyRefs != 0 {
-		t.Fatalf("no new identity may derive from legacy ids, got %d references", legacyRefs)
+	for _, stmt := range []string{
+		`CREATE TABLE device_anchors (anchor_key TEXT PRIMARY KEY)`,
+		`INSERT INTO device_anchors VALUES ('keep-me')`,
+		`PRAGMA user_version = 12`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := Open(path); err == nil {
+		s.Close()
+		t.Fatal("archived schema was admitted")
+	} else if !strings.Contains(err.Error(), "unsupported database schema lineage") {
+		t.Fatal(err)
+	}
+	db, err = sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version int
+	var anchor string
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 12 {
+		t.Fatalf("archived version changed: %d, %v", version, err)
+	}
+	if err := db.QueryRow(`SELECT anchor_key FROM device_anchors`).Scan(&anchor); err != nil || anchor != "keep-me" {
+		t.Fatalf("archived data changed: %q, %v", anchor, err)
+	}
+}
+
+func TestGroupingVersionChangeClosesPriorGroup(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	policy := GroupPolicy{QuietWindow: time.Hour, GroupingVersion: GroupingLegacy}
+	persist := func(id string, pol GroupPolicy) (PersistResult, error) {
+		return s.PersistEventAndGroup(ctx, RawEvent{
+			EventID: id, EventKey: "k", EventType: "host.appeared", Payload: []byte(`{}`),
+			OccurredAt: now, ReceivedAt: now, SignatureTimestamp: now,
+		}, "same-anchor", pol)
+	}
+	old, err := persist("evt-old", policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy.GroupingVersion = GroupingScoped
+	current, err := persist("evt-current", policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.GroupID == current.GroupID || len(current.ClosedGroupIDs) != 1 || current.ClosedGroupIDs[0] != old.GroupID {
+		t.Fatalf("different grouping versions shared a group: old=%+v new=%+v", old, current)
+	}
+	for id, want := range map[string]int{old.GroupID: GroupingLegacy, current.GroupID: GroupingScoped} {
+		var version, count int
+		if err := s.db.QueryRow(`SELECT grouping_version, event_count FROM active_groups WHERE group_id = ?`, id).Scan(&version, &count); err != nil || version != want || count != 1 {
+			t.Fatalf("group %s provenance/count = %d/%d: %v", id, version, count, err)
+		}
+	}
+	policy.GroupingVersion = GroupingScoped + 1
+	if _, err := persist("evt-invalid", policy); err == nil {
+		t.Fatal("unsupported grouping version was accepted")
+	}
+	if _, err := s.StoredEvent(ctx, "evt-invalid"); err != sql.ErrNoRows {
+		t.Fatalf("invalid provenance persisted an event: %v", err)
+	}
+}
+
+func TestGroupingProvenanceUpgrade(t *testing.T) {
+	for _, from := range []int{9, 11} {
+		t.Run(fmt.Sprint(from), func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "bridge.db")
+			s, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC().Truncate(time.Second)
+			gid := seedFeedGroup(t, s, "host:historical", "evt-historical")
+			if _, err := s.CloseDue(ctx, now.Add(2*time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.TakeGroup(ctx, gid); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.InsertBriefing(ctx, Briefing{
+				BriefingID: "brf-history", GroupID: gid, HostAnchorKey: "host:historical",
+				Baseline: "low", Priority: "low", PriorityReason: "r", WhatChanged: "original text",
+				Context: "original context", RecommendedCheck: "original check", ModelRawJSON: `{"audit":"kept"}`, CreatedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			before, err := s.BriefingForGroup(ctx, gid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := s.StoredEvent(ctx, "evt-historical")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db, err := sql.Open("sqlite3", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if from == 9 {
+				dropProjectionSchema(t, db)
+			} else {
+				dropGroupingProvenance(t, db)
+			}
+			if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, from)); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			s, err = Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			after, err := s.BriefingForGroup(ctx, gid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantVersion := GroupingUnknown
+			if from == 9 {
+				wantVersion = GroupingLegacy
+			}
+			var groupVersion int
+			if err := s.db.QueryRow(`SELECT grouping_version FROM active_groups WHERE group_id = ?`, gid).Scan(&groupVersion); err != nil {
+				t.Fatal(err)
+			}
+			if after.GroupingVersion != wantVersion || groupVersion != wantVersion {
+				t.Fatalf("historical provenance = %d/%d, want %d", after.GroupingVersion, groupVersion, wantVersion)
+			}
+			after.GroupingVersion = before.GroupingVersion
+			if !reflect.DeepEqual(before, after) {
+				t.Fatalf("migration changed historical briefing: before=%+v after=%+v", before, after)
+			}
+			retained, err := s.StoredEvent(ctx, "evt-historical")
+			if err != nil || !bytes.Equal(raw.Payload, retained.Payload) {
+				t.Fatalf("migration changed raw evidence: %v", err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			s, err = Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			restarted, err := s.BriefingForGroup(ctx, gid)
+			if err != nil || restarted.GroupingVersion != wantVersion {
+				t.Fatalf("restart changed provenance: %+v, %v", restarted, err)
+			}
+		})
 	}
 }

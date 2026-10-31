@@ -330,9 +330,10 @@ func (s *Server) persistAndReply(ctx context.Context, w http.ResponseWriter, bod
 		ev.OccurredAt = ev.ReceivedAt
 	}
 	res, err := s.events.PersistEventAndGroup(pctx, ev, anchor, store.GroupPolicy{
-		QuietWindow: s.cfg.GroupQuietWindow,
-		MaxWindow:   s.cfg.GroupMaxWindow,
-		MaxEvents:   s.cfg.GroupMaxEvents,
+		GroupingVersion: store.GroupingScoped,
+		QuietWindow:     s.cfg.GroupQuietWindow,
+		MaxWindow:       s.cfg.GroupMaxWindow,
+		MaxEvents:       s.cfg.GroupMaxEvents,
 	})
 	if err != nil {
 		return err
