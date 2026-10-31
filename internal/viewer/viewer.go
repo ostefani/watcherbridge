@@ -9,8 +9,10 @@ package viewer
 import (
 	"context"
 	"embed"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"mime"
 	"net/http"
@@ -178,6 +180,10 @@ type Viewer struct {
 	// MaxSubscribers caps concurrent streams; over it the handler
 	// answers 503. Zero means unbounded (tests).
 	MaxSubscribers int
+
+	// GroupWindowSeconds is the grouping quiet window behind the snapshot
+	// countdowns, set once by the server from config.
+	GroupWindowSeconds int64
 
 	// AllowedHosts gates every viewer route (Designv8 §2.4): r.Host must
 	// match an entry exactly (case-insensitive) or the answer is 403.
@@ -516,7 +522,7 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	defer unsub()
 
 	if groups, err := v.store.OpenGroupSnapshots(streamCtx); err == nil {
-		if !write(Event{Name: "group", Data: mustJSON(groupWireOf(groups))}) {
+		if !write(Event{Name: "group", Data: mustJSON(groupWireOf(time.Now().UTC(), v.GroupWindowSeconds, groups))}) {
 			return
 		}
 	} else {
@@ -666,19 +672,47 @@ type groupWire struct {
 	GroupID    string `json:"group_id"`
 	Anchor     string `json:"anchor"`
 	Status     string `json:"status"`
+	Now        int64  `json:"now_unix"`
+	OpenedAt   int64  `json:"opened_unix"`
+	LastEvent  int64  `json:"last_event_unix"`
 	DeadlineAt int64  `json:"deadline_unix"`
+	Window     int64  `json:"window_seconds"`
 	Events     int    `json:"event_count"`
 }
 
-func groupWireOf(groups []store.GroupSnapshot) []groupWire {
+func groupWireOf(now time.Time, windowSeconds int64, groups []store.GroupSnapshot) []groupWire {
 	out := make([]groupWire, 0, len(groups))
 	for _, g := range groups {
 		out = append(out, groupWire{
 			GroupID: g.GroupID, Anchor: g.Anchor, Status: g.Status,
-			DeadlineAt: g.Deadline.Unix(), Events: g.EventCount,
+			Now: now.Unix(), OpenedAt: g.OpenedAt.Unix(), LastEvent: g.LastEvent.Unix(),
+			DeadlineAt: g.Deadline.Unix(), Window: windowSeconds, Events: g.EventCount,
 		})
 	}
 	return out
+}
+
+// groupHash fingerprints a snapshot so unchanged ticks stay silent: the
+// per-tick broadcast would otherwise rewrite the countdown DOM every
+// second. FNV over the fields the wire carries is enough — a changed
+// snapshot always changes one of them.
+func groupHash(groups []store.GroupSnapshot) uint64 {
+	h := fnv.New64a()
+	var scratch [8]byte
+	put := func(n int64) {
+		binary.LittleEndian.PutUint64(scratch[:], uint64(n))
+		h.Write(scratch[:])
+	}
+	for _, g := range groups {
+		h.Write([]byte(g.GroupID))
+		h.Write([]byte(g.Anchor))
+		h.Write([]byte(g.Status))
+		put(g.Deadline.UnixNano())
+		put(g.OpenedAt.UnixNano())
+		put(g.LastEvent.UnixNano())
+		put(int64(g.EventCount))
+	}
+	return h.Sum64()
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -754,14 +788,15 @@ func (v *Viewer) handleBriefing(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, viewOf(b))
 }
 
-// handleGroups serves the current open-group snapshot.
+// handleGroups serves the current group snapshot: open, closed (queued)
+// and processing rows.
 func (v *Viewer) handleGroups(w http.ResponseWriter, r *http.Request) {
 	groups, err := v.store.OpenGroupSnapshots(r.Context())
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, groupWireOf(groups))
+	writeJSON(w, groupWireOf(time.Now().UTC(), v.GroupWindowSeconds, groups))
 }
 
 // Fanout builds the briefing worker callbacks over hub and publisher:
@@ -770,7 +805,7 @@ func (v *Viewer) handleGroups(w http.ResponseWriter, r *http.Request) {
 // broadcast as `group`. Every path is non-blocking (hub skips slow
 // subscribers, publisher drops on a full queue), so the worker never
 // stalls on its observers. Either may be nil.
-func Fanout(h *Hub, p *Publisher) (func(store.Briefing), func([]store.GroupSnapshot)) {
+func Fanout(h *Hub, p *Publisher, windowSeconds int64) (func(store.Briefing), func([]store.GroupSnapshot)) {
 	onBriefing := func(b store.Briefing) {
 		if h != nil {
 			id := ""
@@ -783,9 +818,15 @@ func Fanout(h *Hub, p *Publisher) (func(store.Briefing), func([]store.GroupSnaps
 			p.Enqueue(b)
 		}
 	}
+	var lastGroups uint64
+	var firstGroups = true
 	onGroups := func(groups []store.GroupSnapshot) {
 		if h != nil {
-			h.Broadcast("group", groupWireOf(groups))
+			if sum := groupHash(groups); firstGroups || sum != lastGroups {
+				firstGroups = false
+				lastGroups = sum
+				h.Broadcast("group", groupWireOf(time.Now().UTC(), windowSeconds, groups))
+			}
 		}
 	}
 	return onBriefing, onGroups

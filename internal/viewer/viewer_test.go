@@ -337,7 +337,7 @@ func TestFanoutNamesAndShapes(t *testing.T) {
 	h := NewHub()
 	ch, unsub := h.Subscribe(8)
 	defer unsub()
-	onBriefing, onGroups := Fanout(h, nil)
+	onBriefing, onGroups := Fanout(h, nil, 45)
 	onBriefing(store.Briefing{BriefingID: "brf-g", GroupID: "g", HostAnchorKey: "host:f",
 		Baseline: "low", Priority: "low", PriorityReason: "r", CreatedAt: time.Now().UTC(),
 		EventIDs: []string{"e1"}})
@@ -980,6 +980,67 @@ func TestMuxResponsesGatedAndHeaded(t *testing.T) {
 	assertViewerHeaders(t, rec.Header())
 	if rec := serveMux(h, "POST", "/api/groups", "evil.example:8081", nil, ""); rec.Code != 403 {
 		t.Fatalf("foreign host on mux 405 = %d, want 403", rec.Code)
+	}
+}
+
+func TestGroupWireShape(t *testing.T) {
+	s := openViewerStore(t)
+	seedOpenGroup(t, s, "host:gw", "evt-gw")
+	v := New(s, NewHub())
+	v.GroupWindowSeconds = 45
+	rec := httptest.NewRecorder()
+	v.handleGroups(rec, httptest.NewRequest("GET", "/api/groups", nil))
+	var rows []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil || len(rows) != 1 {
+		t.Fatalf("groups = %q, err %v", rec.Body.String(), err)
+	}
+	for _, key := range []string{"group_id", "anchor", "status", "now_unix", "opened_unix",
+		"last_event_unix", "deadline_unix", "window_seconds", "event_count"} {
+		if _, ok := rows[0][key]; !ok {
+			t.Fatalf("group wire missing %q: %v", key, rows[0])
+		}
+	}
+	if rows[0]["window_seconds"] != 45.0 || rows[0]["status"] != "open" {
+		t.Fatalf("group wire = %v", rows[0])
+	}
+	if rows[0]["now_unix"] == 0.0 || rows[0]["opened_unix"] == 0.0 || rows[0]["last_event_unix"] == 0.0 {
+		t.Fatalf("group times missing: %v", rows[0])
+	}
+}
+
+// An unchanged snapshot stays silent: the per-tick broadcast must not
+// rewrite countdown DOM every second. Only a content change emits.
+func TestFanoutDedupsUnchangedSnapshot(t *testing.T) {
+	h := NewHub()
+	sub, unsub := h.Subscribe(32)
+	defer unsub()
+	_, onGroups := Fanout(h, nil, 45)
+	groups := []store.GroupSnapshot{{
+		GroupID: "grp-1", Anchor: "host:d", Status: "open",
+		Deadline: time.Now().Add(time.Minute), OpenedAt: time.Now(),
+		LastEvent: time.Now(), EventCount: 1,
+	}}
+	onGroups(groups)
+	onGroups(groups)
+	select {
+	case ev := <-sub.C:
+		if ev.Name != "group" {
+			t.Fatalf("event = %q", ev.Name)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first snapshot never broadcast")
+	}
+	select {
+	case ev := <-sub.C:
+		t.Fatalf("unchanged snapshot rebroadcast: %q", ev.Name)
+	case <-time.After(100 * time.Millisecond):
+	}
+	groups[0].EventCount = 2
+	onGroups(groups)
+	select {
+	case <-sub.C:
+	case <-time.After(2 * time.Second):
+		t.Fatal("changed snapshot never broadcast")
 	}
 }
 

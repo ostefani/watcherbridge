@@ -20,7 +20,7 @@
       <option value="low">low</option>
     </select></label>
     <label>Host <input id="filter-host" type="text" placeholder="anchor substring" autocomplete="off"></label>
-    <label>Search <input id="filter-text" type="text" placeholder="text, id, token" autocomplete="off"></label>
+    <label>Search <input id="filter-text" type="text" placeholder="text, id" autocomplete="off"></label>
   </div>
 </header>
 <main>
@@ -29,6 +29,8 @@
     <ul id="group-list" class="groups"></ul>
     <h2>Briefings</h2>
     <ol id="brief-list" class="briefs"></ol>
+    <button id="older" type="button">Load older</button>
+    <button id="live" type="button" style="display:none">Back to live</button>
   </section>
   <section class="right">
     <h2>Dossier</h2>

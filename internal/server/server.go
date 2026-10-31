@@ -107,6 +107,7 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 	s.viewer.ReplayMax = cfg.SSEReplayMax
 	s.viewer.WriteTimeout = cfg.SSEWriteTimeout
 	s.viewer.MaxSubscribers = cfg.SSEMaxSubscribers
+	s.viewer.GroupWindowSeconds = int64(cfg.GroupQuietWindow / time.Second)
 	hosts := cfg.ViewerAllowedHosts
 	if len(hosts) == 0 {
 		// Validate already refused non-loopback and malformed binds.

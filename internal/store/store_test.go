@@ -75,8 +75,20 @@ func TestViewerFeeds(t *testing.T) {
 	// it instead of opening a new one.
 	seedFeedGroup(t, s, "host:c", "evt-c1")
 	snaps, err = s.OpenGroupSnapshots(context.Background())
-	if err != nil || len(snaps) != 1 || snaps[0].Anchor != "host:c" {
+	// The briefed group is gone; the unbriefed closed host:b group stays
+	// visible as queued alongside the fresh open host:c group.
+	if err != nil || len(snaps) != 2 {
 		t.Fatalf("after brief: %+v %v", snaps, err)
+	}
+	byAnchor := map[string]GroupSnapshot{}
+	for _, g := range snaps {
+		byAnchor[g.Anchor] = g
+	}
+	if byAnchor["host:b"].Status != "closed" {
+		t.Fatalf("queued row = %+v", byAnchor["host:b"])
+	}
+	if byAnchor["host:c"].Status != "open" {
+		t.Fatalf("open row = %+v", byAnchor["host:c"])
 	}
 	rows, err := s.BriefingsPage(context.Background(), 0, 0, 10)
 	if err != nil || len(rows) != 1 {
@@ -93,6 +105,43 @@ func TestViewerFeeds(t *testing.T) {
 	}
 }
 
+// A group being briefed stays visible until its briefing lands: the
+// snapshot carries open, closed and processing rows with the times the
+// wire needs for countdowns. A group queued behind a taken one stays
+// closed in the snapshot — waiting, not gone.
+func TestSnapshotKeepsProcessingGroups(t *testing.T) {
+	s := openTestStore(t)
+	gid := seedFeedGroup(t, s, "host:proc", "evt-proc")
+	waiter := seedFeedGroup(t, s, "host:wait", "evt-wait")
+	if _, err := s.CloseDue(context.Background(), time.Now().UTC().Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TakeGroup(context.Background(), gid); err != nil {
+		t.Fatal(err)
+	}
+	snaps, err := s.OpenGroupSnapshots(context.Background())
+	if err != nil || len(snaps) != 2 {
+		t.Fatalf("snapshot = %+v %v", snaps, err)
+	}
+	byID := map[string]GroupSnapshot{}
+	for _, g := range snaps {
+		byID[g.GroupID] = g
+	}
+	if byID[gid].Status != "processing" {
+		t.Fatalf("taken status = %q, want processing", byID[gid].Status)
+	}
+	if byID[waiter].Status != "closed" {
+		t.Fatalf("queued status = %q, want closed", byID[waiter].Status)
+	}
+	g := byID[gid]
+	if g.OpenedAt.IsZero() || g.LastEvent.IsZero() || g.Deadline.IsZero() {
+		t.Fatalf("snapshot times missing: %+v", g)
+	}
+	if g.EventCount != 1 {
+		t.Fatalf("event count = %d", g.EventCount)
+	}
+}
+
 func TestViewerFeedQueriesUseIndexes(t *testing.T) {
 	s := openTestStore(t)
 	for _, q := range []string{
@@ -100,7 +149,7 @@ func TestViewerFeedQueriesUseIndexes(t *testing.T) {
 		`EXPLAIN QUERY PLAN SELECT briefing_id FROM briefings WHERE seq > 5 ORDER BY seq ASC LIMIT 10`,
 		`EXPLAIN QUERY PLAN SELECT briefing_id, group_id FROM briefings WHERE seq > 5 ORDER BY seq ASC LIMIT 11`,
 		`EXPLAIN QUERY PLAN SELECT briefing_id FROM briefings WHERE seq < 5 ORDER BY seq DESC LIMIT 10`,
-		`EXPLAIN QUERY PLAN SELECT ag.group_id FROM active_groups ag LEFT JOIN group_events ge ON ge.group_id = ag.group_id WHERE ag.status = 'open' GROUP BY ag.group_id ORDER BY ag.deadline_at`,
+		`EXPLAIN QUERY PLAN SELECT ag.group_id FROM active_groups ag LEFT JOIN group_events ge ON ge.group_id = ag.group_id WHERE ag.status IN ('open','processing') GROUP BY ag.group_id ORDER BY ag.deadline_at`,
 	} {
 		rows, err := s.db.Query(q)
 		if err != nil {

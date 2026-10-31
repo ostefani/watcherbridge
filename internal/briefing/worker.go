@@ -7,6 +7,8 @@ import (
 	"log"
 	"runtime/debug"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ostefani/watcherbridge/internal/provider"
@@ -103,6 +105,22 @@ func Run(ctx context.Context, d Deps) error {
 	}
 }
 
+// publishGroups emits the current open/processing snapshot. It runs both
+// before the briefing drain (so closures show promptly) and after it (so
+// the closed→processing transitions TakeGroup committed mid-drain reach
+// subscribers in the same tick instead of vanishing until the next one).
+func publishGroups(ctx context.Context, d Deps) {
+	if d.OnGroups == nil {
+		return
+	}
+	groups, err := d.Store.OpenGroupSnapshots(ctx)
+	if err != nil {
+		log.Printf("briefing: group snapshot: %s", store.SanitizeErrorText(err.Error()))
+		return
+	}
+	d.OnGroups(groups)
+}
+
 func drainOnce(ctx context.Context, d Deps, now time.Time) {
 	if _, err := d.Store.CloseDue(ctx, now); err != nil {
 		log.Printf("briefing: close-due: %s", store.SanitizeErrorText(err.Error()))
@@ -110,13 +128,8 @@ func drainOnce(ctx context.Context, d Deps, now time.Time) {
 	if _, err := d.Store.ReleaseStale(ctx, now, d.Lease); err != nil {
 		log.Printf("briefing: release-stale: %s", store.SanitizeErrorText(err.Error()))
 	}
-	if d.OnGroups != nil {
-		if groups, err := d.Store.OpenGroupSnapshots(ctx); err != nil {
-			log.Printf("briefing: group snapshot: %s", store.SanitizeErrorText(err.Error()))
-		} else {
-			d.OnGroups(groups)
-		}
-	}
+	publishGroups(ctx, d)
+	drained := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -129,7 +142,7 @@ func drainOnce(ctx context.Context, d Deps, now time.Time) {
 			return
 		}
 		if len(ids) == 0 {
-			return
+			break
 		}
 		progress := false
 		for _, id := range ids {
@@ -142,12 +155,20 @@ func drainOnce(ctx context.Context, d Deps, now time.Time) {
 				progress = true
 			}
 		}
+		drained = drained || progress
 		if !progress {
 			// A full page changed no group state (lost races, store
 			// hiccups): re-reading would spin on the same rows until
 			// the next tick, so end the pass here.
-			return
+			break
 		}
+	}
+	if drained {
+		// The drain took groups closed→processing; republish so the
+		// snapshot carries those transitions in this tick. Idle ticks
+		// stay silent: the hash dedup downstream drops no-change
+		// snapshots anyway, and one publish is enough.
+		publishGroups(ctx, d)
 	}
 }
 
@@ -197,6 +218,11 @@ func briefOne(ctx context.Context, d Deps, groupID string) (progressed bool) {
 		}
 		return false // lost race or store hiccup; next tick retries
 	}
+	// The claim committed: publish before any provider work, so a group
+	// that waits on the model is visible as processing (and the groups
+	// queued closed behind it as waiting) for the whole call — not only
+	// after the drain finishes, when the group is normally already done.
+	publishGroups(ctx, d)
 	outcome, berr := Baseline(decodeTaken(taken), asOf(taken), d.Policy)
 	if berr != nil {
 		// Empty group: nothing to resolve. Retry while takes remain; the
@@ -369,8 +395,32 @@ func asOf(taken store.TakenGroup) time.Time {
 	return last
 }
 
+// maxAnchorLabelRunes caps the anchor label in deterministic text.
+// Ingest does not impose the redactor's 253-byte hostname limit on
+// anchors, so a hostile multi-hundred-KiB hostname would otherwise sail
+// through the model-budget rejection and land verbatim in the fallback
+// sentence that replaces it. The cap (one MAX_FIELD_CHARS width, rune
+// sound, marked) keeps fallback generation bounded independently of
+// model restoration; falling back must not reproduce the oversized value
+// that caused rejection. The stored anchor key itself is untouched —
+// grouping identity still compares exact values.
+const maxAnchorLabelRunes = 256
+
+// anchorLabel strips the anchor-key prefix and caps degenerate labels.
+func anchorLabel(anchor string) string {
+	label := stripAnchorPrefix(anchor)
+	if r := []rune(label); len(r) > maxAnchorLabelRunes {
+		return string(r[:maxAnchorLabelRunes]) + "…"
+	}
+	return label
+}
+
 // describeEvents renders fixed templates plus event-type counts (enum
-// values only) — no payload free text, per the Step 9 scope.
+// values only) — no payload free text, per the Step 9 scope. Parts pass
+// through dedupStrings and the anchor through stripAnchorPrefix so the
+// production sentence never repeats a value or prints an anchor-key
+// prefix; both are no-ops on today's already-unique parts, and guard the
+// helpers' future callers.
 func describeEvents(taken store.TakenGroup) string {
 	counts := map[string]int{}
 	order := []string{}
@@ -380,12 +430,10 @@ func describeEvents(taken store.TakenGroup) string {
 		}
 		counts[ev.EventType]++
 	}
-	parts := ""
-	for i, typ := range order {
-		if i > 0 {
-			parts += ", "
-		}
-		parts += fmt.Sprintf("%d %s", counts[typ], typ)
+	parts := make([]string, 0, len(order))
+	for _, typ := range order {
+		parts = append(parts, strconv.Itoa(counts[typ])+" "+typ)
 	}
-	return fmt.Sprintf("%d events in group: %s", len(taken.Events), parts)
+	parts = dedupStrings(parts)
+	return plural(len(taken.Events), "event") + " on " + anchorLabel(taken.Anchor) + ": " + strings.Join(parts, ", ")
 }

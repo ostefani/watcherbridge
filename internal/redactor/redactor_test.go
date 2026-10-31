@@ -189,6 +189,26 @@ func TestRestoreGluedTokens(t *testing.T) {
 	}
 }
 
+// The projection must equal the built length exactly — the budget
+// preflight is only sound if no allocation can exceed it. Unknown tokens
+// restore to themselves, so they contribute zero delta.
+func TestProjectedRestoreSizeExact(t *testing.T) {
+	issued := TokenMap{"IP_1": "192.168.0.5", "HOST_2": "nebula-1.local"}
+	for _, text := range []string{
+		"",
+		"no tokens here",
+		"from IP_1 to HOST_2 done",
+		"IP_1 IP_1 IP_1",           // repeats expand linearly
+		"XIP_1 and IP_10 stay put", // word-glued and unknown: no delta
+		"IP_1:8080, (HOST_2).",
+		strings.Repeat("IP_1 ", 1000),
+	} {
+		if got, want := ProjectedRestoreSize(text, issued), len(Restore(text, issued)); got != want {
+			t.Fatalf("projection %d != restored %d for %q", got, want, text[:min(64, len(text))])
+		}
+	}
+}
+
 func TestInventedTokenRejected(t *testing.T) {
 	issued := TokenMap{"IP_1": "10.0.0.1"}
 	if err := ValidateTokens("saw IP_1 and IP_9", issued); err == nil {

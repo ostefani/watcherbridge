@@ -39,6 +39,7 @@ func main() {
 	maxWindow := fs.Duration("group-max-window", def.GroupMaxWindow, "grouping hard cap")
 	tick := fs.Duration("grouper-tick", def.GrouperTick, "worker tick")
 	lease := fs.Duration("processing-lease", def.ProcessingLease, "stale processing lease")
+	agentTimeout := fs.Duration("agent-timeout", def.AgentTimeout, "per-turn agent budget (Step 26 uses it)")
 	modelProvider := fs.String("model-provider", def.ModelProvider, "meta or fake")
 	modelID := fs.String("model-id", def.ModelID, "model ID for the meta provider")
 	modelKey := fs.String("model-key", "", "model API key (or MODEL_API_KEY)")
@@ -62,6 +63,7 @@ func main() {
 	cfg.GroupMaxWindow = *maxWindow
 	cfg.GrouperTick = *tick
 	cfg.ProcessingLease = *lease
+	cfg.AgentTimeout = *agentTimeout
 	cfg.ModelProvider = *modelProvider
 	cfg.ModelID = *modelID
 	cfg.ModelAPIKey = config.Secret(firstNonEmpty(*modelKey, os.Getenv("MODEL_API_KEY")))
@@ -118,7 +120,7 @@ func main() {
 	} else {
 		log.Print("watcherbridge: no ScanRelay URL; annotations disabled")
 	}
-	onBriefing, onGroups := viewer.Fanout(hub, pub)
+	onBriefing, onGroups := viewer.Fanout(hub, pub, int64(cfg.GroupQuietWindow/time.Second))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

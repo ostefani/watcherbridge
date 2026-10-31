@@ -3,7 +3,13 @@
 // so hostile hostnames and prompt-injection banners stay inert text.
 (function () {
   "use strict";
-  var state = { briefings: [], groups: [], selected: null };
+  // groupSkew corrects the client clock to the server clock: the group
+  // wire carries per-row now_unix, and the first row's value minus the
+  // client time at snapshot arrival is the offset the countdown uses.
+  // detached marks a history-shifted window: an explicit older-page load
+  // slid the 500-row window down, so Back to live is offered until a
+  // reset re-anchors on the latest page.
+  var state = { briefings: [], groups: [], selected: null, groupSkew: 0, detached: false };
   var connEl = document.getElementById("conn");
 
   function el(tag, cls, text) {
@@ -48,37 +54,76 @@
       " — clamped to " + b.priority.toUpperCase();
   }
 
+  // stripPrefix drops the "kind:" anchor prefix operators never say out
+  // loud ("host:nebula-1.local" renders as "nebula-1.local"). Mirrors the
+  // Go stripAnchorPrefix helper; both must agree.
+  function stripPrefix(s) {
+    s = String(s === undefined || s === null ? "" : s);
+    var i = s.indexOf(":");
+    return i > 0 ? s.slice(i + 1) : s;
+  }
+
+  function plural(n, unit) {
+    return n + " " + unit + (n === 1 ? "" : "s");
+  }
+
+  // renderGroups is status-driven (Designv8 §2.3): open groups show the
+  // countdown bar, processing groups render as "ANALYSING…" with no bar,
+  // so a group never restarts its fraction when a snapshot arrives —
+  // the 1s client tick animates the bar between snapshots.
   function renderGroups() {
     var ul = document.getElementById("group-list");
     while (ul.firstChild) ul.removeChild(ul.firstChild);
-    var now = Math.floor(Date.now() / 1000);
     state.groups.forEach(function (g) {
       var li = el("li", null, null);
-      li.appendChild(el("span", "pill " + "medium", "OPEN"));
-      li.appendChild(el("span", "meta", g.anchor + " · " + g.event_count + " events · closes in " +
-        Math.max(0, g.deadline_unix - now) + "s"));
-      var bar = el("div", "countbar", null);
-      var fill = el("div", null, null);
-      bar.appendChild(fill);
-      li.appendChild(bar);
-      li.setAttribute("data-deadline", String(g.deadline_unix));
-      li.setAttribute("data-opened", String(now));
+      var label = stripPrefix(g.anchor);
+      if (g.status === "processing") {
+        li.appendChild(el("span", "pill medium", "ANALYSING"));
+        li.appendChild(el("span", "meta", label + " · " + plural(g.event_count, "event") + " · analysing…"));
+        li.setAttribute("data-static", "1");
+      } else if (g.status === "closed") {
+        li.appendChild(el("span", "pill medium", "QUEUED"));
+        li.appendChild(el("span", "meta", label + " · " + plural(g.event_count, "event") + " · queued…"));
+        li.setAttribute("data-static", "1");
+      } else {
+        li.appendChild(el("span", "pill medium", "OPEN"));
+        li.appendChild(el("span", "meta", null));
+        var bar = el("div", "countbar", null);
+        bar.appendChild(el("div", null, null));
+        li.appendChild(bar);
+        li.setAttribute("data-deadline", String(g.deadline_unix));
+        li.setAttribute("data-lastevent", String(g.last_event_unix));
+        li.setAttribute("data-label", label);
+        li.setAttribute("data-count", String(g.event_count));
+      }
       ul.appendChild(li);
     });
     tickCountdowns();
   }
 
+  // tickCountdowns animates the open-group bars between snapshots. now is
+  // corrected by the server clock skew measured at snapshot arrival (the
+  // client never stamps its own "opened" time), and the fraction follows
+  // Designv8 §2.3: clamp((deadline − now) / max(1, deadline − last_event)).
   function tickCountdowns() {
-    var now = Math.floor(Date.now() / 1000);
+    var now = Math.floor(Date.now() / 1000) + (state.groupSkew || 0);
     var items = document.getElementById("group-list").children;
     for (var i = 0; i < items.length; i++) {
       var li = items[i];
+      if (li.getAttribute("data-static")) continue;
       var deadline = parseInt(li.getAttribute("data-deadline"), 10);
-      var opened = parseInt(li.getAttribute("data-opened"), 10) || now;
-      var total = Math.max(1, deadline - opened);
+      var lastEvent = parseInt(li.getAttribute("data-lastevent"), 10);
+      if (isNaN(lastEvent)) lastEvent = deadline;
       var left = Math.max(0, deadline - now);
+      var total = Math.max(1, deadline - lastEvent);
       var fill = li.querySelector(".countbar > div");
       if (fill) fill.style.width = (100 * left / total).toFixed(1) + "%";
+      var meta = li.querySelector(".meta");
+      if (meta) {
+        meta.textContent = li.getAttribute("data-label") + " · " +
+          plural(parseInt(li.getAttribute("data-count"), 10) || 0, "event") +
+          " · closes in " + left + "s";
+      }
     }
   }
 
@@ -125,6 +170,20 @@
     box.appendChild(dl);
   }
 
+  // MAX_BRIEFINGS caps the in-memory list (Designv8 §2.5): the list is
+  // newest-first by seq. Live and recovery merges anchor at the newest
+  // end and evict the oldest; explicit history loads anchor at the oldest
+  // end and evict the newest (page replacement), so fetching older pages
+  // while full moves the window down instead of discarding the fetch.
+  // Anything evicted stays pageable through ?before=.
+  var MAX_BRIEFINGS = 500;
+  function bySeqDesc(a, b) { return (b.seq || 0) - (a.seq || 0); }
+  function normalizeBriefings() {
+    state.briefings.sort(bySeqDesc);
+    if (state.briefings.length > MAX_BRIEFINGS) state.briefings.length = MAX_BRIEFINGS;
+    reconcileSelection();
+  }
+
   function upsertBriefing(b) {
     var found = false;
     state.briefings = state.briefings.map(function (x) {
@@ -132,6 +191,7 @@
       return x;
     });
     if (!found) state.briefings.unshift(b);
+    normalizeBriefings();
     renderBriefs();
     if (state.selected === b.briefing_id) selectBriefing(b.briefing_id);
   }
@@ -156,7 +216,10 @@
   // upsertMany batches one page into a single state update: the per-row
   // upsert copies the whole list, which multiplies DOM work during a
   // multi-page recovery. Gap rows are new by construction; overlap with
-  // live upserts shares the briefing id and is skipped.
+  // live upserts shares the briefing id and is skipped. Recovery pages
+  // arrive ascending, so the merge normalizes back to newest-first before
+  // trimming — otherwise the trim keeps the oldest rows and discards the
+  // newest recovery while the cursor still advances past them.
   function upsertMany(rows) {
     var seen = {};
     state.briefings.forEach(function (b) { seen[b.briefing_id] = true; });
@@ -168,8 +231,82 @@
     });
     if (fresh.length) {
       state.briefings = state.briefings.concat(fresh);
+      normalizeBriefings();
       renderBriefs();
     }
+  }
+
+  // upsertHistory merges one explicitly requested older page. Newest-first
+  // order holds, but on overflow the eviction comes off the newest end:
+  // the operator asked to look back, so the window slides down instead of
+  // throwing the fetched rows away and refetching the same page forever.
+  // Recovery merges (upsertMany) keep the opposite anchor — live data wins
+  // over history while a gap is being repaired.
+  function upsertHistory(rows) {
+    var seen = {};
+    state.briefings.forEach(function (b) { seen[b.briefing_id] = true; });
+    var fresh = [];
+    rows.forEach(function (b) {
+      if (!b || seen[b.briefing_id]) return;
+      seen[b.briefing_id] = true;
+      fresh.push(b);
+    });
+    if (!fresh.length) return 0;
+    state.briefings = state.briefings.concat(fresh);
+    state.briefings.sort(bySeqDesc);
+    var overflow = state.briefings.length - MAX_BRIEFINGS;
+    if (overflow > 0) state.briefings.splice(0, overflow);
+    reconcileSelection();
+    renderBriefs();
+    return fresh.length;
+  }
+
+  function updateLiveBtn() {
+    var btn = document.getElementById("live");
+    if (btn) btn.style.display = state.detached ? "" : "none";
+  }
+
+  // loadOlder pages history the 500-row cap evicted: ?before=<oldest seq>
+  // returns the next older page ascending, and the merge slides the
+  // window down. A short page means history is exhausted. Guarded against
+  // concurrent recovery: a pending gap-fill owns the list until it lands.
+  function loadOlder() {
+    if (pending) return;
+    var btn = document.getElementById("older");
+    var min = Infinity;
+    state.briefings.forEach(function (b) {
+      if (b && typeof b.seq === "number" && b.seq < min) min = b.seq;
+    });
+    if (min === Infinity) return;
+    if (btn) btn.disabled = true;
+    fetch("/api/briefings?before=" + encodeURIComponent(String(min)) + "&limit=50")
+      .then(function (r) { if (!r.ok) throw new Error("briefings " + r.status); return r.json(); })
+      .then(function (rows) {
+        rows = rows || [];
+        var added = upsertHistory(rows);
+        if (added > 0) {
+          state.detached = true;
+          updateLiveBtn();
+        }
+        if (btn) {
+          if (rows.length < 50) {
+            btn.textContent = "No older briefings";
+          } else {
+            btn.disabled = false;
+          }
+        }
+      })
+      .catch(function () { if (btn) btn.disabled = false; });
+  }
+
+  // backToLive re-anchors the window on the latest page through the same
+  // reset machinery as resync recovery: the snapshot replaces state and
+  // the tail covers live rows that arrive mid-fetch. Guarded like
+  // loadOlder — a pending recovery already owns the list.
+  function backToLive() {
+    if (pending) return;
+    pending = {id: ++opSeq, kind: "reset", boundary: 0, liveMax: 0, running: false, timer: 0};
+    runReset(pending);
   }
 
   // runGapFill pages ?after= toward the resync boundary, a calm page at a
@@ -217,6 +354,8 @@
         rows = rows || [];
         state.briefings = [];
         upsertMany(rows);
+        state.detached = false; // a reset re-anchors on the latest page
+        updateLiveBtn();
         renderBriefs(); // replacement renders even when empty: no stale rows survive
         reconcileSelection();
         var pageMax = 0;
@@ -285,7 +424,11 @@
     src.addEventListener("resync", onResync);
     src.addEventListener("group", function (ev) {
       try {
-        state.groups = JSON.parse(ev.data) || [];
+        var rows = JSON.parse(ev.data) || [];
+        if (rows.length && typeof rows[0].now_unix === "number") {
+          state.groupSkew = Math.floor(rows[0].now_unix - Date.now() / 1000);
+        }
+        state.groups = rows;
         renderGroups();
       } catch (e) { /* keep old state */ }
     });
@@ -303,6 +446,9 @@
     ["filter-priority", "filter-host", "filter-text"].forEach(function (id) {
       document.getElementById(id).addEventListener("input", renderBriefs);
     });
+    document.getElementById("older").addEventListener("click", loadOlder);
+    document.getElementById("live").addEventListener("click", backToLive);
+    updateLiveBtn();
     setInterval(tickCountdowns, 1000);
     // Initialization runs through the same snapshot/tail recovery as a
     // reset, with operation ownership and retry: a standalone fetch could

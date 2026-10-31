@@ -43,6 +43,18 @@ const maxInflightBytes = 64 << 20
 // (single-transaction read, decode, tokenize) and bundle size.
 const maxGroupEvents = 128
 
+// agentMaxSteps is the Step 26 per-turn agent cap, needed early for the
+// timeout inequality. Step 26 promotes it to AGENT_MAX_STEPS config;
+// until then the divisor stays fixed and the check stays startup-true.
+const agentMaxSteps = 4
+
+// leaseMargin is the Designv8 §6.8 hand-off margin for the processing
+// lease: PROCESSING_LEASE must cover 2×AGENT_TIMEOUT plus this. It is
+// deliberately not Margin (1s of handler slack): a 182s lease with a 90s
+// agent budget must refuse startup, and the 210s default (2×90s+30s)
+// must pass, so the comparison is "at least", not strict inequality.
+const leaseMargin = 30 * time.Second
+
 // Secret is key material that must never appear in logs, errors, or
 // dumps: its formatted forms all render as ***. Convert back to string
 // only at the exact use site (HMAC, outgoing header, provider client).
@@ -156,7 +168,8 @@ type Config struct {
 	GroupMaxEvents   int
 
 	GrouperTick          time.Duration
-	ProcessingLease      time.Duration // stale processing age; must exceed 2 x provider timeout + margin
+	ProcessingLease      time.Duration // stale processing age; must exceed 2 x agent timeout + margin
+	AgentTimeout         time.Duration // per-turn agent budget; must cover the provider timeout
 	EstablishedAge       time.Duration // first-seen age for established; dormant until Pro ships the field
 	StrongHistoryAge     time.Duration // first-seen age for strong history; dormant until Pro ships the field
 	StableIdentityFields []string      // change-field names that break stability; validated at startup
@@ -220,7 +233,8 @@ func Default() Config {
 		GroupMaxEvents:   10,
 
 		GrouperTick:          1 * time.Second,
-		ProcessingLease:      90 * time.Second,
+		ProcessingLease:      210 * time.Second,
+		AgentTimeout:         90 * time.Second,
 		EstablishedAge:       1 * time.Hour,
 		StrongHistoryAge:     24 * time.Hour,
 		StableIdentityFields: []string{"mac", "hostname", "host_id", "identity_confidence", "identity_source"},
@@ -552,6 +566,27 @@ func (c Config) Validate() error {
 	}
 	if c.ProcessingLease <= 0 {
 		return fmt.Errorf("processing lease must be positive")
+	}
+	if c.AgentTimeout <= 0 {
+		return fmt.Errorf("agent timeout must be positive")
+	}
+	// Designv8 §6.8: the lease only governs a live worker that stalls,
+	// so it must cover twice the agent budget plus the explicit 30s
+	// hand-off margin — not the 1s handler Margin above, which is a
+	// different pairing. At least, not strictly above: the 210s default
+	// is exactly 2×90s+30s and must pass.
+	if c.ProcessingLease < 2*c.AgentTimeout+leaseMargin {
+		return fmt.Errorf("processing lease %v must be at least 2 x agent timeout %v + %v lease margin, or a live worker is reaped mid-turn",
+			c.ProcessingLease, c.AgentTimeout, leaseMargin)
+	}
+	// Designv8 §6.2: the agent budget must cover the provider call it
+	// wraps, including the repair attempt it may need.
+	if c.AgentTimeout < c.ProviderTimeout {
+		return fmt.Errorf("agent timeout %v must cover the provider timeout %v", c.AgentTimeout, c.ProviderTimeout)
+	}
+	if c.AgentTimeout < (agentMaxSteps+1)*(c.ProviderTimeout/2) {
+		return fmt.Errorf("agent timeout %v must allow a full call plus repair within %d steps (provider timeout %v)",
+			c.AgentTimeout, agentMaxSteps+1, c.ProviderTimeout)
 	}
 	if c.GrouperTick >= c.ProcessingLease {
 		return fmt.Errorf("grouper tick %v must be below the processing lease %v, or a stale worker is never reaped in time", c.GrouperTick, c.ProcessingLease)

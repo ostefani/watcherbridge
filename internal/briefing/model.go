@@ -97,10 +97,37 @@ func checkModelBriefing(m modelBriefing, taken store.TakenGroup, issued redactor
 // failure, no repair — the baseline simply stands.
 var errAbstain = fmt.Errorf("model abstains")
 
-// clean caps accepted model text the same way bundle strings are capped:
-// controls stripped, rune-counted, truncation marked.
-func clean(s string, maxChars int) string {
-	return redactor.CapField(redactor.StripControls(s), maxChars)
+// plainText sanitizes stored model text without truncating it (Designv8
+// §2.5): controls are stripped, but the full length is stored and the UI
+// clamps with CSS — never "[truncated]" in the row. Length caps apply only
+// to the provider-bound bundle copy, where the model actually receives it.
+func plainText(s string) string {
+	return redactor.StripControls(s)
+}
+
+// maxRestoredBytes caps the post-restoration stored text. The provider's
+// 64 KiB response cap bounds tokenized text, not expanded text: one short
+// token can restore into a long network-supplied hostname, so the sum of
+// the restored fields is budgeted separately. Over budget the group
+// degrades to the deterministic fallback — rejection, never silent
+// truncation.
+const maxRestoredBytes = 256 << 10
+
+// projectedRestoredSize sums the exact restored lengths of the model text
+// fields without building them (redactor.ProjectedRestoreSize is exact, so
+// no allocation can exceed the sum). briefWithModel calls it before any
+// Restore, so the budget check bounds restoration memory too — checking
+// after Restore would protect storage but not the allocation itself. The
+// reason travels raw and contributes its plain length.
+func projectedRestoredSize(m modelBriefing, issued redactor.TokenMap) int {
+	total := len(m.Reason)
+	for _, f := range []string{m.What, m.Context, m.Check} {
+		total += redactor.ProjectedRestoreSize(f, issued)
+		if total > maxRestoredBytes {
+			return total
+		}
+	}
+	return total
 }
 
 // fallbackBriefing builds the deterministic briefing (Designv5 §7.3): the
@@ -166,7 +193,6 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	maxChars := d.Redaction.MaxFieldChars
 
 	events := make([]redactor.InputEvent, 0, len(taken.Events))
 	for _, ev := range taken.Events {
@@ -241,6 +267,16 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 		s := suggestion.String()
 		sug = &s
 	}
+	// Preflight before allocating: the projection is exact, so nothing
+	// restored can exceed what was just approved.
+	if projectedRestoredSize(m, issued) > maxRestoredBytes {
+		log.Printf("briefing: group %s restored text exceeds the %d-byte budget", taken.GroupID, maxRestoredBytes)
+		return insertFallback(ctx, d, taken, outcome, "restored text exceeds size budget; briefing from deterministic baseline only")
+	}
+	what := plainText(redactor.Restore(m.What, restoreMap(issued, display)))
+	briefCtx := plainText(redactor.Restore(m.Context, restoreMap(issued, display)))
+	check := plainText(redactor.Restore(m.Check, restoreMap(issued, display)))
+	reason := plainText(m.Reason)
 	b := store.Briefing{
 		BriefingID:       "brf-" + taken.GroupID,
 		GroupID:          taken.GroupID,
@@ -248,13 +284,13 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 		Baseline:         outcome.Level.String(),
 		ModelSuggestion:  sug,
 		Priority:         final.String(),
-		PriorityReason:   clean(m.Reason, maxChars),
+		PriorityReason:   reason,
 		BaselineRule:     outcome.RuleID,
 		Clamped:          clamped,
 		FallbackUsed:     false,
-		WhatChanged:      clean(redactor.Restore(m.What, restoreMap(issued, display)), maxChars),
-		Context:          clean(redactor.Restore(m.Context, restoreMap(issued, display)), maxChars),
-		RecommendedCheck: clean(redactor.Restore(m.Check, restoreMap(issued, display)), maxChars),
+		WhatChanged:      what,
+		Context:          briefCtx,
+		RecommendedCheck: check,
 		ModelRawJSON:     string(rawJSON),
 		CreatedAt:        now,
 	}

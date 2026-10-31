@@ -127,6 +127,10 @@ func TestValidateRejects(t *testing.T) {
 		"SSE write over grace":    func(c *Config) { c.SSEWriteTimeout = c.ShutdownGrace },
 		"zero SSE subscribers":    func(c *Config) { c.SSEMaxSubscribers = 0 },
 		"blank viewer host":       func(c *Config) { c.ViewerAllowedHosts = []string{"127.0.0.1:8081", " "} },
+		"zero agent timeout":      func(c *Config) { c.AgentTimeout = 0 },
+		"agent below provider":    func(c *Config) { c.AgentTimeout = c.ProviderTimeout - time.Second },
+		"agent below call+repair": func(c *Config) { c.AgentTimeout = 2 * c.ProviderTimeout },
+		"lease at 2x agent":       func(c *Config) { c.ProcessingLease = 2*c.AgentTimeout + c.Margin },
 		"zero quiet window":       func(c *Config) { c.GroupQuietWindow = 0 },
 		"max window below quiet":  func(c *Config) { c.GroupMaxWindow = time.Second },
 		"group max below quiet":   func(c *Config) { c.GroupMaxWindow = c.GroupQuietWindow - time.Second },
@@ -136,6 +140,22 @@ func TestValidateRejects(t *testing.T) {
 		mutate(&c)
 		if err := c.Validate(); err == nil {
 			t.Errorf("%s: expected validation error", name)
+		}
+	}
+}
+
+// The lease margin is the explicit 30s hand-off margin from Designv8
+// §6.8, not the 1s handler Margin: 182s with a 90s agent budget refuses,
+// 209s refuses, and the 210s default (exactly 2×90s+30s) passes.
+func TestProcessingLeaseMargin(t *testing.T) {
+	if err := Default().Validate(); err != nil {
+		t.Fatalf("default 210s lease must pass: %v", err)
+	}
+	for _, lease := range []time.Duration{182 * time.Second, 209 * time.Second} {
+		c := Default()
+		c.ProcessingLease = lease
+		if err := c.Validate(); err == nil {
+			t.Fatalf("%v lease with a 90s agent budget must refuse", lease)
 		}
 	}
 }

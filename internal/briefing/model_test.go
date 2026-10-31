@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -237,6 +238,63 @@ func TestOversizeBundleFallsBackWithDistinctReason(t *testing.T) {
 		if fake.Briefs != 0 {
 			t.Fatalf("enabled=%v: provider called %d times", enabled, fake.Briefs)
 		}
+	}
+}
+
+// A model answer whose tokens restore past the storage budget degrades to
+// the deterministic fallback with its own reason: the 64 KiB response cap
+// bounds tokenized text, not the expanded text the row would store.
+// Rejection, never silent truncation.
+func TestRestoredBudgetFallsBackWithDistinctReason(t *testing.T) {
+	// Boundary: exactly at budget fits, one byte over fails — decided on
+	// projections, before any restored string is allocated.
+	fit := modelBriefing{What: strings.Repeat("x", maxRestoredBytes-3), Context: "c", Check: "k", Reason: "r"}
+	if got := projectedRestoredSize(fit, redactor.TokenMap{}); got > maxRestoredBytes {
+		t.Fatalf("exactly-at-budget projection %d must fit", got)
+	}
+	fit.Reason = "rr"
+	if got := projectedRestoredSize(fit, redactor.TokenMap{}); got <= maxRestoredBytes {
+		t.Fatalf("one-over-budget projection %d must fail", got)
+	}
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		if repair {
+			t.Fatal("budget rejection is not a schema error: no repair")
+		}
+		hosts := sortedTokensWithPrefix(valid, "HOST_")
+		ips := sortedTokensWithPrefix(valid, "IP_")
+		if len(hosts) == 0 || len(ips) == 0 {
+			t.Fatal("bundle must issue host and IP tokens")
+		}
+		var bundle struct {
+			EventIDs []string `json:"event_ids"`
+		}
+		if err := json.Unmarshal(payload, &bundle); err != nil {
+			t.Fatal(err)
+		}
+		// Short tokens, long values: the tokenized answer stays small
+		// while the restored row blows the budget.
+		m := map[string]any{
+			"event_ids": bundle.EventIDs, "host": hosts[0],
+			"what_changed": strings.Repeat(ips[0]+" ", 1<<15),
+			"context":      "context for " + hosts[0], "model_suggestion": nil,
+			"priority_reason": "because reasons", "recommended_check": "look",
+		}
+		b, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return provider.RawBriefing{JSON: b}, nil
+	}
+	briefOne(context.Background(), modelDeps(t, s, fake), gid)
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || !strings.Contains(b.Context, "restored text exceeds size budget") {
+		t.Fatalf("distinct restored-budget reason required: %+v", b)
+	}
+	if fake.Briefs != 1 || fake.Repairs != 0 {
+		t.Fatalf("provider called once with no repair: briefs=%d repairs=%d", fake.Briefs, fake.Repairs)
 	}
 }
 
@@ -543,6 +601,94 @@ func TestOnGroupsFiresPerTick(t *testing.T) {
 	drainOnce(context.Background(), d, now)
 	if len(snaps) != 1 || len(snaps[0]) != 1 || snaps[0][0].Anchor != "host:tick" {
 		t.Fatalf("snapshots = %+v", snaps)
+	}
+}
+
+// While the provider is blocked, subscribers must see the claimed group
+// as processing and the groups queued behind it as closed: the snapshot
+// publishes right after TakeGroup commits, not after the drain finishes
+// (when the group is normally already done). The handler builds its
+// answer without test helpers — it runs on the worker goroutine, where
+// t.Fatal is illegal.
+func TestProcessingVisibleWhileProviderBlocked(t *testing.T) {
+	s := openWorkerStore(t)
+	gidA := seedGroup(t, s, "host:pa", "evt-pa", "host.appeared", `{"event_id":"e"}`)
+	gidB := seedGroup(t, s, "host:pb", "evt-pb", "host.appeared", `{"event_id":"e"}`)
+	release := make(chan struct{})
+	fake := provider.NewFake()
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		if repair {
+			return provider.RawBriefing{}, fmt.Errorf("abstain path must not repair")
+		}
+		<-release
+		var bundle struct {
+			EventIDs []string `json:"event_ids"`
+		}
+		if err := json.Unmarshal(payload, &bundle); err != nil {
+			return provider.RawBriefing{}, err
+		}
+		host := ""
+		for tok := range valid {
+			host = tok
+			break
+		}
+		raw, err := json.Marshal(map[string]any{
+			"event_ids": bundle.EventIDs, "host": host,
+			"what_changed": "w", "context": "c", "model_suggestion": nil,
+			"priority_reason": "r", "recommended_check": "k",
+		})
+		if err != nil {
+			return provider.RawBriefing{}, err
+		}
+		return provider.RawBriefing{JSON: raw}, nil
+	}
+	d := modelDeps(t, s, fake)
+	d.ModelTimeout = 30 * time.Second
+	var mu sync.Mutex
+	var snaps [][]store.GroupSnapshot
+	d.OnGroups = func(g []store.GroupSnapshot) {
+		mu.Lock()
+		snaps = append(snaps, append([]store.GroupSnapshot(nil), g...))
+		mu.Unlock()
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); drainOnce(context.Background(), d, time.Now()) }()
+	observed := false
+	for deadline := time.Now().Add(5 * time.Second); !observed && time.Now().Before(deadline); {
+		mu.Lock()
+		for _, snap := range snaps {
+			var proc, closed string
+			for _, g := range snap {
+				if g.Status == "processing" {
+					proc = g.GroupID
+				} else if g.Status == "closed" {
+					closed = g.GroupID
+				}
+			}
+			if proc != "" && closed != "" && proc != closed {
+				observed = true
+				break
+			}
+		}
+		mu.Unlock()
+		if !observed {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if !observed {
+		close(release)
+		t.Fatal("no snapshot showed a processing group with a closed waiter while the provider was blocked")
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("drain did not finish after the provider was released")
+	}
+	for _, gid := range []string{gidA, gidB} {
+		if st, _ := s.GroupStatus(context.Background(), gid); st != "done" {
+			t.Fatalf("group %s must be briefed, got %q", gid, st)
+		}
 	}
 }
 

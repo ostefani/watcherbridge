@@ -343,22 +343,33 @@ func (s *Store) GroupDeadline(ctx context.Context, groupID string) (time.Time, e
 
 // GroupSnapshot is the viewer-facing view of an in-progress group: all
 // fields are safe for local display (anchors are raw local identifiers).
+// Open, closed and processing rows all appear. A closed row is queued
+// behind a slow provider call, not gone: hiding it would drop queued
+// groups from the viewer for the whole provider timeout. Closed renders
+// as waiting; processing renders as "Analysing…" until its briefing
+// lands, never vanishing early.
 type GroupSnapshot struct {
 	GroupID    string
 	Anchor     string
 	Status     string
 	Deadline   time.Time
+	OpenedAt   time.Time
+	LastEvent  time.Time
 	EventCount int
 }
 
-// OpenGroupSnapshots lists groups still accumulating events, oldest
-// deadline first. The groups_status_deadline index serves the filter and
-// order; the event count comes from the join table in the same query.
+// OpenGroupSnapshots lists groups still accumulating events plus queued
+// and in-flight ones, oldest deadline first. Closed-but-untaken groups
+// are the briefing queue: while one group waits on the provider, the
+// rest wait closed behind it, and the snapshot must show them waiting.
+// The groups_status_deadline index serves the filter and order; the event
+// count comes from the join table in the same query, and opened/last-
+// event times ride along from the group row the writer already maintains.
 func (s *Store) OpenGroupSnapshots(ctx context.Context) ([]GroupSnapshot, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT ag.group_id, ag.host_anchor_key, ag.status, ag.deadline_at,
-		COUNT(ge.event_id) FROM active_groups ag
+		ag.opened_at, ag.last_event_at, COUNT(ge.event_id) FROM active_groups ag
 		LEFT JOIN group_events ge ON ge.group_id = ag.group_id
-		WHERE ag.status = 'open' GROUP BY ag.group_id ORDER BY ag.deadline_at`)
+		WHERE ag.status IN ('open', 'closed', 'processing') GROUP BY ag.group_id ORDER BY ag.deadline_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -366,11 +377,13 @@ func (s *Store) OpenGroupSnapshots(ctx context.Context) ([]GroupSnapshot, error)
 	var out []GroupSnapshot
 	for rows.Next() {
 		var g GroupSnapshot
-		var deadline int64
-		if err := rows.Scan(&g.GroupID, &g.Anchor, &g.Status, &deadline, &g.EventCount); err != nil {
+		var deadline, opened, last int64
+		if err := rows.Scan(&g.GroupID, &g.Anchor, &g.Status, &deadline, &opened, &last, &g.EventCount); err != nil {
 			return nil, err
 		}
 		g.Deadline = fromNanos(deadline)
+		g.OpenedAt = fromNanos(opened)
+		g.LastEvent = fromNanos(last)
 		out = append(out, g)
 	}
 	return out, rows.Err()

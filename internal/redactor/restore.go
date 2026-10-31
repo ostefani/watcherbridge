@@ -36,6 +36,22 @@ func tokenShaped(s string) bool {
 	return tokenRe.MatchString(s)
 }
 
+// ProjectedRestoreSize returns the exact length Restore would produce for
+// text, without building the string: the tokenized length plus each known
+// token's expansion delta. Unknown tokens restore to themselves (zero
+// delta), mirroring Restore. Callers preflight multi-kilobyte model output
+// against the storage budget before allocating the restored copy — the
+// check bounds memory, not just the stored row.
+func ProjectedRestoreSize(text string, issued TokenMap) int {
+	size := len(text)
+	for _, idx := range tokenRe.FindAllStringIndex(text, -1) {
+		if val, ok := issued[text[idx[0]:idx[1]]]; ok {
+			size += len(val) - (idx[1] - idx[0])
+		}
+	}
+	return size
+}
+
 // wordChar reports rune-aware word membership for boundary guards. Go's
 // RE2 \b is ASCII-only, so Cyrillic or punctuated hostnames ("Олексій-ПК",
 // "iPhone de José") need explicit neighbours instead.
