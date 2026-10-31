@@ -3,12 +3,14 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // dropProjectionSchema rewinds the Step-18 schema additions (v10 tables,
@@ -88,6 +90,66 @@ func TestUnprojectedGroupNotReady(t *testing.T) {
 	taken, err := s.TakeGroup(ctx, gid)
 	if err != nil || taken.GroupID != gid {
 		t.Fatalf("take after projection = %+v %v", taken, err)
+	}
+}
+
+// Scanner observation times and liveness evidence survive projection
+// bounded with omission flags; the observation keeps the event time
+// as reported_at and never substitutes it for scanner time.
+func TestProjectedTimestampsAndLivenessPreserved(t *testing.T) {
+	s := openTestStore(t)
+	at := time.Now().UTC().Truncate(time.Second)
+	longAlias := strings.Repeat("a", maxDisplayRunes+10)
+	body := []byte(`{"event_id":"evt-ts","event_key":"k","event_type":"host.appeared","occurred_at":"2026-10-20T12:00:05Z","cycle":3,
+		"host":{"mac":"10:20:30:40:50:62","host_id":"mac:10:20:30:40:50:62","identity_source":"mac","identity_confidence":"high",
+		"last_seen_at":"2026-10-20T12:00:01Z","last_strong_seen_at":"2026-10-19T12:00:00Z","last_weak_seen_at":"2026-10-20T11:00:00Z",
+		"liveness":[{"source":"arp","weak":false,"expires_at":"2026-10-20T12:05:00Z"}],
+		"confirmation_source":"arp","confirmation_proto":"tcp","confirmation_port":22,
+		"identity_aliases":["h1","` + longAlias + `"]}}`)
+	persistReported(t, s, "lab", "evt-ts", "k", "host.appeared", body, at)
+	if _, err := s.ProjectReported(context.Background(), "lab", 64); err != nil {
+		t.Fatal(err)
+	}
+	var attrsJSON string
+	var reportedAt int64
+	err := s.db.QueryRow(`SELECT attributes_json, reported_at FROM reported_observations WHERE event_id = 'evt-ts'`).Scan(&attrsJSON, &reportedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reportedAt != at.UnixNano() {
+		t.Fatalf("reported_at = %d, want event time %d", reportedAt, at.UnixNano())
+	}
+	var attrs map[string]any
+	if err := json.Unmarshal([]byte(attrsJSON), &attrs); err != nil {
+		t.Fatal(err)
+	}
+	for k, want := range map[string]string{
+		"last_seen_at": "2026-10-20T12:00:01Z", "last_strong_seen_at": "2026-10-19T12:00:00Z",
+		"last_weak_seen_at": "2026-10-20T11:00:00Z", "confirmation_source": "arp",
+		"confirmation_proto": "tcp",
+	} {
+		if attrs[k] != want {
+			t.Fatalf("%s = %v, want %q", k, attrs[k], want)
+		}
+	}
+	if attrs["confirmation_port"] != float64(22) {
+		t.Fatalf("confirmation_port = %v, want 22", attrs["confirmation_port"])
+	}
+	live, ok := attrs["liveness"].([]any)
+	if !ok || len(live) != 1 {
+		t.Fatalf("liveness = %v, want one entry", attrs["liveness"])
+	}
+	entry, ok := live[0].(map[string]any)
+	if !ok || entry["source"] != "arp" || entry["weak"] != false || entry["expires_at"] != "2026-10-20T12:05:00Z" {
+		t.Fatalf("liveness entry = %v", live)
+	}
+	// One over-long alias in a two-entry list must flag truncation even
+	// though the entry count is under the cap (the P3 under-report).
+	if attrs["aliases_truncated"] != true || attrs["attributes_truncated"] != true {
+		t.Fatalf("truncation flags = aliases %v attributes %v, want true/true", attrs["aliases_truncated"], attrs["attributes_truncated"])
+	}
+	if got := attrs["aliases"].([]any)[1].(string); utf8.RuneCountInString(got) != maxDisplayRunes {
+		t.Fatalf("over-long alias capped to %d runes, got %d", maxDisplayRunes, utf8.RuneCountInString(got))
 	}
 }
 

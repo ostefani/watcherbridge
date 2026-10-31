@@ -875,3 +875,45 @@ func TestDisplayRestoresOriginalCase(t *testing.T) {
 		t.Fatalf("display restore lost spelling: %q", restored)
 	}
 }
+
+// Scoped group anchors must never leak the deployment scope or the raw
+// reference to the provider: the scope is dropped before discovery and
+// the remainder tokenizes exactly like the equivalent legacy anchor.
+func TestScopedAnchorDropsScope(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		anchor string
+		raw    string
+	}{
+		{"device", "sub:customer-office:mac:AA:BB:CC:DD:EE:FF", "AA:BB:CC:DD:EE:FF"},
+		{"address", "addr:customer-office:192.168.0.23", "192.168.0.23"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testStore(t)
+			b, issued, _, err := BuildBundle(context.Background(), s, BundleInput{
+				GroupID: "grp-1", Anchor: tc.anchor, Target: "192.168.0.0/24",
+				Baseline: "low",
+				Events:   []InputEvent{{EventID: "e1", EventType: "host.appeared", Payload: []byte(`{"event_id":"e1"}`)}},
+			}, testPolicy())
+			if err != nil {
+				t.Fatal(err)
+			}
+			ser, err := json.Marshal(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(ser), "customer-office") {
+				t.Fatalf("deployment scope left the machine: %s", ser)
+			}
+			if strings.Contains(string(ser), tc.raw) {
+				t.Fatalf("raw anchor reference left the machine: %s", ser)
+			}
+			if strings.Contains(b.Anchor, "customer-office") || strings.Contains(b.Anchor, tc.raw) {
+				t.Fatalf("bundle anchor not tokenized: %q", b.Anchor)
+			}
+			if hits, err := ScanOutboundLeaks(ser, issued, nil); err != nil || len(hits) != 0 {
+				t.Fatalf("leaks in scoped-anchor bundle: %v %v", hits, err)
+			}
+		})
+	}
+}

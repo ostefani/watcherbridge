@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ostefani/watcherbridge/internal/provider"
@@ -72,9 +73,44 @@ func notifyBriefing(d Deps, taken store.TakenGroup, b store.Briefing) {
 	d.OnBriefing(b)
 }
 
-// Run ticks until ctx ends: close due groups, reap stale leases, then drain
-// the briefing queue page by page. It returns nil when ctx ends; per-group
-// panics are recovered so one poison group cannot stop the worker.
+// projectStep runs one bounded projection batch through the writer.
+// Projection is scheduled independently of briefing progress (see
+// projectLoop) so a backlog of ready groups behind slow provider calls
+// never delays capture of newly accepted events (Designv9 §4.1).
+// drainOnce also calls it first to preserve persist -> project ->
+// close -> take order for direct callers; the second call on an empty
+// queue is a single indexed lookup.
+func projectStep(ctx context.Context, d Deps) {
+	if d.SourceScope == "" {
+		return
+	}
+	if _, err := d.Store.ProjectReported(ctx, d.SourceScope, 256); err != nil {
+		log.Printf("briefing: project reported: %s", store.SanitizeErrorText(err.Error()))
+	}
+}
+
+// projectLoop projects reported context on its own tick, independent of
+// the briefing drain: provider calls happen outside the writer, so this
+// loop keeps capturing newly accepted events while briefOne blocks on
+// the model. Batches stay bounded; leftovers resume next tick.
+func projectLoop(ctx context.Context, d Deps, tick time.Duration) {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		projectStep(ctx, d)
+		timer.Reset(tick)
+	}
+}
+
+// Run ticks until ctx ends: project reported context on its own loop,
+// then close due groups, reap stale leases, and drain the briefing
+// queue page by page. It returns nil when ctx ends; per-group panics
+// are recovered so one poison group cannot stop the worker.
 func Run(ctx context.Context, d Deps) error {
 	if d.Store == nil {
 		return fmt.Errorf("briefing worker requires a store")
@@ -94,6 +130,13 @@ func Run(ctx context.Context, d Deps) error {
 	if tick <= 0 {
 		tick = time.Second
 	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		projectLoop(ctx, d, tick)
+	}()
+	defer wg.Wait()
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
@@ -128,13 +171,9 @@ func publishGroups(ctx context.Context, d Deps) {
 func drainOnce(ctx context.Context, d Deps, now time.Time) {
 	// Project reported context before closing anything: briefing
 	// inserts copy group_subjects, so subjects must already be linked
-	// when a group is taken. Bounded per tick; leftovers resume next
-	// tick or after a restart via the progress table.
-	if d.SourceScope != "" {
-		if _, err := d.Store.ProjectReported(ctx, d.SourceScope, 256); err != nil {
-			log.Printf("briefing: project reported: %s", store.SanitizeErrorText(err.Error()))
-		}
-	}
+	// when a group is taken. The independent projectLoop repeats this
+	// between drains; this call keeps direct callers ordered.
+	projectStep(ctx, d)
 	if _, err := d.Store.CloseDue(ctx, now); err != nil {
 		log.Printf("briefing: close-due: %s", store.SanitizeErrorText(err.Error()))
 	}

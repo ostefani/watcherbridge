@@ -746,6 +746,86 @@ func TestProcessingVisibleWhileProviderBlocked(t *testing.T) {
 	}
 }
 
+// While the provider blocks a briefing, newly accepted events must still
+// project: the independent projectLoop keeps capturing through the
+// writer although the drain is stuck in briefOne. The take of the later
+// group proves projection; the suite releases the provider afterwards.
+func TestProjectionProgressesWhileProviderBlocked(t *testing.T) {
+	s := openWorkerStore(t)
+	gidA := seedGroup(t, s, "host:qa", "evt-qa", "host.appeared", `{"event_id":"e"}`)
+	release := make(chan struct{})
+	fake := provider.NewFake()
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		if repair {
+			return provider.RawBriefing{}, fmt.Errorf("abstain path must not repair")
+		}
+		<-release
+		return provider.RawBriefing{JSON: validAnswer(t, payload, valid, strptr("high"), nil)}, nil
+	}
+	d := modelDeps(t, s, fake)
+	d.ModelTimeout = 30 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- Run(ctx, d) }()
+	// Wait until the drain is provably stuck inside the provider call.
+	stuck := false
+	for deadline := time.Now().Add(5 * time.Second); !stuck && time.Now().Before(deadline); {
+		if st, _ := s.GroupStatus(context.Background(), gidA); st == "processing" {
+			stuck = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !stuck {
+		close(release)
+		cancel()
+		t.Fatal("group A was never taken, the provider is not blocked")
+	}
+	// Accept an event after the block began; it must become briefable
+	// although no briefing can complete.
+	now := time.Now().UTC().Truncate(time.Second)
+	res, err := s.PersistEventAndGroup(ctx, store.RawEvent{
+		EventID: "evt-qb", EventKey: "k", EventType: "host.appeared",
+		OccurredAt: now, Payload: []byte(`{"event_id":"e"}`), ReceivedAt: now, SignatureTimestamp: now,
+	}, "host:qb", store.GroupPolicy{QuietWindow: time.Millisecond, MaxWindow: time.Hour})
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	briefable := false
+	for deadline := time.Now().Add(10 * time.Second); !briefable && time.Now().Before(deadline); {
+		if _, err := s.CloseDue(ctx, time.Now()); err != nil {
+			t.Logf("close due: %v", err)
+		}
+		if taken, err := s.TakeGroup(ctx, res.GroupID); err == nil && taken.GroupID == res.GroupID {
+			briefable = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !briefable {
+		close(release)
+		cancel()
+		t.Fatal("event accepted during a blocked drain never projected")
+	}
+	if st, _ := s.GroupStatus(context.Background(), gidA); st != "processing" {
+		close(release)
+		cancel()
+		t.Fatalf("group A must still be blocked in the provider, got %q", st)
+	}
+	close(release)
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run returned %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not stop after release and cancel")
+	}
+}
+
 func TestDecodeModelBriefingRejects(t *testing.T) {
 	full := `{"event_ids":["e1"],"host":"HOST_1","what_changed":"w","context":"c","model_suggestion":"high","priority_reason":"r","recommended_check":"k"}`
 	for name, raw := range map[string]string{

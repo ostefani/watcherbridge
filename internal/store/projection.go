@@ -52,6 +52,8 @@ type subjectPort struct {
 // contract pins. Booleans are tri-state: nil means the report did not
 // say, and only an explicit value is stored as true/false. Free-form
 // evidence stays in the raw payload and the capped attributes snapshot.
+// Scanner timestamps ride along as reported strings (never substituted
+// with event time); missing stays empty, never zero-filled.
 type subjectView struct {
 	role               string // host, previous or current
 	hostID             string
@@ -74,6 +76,21 @@ type subjectView struct {
 	aliases            []string
 	anchorKeys         []string
 	fingerprint        string
+	lastSeen           string
+	lastStrongSeen     string
+	lastWeakSeen       string
+	liveness           []subjectLiveness
+	confirmSource      string
+	confirmProto       string
+	confirmPort        int
+}
+
+// subjectLiveness is one reported liveness entry: who vouches, whether
+// the observation was weak, and when the claim expires ("" = unstated).
+type subjectLiveness struct {
+	source    string
+	weak      bool
+	expiresAt string
 }
 
 // hostViewJSON mirrors the producer HostState fields projection reads.
@@ -99,6 +116,17 @@ type hostViewJSON struct {
 	IdentityAliases    []string `json:"identity_aliases"`
 	IdentityAnchorKeys []string `json:"identity_anchor_keys"`
 	Fingerprint        string   `json:"evidence_fingerprint"`
+	LastSeenAt         string   `json:"last_seen_at"`
+	LastStrongSeenAt   string   `json:"last_strong_seen_at"`
+	LastWeakSeenAt     string   `json:"last_weak_seen_at"`
+	Liveness           []struct {
+		Source    string `json:"source"`
+		Weak      bool   `json:"weak"`
+		ExpiresAt string `json:"expires_at"`
+	} `json:"liveness"`
+	ConfirmationSource string `json:"confirmation_source"`
+	ConfirmationProto  string `json:"confirmation_proto"`
+	ConfirmationPort   int    `json:"confirmation_port"`
 	Ports              []struct {
 		Number   int    `json:"number"`
 		Protocol string `json:"protocol"`
@@ -137,6 +165,19 @@ func toSubjectView(role string, h *hostViewJSON) subjectView {
 	v.aliases = h.IdentityAliases
 	v.anchorKeys = h.IdentityAnchorKeys
 	v.fingerprint = h.Fingerprint
+	v.lastSeen = h.LastSeenAt
+	v.lastStrongSeen = h.LastStrongSeenAt
+	v.lastWeakSeen = h.LastWeakSeenAt
+	v.confirmSource = h.ConfirmationSource
+	v.confirmProto = h.ConfirmationProto
+	v.confirmPort = h.ConfirmationPort
+	for _, l := range h.Liveness {
+		v.liveness = append(v.liveness, subjectLiveness{
+			source:    l.Source,
+			weak:      l.Weak,
+			expiresAt: l.ExpiresAt,
+		})
+	}
 	for _, p := range h.Ports {
 		v.ports = append(v.ports, subjectPort{
 			proto:   p.Protocol,
@@ -272,20 +313,35 @@ func capRunes(s string, n int) string {
 	return string(runes[:n])
 }
 
-func capStringList(in []string, maxEntries, maxRunes int) ([]string, bool) {
-	if len(in) > maxEntries {
-		in = in[:maxEntries]
-		return cappedStrings(in, maxRunes), true
+// capRunesFlag caps like capRunes and reports whether content changed.
+func capRunesFlag(s string, n int) (string, bool) {
+	if utf8.RuneCountInString(s) <= n {
+		return s, false
 	}
-	return cappedStrings(in, maxRunes), false
+	return string([]rune(s)[:n]), true
 }
 
-func cappedStrings(in []string, maxRunes int) []string {
-	out := make([]string, 0, len(in))
-	for _, s := range in {
-		out = append(out, capRunes(s, maxRunes))
+// capStringList caps entry count and per-entry length, reporting
+// truncation from either cause: an over-long alias in a short list
+// truncates just as much as a 201st entry.
+func capStringList(in []string, maxEntries, maxRunes int) ([]string, bool) {
+	truncated := len(in) > maxEntries
+	if truncated {
+		in = in[:maxEntries]
 	}
-	return out
+	out, cut := cappedStrings(in, maxRunes)
+	return out, truncated || cut
+}
+
+func cappedStrings(in []string, maxRunes int) ([]string, bool) {
+	out := make([]string, 0, len(in))
+	var truncated bool
+	for _, s := range in {
+		c, cut := capRunesFlag(s, maxRunes)
+		out = append(out, c)
+		truncated = truncated || cut
+	}
+	return out, truncated
 }
 
 func newProfileID() (string, error) {
@@ -474,12 +530,16 @@ func ensureSubject(tx *sql.Tx, sourceScope, class, namespace, upstreamRef string
 	if err != nil {
 		return "", err
 	}
+	// Profile columns are bounded like the snapshot: unbounded
+	// upstream strings never widen a stored current-state column.
 	if _, err := tx.Exec(`INSERT OR IGNORE INTO reported_subjects
 		(profile_id, source_scope, reference_class, identity_namespace, upstream_reference,
 		 reported_identity_source, reported_confidence, first_report_at, last_report_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, sourceScope, class, namespace, upstreamRef,
-		view.identitySource, view.identityConfidence, receivedAt, receivedAt); err != nil {
+		capRunes(view.identitySource, maxDisplayRunes),
+		capRunes(view.identityConfidence, maxDisplayRunes),
+		receivedAt, receivedAt); err != nil {
 		return "", err
 	}
 	var profileID string
@@ -495,7 +555,9 @@ func ensureSubject(tx *sql.Tx, sourceScope, class, namespace, upstreamRef string
 		    reported_confidence = CASE WHEN ? >= last_report_at THEN ? ELSE reported_confidence END,
 		    last_report_at = MAX(last_report_at, ?)
 		WHERE profile_id = ?`,
-		receivedAt, view.identitySource, receivedAt, view.identityConfidence, receivedAt, profileID); err != nil {
+		receivedAt, capRunes(view.identitySource, maxDisplayRunes),
+		receivedAt, capRunes(view.identityConfidence, maxDisplayRunes),
+		receivedAt, profileID); err != nil {
 		return "", err
 	}
 	return profileID, nil
@@ -525,29 +587,39 @@ func ensureObservation(tx *sql.Tx, eventID, role, profileID string, reportedAt, 
 }
 
 // viewAttributes snapshots the reported enrichment a view carried. ID,
-// address, hostname, MAC and tri-state presence survive; display
-// strings are capped, alias lists are capped with an omission flag,
-// and a missing boolean stays null instead of becoming false. Ports
-// live in reported_ports; only their count and truncation flag ride
-// along here.
+// address, hostname, MAC, tri-state presence and the scanner's own
+// timestamps survive; display strings are capped, alias/liveness lists
+// are capped with omission flags, and attributes_truncated reports any
+// scalar or list capping anywhere in the snapshot. reported_at keeps
+// the enclosing event time; scanner observation times ride as
+// attributes, never substituted. Ports live in reported_ports; only
+// their count and truncation flag ride along here.
 func viewAttributes(view subjectView) (string, error) {
+	var truncated bool
+	cap := func(s string) string {
+		c, cut := capRunesFlag(s, maxDisplayRunes)
+		truncated = truncated || cut
+		return c
+	}
 	aliases, aliasesTruncated := capStringList(view.aliases, maxAliasEntries, maxDisplayRunes)
 	anchors, anchorsTruncated := capStringList(view.anchorKeys, maxAliasEntries, maxDisplayRunes)
+	liveness, livenessTruncated := capLiveness(view.liveness)
+	truncated = truncated || aliasesTruncated || anchorsTruncated || livenessTruncated
 	attrs := map[string]any{
-		"host_id":               capRunes(view.hostID, maxDisplayRunes),
-		"identity_source":       view.identitySource,
-		"identity_confidence":   view.identityConfidence,
-		"ip":                    capRunes(view.ip, maxDisplayRunes),
-		"hostname":              capRunes(view.hostname, maxDisplayRunes),
-		"mac":                   capRunes(view.mac, maxDisplayRunes),
+		"host_id":               cap(view.hostID),
+		"identity_source":       cap(view.identitySource),
+		"identity_confidence":   cap(view.identityConfidence),
+		"ip":                    cap(view.ip),
+		"hostname":              cap(view.hostname),
+		"mac":                   cap(view.mac),
 		"randomized":            view.randomized,
-		"vendor":                capRunes(view.vendor, maxDisplayRunes),
-		"os":                    capRunes(view.os, maxDisplayRunes),
-		"device":                capRunes(view.device, maxDisplayRunes),
-		"os_evidence":           capRunes(view.osEvidence, maxDisplayRunes),
-		"device_evidence":       capRunes(view.deviceEvidence, maxDisplayRunes),
-		"source":                capRunes(view.source, maxDisplayRunes),
-		"source_name":           capRunes(view.sourceName, maxDisplayRunes),
+		"vendor":                cap(view.vendor),
+		"os":                    cap(view.os),
+		"device":                cap(view.device),
+		"os_evidence":           cap(view.osEvidence),
+		"device_evidence":       cap(view.deviceEvidence),
+		"source":                cap(view.source),
+		"source_name":           cap(view.sourceName),
 		"alive":                 view.alive,
 		"weak":                  view.weak,
 		"aliases":               aliases,
@@ -556,13 +628,44 @@ func viewAttributes(view subjectView) (string, error) {
 		"anchor_keys_truncated": anchorsTruncated,
 		"ports_total":           len(view.ports),
 		"ports_truncated":       len(view.ports) > maxPortsPerObservation,
-		"evidence_fingerprint":  capRunes(view.fingerprint, maxDisplayRunes),
+		"evidence_fingerprint":  cap(view.fingerprint),
+		"last_seen_at":          cap(view.lastSeen),
+		"last_strong_seen_at":   cap(view.lastStrongSeen),
+		"last_weak_seen_at":     cap(view.lastWeakSeen),
+		"liveness":              liveness,
+		"liveness_truncated":    livenessTruncated,
+		"confirmation_source":   cap(view.confirmSource),
+		"confirmation_proto":    cap(view.confirmProto),
+		"confirmation_port":     view.confirmPort,
+		"attributes_truncated":  truncated,
 	}
 	raw, err := json.Marshal(attrs)
 	if err != nil {
 		return "", err
 	}
 	return string(raw), nil
+}
+
+// capLiveness bounds one observation's liveness entries (count and
+// per-entry strings) and reports any capping. Entries are small maps
+// so the snapshot stays readable; the raw payload keeps full fidelity.
+func capLiveness(in []subjectLiveness) ([]map[string]any, bool) {
+	truncated := len(in) > maxAliasEntries
+	if truncated {
+		in = in[:maxAliasEntries]
+	}
+	out := make([]map[string]any, 0, len(in))
+	for _, l := range in {
+		source, cutSource := capRunesFlag(l.source, maxDisplayRunes)
+		expires, cutExpires := capRunesFlag(l.expiresAt, maxDisplayRunes)
+		truncated = truncated || cutSource || cutExpires
+		out = append(out, map[string]any{
+			"source":     source,
+			"weak":       l.weak,
+			"expires_at": expires,
+		})
+	}
+	return out, truncated
 }
 
 // ensurePorts records the reported port states for one observation,
