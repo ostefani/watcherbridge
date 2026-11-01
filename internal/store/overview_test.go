@@ -59,14 +59,10 @@ func TestOverviewReads(t *testing.T) {
 	}
 	// The narrow projection serves the ordering from the created_at
 	// index, not a table scan.
-	for _, row := range explainQuery(t, s, `SELECT briefing_id, priority, created_at, kind FROM briefings
+	assertIndexed(t, explainQuery(t, s, `SELECT briefing_id, priority, created_at, kind FROM briefings
 		WHERE created_at >= 0
 		ORDER BY CASE priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END DESC,
-			created_at DESC, briefing_id ASC LIMIT 10`) {
-		if strings.Contains(strings.ToUpper(row), "SCAN briefings") && !strings.Contains(strings.ToUpper(row), "USING") {
-			t.Fatalf("candidates scan briefings:\n%s", row)
-		}
-	}
+			created_at DESC, briefing_id ASC LIMIT 10`), "candidates")
 
 	digest, err := s.BriefingDigest(ctx, old.Add(-time.Minute))
 	if err != nil {
@@ -76,13 +72,7 @@ func TestOverviewReads(t *testing.T) {
 		t.Fatalf("digest = %v", digest)
 	}
 
-	var plan string
-	for _, row := range explainQuery(t, s, `SELECT kind, COUNT(*) FROM briefings WHERE created_at >= ? GROUP BY kind`) {
-		plan += row + "\n"
-	}
-	if strings.Contains(strings.ToUpper(plan), "SCAN briefings") && !strings.Contains(strings.ToUpper(plan), "USING") {
-		t.Fatalf("digest scans briefings:\n%s", plan)
-	}
+	assertIndexed(t, explainQuery(t, s, `SELECT kind, COUNT(*) FROM briefings WHERE created_at >= ? GROUP BY kind`), "digest")
 
 	used, total, err := s.FallbackShare(ctx, old.Add(-time.Minute))
 	if err != nil {
@@ -162,6 +152,78 @@ func TestPurgeLastSuccessSurvivesFailure(t *testing.T) {
 	}
 	if success.ByTable == nil {
 		t.Fatal("success must carry the per-table breakdown, even when empty")
+	}
+}
+
+// assertIndexed fails when the plan contains a bare table scan of
+// briefings or uses no index at all. Both operands are normalized to
+// the same case first — comparing a normalized plan against a
+// mixed-case needle can never match and silently disables the guard.
+func assertIndexed(t *testing.T, rows []string, what string) {
+	t.Helper()
+	joined := strings.ToUpper(strings.Join(rows, "\n"))
+	bare := false
+	for _, line := range strings.Split(joined, "\n") {
+		if strings.Contains(line, "SCAN") && strings.Contains(line, "BRIEFINGS") && !strings.Contains(line, "USING") {
+			bare = true
+		}
+	}
+	if bare {
+		t.Fatalf("%s table-scans briefings:\n%s", what, strings.Join(rows, "\n"))
+	}
+	if !strings.Contains(joined, "USING") {
+		t.Fatalf("%s uses no index:\n%s", what, strings.Join(rows, "\n"))
+	}
+}
+
+// group_events deletions already ran through the purge transaction and
+// its cumulative totals, but no per-run counter attributed them: the
+// run report and the health breakdown omitted those rows. Seeding one
+// done group with aged rows and purging must count them per run.
+func TestPurgeGroupEventsCounted(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	old := now.Add(-48 * time.Hour)
+
+	body := producerPayload("evt-ge", "k", "host.changed", `{"ip":"192.168.0.1","hostname":"h","ports":[]}`)
+	gid := persistReported(t, s, "lab", "evt-ge", "k", "host.changed", body, old)
+	projectAll(t, s)
+	if _, err := s.CloseDue(ctx, old.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := s.TakeGroup(ctx, gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertBriefing(ctx, Briefing{
+		BriefingID: "brf-" + taken.GroupID, GroupID: taken.GroupID, HostAnchorKey: taken.Anchor,
+		Baseline: "low", Priority: "low", PriorityReason: "r",
+		WhatChanged: "w", Context: "c", RecommendedCheck: "k", CreatedAt: old,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := s.PurgeOnce(ctx, PurgeSettings{BriefingRetention: 25 * time.Hour, SubjectRetention: 26 * time.Hour}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.GroupEvents < 1 {
+		t.Fatalf("run report omits group_events deletions: %+v", rep)
+	}
+	run, err := s.LastPurgeRun(ctx)
+	if err != nil || !run.HaveRun {
+		t.Fatalf("last run = %+v, %v", run, err)
+	}
+	if run.ByTable["group_events"] < 1 {
+		t.Fatalf("health breakdown omits group_events: %+v", run.ByTable)
+	}
+	if totals, err := s.PurgeTotals(ctx); err != nil || totals["group_events"] < 1 {
+		t.Fatalf("cumulative totals omit group_events: %v, %v", totals, err)
+	}
+	var v int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil || v != 17 {
+		t.Fatalf("schema version = %d, %v; want 17", v, err)
 	}
 }
 

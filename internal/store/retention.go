@@ -95,7 +95,8 @@ type PurgeReport struct {
 	BriefingLinks int64
 	Briefings     int64
 	Groups        int64
-	GroupLinks    int64
+	GroupLinks    int64 // group_subjects rows; group_events has its own counter below
+	GroupEvents   int64
 	Ports         int64
 	Observations  int64
 	Progress      int64 // projection_progress + projection_pending rows
@@ -111,6 +112,7 @@ func (r *PurgeReport) add(o PurgeReport) {
 	r.Briefings += o.Briefings
 	r.Groups += o.Groups
 	r.GroupLinks += o.GroupLinks
+	r.GroupEvents += o.GroupEvents
 	r.Ports += o.Ports
 	r.Observations += o.Observations
 	r.Progress += o.Progress
@@ -122,7 +124,7 @@ func (r *PurgeReport) add(o PurgeReport) {
 }
 
 func (r PurgeReport) total() int64 {
-	return r.BriefingLinks + r.Briefings + r.Groups + r.GroupLinks + r.Ports +
+	return r.BriefingLinks + r.Briefings + r.Groups + r.GroupLinks + r.GroupEvents + r.Ports +
 		r.Observations + r.Progress + r.RawEvents + r.Subjects + r.Sources + r.Pseudonyms
 }
 
@@ -234,6 +236,8 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				report.Groups += n
 			case "group_subjects":
 				report.GroupLinks += n
+			case "group_events":
+				report.GroupEvents += n
 			case "reported_ports":
 				report.Ports += n
 			case "reported_observations":
@@ -576,6 +580,7 @@ func addPurgeRunCounts(tx *sql.Tx, runID int64, report PurgeReport) error {
 		briefings_deleted = briefings_deleted + ?,
 		groups_deleted = groups_deleted + ?,
 		group_links_deleted = group_links_deleted + ?,
+		group_events_deleted = group_events_deleted + ?,
 		ports_deleted = ports_deleted + ?,
 		observations_deleted = observations_deleted + ?,
 		progress_deleted = progress_deleted + ?,
@@ -586,6 +591,7 @@ func addPurgeRunCounts(tx *sql.Tx, runID int64, report PurgeReport) error {
 		bookkeeping_writes = bookkeeping_writes + ?
 		WHERE run_id = ?`,
 		report.BriefingLinks, report.Briefings, report.Groups, report.GroupLinks,
+		report.GroupEvents,
 		report.Ports, report.Observations, report.Progress, report.RawEvents,
 		report.Subjects, report.Sources, report.Pseudonyms, report.Bookkeeping,
 		runID)
@@ -764,11 +770,13 @@ func (s *Store) LatestPurgeRun(ctx context.Context) (purgeRun, error) {
 	var run purgeRun
 	err := s.db.QueryRowContext(ctx, `SELECT run_id, started_at, finished_at, status, error,
 		briefing_links_deleted, briefings_deleted, groups_deleted, group_links_deleted,
+		group_events_deleted,
 		ports_deleted, observations_deleted, progress_deleted, raw_events_deleted,
 		subjects_deleted, sources_deleted, pseudonyms_deleted, bookkeeping_writes
 		FROM purge_runs ORDER BY run_id DESC LIMIT 1`).Scan(
 		&run.runID, &run.startedAt, &run.finishedAt, &run.status, &run.errText,
 		&run.total.BriefingLinks, &run.total.Briefings, &run.total.Groups, &run.total.GroupLinks,
+		&run.total.GroupEvents,
 		&run.total.Ports, &run.total.Observations, &run.total.Progress, &run.total.RawEvents,
 		&run.total.Subjects, &run.total.Sources, &run.total.Pseudonyms, &run.total.Bookkeeping)
 	if err != nil {

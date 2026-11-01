@@ -56,6 +56,7 @@ var purgeRunColumns = []struct {
 	{"briefings_deleted", "briefings"},
 	{"groups_deleted", "active_groups"},
 	{"group_links_deleted", "group_subjects"},
+	{"group_events_deleted", "group_events"},
 	{"ports_deleted", "reported_ports"},
 	{"observations_deleted", "reported_observations"},
 	{"progress_deleted", "projection_progress"},
@@ -112,11 +113,14 @@ func (s *Store) LastPurgeRun(ctx context.Context) (PurgeRunHealth, error) {
 	return h, err
 }
 
-// LastSuccessfulPurgeRun reads the newest completed purge_runs row: the
-// last known-good state, which survives newer failed or running rows.
-// HaveRun is false when no run has completed yet.
+// LastSuccessfulPurgeRun reads the newest cleanly completed purge_runs
+// row: the last known-good state, which survives newer failed, running,
+// or error-bearing rows. A 'completed' run that still carries error
+// text skipped work (for example token expiry after failed discovery),
+// so it does not qualify — the latest attempt already reports it.
+// HaveRun is false when no clean run exists yet.
 func (s *Store) LastSuccessfulPurgeRun(ctx context.Context) (PurgeRunHealth, error) {
-	h, _, err := scanPurgeRun(s.db.QueryRowContext(ctx, purgeRunSelect(`WHERE status = 'completed' ORDER BY run_id DESC LIMIT 1`)))
+	h, _, err := scanPurgeRun(s.db.QueryRowContext(ctx, purgeRunSelect(`WHERE status = 'completed' AND error = '' ORDER BY run_id DESC LIMIT 1`)))
 	return h, err
 }
 
