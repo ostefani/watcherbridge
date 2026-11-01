@@ -21,6 +21,13 @@ func dropProjectionSchema(t *testing.T, db *sql.DB) {
 	t.Helper()
 	dropGroupingProvenance(t, db)
 	dropColumnIfExists(t, db, "pseudonym_map", "last_used_at")
+	// SQLite refuses DROP COLUMN while a dependent index exists, so
+	// the kind index goes before the kind/source columns.
+	if _, err := db.Exec(`DROP INDEX IF EXISTS briefings_created_kind`); err != nil {
+		t.Fatal(err)
+	}
+	dropColumnIfExists(t, db, "briefings", "kind")
+	dropColumnIfExists(t, db, "briefings", "source")
 	for _, stmt := range []string{
 		`DROP TABLE IF EXISTS reported_ports`,
 		`DROP TABLE IF EXISTS reported_observations`,
@@ -50,20 +57,24 @@ func dropGroupingProvenance(t *testing.T, db *sql.DB) {
 		}
 	}
 	// Rewinding past v12 must also drop the v13/v14 purge tables, or
-	// the replayed migrations meet their own tables. The v13-v15
+	// the replayed migrations meet their own tables. The v13-v16
 	// indexes are idempotent (CREATE INDEX IF NOT EXISTS) and stay,
-	// and the token column rewinds through dropColumnIfExists:
-	// intermediate versions predate it.
+	// except the kind index, which blocks DROP COLUMN while present.
+	// Added columns rewind through dropColumnIfExists since
+	// intermediate versions predate them.
 	for _, stmt := range []string{
 		`DROP TABLE IF EXISTS purge_runs`,
 		`DROP TABLE IF EXISTS purge_protected_tokens`,
 		`DROP TABLE IF EXISTS purge_state`,
+		`DROP INDEX IF EXISTS briefings_created_kind`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			t.Fatal(err)
 		}
 	}
 	dropColumnIfExists(t, db, "pseudonym_map", "last_used_at")
+	dropColumnIfExists(t, db, "briefings", "kind")
+	dropColumnIfExists(t, db, "briefings", "source")
 }
 
 // dropColumnIfExists rewinds an added column only when a newer schema

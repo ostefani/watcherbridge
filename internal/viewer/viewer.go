@@ -649,6 +649,8 @@ type briefingView struct {
 	Priority         string   `json:"priority"`
 	PriorityReason   string   `json:"priority_reason"`
 	BaselineRule     string   `json:"baseline_rule"`
+	Kind             string   `json:"kind"`
+	Source           string   `json:"source"`
 	Clamped          bool     `json:"clamped"`
 	FallbackUsed     bool     `json:"fallback_used"`
 	WhatChanged      string   `json:"what_changed"`
@@ -664,7 +666,7 @@ func viewOf(b store.Briefing) briefingView {
 		GroupingVersion: b.GroupingVersion,
 		BriefingID:      b.BriefingID, GroupID: b.GroupID, Host: b.HostAnchorKey,
 		Baseline: b.Baseline, ModelSuggestion: b.ModelSuggestion, Priority: b.Priority,
-		PriorityReason: b.PriorityReason, BaselineRule: b.BaselineRule, Clamped: b.Clamped,
+		PriorityReason: b.PriorityReason, BaselineRule: b.BaselineRule, Kind: b.Kind, Source: b.Source, Clamped: b.Clamped,
 		FallbackUsed: b.FallbackUsed, WhatChanged: b.WhatChanged, Context: b.Context,
 		RecommendedCheck: b.RecommendedCheck, CreatedAt: b.CreatedAt.UTC().Format(time.RFC3339),
 		EventIDs: append([]string(nil), b.EventIDs...), Seq: b.Seq,

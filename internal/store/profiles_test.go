@@ -352,6 +352,75 @@ func TestLatestObservationUsesReceiptIndex(t *testing.T) {
 	}
 }
 
+// Missing enrichment stays missing through projection and serving:
+// the pipeline never fabricates vendor, OS, device or evidence text,
+// and tri-state presence survives as null rather than false.
+func TestUnknownEnrichmentStaysUnknown(t *testing.T) {
+	s := openTestStore(t)
+	at := time.Now().UTC().Truncate(time.Second)
+	bare := `{"mac":"10:20:30:40:50:77","host_id":"mac:10:20:30:40:50:77","identity_source":"mac","identity_confidence":"high"}`
+	rich := `{"mac":"10:20:30:40:50:78","host_id":"mac:10:20:30:40:50:78","identity_source":"mac","identity_confidence":"high",` +
+		`"vendor":"Acme","os":"Debian 12","device":"printer","os_evidence":"nmap","device_evidence":"mdns"}`
+	seedSubject(t, s, "lab", "evt-bare", bare, at)
+	seedSubject(t, s, "lab", "evt-rich", rich, at.Add(time.Second))
+	subs, _, err := s.ReportedSubjectsPage(context.Background(), 0, "", 10)
+	if err != nil || len(subs) != 2 {
+		t.Fatalf("subjects = %+v %v", subs, err)
+	}
+	// Identify the bare and rich observations by their event IDs.
+	pages := map[string]map[string]any{}
+	for _, sub := range subs {
+		page, _, err := s.SubjectHistoryPage(context.Background(), sub.ProfileID, 0, 0, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages[page[0].EventID] = page[0].Attributes
+	}
+	bareAttrs, richAttrs := pages["evt-bare"], pages["evt-rich"]
+	for _, key := range []string{"vendor", "os", "device", "os_evidence", "device_evidence"} {
+		if v, ok := bareAttrs[key]; !ok || v != "" {
+			t.Fatalf("bare %s = %v, want absent-or-empty (unknown)", key, v)
+		}
+	}
+	if richAttrs["vendor"] != "Acme" || richAttrs["os"] != "Debian 12" || richAttrs["device"] != "printer" {
+		t.Fatalf("rich enrichment must round-trip exactly: %v", richAttrs)
+	}
+	if richAttrs["os_evidence"] != "nmap" || richAttrs["device_evidence"] != "mdns" {
+		t.Fatalf("rich evidence must round-trip exactly: %v", richAttrs)
+	}
+}
+
+// The digest window groups retained briefings by reported-change kind:
+// the (created_at, kind) index must serve it without scanning history.
+func TestDigestWindowUsesKindIndex(t *testing.T) {
+	s := openTestStore(t)
+	rows, err := s.db.Query(`EXPLAIN QUERY PLAN SELECT kind, COUNT(*) FROM briefings WHERE created_at >= 0 GROUP BY kind`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	indexed := false
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(detail, "SCAN briefings") {
+			t.Fatalf("digest window scans history: %s", detail)
+		}
+		if strings.Contains(detail, "briefings_created_kind") {
+			indexed = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !indexed {
+		t.Fatal("digest window must use the (created_at, kind) index")
+	}
+}
+
 // Serving reads behind /api/devices must stay indexed as history
 // grows: no serving query scans an association or observation table.
 func TestServingQueriesUseIndexes(t *testing.T) {

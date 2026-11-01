@@ -333,8 +333,18 @@ func TestGroupingProvenanceUpgrade(t *testing.T) {
 				t.Fatalf("historical provenance = %d/%d, want %d", after.GroupingVersion, groupVersion, wantVersion)
 			}
 			after.GroupingVersion = before.GroupingVersion
+			// The seed row was written by current code (source model),
+			// then rewound to pre-column history: the conservative
+			// v16 backfill must report legacy, never guess the old
+			// model value. Normalize like grouping version and pin
+			// the backfill explicitly.
+			after.Kind, after.Source = before.Kind, "legacy"
+			before.Source = "legacy"
 			if !reflect.DeepEqual(before, after) {
 				t.Fatalf("migration changed historical briefing: before=%+v after=%+v", before, after)
+			}
+			if after.Kind != "other" {
+				t.Fatalf("backfilled kind = %q, want other", after.Kind)
 			}
 			retained, err := s.StoredEvent(ctx, "evt-historical")
 			if err != nil || !bytes.Equal(raw.Payload, retained.Payload) {
@@ -356,17 +366,43 @@ func TestGroupingProvenanceUpgrade(t *testing.T) {
 	}
 }
 
-// TestMigrateV15FromV13 rewinds a fresh database to the v13 schema and
-// reopens it: the upgrade must reach the supported schema with the run
-// ledger, the protected-token scratch table, the profile-leading
-// association indexes, and the receipt-ordered observation index,
-// without touching retained rows.
-func TestMigrateV15FromV13(t *testing.T) {
+// TestMigrateSupportedFromV13 rewinds a database holding retained
+// briefings to the v13 schema and reopens it: the upgrade must reach
+// the supported schema with the run ledger, the protected-token
+// scratch table, the serving indexes, and the v16 kind/source columns
+// backfilled conservatively (fallback rows to fallback, everything
+// else to legacy) without touching retained rows.
+func TestMigrateSupportedFromV13(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v13.db")
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	ctx := context.Background()
+	old := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+	seedBriefing := func(eventID string, fallback bool, kind, source string) string {
+		body := producerPayload(eventID, "k", "host.appeared", `{"ip":"192.168.7.71"}`)
+		gid := persistReported(t, s, "lab", eventID, "k", "host.appeared", body, old)
+		projectAll(t, s)
+		if _, err := s.CloseDue(ctx, old.Add(2*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		taken, err := s.TakeGroup(ctx, gid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.InsertBriefing(ctx, Briefing{
+			BriefingID: "brf-" + taken.GroupID, GroupID: taken.GroupID, HostAnchorKey: taken.Anchor,
+			Baseline: "low", Priority: "low", PriorityReason: "r",
+			WhatChanged: "w", Context: "c", RecommendedCheck: "k",
+			FallbackUsed: fallback, Kind: kind, Source: source, CreatedAt: old,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return taken.GroupID
+	}
+	fallbackGID := seedBriefing("evt-v13-fallback", true, "", "")
+	modelGID := seedBriefing("evt-v13-model", false, "", "")
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -380,6 +416,7 @@ func TestMigrateV15FromV13(t *testing.T) {
 		`DROP INDEX IF EXISTS group_subjects_profile`,
 		`DROP INDEX IF EXISTS briefing_subjects_profile`,
 		`DROP INDEX IF EXISTS reported_observations_profile_received`,
+		`DROP INDEX IF EXISTS briefings_created_kind`,
 		`PRAGMA user_version = 13`,
 	} {
 		if _, err := raw.Exec(stmt); err != nil {
@@ -387,6 +424,8 @@ func TestMigrateV15FromV13(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	dropColumnIfExists(t, raw, "briefings", "kind")
+	dropColumnIfExists(t, raw, "briefings", "source")
 	if err := raw.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +442,23 @@ func TestMigrateV15FromV13(t *testing.T) {
 	if err := s2.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('purge_runs','purge_protected_tokens')`).Scan(&tables); err != nil || tables != 2 {
 		t.Fatalf("v14 purge tables missing: %d %v", tables, err)
 	}
-	if err := s2.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('group_subjects_profile','briefing_subjects_profile','reported_observations_profile_received')`).Scan(&indexes); err != nil || indexes != 3 {
-		t.Fatalf("association and receipt indexes missing: %d %v", indexes, err)
+	if err := s2.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('group_subjects_profile','briefing_subjects_profile','reported_observations_profile_received','briefings_created_kind')`).Scan(&indexes); err != nil || indexes != 4 {
+		t.Fatalf("association, receipt and digest indexes missing: %d %v", indexes, err)
+	}
+	for _, tc := range []struct {
+		groupID    string
+		wantKind   string
+		wantSource string
+	}{
+		{fallbackGID, "other", "fallback"},
+		{modelGID, "other", "legacy"},
+	} {
+		b, err := s2.BriefingForGroup(ctx, tc.groupID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Kind != tc.wantKind || b.Source != tc.wantSource {
+			t.Fatalf("backfilled briefing = kind %q source %q, want %q %q", b.Kind, b.Source, tc.wantKind, tc.wantSource)
+		}
 	}
 }

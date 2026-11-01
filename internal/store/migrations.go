@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 15
+const supportedSchemaVersion = 16
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -138,6 +138,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 14, migrateV14)
 		case 14:
 			err = applyMigration(db, 15, migrateV15)
+		case 15:
+			err = applyMigration(db, 16, migrateV16)
 		}
 		if err != nil {
 			return err
@@ -250,6 +252,29 @@ func migrateV14(tx *sql.Tx) error {
 func migrateV15(tx *sql.Tx) error {
 	_, err := tx.Exec(`CREATE INDEX IF NOT EXISTS reported_observations_profile_received ON reported_observations(profile_id, received_at, observation_id)`)
 	return err
+}
+
+// migrateV16 adds the reported-change kind and briefing source to
+// briefings (Designv9 §6.1, Plan Step 19). kind classifies the reported
+// change for digest grouping and defaults to other; source names the
+// briefing producer. The backfill is deliberately conservative: every
+// retained row becomes legacy except rows the store knows came from the
+// deterministic fallback, which become fallback. Historical model or
+// rules output is never guessed. The (created_at, kind) index serves
+// the digest window query directly.
+func migrateV16(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE briefings ADD COLUMN kind TEXT NOT NULL DEFAULT 'other' CHECK(kind IN ('weak_appearance','weak_disappearance','port_closed','hostname_change','os_refinement','other'))`,
+		`ALTER TABLE briefings ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy' CHECK(source IN ('rules','model','agent','fallback','legacy'))`,
+		`UPDATE briefings SET source = 'fallback' WHERE fallback_used`,
+		`CREATE INDEX IF NOT EXISTS briefings_created_kind ON briefings(created_at, kind)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func applyMigration(db *sql.DB, to int, fn func(*sql.Tx) error) error {

@@ -16,6 +16,8 @@ type Briefing struct {
 	ModelSuggestion                              *string
 	Priority, PriorityReason                     string
 	BaselineRule                                 string // matched baseline rule ID, empty when unknown
+	Kind                                         string // reported-change kind for digest grouping, default other
+	Source                                       string // rules|model|agent|fallback|legacy; every insert sets it
 	Clamped, FallbackUsed                        bool
 	WhatChanged, Context, RecommendedCheck       string
 	ModelRawJSON                                 string
@@ -27,7 +29,7 @@ type Briefing struct {
 // briefingColumns is the single column list for every briefing read;
 // seq rides along so the API, the SSE id: field and replay share it.
 const briefingColumns = `briefing_id, group_id, host_anchor_key, baseline, model_suggestion,
-	priority, priority_reason, baseline_rule, clamped, fallback_used, what_changed, context,
+	priority, priority_reason, baseline_rule, kind, source, clamped, fallback_used, what_changed, context,
 	recommended_check, model_raw_json, created_at, event_ids_json, seq, grouping_version`
 
 func scanBriefing(rows interface {
@@ -37,7 +39,7 @@ func scanBriefing(rows interface {
 	var eventIDs string
 	var created int64
 	if err := rows.Scan(&b.BriefingID, &b.GroupID, &b.HostAnchorKey, &b.Baseline, &suggestion,
-		&b.Priority, &b.PriorityReason, &rule, &b.Clamped, &b.FallbackUsed, &b.WhatChanged, &b.Context,
+		&b.Priority, &b.PriorityReason, &rule, &b.Kind, &b.Source, &b.Clamped, &b.FallbackUsed, &b.WhatChanged, &b.Context,
 		&b.RecommendedCheck, &rawJSON, &created, &eventIDs, &b.Seq, &b.GroupingVersion); err != nil {
 		return err
 	}
@@ -219,6 +221,21 @@ func (s *Store) InsertBriefing(ctx context.Context, b Briefing) error {
 		if rule != "" {
 			ruleArg = rule
 		}
+		// Kind defaults to other and source derives from the fallback
+		// flag when the caller leaves them unset, so every insert sets
+		// both without guessing historical model/rules output. Explicit
+		// rules/agent values pass through for the investigator phase.
+		kind := b.Kind
+		if kind == "" {
+			kind = "other"
+		}
+		source := b.Source
+		if source == "" {
+			source = "model"
+			if b.FallbackUsed {
+				source = "fallback"
+			}
+		}
 		// The resumable-stream cursor: bumped from the durable high-water
 		// mark in the same transaction, so ids stay monotonic across
 		// purges and restarts under the single writer. MAX(seq)+1 would
@@ -230,9 +247,9 @@ func (s *Store) InsertBriefing(ctx context.Context, b Briefing) error {
 		if err := tx.QueryRow(`UPDATE seq_state SET next_seq = next_seq + 1 WHERE id = 0 RETURNING next_seq - 1`).Scan(&seq); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`INSERT INTO briefings (briefing_id, group_id, host_anchor_key, baseline, model_suggestion, priority, priority_reason, baseline_rule, clamped, fallback_used, what_changed, context, recommended_check, model_raw_json, created_at, event_ids_json, seq, grouping_version)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			b.BriefingID, b.GroupID, b.HostAnchorKey, b.Baseline, b.ModelSuggestion, b.Priority, b.PriorityReason, ruleArg, b.Clamped, b.FallbackUsed, b.WhatChanged, b.Context, b.RecommendedCheck, b.ModelRawJSON, nanos(b.CreatedAt), string(eventIDsJSON), seq, groupingVersion); err != nil {
+		if _, err := tx.Exec(`INSERT INTO briefings (briefing_id, group_id, host_anchor_key, baseline, model_suggestion, priority, priority_reason, baseline_rule, kind, source, clamped, fallback_used, what_changed, context, recommended_check, model_raw_json, created_at, event_ids_json, seq, grouping_version)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			b.BriefingID, b.GroupID, b.HostAnchorKey, b.Baseline, b.ModelSuggestion, b.Priority, b.PriorityReason, ruleArg, kind, source, b.Clamped, b.FallbackUsed, b.WhatChanged, b.Context, b.RecommendedCheck, b.ModelRawJSON, nanos(b.CreatedAt), string(eventIDsJSON), seq, groupingVersion); err != nil {
 			return err
 		}
 		res, err := tx.Exec(`UPDATE active_groups SET status = 'done' WHERE group_id = ? AND status = 'processing'`, b.GroupID)

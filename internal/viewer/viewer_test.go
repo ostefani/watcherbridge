@@ -225,6 +225,11 @@ func TestBriefingEndpointsShapeAndHeaders(t *testing.T) {
 	if rows[0]["host"] != "host:api" || rows[0]["priority"] != "high" {
 		t.Fatalf("row = %v", rows[0])
 	}
+	// Step 19: kind and source ride the API; the seed insert leaves
+	// both unset, so the store defaults apply (other/model).
+	if rows[0]["kind"] != "other" || rows[0]["source"] != "model" {
+		t.Fatalf("kind/source missing from API: %v", rows[0])
+	}
 	if rows[0]["grouping_version"] != float64(store.GroupingUnknown) {
 		t.Fatalf("grouping provenance missing from list: %v", rows[0])
 	}
@@ -236,6 +241,9 @@ func TestBriefingEndpointsShapeAndHeaders(t *testing.T) {
 	}
 	if one["group_id"] != gid {
 		t.Fatalf("wrong briefing: %v", one)
+	}
+	if one["kind"] != "other" || one["source"] != "model" {
+		t.Fatalf("kind/source missing from detail: %v", one)
 	}
 	if one["grouping_version"] != rows[0]["grouping_version"] {
 		t.Fatalf("detail/list grouping provenance disagree: %v", one)

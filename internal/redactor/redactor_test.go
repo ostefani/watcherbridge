@@ -45,6 +45,65 @@ func buildOne(t *testing.T, s *store.Store, p Policy, payload []byte) (*Redacted
 	return b, issued, display
 }
 
+// Hostile enrichment text (vendor, device, OS, service, evidence)
+// travels as inert JSON string data: markup survives byte-identical
+// for the operator, embedded address shapes are tokenized, and the
+// final leak scan stays clean. Nothing in the enrichment fields may
+// break the bundle schema or leak raw identifiers.
+func TestHostileEnrichmentStaysInert(t *testing.T) {
+	s := testStore(t)
+	host := `{"ip":"192.168.0.5","hostname":"printer","mac":"AA:BB:CC:DD:EE:FF","weak":false,"alive":true,` +
+		`"identity_confidence":"high",` +
+		`"vendor":"Acme <script>alert(1)</script> 10.9.9.9",` +
+		`"device":"evil-router\"; DROP TABLE briefings;--",` +
+		`"os":"Debian <img src=x onerror=alert(2)>",` +
+		`"os_evidence":"banner from 192.168.0.99",` +
+		`"device_evidence":"mDNS at AA-BB-CC-DD-EE-11",` +
+		`"ports":[{"number":22,"protocol":"tcp","state":"open","service":"ssh <b>evil</b>"}]}`
+	b, issued, display := buildOne(t, s, testPolicy(), payload(t, host, ""))
+	ser, err := json.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{"10.9.9.9", "192.168.0.99", "AA-BB-CC-DD-EE-11"} {
+		if strings.Contains(string(ser), raw) {
+			t.Fatalf("enrichment identifier leaked raw: %s", raw)
+		}
+	}
+	if hits, err := ScanOutboundLeaks(ser, issued, nil); err != nil || len(hits) != 0 {
+		t.Fatalf("leaks in hostile bundle: %v %v", hits, err)
+	}
+	if err := ValidateTokens(string(ser), issued); err != nil {
+		t.Fatalf("hostile bundle must validate: %v", err)
+	}
+	// Markup is data, not code: restoration returns the original
+	// spellings for display, never executed. The bundle is JSON, so
+	// decode it first: Go escapes < > & as \u003c \u003e \u0026 on the
+	// wire, which is still byte-identical data, not mangling.
+	var decoded struct {
+		Events []struct {
+			Host map[string]any `json:"host"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal([]byte(Restore(string(ser), issued)), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Events) != 1 {
+		t.Fatalf("decoded events = %d, want 1", len(decoded.Events))
+	}
+	got := decoded.Events[0].Host
+	for key, want := range map[string]string{
+		"vendor": "Acme <script>alert(1)</script> 10.9.9.9",
+		"device": "evil-router\"; DROP TABLE briefings;--",
+		"os":     "Debian <img src=x onerror=alert(2)>",
+	} {
+		if got[key] != want {
+			t.Fatalf("host.%s = %q, want %q", key, got[key], want)
+		}
+	}
+	_ = display
+}
+
 func TestRoundTrip(t *testing.T) {
 	s := testStore(t)
 	b, issued, _ := buildOne(t, s, testPolicy(), payload(t, richHost, ""))
