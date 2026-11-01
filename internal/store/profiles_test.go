@@ -315,6 +315,43 @@ func TestSubjectHistoryByteBudget(t *testing.T) {
 	}
 }
 
+// The latest-evidence lookup must use the receipt-ordered profile
+// index directly: sorting one subject's whole retained history for
+// every LIMIT 1 read does not stay bounded as history grows.
+func TestLatestObservationUsesReceiptIndex(t *testing.T) {
+	s := openTestStore(t)
+	rows, err := s.db.Query(`EXPLAIN QUERY PLAN SELECT observation_id FROM reported_observations WHERE profile_id = 'prof-x' ORDER BY received_at DESC, observation_id DESC LIMIT 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	indexed := false
+	var plan []string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+		if strings.Contains(detail, "SCAN ") {
+			t.Fatalf("latest-evidence lookup scans: %s", detail)
+		}
+		if strings.Contains(detail, "TEMP B-TREE") {
+			t.Fatalf("latest-evidence lookup sorts instead of using the receipt index: %s", detail)
+		}
+		if strings.Contains(detail, "reported_observations_profile_received") {
+			indexed = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !indexed {
+		t.Fatalf("latest-evidence lookup must use the receipt-ordered profile index: %q", plan)
+	}
+}
+
 // Serving reads behind /api/devices must stay indexed as history
 // grows: no serving query scans an association or observation table.
 func TestServingQueriesUseIndexes(t *testing.T) {

@@ -209,7 +209,7 @@ func main() {
 
 // runPurgeLoop ticks PurgeOnce until ctx ends. Errors are logged and
 // retried next tick: a transient failure must not kill the process,
-// and the next pass resumes from recorded purge_state cutoffs.
+// and the next pass reselects remaining eligible work.
 func runPurgeLoop(ctx context.Context, st *store.Store, cfg config.Config, settings store.PurgeSettings) error {
 	tick := time.NewTicker(cfg.PurgeInterval)
 	defer tick.Stop()

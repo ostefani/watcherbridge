@@ -356,11 +356,12 @@ func TestGroupingProvenanceUpgrade(t *testing.T) {
 	}
 }
 
-// TestMigrateV14FromV13 rewinds a fresh database to the v13 schema and
-// reopens it: the upgrade must reach v14 with the run ledger, the
-// protected-token scratch table, and the profile-leading association
-// indexes, without touching retained rows.
-func TestMigrateV14FromV13(t *testing.T) {
+// TestMigrateV15FromV13 rewinds a fresh database to the v13 schema and
+// reopens it: the upgrade must reach the supported schema with the run
+// ledger, the protected-token scratch table, the profile-leading
+// association indexes, and the receipt-ordered observation index,
+// without touching retained rows.
+func TestMigrateV15FromV13(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v13.db")
 	s, err := Open(path)
 	if err != nil {
@@ -378,6 +379,7 @@ func TestMigrateV14FromV13(t *testing.T) {
 		`DROP TABLE IF EXISTS purge_protected_tokens`,
 		`DROP INDEX IF EXISTS group_subjects_profile`,
 		`DROP INDEX IF EXISTS briefing_subjects_profile`,
+		`DROP INDEX IF EXISTS reported_observations_profile_received`,
 		`PRAGMA user_version = 13`,
 	} {
 		if _, err := raw.Exec(stmt); err != nil {
@@ -394,14 +396,14 @@ func TestMigrateV14FromV13(t *testing.T) {
 	}
 	defer s2.Close()
 	var version int
-	if err := s2.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 14 {
-		t.Fatalf("user_version = %d, %v; want 14", version, err)
+	if err := s2.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != supportedSchemaVersion {
+		t.Fatalf("user_version = %d, %v; want %d", version, err, supportedSchemaVersion)
 	}
 	var tables, indexes int
 	if err := s2.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('purge_runs','purge_protected_tokens')`).Scan(&tables); err != nil || tables != 2 {
 		t.Fatalf("v14 purge tables missing: %d %v", tables, err)
 	}
-	if err := s2.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('group_subjects_profile','briefing_subjects_profile')`).Scan(&indexes); err != nil || indexes != 2 {
-		t.Fatalf("v14 association indexes missing: %d %v", indexes, err)
+	if err := s2.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('group_subjects_profile','briefing_subjects_profile','reported_observations_profile_received')`).Scan(&indexes); err != nil || indexes != 3 {
+		t.Fatalf("association and receipt indexes missing: %d %v", indexes, err)
 	}
 }

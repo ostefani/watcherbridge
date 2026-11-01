@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -16,6 +17,12 @@ import (
 // dead one; assignment and every later lookup bump it.
 
 var tokenPrefixes = map[string]string{"ip": "IP", "mac": "MAC", "hostname": "HOST", "net": "NET"}
+
+// errPseudonymVanished is a value-free retry signal. The normalized
+// private value must not travel in the error because assignment
+// failures are logged downstream after sanitization that does not
+// cover every hostname shape.
+var errPseudonymVanished = errors.New("pseudonym vanished during assignment; retry")
 
 func normalizePseudonymValue(category, value string) string {
 	value = strings.TrimSpace(value)
@@ -121,6 +128,14 @@ func (s *Store) GetOrAssignPseudonyms(ctx context.Context, category string, real
 	if err != nil {
 		return nil, err
 	}
+	return s.assignPseudonyms(ctx, category, prefix, realValues, normalized, originalOf, found)
+}
+
+// assignPseudonyms completes assignment from an explicit pre-read hit
+// map. Tests supply a stale map to exercise the exact read-hit,
+// purge-delete, then write window: a stale hit is not reissued, and
+// the in-transaction recheck returns a value-free retry signal.
+func (s *Store) assignPseudonyms(ctx context.Context, category, prefix string, realValues, normalized []string, originalOf, found map[string]string) (map[string]string, error) {
 	type pending struct{ normalized, original string }
 	var missing []pending // input order: token numbering is deterministic
 	seenMissing := map[string]bool{}
@@ -137,7 +152,7 @@ func (s *Store) GetOrAssignPseudonyms(ctx context.Context, category string, real
 	// always comes from this in-transaction validation, never from the
 	// pre-read (Designv9 §4.6: touch-then-recheck).
 	final := map[string]string{}
-	err = s.write(ctx, func(tx *sql.Tx) error {
+	err := s.write(ctx, func(tx *sql.Tx) error {
 		// One timestamp for the whole transaction: the touch and the
 		// assignment agree exactly, regardless of queue delay.
 		now := nanos(s.now())
@@ -238,7 +253,7 @@ func (s *Store) GetOrAssignPseudonyms(ctx context.Context, category string, real
 		n := normalizePseudonymValue(category, v)
 		token, ok := final[n]
 		if !ok {
-			return nil, fmt.Errorf("pseudonym for %q vanished during assignment; retry", n)
+			return nil, errPseudonymVanished
 		}
 		result[v] = token
 	}

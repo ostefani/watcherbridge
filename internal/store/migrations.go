@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 14
+const supportedSchemaVersion = 15
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -136,6 +136,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 13, migrateV13)
 		case 13:
 			err = applyMigration(db, 14, migrateV14)
+		case 14:
+			err = applyMigration(db, 15, migrateV15)
 		}
 		if err != nil {
 			return err
@@ -238,6 +240,16 @@ func migrateV14(tx *sql.Tx) error {
 		}
 	}
 	return nil
+}
+
+// migrateV15 adds the receipt-ordered observation index backing the
+// latest-evidence read. The existing profile index orders by reported
+// time, so LIMIT 1 by receipt time could scan and sort one subject's
+// whole retained history; the new key serves the exact filter and
+// ordering directly.
+func migrateV15(tx *sql.Tx) error {
+	_, err := tx.Exec(`CREATE INDEX IF NOT EXISTS reported_observations_profile_received ON reported_observations(profile_id, received_at, observation_id)`)
+	return err
 }
 
 func applyMigration(db *sql.DB, to int, fn func(*sql.Tx) error) error {

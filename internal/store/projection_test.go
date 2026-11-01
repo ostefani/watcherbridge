@@ -50,7 +50,7 @@ func dropGroupingProvenance(t *testing.T, db *sql.DB) {
 		}
 	}
 	// Rewinding past v12 must also drop the v13/v14 purge tables, or
-	// the replayed migrations meet their own tables. The v13/v14
+	// the replayed migrations meet their own tables. The v13-v15
 	// indexes are idempotent (CREATE INDEX IF NOT EXISTS) and stay,
 	// and the token column rewinds through dropColumnIfExists:
 	// intermediate versions predate it.

@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -45,6 +47,13 @@ func TestPurgeBatchRespectsRowBudget(t *testing.T) {
 		}
 	}
 	now := time.Now().UTC()
+	// Run with a live ledger ID: the budget covers deletions plus the
+	// per-batch purge_state and run-ledger bookkeeping writes, exactly
+	// as production drains.
+	runID, err := s.beginPurgeRun(ctx, nanos(now))
+	if err != nil {
+		t.Fatal(err)
+	}
 	plan := purgePlan{
 		stages:      stageAll,
 		briefingCut: nanos(now.Add(-time.Hour)),
@@ -53,6 +62,7 @@ func TestPurgeBatchRespectsRowBudget(t *testing.T) {
 		subjectCut:  nanos(now.Add(-2 * time.Hour)),
 		sourceCut:   nanos(now.Add(-heartbeatRetention)),
 		tokenCut:    nanos(now.Add(-time.Hour)),
+		runID:       runID,
 	}
 	batches := 0
 	for {
@@ -64,7 +74,7 @@ func TestPurgeBatchRespectsRowBudget(t *testing.T) {
 			break
 		}
 		batches++
-		if report.total() > maxPurgeRowsPerTxn {
+		if committed := report.total() + report.Bookkeeping; committed > maxPurgeRowsPerTxn {
 			t.Fatalf("batch %d exceeded the row budget: %+v", batches, report)
 		}
 		if batches > 10 {
@@ -285,15 +295,15 @@ func TestPurgeRunLedgerAndPruning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.finishPurgeRun(ctx, runID, "interrupted", "test cancel", PurgeReport{RawEvents: 3}); err != nil {
+	if err := s.finishPurgeRun(ctx, runID, "interrupted", "test cancel", nil); err != nil {
 		t.Fatal(err)
 	}
 	interrupted, err := s.LatestPurgeRun(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if interrupted.status != "interrupted" || interrupted.errText != "test cancel" || interrupted.total.RawEvents != 3 {
-		t.Fatalf("interrupted run must keep status, error and counts: %+v", interrupted)
+	if interrupted.status != "interrupted" || interrupted.errText != "test cancel" {
+		t.Fatalf("interrupted run must keep status and error: %+v", interrupted)
 	}
 	for i := 0; i < 31; i++ {
 		if _, err := s.PurgeOnce(ctx, settings, now); err != nil {
@@ -303,6 +313,82 @@ func TestPurgeRunLedgerAndPruning(t *testing.T) {
 	var rows int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM purge_runs`).Scan(&rows); err != nil || rows != 30 {
 		t.Fatalf("ledger must prune to 30 rows, got %d (%v)", rows, err)
+	}
+}
+
+// A cancelled run context must not prevent recording the terminal
+// ledger state. Finalization uses bounded shutdown-safe work rather
+// than the cancelled caller context.
+func TestPurgeFinalizesCancelledRun(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	runID, err := s.beginPurgeRun(ctx, nanos(time.Now().UTC()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.finishPurgeRun(cancelled, runID, "interrupted", "test cancel", nil); err != nil {
+		t.Fatalf("cancelled context must not block run finalization: %v", err)
+	}
+	run, err := s.LatestPurgeRun(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.status != "interrupted" || run.errText != "test cancel" {
+		t.Fatalf("cancelled run must keep status and error: %+v", run)
+	}
+}
+
+// Cancellation between ledger begin and batch work records an
+// interrupted run through detached finalization rather than leaving
+// the running row behind.
+func TestPurgeDrainRecordsInterruptedAfterBegin(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	runID, err := s.beginPurgeRun(ctx, nanos(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := purgePlan{stages: stageAll, runID: runID}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	status, errText, runErr, _ := s.runPurgeBatches(cancelled, now, plan, PurgeReport{})
+	if status != "interrupted" || !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("cancelled drain must report interrupted: %q %v", status, runErr)
+	}
+	if err := s.finishPurgeRun(cancelled, runID, status, errText, runErr); !errors.Is(err, context.Canceled) {
+		t.Fatalf("interrupted drain must preserve cancellation: %v", err)
+	}
+	run, err := s.LatestPurgeRun(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.status != "interrupted" {
+		t.Fatalf("cancelled drain must ledger interrupted, got %+v", run)
+	}
+}
+
+// A run left marked running by a previous process is reconciled at the
+// next startup purge instead of remaining an open run forever.
+func TestPurgeReconcilesStaleRunningRun(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if _, err := s.db.Exec(`INSERT INTO purge_runs (started_at, status) VALUES (?, 'running')`, nanos(now.Add(-time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PurgeOnce(ctx, PurgeSettings{BriefingRetention: time.Hour, SubjectRetention: 90 * 24 * time.Hour}, now); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var finished int64
+	if err := s.db.QueryRow(`SELECT status, finished_at FROM purge_runs ORDER BY run_id ASC LIMIT 1`).Scan(&status, &finished); err != nil {
+		t.Fatal(err)
+	}
+	if status != "interrupted" || finished == 0 {
+		t.Fatalf("stale run must be reconciled as interrupted, got %q at %d", status, finished)
 	}
 }
 
@@ -394,25 +480,334 @@ func TestPurgeProtectsReferencedTokens(t *testing.T) {
 	}
 }
 
-// Deleting a token row out from under a pending lookup (the purge race
-// the in-transaction recheck closes) surfaces a retryable error, never
-// a mapping to a rowless token.
-func TestPseudonymVanishedDuringAssignmentRetries(t *testing.T) {
+// seedRetainedBriefing persists, projects, closes, takes and briefs one
+// group in production order. Direct SQL would bypass the worker's
+// projection-before-briefing invariant, so tests pay for the full path.
+func seedRetainedBriefing(t *testing.T, s *Store, scope, eventID, hostJSON, rawJSON, reason string, at time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	body := producerPayload(eventID, "k", "host.appeared", hostJSON)
+	gid := persistReported(t, s, scope, eventID, "k", "host.appeared", body, at)
+	if _, err := s.ProjectReported(ctx, scope, 64); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CloseDue(ctx, at.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := s.TakeGroup(ctx, gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertBriefing(ctx, Briefing{
+		BriefingID: "brf-" + taken.GroupID, GroupID: taken.GroupID, HostAnchorKey: taken.Anchor,
+		Baseline: "low", Priority: "low", PriorityReason: reason,
+		WhatChanged: "w", Context: "c", RecommendedCheck: "k",
+		ModelRawJSON: rawJSON, CreatedAt: at,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A retained NULL audit field is a readable empty reference source, not
+// a startup-purge failure. Historical audit rows may store NULL, and
+// protection must still see their token names.
+func TestPurgeHandlesNullAuditFields(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
-	first, err := s.GetOrAssignPseudonym(ctx, "ip", "192.168.8.8")
+	old := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+	now := time.Now().UTC()
+	body := producerPayload("evt-null-audit", "k", "host.appeared", `{"ip":"192.168.7.11","host_id":"ip:192.168.7.11","identity_source":"ip","identity_confidence":"high"}`)
+	gid := persistReported(t, s, "lab", "evt-null-audit", "k", "host.appeared", body, old)
+	projectAll(t, s)
+	if _, err := s.CloseDue(ctx, old.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := s.TakeGroup(ctx, gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := s.GetOrAssignPseudonym(ctx, "ip", "192.168.7.11")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertBriefing(ctx, Briefing{
+		BriefingID: "brf-" + taken.GroupID, GroupID: taken.GroupID, HostAnchorKey: taken.Anchor,
+		Baseline: "low", Priority: "low", PriorityReason: "saw " + ref,
+		WhatChanged: "w", Context: "c", RecommendedCheck: "k",
+		ModelRawJSON: `{"host":` + fmt.Sprintf("%q", ref) + `}`,
+		CreatedAt:    now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE briefings SET model_raw_json = NULL WHERE briefing_id = ?`, "brf-"+taken.GroupID); err != nil {
+		t.Fatal(err)
+	}
+	read, err := s.BriefingForGroup(ctx, taken.GroupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read.ModelRawJSON != "" {
+		t.Fatalf("NULL audit must read as empty, got %q", read.ModelRawJSON)
+	}
+	if _, err := s.db.Exec(`UPDATE pseudonym_map SET last_used_at = ? WHERE token = ?`, nanos(now.Add(-48*time.Hour)), ref); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PurgeOnce(ctx, PurgeSettings{BriefingRetention: time.Hour, SubjectRetention: 90 * 24 * time.Hour}, now); err != nil {
+		t.Fatal(err)
+	}
+	var kept int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pseudonym_map WHERE token = ?`, ref).Scan(&kept); err != nil || kept != 1 {
+		t.Fatalf("referenced token %q must survive NULL audit: %d %v", ref, kept, err)
+	}
+}
+
+// Reference discovery collects every distinct token shape, not merely
+// the first 256 occurrences. Repeating one token cannot push a later
+// retained reference out of protection.
+func TestPurgeProtectsReferenceAfterRepeatedTokens(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	old := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+	now := time.Now().UTC()
+	body := producerPayload("evt-overflow", "k", "host.appeared", `{"ip":"192.168.7.12","host_id":"ip:192.168.7.12","identity_source":"ip","identity_confidence":"high"}`)
+	gid := persistReported(t, s, "lab", "evt-overflow", "k", "host.appeared", body, old)
+	projectAll(t, s)
+	if _, err := s.CloseDue(ctx, old.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := s.TakeGroup(ctx, gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.GetOrAssignPseudonym(ctx, "ip", "192.168.7.12")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.GetOrAssignPseudonym(ctx, "ip", "192.168.7.13")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeated := "[" + strings.Repeat(fmt.Sprintf("%q,", first), 300) + fmt.Sprintf("%q]", second)
+	if err := s.InsertBriefing(ctx, Briefing{
+		BriefingID: "brf-" + taken.GroupID, GroupID: taken.GroupID, HostAnchorKey: taken.Anchor,
+		Baseline: "low", Priority: "low", PriorityReason: "audit",
+		WhatChanged: "w", Context: "c", RecommendedCheck: "k",
+		ModelRawJSON: repeated,
+		CreatedAt:    now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE pseudonym_map SET last_used_at = ? WHERE token IN (?, ?)`, nanos(now.Add(-48*time.Hour)), first, second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PurgeOnce(ctx, PurgeSettings{BriefingRetention: time.Hour, SubjectRetention: 90 * 24 * time.Hour}, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range []string{first, second} {
+		var kept int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM pseudonym_map WHERE token = ?`, token).Scan(&kept); err != nil || kept != 1 {
+			t.Fatalf("referenced token %q must survive repeated-token audit: %d %v", token, kept, err)
+		}
+	}
+}
+
+// Scratch maintenance shares the 200-write transaction budget with
+// every other purge write, and yields under writer pressure like the
+// deletion batches. The page sizes below are the enforcement point.
+func TestProtectedScratchPagesRespectWriteBudget(t *testing.T) {
+	if protectedTokenWritePage > maxPurgeRowsPerTxn {
+		t.Fatalf("scratch write page %d exceeds the %d-write budget", protectedTokenWritePage, maxPurgeRowsPerTxn)
+	}
+	if protectedTokenClearPage > maxPurgeRowsPerTxn {
+		t.Fatalf("scratch clear page %d exceeds the %d-write budget", protectedTokenClearPage, maxPurgeRowsPerTxn)
+	}
+}
+
+// Paged discovery must remain complete: one-row scan pages still find
+// references spread across retained briefings.
+func TestProtectedTokenRefillPagesAcrossBriefings(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	first, err := s.GetOrAssignPseudonym(ctx, "ip", "192.168.7.21")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.GetOrAssignPseudonym(ctx, "ip", "192.168.7.22")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := `{"ip":"192.168.7.21","host_id":"ip:192.168.7.21","identity_source":"ip","identity_confidence":"high"}`
+	seedRetainedBriefing(t, s, "lab", "evt-page-a", host, `{"host":`+fmt.Sprintf("%q", first)+`}`, "audit", now)
+	seedRetainedBriefing(t, s, "lab", "evt-page-b", host, `{"host":`+fmt.Sprintf("%q", second)+`}`, "audit", now)
+	fence, err := s.refillProtectedTokensPaged(ctx, nanos(now), 1, 1, 1, protectedRefillPasses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var protected int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM purge_protected_tokens WHERE token IN (?, ?)`, first, second).Scan(&protected); err != nil || protected != 2 {
+		t.Fatalf("paged refill must protect both references: %d %v", protected, err)
+	}
+	var maxRowID int64
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(rowid), 0) FROM briefings`).Scan(&maxRowID); err != nil {
+		t.Fatal(err)
+	}
+	if fence != maxRowID {
+		t.Fatalf("refill fence must cover the scanned audit: %d vs %d", fence, maxRowID)
+	}
+}
+
+// When reference discovery cannot complete, token expiry is skipped
+// while independently safe retention still proceeds — and the run
+// ledger records both. Dropping the scratch table forces discovery to
+// fail deterministically before any deletion batch runs.
+func TestPurgeOnceProceedsWhenDiscoveryFails(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	old := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+	host := `{"ip":"192.168.7.51","host_id":"ip:192.168.7.51","identity_source":"ip","identity_confidence":"high"}`
+	seedRetainedBriefing(t, s, "lab", "evt-discovery-fail", host, "{}", "audit", old)
+	if _, err := s.db.Exec(`DROP TABLE purge_protected_tokens`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	_, err := s.PurgeOnce(ctx, PurgeSettings{BriefingRetention: time.Hour, SubjectRetention: 2 * time.Hour}, now)
+	if err == nil {
+		t.Fatal("incomplete discovery must surface instead of passing silently")
+	}
+	var briefings int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM briefings`).Scan(&briefings); err != nil || briefings != 0 {
+		t.Fatalf("safe briefing retention must proceed despite discovery failure: %d %v", briefings, err)
+	}
+	run, err := s.LatestPurgeRun(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.status != "completed" {
+		t.Fatalf("discovery failure must not fail the retention run itself: %+v", run)
+	}
+	if !strings.Contains(run.errText, "token") {
+		t.Fatalf("run history must record the skipped token expiry: %q", run.errText)
+	}
+}
+
+// Skipped token expiry deletes nothing while every other eligible
+// stage still drains. Clearing the flag on the same plan releases the
+// deferred expiry without touching anything else.
+func TestPurgeBatchSkipsTokenExpiryWhenFlagged(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	doomed, err := s.GetOrAssignPseudonym(ctx, "ip", "192.168.7.61")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE pseudonym_map SET last_used_at = ? WHERE token = ?`, nanos(now.Add(-48*time.Hour)), doomed); err != nil {
+		t.Fatal(err)
+	}
+	plan := purgePlan{
+		stages:          stageSubjects,
+		subjectCut:      nanos(now.Add(time.Hour)),
+		sourceCut:       nanos(now.Add(time.Hour)),
+		tokenCut:        nanos(now.Add(-time.Hour)),
+		skipTokenExpiry: true,
+	}
+	report, _, err := s.purgeBatch(ctx, now, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Pseudonyms != 0 {
+		t.Fatalf("flagged token expiry must delete nothing: %+v", report)
+	}
+	plan.skipTokenExpiry = false
+	report, _, err = s.purgeBatch(ctx, now, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Pseudonyms != 1 {
+		t.Fatalf("unflagged expiry must release the deferred deletion: %+v", report)
+	}
+}
+
+// The delete-time fence blocks token expiry when a retained briefing
+// arrived after reference discovery. Rescanning through the new
+// maximum releases the gate.
+func TestPurgeTokenFenceBlocksNewBriefings(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	doomed, err := s.GetOrAssignPseudonym(ctx, "ip", "192.168.7.31")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := `{"ip":"192.168.7.31","host_id":"ip:192.168.7.31","identity_source":"ip","identity_confidence":"high"}`
+	seedRetainedBriefing(t, s, "lab", "evt-fence-a", host, "{}", "audit", now)
+	fence, err := s.refillProtectedTokens(ctx, nanos(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedRetainedBriefing(t, s, "lab", "evt-fence-b", host, "{}", "audit", now)
+	if _, err := s.db.Exec(`UPDATE pseudonym_map SET last_used_at = ? WHERE token = ?`, nanos(now.Add(-48*time.Hour)), doomed); err != nil {
+		t.Fatal(err)
+	}
+	plan := purgePlan{
+		stages:     stageSubjects,
+		subjectCut: nanos(now.Add(time.Hour)),
+		sourceCut:  nanos(now.Add(time.Hour)),
+		tokenCut:   nanos(now.Add(-time.Hour)),
+		tokenFence: fence,
+	}
+	report, _, err := s.purgeBatch(ctx, now, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Pseudonyms != 0 {
+		t.Fatalf("new audit must block token deletions: %+v", report)
+	}
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(rowid), 0) FROM briefings`).Scan(&plan.tokenFence); err != nil {
+		t.Fatal(err)
+	}
+	report, _, err = s.purgeBatch(ctx, now, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Pseudonyms != 1 {
+		t.Fatalf("current fence must release unrelated expiry: %+v", report)
+	}
+}
+
+// A stale read-hit followed by a purge delete must surface a value-free
+// retry signal, never a mapping to the deleted row. A fresh lookup after
+// the race recovers by assigning a live token.
+func TestPseudonymStaleHitRetriesWithoutValue(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	const value = "192.168.8.8"
+	first, err := s.GetOrAssignPseudonym(ctx, "ip", value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized := []string{normalizePseudonymValue("ip", value)}
+	stale, err := s.lookupPseudonymBatch(ctx, "ip", normalized)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.db.Exec(`DELETE FROM pseudonym_map WHERE token = ?`, first); err != nil {
 		t.Fatal(err)
 	}
-	second, err := s.GetOrAssignPseudonym(ctx, "ip", "192.168.8.8")
+	_, err = s.assignPseudonyms(ctx, "ip", "IP", []string{value}, normalized, map[string]string{normalized[0]: value}, stale)
+	if !errors.Is(err, errPseudonymVanished) {
+		t.Fatalf("stale hit must return the retry sentinel, got %v", err)
+	}
+	if err != nil && strings.Contains(err.Error(), value) {
+		t.Fatalf("retry error must not disclose the private value: %q", err.Error())
+	}
+	second, err := s.GetOrAssignPseudonym(ctx, "ip", value)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var kept string
-	if err := s.db.QueryRow(`SELECT token FROM pseudonym_map WHERE real_value = '192.168.8.8' AND category = 'ip'`).Scan(&kept); err != nil || kept != second {
+	if err := s.db.QueryRow(`SELECT token FROM pseudonym_map WHERE real_value = ? AND category = 'ip'`, value).Scan(&kept); err != nil || kept != second {
 		t.Fatalf("recovery must map to a live row: %q %v", kept, err)
 	}
 }
@@ -458,5 +853,79 @@ func TestPurgeReportChargesBookkeeping(t *testing.T) {
 	}
 	if run.status != "completed" || run.total.Bookkeeping != rep.Bookkeeping || run.total.Briefings != rep.Briefings {
 		t.Fatalf("ledger must mirror the run report: run %+v vs report %+v", run.total, rep)
+	}
+}
+
+// A batch filled exactly to capacity must still commit its ledger row
+// with a live run ID. The ledger reservation is consumed once, not
+// charged twice: 198 deletions plus one purge_state upsert plus the
+// run-ledger update commit exactly 200 writes.
+func TestPurgeBatchFullCapacityWithLedger(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	old := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+	host := `{"ip":"192.168.7.41","host_id":"ip:192.168.7.41","identity_source":"ip","identity_confidence":"high"}`
+	for i := 0; i < 200; i++ {
+		seedRetainedBriefing(t, s, "lab", fmt.Sprintf("evt-full-%03d", i), host, "{}", "audit", old)
+	}
+	runID, err := s.beginPurgeRun(ctx, nanos(time.Now().UTC()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := purgePlan{stages: stageBriefings, briefingCut: nanos(time.Now().UTC().Add(-time.Hour)), runID: runID}
+	report, progress, err := s.purgeBatch(ctx, time.Now().UTC(), plan)
+	if err != nil {
+		t.Fatalf("full batch must commit with a live ledger: %v", err)
+	}
+	if !progress {
+		t.Fatal("a 200-briefing backlog must leave progress after one full batch")
+	}
+	if committed := report.total() + report.Bookkeeping; committed != maxPurgeRowsPerTxn {
+		t.Fatalf("full batch must commit exactly the budget: %+v", report)
+	}
+}
+
+// A batch error under cancellation records interrupted, not failed: the
+// batch may have committed while its caller never collected the
+// report, so the run must not blame the batch. A live-context error
+// stays failed.
+func TestPurgeBatchErrorClassification(t *testing.T) {
+	boom := errors.New("test batch failure")
+	if status, err := batchRunStatus(context.Background(), boom); status != "failed" || !errors.Is(err, boom) {
+		t.Fatalf("live-context batch error must stay failed: %q %v", status, err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if status, err := batchRunStatus(cancelled, boom); status != "interrupted" || !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled batch error must record interrupted: %q %v", status, err)
+	}
+}
+
+// One deleting batch updates its ledger row in the same transaction.
+// A crash after the commit still attributes that batch, rather than
+// leaving progress only in the final run totals.
+func TestPurgeBatchPersistsRunCountsAtomically(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	old := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+	seedRetainedBriefing(t, s, "lab", "evt-batch-ledger", `{"ip":"192.168.0.3"}`, "{}", "audit", old)
+	runID, err := s.beginPurgeRun(ctx, nanos(time.Now().UTC()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := purgePlan{stages: stageBriefings, briefingCut: nanos(time.Now().UTC().Add(-time.Hour)), runID: runID}
+	report, _, err := s.purgeBatch(ctx, time.Now().UTC(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Briefings == 0 {
+		t.Fatalf("seeded briefing must delete: %+v", report)
+	}
+	var deleted, writes int64
+	if err := s.db.QueryRow(`SELECT briefings_deleted, bookkeeping_writes FROM purge_runs WHERE run_id = ?`, runID).Scan(&deleted, &writes); err != nil {
+		t.Fatal(err)
+	}
+	if deleted != report.Briefings || writes != report.Bookkeeping {
+		t.Fatalf("ledger must carry the committed batch: db=(%d,%d) report=%+v", deleted, writes, report)
 	}
 }

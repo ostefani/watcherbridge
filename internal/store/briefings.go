@@ -33,12 +33,12 @@ const briefingColumns = `briefing_id, group_id, host_anchor_key, baseline, model
 func scanBriefing(rows interface {
 	Scan(dest ...any) error
 }, b *Briefing) error {
-	var suggestion, rule sql.NullString
+	var suggestion, rule, rawJSON sql.NullString
 	var eventIDs string
 	var created int64
 	if err := rows.Scan(&b.BriefingID, &b.GroupID, &b.HostAnchorKey, &b.Baseline, &suggestion,
 		&b.Priority, &b.PriorityReason, &rule, &b.Clamped, &b.FallbackUsed, &b.WhatChanged, &b.Context,
-		&b.RecommendedCheck, &b.ModelRawJSON, &created, &eventIDs, &b.Seq, &b.GroupingVersion); err != nil {
+		&b.RecommendedCheck, &rawJSON, &created, &eventIDs, &b.Seq, &b.GroupingVersion); err != nil {
 		return err
 	}
 	if suggestion.Valid {
@@ -47,6 +47,9 @@ func scanBriefing(rows interface {
 	if rule.Valid {
 		b.BaselineRule = rule.String
 	}
+	// model_raw_json remains nullable for retained rows; a NULL audit
+	// reads as empty rather than failing the briefing read.
+	b.ModelRawJSON = rawJSON.String
 	b.CreatedAt = fromNanos(created)
 	if eventIDs != "" {
 		if err := json.Unmarshal([]byte(eventIDs), &b.EventIDs); err != nil {

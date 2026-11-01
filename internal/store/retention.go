@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"regexp"
 	"time"
@@ -15,9 +16,16 @@ import (
 // childlessness, so cascades stay empty and every deleted row is
 // counted against the budget in its own statement.
 
-// maxPurgeRowsPerTxn caps committed deletions across all statements in
-// one purge transaction, including relation and progress rows.
+// maxPurgeRowsPerTxn caps committed writes across all statements in
+// one purge transaction: deletions plus purge_state and run-ledger
+// bookkeeping. Reserving those auxiliary rows before choosing delete
+// limits keeps the committed total within budget.
 const maxPurgeRowsPerTxn = 200
+
+// purgeLedgerTimeout bounds terminal run-ledger finalization when the
+// caller's context is already cancelled. Shutdown must record the run
+// outcome without waiting indefinitely behind writer pressure.
+const purgeLedgerTimeout = 5 * time.Second
 
 // heartbeatRetention compacts stale scanner heartbeat rows. A scope
 // that still owns subjects is never compacted, however old.
@@ -143,6 +151,18 @@ type purgePlan struct {
 	// activeSource names the configured SOURCE_ID. A quiet-but-live
 	// registration is never retired by inactivity alone (Designv9 §4.6).
 	activeSource string
+	// skipTokenExpiry keeps token deletions out of the drain when
+	// reference discovery could not establish completeness. Every other
+	// stage still proceeds; expiry is deferred to a later run.
+	skipTokenExpiry bool
+	// runID carries the purge_runs ledger row updated atomically with
+	// each deleting batch. Zero disables ledger updates for direct
+	// bounded-batch tests.
+	runID int64
+	// tokenFence is the maximum briefing rowid included by protected
+	// reference discovery. A newer briefing inserted during discovery
+	// blocks token deletions until the next purge includes it.
+	tokenFence int64
 }
 
 // eligibleEvents selects raw events old enough to purge: not pending
@@ -171,8 +191,21 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 	var report PurgeReport
 	err := s.write(ctx, func(tx *sql.Tx) error {
 		remaining := int64(maxPurgeRowsPerTxn)
-		take := func(table string, cutoff int64, stmt string, args ...any) error {
-			if remaining <= 0 {
+		if plan.runID != 0 {
+			// Reserve the atomic per-batch ledger update before any
+			// delete limit is chosen.
+			remaining--
+		}
+		deleteLimit := func() int64 {
+			limit := remaining - 1 // the purge_state upsert for this take
+			if limit < 0 {
+				return 0
+			}
+			return limit
+		}
+		limit := int64(0)
+		take := func(table string, cutoff int64, stmt string, limit int64, args ...any) error {
+			if limit <= 0 {
 				return nil
 			}
 			n, err := deleteBounded(tx, stmt, args...)
@@ -220,64 +253,77 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 		}
 		if plan.stages&stageBriefings != 0 {
 			oldBriefings := `briefing_id IN (SELECT briefing_id FROM briefings WHERE created_at < ? ORDER BY created_at, rowid LIMIT ?)`
-			if err := take("briefing_subjects", plan.briefingCut, `DELETE FROM briefing_subjects WHERE rowid IN (SELECT rowid FROM briefing_subjects WHERE `+oldBriefings+` ORDER BY rowid LIMIT ?)`, plan.briefingCut, remaining, remaining); err != nil {
+			limit = deleteLimit()
+			if err := take("briefing_subjects", plan.briefingCut, `DELETE FROM briefing_subjects WHERE rowid IN (SELECT rowid FROM briefing_subjects WHERE `+oldBriefings+` ORDER BY rowid LIMIT ?)`, limit, plan.briefingCut, limit, limit); err != nil {
 				return err
 			}
-			if err := take("briefings", plan.briefingCut, `DELETE FROM briefings WHERE rowid IN (SELECT rowid FROM briefings WHERE created_at < ? AND NOT EXISTS (SELECT 1 FROM briefing_subjects WHERE briefing_subjects.briefing_id = briefings.briefing_id) ORDER BY created_at, rowid LIMIT ?)`, plan.briefingCut, remaining); err != nil {
+			limit = deleteLimit()
+			if err := take("briefings", plan.briefingCut, `DELETE FROM briefings WHERE rowid IN (SELECT rowid FROM briefings WHERE created_at < ? AND NOT EXISTS (SELECT 1 FROM briefing_subjects WHERE briefing_subjects.briefing_id = briefings.briefing_id) ORDER BY created_at, rowid LIMIT ?)`, limit, plan.briefingCut, limit); err != nil {
 				return err
 			}
 			deletableDone := `status = 'done'
 				AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id)
 				AND NOT EXISTS (SELECT 1 FROM group_events WHERE group_events.group_id = active_groups.group_id)`
-			if err := take("group_subjects", plan.briefingCut, `DELETE FROM group_subjects WHERE rowid IN (SELECT rowid FROM group_subjects WHERE group_id IN (SELECT group_id FROM active_groups WHERE `+deletableDone+`) ORDER BY rowid LIMIT ?)`, remaining); err != nil {
+			limit = deleteLimit()
+			if err := take("group_subjects", plan.briefingCut, `DELETE FROM group_subjects WHERE rowid IN (SELECT rowid FROM group_subjects WHERE group_id IN (SELECT group_id FROM active_groups WHERE `+deletableDone+`) ORDER BY rowid LIMIT ?)`, limit, limit); err != nil {
 				return err
 			}
+			limit = deleteLimit()
 			if err := take("active_groups", plan.briefingCut, `DELETE FROM active_groups WHERE rowid IN (SELECT rowid FROM active_groups WHERE `+deletableDone+`
-				AND NOT EXISTS (SELECT 1 FROM group_subjects WHERE group_subjects.group_id = active_groups.group_id) ORDER BY opened_at, rowid LIMIT ?)`, remaining); err != nil {
+				AND NOT EXISTS (SELECT 1 FROM group_subjects WHERE group_subjects.group_id = active_groups.group_id) ORDER BY opened_at, rowid LIMIT ?)`, limit, limit); err != nil {
 				return err
 			}
 		}
 		if plan.stages&stageEvents != 0 {
-			if err := take("reported_ports", plan.rawCut, `DELETE FROM reported_ports WHERE rowid IN (SELECT rowid FROM reported_ports WHERE observation_id IN (SELECT observation_id FROM reported_observations WHERE `+eligibleEvents+`) ORDER BY rowid LIMIT ?)`, plan.rawCut, plan.failedCut, plan.rawCut, remaining); err != nil {
+			limit = deleteLimit()
+			if err := take("reported_ports", plan.rawCut, `DELETE FROM reported_ports WHERE rowid IN (SELECT rowid FROM reported_ports WHERE observation_id IN (SELECT observation_id FROM reported_observations WHERE `+eligibleEvents+`) ORDER BY rowid LIMIT ?)`, limit, plan.rawCut, plan.failedCut, plan.rawCut, limit); err != nil {
 				return err
 			}
-			if err := take("reported_observations", plan.rawCut, `DELETE FROM reported_observations WHERE rowid IN (SELECT observation_id FROM reported_observations WHERE `+eligibleEvents+` AND NOT EXISTS (SELECT 1 FROM reported_ports WHERE reported_ports.observation_id = reported_observations.observation_id) ORDER BY observation_id LIMIT ?)`, plan.rawCut, plan.failedCut, plan.rawCut, remaining); err != nil {
+			limit = deleteLimit()
+			if err := take("reported_observations", plan.rawCut, `DELETE FROM reported_observations WHERE rowid IN (SELECT observation_id FROM reported_observations WHERE `+eligibleEvents+` AND NOT EXISTS (SELECT 1 FROM reported_ports WHERE reported_ports.observation_id = reported_observations.observation_id) ORDER BY observation_id LIMIT ?)`, limit, plan.rawCut, plan.failedCut, plan.rawCut, limit); err != nil {
 				return err
 			}
-			if err := take("projection_progress", plan.rawCut, `DELETE FROM projection_progress WHERE rowid IN (SELECT rowid FROM projection_progress WHERE `+eligibleEvents+` ORDER BY rowid LIMIT ?)`, plan.rawCut, plan.failedCut, plan.rawCut, remaining); err != nil {
+			limit = deleteLimit()
+			if err := take("projection_progress", plan.rawCut, `DELETE FROM projection_progress WHERE rowid IN (SELECT rowid FROM projection_progress WHERE `+eligibleEvents+` ORDER BY rowid LIMIT ?)`, limit, plan.rawCut, plan.failedCut, plan.rawCut, limit); err != nil {
 				return err
 			}
-			if err := take("projection_pending", plan.rawCut, `DELETE FROM projection_pending WHERE rowid IN (SELECT rowid FROM projection_pending WHERE `+eligibleEvents+` ORDER BY rowid LIMIT ?)`, plan.rawCut, plan.failedCut, plan.rawCut, remaining); err != nil {
+			limit = deleteLimit()
+			if err := take("projection_pending", plan.rawCut, `DELETE FROM projection_pending WHERE rowid IN (SELECT rowid FROM projection_pending WHERE `+eligibleEvents+` ORDER BY rowid LIMIT ?)`, limit, plan.rawCut, plan.failedCut, plan.rawCut, limit); err != nil {
 				return err
 			}
-			if err := take("group_events", plan.rawCut, `DELETE FROM group_events WHERE rowid IN (SELECT rowid FROM group_events WHERE group_id IN (SELECT group_id FROM active_groups WHERE status IN ('done','failed')) AND `+eligibleEvents+` ORDER BY rowid LIMIT ?)`, plan.rawCut, plan.failedCut, plan.rawCut, remaining); err != nil {
+			limit = deleteLimit()
+			if err := take("group_events", plan.rawCut, `DELETE FROM group_events WHERE rowid IN (SELECT rowid FROM group_events WHERE group_id IN (SELECT group_id FROM active_groups WHERE status IN ('done','failed')) AND `+eligibleEvents+` ORDER BY rowid LIMIT ?)`, limit, plan.rawCut, plan.failedCut, plan.rawCut, limit); err != nil {
 				return err
 			}
+			limit = deleteLimit()
 			if err := take("raw_events", plan.rawCut, `DELETE FROM raw_events WHERE rowid IN (SELECT rowid FROM raw_events WHERE received_at < ?
 				AND NOT EXISTS (SELECT 1 FROM group_events WHERE group_events.event_id = raw_events.event_id)
 				AND NOT EXISTS (SELECT 1 FROM reported_observations WHERE reported_observations.event_id = raw_events.event_id)
 				AND NOT EXISTS (SELECT 1 FROM projection_pending WHERE projection_pending.event_id = raw_events.event_id)
-				AND NOT EXISTS (SELECT 1 FROM projection_progress WHERE projection_progress.event_id = raw_events.event_id) ORDER BY received_at, rowid LIMIT ?)`, plan.rawCut, remaining); err != nil {
+				AND NOT EXISTS (SELECT 1 FROM projection_progress WHERE projection_progress.event_id = raw_events.event_id) ORDER BY received_at, rowid LIMIT ?)`, limit, plan.rawCut, limit); err != nil {
 				return err
 			}
 			failedGroups := `group_id IN (SELECT group_id FROM active_groups WHERE status = 'failed' AND deadline_at < ?
 				AND NOT EXISTS (SELECT 1 FROM group_events WHERE group_events.group_id = active_groups.group_id)
 				AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id))`
-			if err := take("group_subjects", plan.failedCut, `DELETE FROM group_subjects WHERE rowid IN (SELECT rowid FROM group_subjects WHERE `+failedGroups+` ORDER BY rowid LIMIT ?)`, plan.failedCut, remaining); err != nil {
+			limit = deleteLimit()
+			if err := take("group_subjects", plan.failedCut, `DELETE FROM group_subjects WHERE rowid IN (SELECT rowid FROM group_subjects WHERE `+failedGroups+` ORDER BY rowid LIMIT ?)`, limit, plan.failedCut, limit); err != nil {
 				return err
 			}
+			limit = deleteLimit()
 			if err := take("active_groups", plan.failedCut, `DELETE FROM active_groups WHERE rowid IN (SELECT rowid FROM active_groups WHERE status = 'failed' AND deadline_at < ?
 				AND NOT EXISTS (SELECT 1 FROM group_events WHERE group_events.group_id = active_groups.group_id)
 				AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id)
-				AND NOT EXISTS (SELECT 1 FROM group_subjects WHERE group_subjects.group_id = active_groups.group_id) ORDER BY deadline_at, rowid LIMIT ?)`, plan.failedCut, remaining); err != nil {
+				AND NOT EXISTS (SELECT 1 FROM group_subjects WHERE group_subjects.group_id = active_groups.group_id) ORDER BY deadline_at, rowid LIMIT ?)`, limit, plan.failedCut, limit); err != nil {
 				return err
 			}
 		}
 		if plan.stages&stageSubjects != 0 {
+			limit = deleteLimit()
 			if err := take("reported_subjects", plan.subjectCut, `DELETE FROM reported_subjects WHERE rowid IN (SELECT rowid FROM reported_subjects WHERE last_report_at < ?
 				AND NOT EXISTS (SELECT 1 FROM reported_observations WHERE reported_observations.profile_id = reported_subjects.profile_id)
 				AND NOT EXISTS (SELECT 1 FROM group_subjects WHERE group_subjects.profile_id = reported_subjects.profile_id)
-				AND NOT EXISTS (SELECT 1 FROM briefing_subjects WHERE briefing_subjects.profile_id = reported_subjects.profile_id) ORDER BY last_report_at, rowid LIMIT ?)`, plan.subjectCut, remaining); err != nil {
+				AND NOT EXISTS (SELECT 1 FROM briefing_subjects WHERE briefing_subjects.profile_id = reported_subjects.profile_id) ORDER BY last_report_at, rowid LIMIT ?)`, limit, plan.subjectCut, limit); err != nil {
 				return err
 			}
 			sourceScope := "last_report_at IS NOT NULL AND last_report_at < ?\n\t\t\t\tAND NOT EXISTS (SELECT 1 FROM reported_subjects WHERE reported_subjects.source_scope = report_sources.source_scope)"
@@ -286,12 +332,29 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				sourceScope += " AND source_scope <> ?"
 				sourceArgs = append(sourceArgs, plan.activeSource)
 			}
-			sourceArgs = append(sourceArgs, remaining)
-			if err := take("report_sources", plan.sourceCut, `DELETE FROM report_sources WHERE rowid IN (SELECT rowid FROM report_sources WHERE `+sourceScope+` ORDER BY last_report_at, rowid LIMIT ?)`, sourceArgs...); err != nil {
+			limit = deleteLimit()
+			sourceArgs = append(sourceArgs, limit)
+			if err := take("report_sources", plan.sourceCut, `DELETE FROM report_sources WHERE rowid IN (SELECT rowid FROM report_sources WHERE `+sourceScope+` ORDER BY last_report_at, rowid LIMIT ?)`, limit, sourceArgs...); err != nil {
 				return err
 			}
-			if err := take("pseudonym_map", plan.tokenCut, `DELETE FROM pseudonym_map WHERE rowid IN (SELECT rowid FROM pseudonym_map WHERE last_used_at < ?
-				AND NOT EXISTS (SELECT 1 FROM purge_protected_tokens WHERE purge_protected_tokens.token = pseudonym_map.token) ORDER BY last_used_at, rowid LIMIT ?)`, plan.tokenCut, remaining); err != nil {
+			if !plan.skipTokenExpiry {
+				limit = deleteLimit()
+				if err := take("pseudonym_map", plan.tokenCut, `DELETE FROM pseudonym_map WHERE rowid IN (SELECT rowid FROM pseudonym_map WHERE last_used_at < ?
+					AND NOT EXISTS (SELECT 1 FROM purge_protected_tokens WHERE purge_protected_tokens.token = pseudonym_map.token)
+					AND NOT EXISTS (SELECT 1 FROM briefings WHERE rowid > ?) ORDER BY last_used_at, rowid LIMIT ?)`, limit, plan.tokenCut, plan.tokenFence, limit); err != nil {
+					return err
+				}
+			}
+		}
+		if plan.runID != 0 && report.total() > 0 {
+			// Persist this batch atomically with its deletions: a crash
+			// leaves completed batches attributed instead of only the
+			// final totals. This consumes the ledger row reserved before
+			// delete limits were chosen, so no second reservation is
+			// taken here: a batch filled exactly to capacity still
+			// commits instead of rolling back.
+			report.Bookkeeping++
+			if err := addPurgeRunCounts(tx, plan.runID, report); err != nil {
 				return err
 			}
 		}
@@ -324,72 +387,171 @@ func deleteBounded(tx *sql.Tx, stmt string, args ...any) (int64, error) {
 // deleting a token they name would corrupt the retained rendering.
 var protectedTokenRe = regexp.MustCompile(`\b(?:IP|MAC|HOST|NET)_[0-9]+\b`)
 
-// maxProtectedRefsPerBriefing caps candidate references scanned from
-// one briefing. Only distinct tokens insert, so the worst-case scratch
-// refill per briefing is this many rows.
-const maxProtectedRefsPerBriefing = 256
+// protectedTokenScanPage bounds one reference-discovery read: one
+// briefing row is decoded at a time and only the page's distinct
+// references are retained before the transaction commits.
+const protectedTokenScanPage = 100
+
+// protectedTokenWritePage bounds one scratch-write transaction to the
+// shared maintenance row budget.
+const protectedTokenWritePage = maxPurgeRowsPerTxn
+
+// protectedTokenClearPage bounds one scratch-clear transaction to the
+// shared maintenance row budget.
+const protectedTokenClearPage = maxPurgeRowsPerTxn
+
+// protectedRefillPasses bounds catch-up discovery when retained
+// briefings are inserted concurrently with a purge. Discovery remains
+// complete for a quiescent database; sustained inserts fail closed and
+// leave token deletions for a later run.
+const protectedRefillPasses = 5
 
 // refillProtectedTokens rebuilds the per-run protected-token scratch
 // set from every retained briefing (created_at >= briefingCut). A
-// stale scratch row only over-protects, so the rebuild runs once per
-// PurgeOnce outside the batch budget; per-batch exclusion then keeps
-// referenced tokens alive while expiry deletes the rest.
-func (s *Store) refillProtectedTokens(ctx context.Context, briefingCut int64) error {
-	type briefingText struct {
-		rawJSON string
-		reason  string
+// stale scratch row only over-protects, so the rebuild runs before any
+// deletion batch; per-batch exclusion then keeps referenced tokens
+// alive while expiry deletes the rest. It returns the highest briefing
+// rowid included, fencing token deletes against briefings inserted
+// during discovery.
+func (s *Store) refillProtectedTokens(ctx context.Context, briefingCut int64) (int64, error) {
+	return s.refillProtectedTokensPaged(ctx, briefingCut, protectedTokenScanPage, protectedTokenWritePage, protectedTokenClearPage, protectedRefillPasses)
+}
+
+func (s *Store) refillProtectedTokensPaged(ctx context.Context, briefingCut int64, scanPage, writePage, clearPage, maxPasses int) (int64, error) {
+	if scanPage <= 0 || writePage <= 0 || clearPage <= 0 || maxPasses <= 0 {
+		return 0, fmt.Errorf("protected token page sizes must be positive")
 	}
-	// Plain read outside the writer: the scan only collects text for
-	// the scratch rebuild below and must not hold the write queue.
-	rows, err := s.db.QueryContext(ctx, `SELECT model_raw_json, priority_reason FROM briefings WHERE created_at >= ?`, briefingCut)
-	if err != nil {
-		return err
+	// Plain reads stay outside the writer; scratch writes use bounded
+	// transactions. A briefing inserted during discovery is handled by
+	// catch-up passes and, ultimately, by the delete-time rowid fence.
+	var fence int64
+	if err := s.clearProtectedTokensPaged(ctx, clearPage); err != nil {
+		return 0, err
 	}
-	var texts []briefingText
-	for rows.Next() {
-		var t briefingText
-		if err := rows.Scan(&t.rawJSON, &t.reason); err != nil {
+	for pass := 1; pass <= maxPasses; pass++ {
+		var snapshot int64
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) FROM briefings WHERE created_at >= ?`, briefingCut).Scan(&snapshot); err != nil {
+			return 0, err
+		}
+		if err := s.refillProtectedTokensThrough(ctx, briefingCut, fence, snapshot, scanPage, writePage); err != nil {
+			return 0, err
+		}
+		fence = snapshot
+		var current int64
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) FROM briefings WHERE created_at >= ?`, briefingCut).Scan(&current); err != nil {
+			return 0, err
+		}
+		if current <= fence {
+			return fence, nil
+		}
+	}
+	return fence, fmt.Errorf("protected token references changed during discovery; retry purge")
+}
+
+func (s *Store) refillProtectedTokensThrough(ctx context.Context, briefingCut, afterRowID, throughRowID int64, scanPage, writePage int) error {
+	lastRowID := afterRowID
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT rowid, COALESCE(model_raw_json, ''), COALESCE(priority_reason, '') FROM briefings
+			WHERE created_at >= ? AND rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`,
+			briefingCut, lastRowID, throughRowID, scanPage)
+		if err != nil {
+			return err
+		}
+		seen := map[string]struct{}{}
+		var tokens []string
+		scanned := int64(0)
+		for rows.Next() {
+			var rowID int64
+			var rawJSON, reason string
+			if err := rows.Scan(&rowID, &rawJSON, &reason); err != nil {
+				rows.Close()
+				return err
+			}
+			tokens = appendProtectedTokens(seen, tokens, rawJSON)
+			tokens = appendProtectedTokens(seen, tokens, reason)
+			lastRowID = rowID
+			scanned++
+		}
+		if err := rows.Err(); err != nil {
 			rows.Close()
 			return err
 		}
-		texts = append(texts, t)
-	}
-	if err := rows.Err(); err != nil {
 		rows.Close()
-		return err
+		if len(tokens) > 0 {
+			if err := s.storeProtectedTokensPaged(ctx, tokens, writePage); err != nil {
+				return err
+			}
+		}
+		if scanned < int64(scanPage) {
+			return nil
+		}
 	}
-	rows.Close()
-	return s.write(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`DELETE FROM purge_protected_tokens`); err != nil {
+}
+
+// appendProtectedTokens collects every distinct token occurrence. The
+// caller bounds memory with paged reads and writes; no occurrence cap
+// may silently drop a later retained reference.
+func appendProtectedTokens(seen map[string]struct{}, tokens []string, text string) []string {
+	for _, match := range protectedTokenRe.FindAllString(text, -1) {
+		if _, ok := seen[match]; !ok {
+			seen[match] = struct{}{}
+			tokens = append(tokens, match)
+		}
+	}
+	return tokens
+}
+
+func (s *Store) clearProtectedTokensPaged(ctx context.Context, clearPage int) error {
+	for {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		seen := map[string]bool{}
-		insert := func(s string) error {
-			matches := protectedTokenRe.FindAllString(s, maxProtectedRefsPerBriefing+1)
-			if len(matches) > maxProtectedRefsPerBriefing {
-				matches = matches[:maxProtectedRefsPerBriefing]
+		s.yieldOnPressure(ctx)
+		var deleted int64
+		err := s.write(ctx, func(tx *sql.Tx) error {
+			res, err := tx.Exec(`DELETE FROM purge_protected_tokens WHERE rowid IN (SELECT rowid FROM purge_protected_tokens ORDER BY rowid LIMIT ?)`, clearPage)
+			if err != nil {
+				return err
 			}
-			for _, m := range matches {
-				if seen[m] {
-					continue
-				}
-				seen[m] = true
-				if _, err := tx.Exec(`INSERT OR IGNORE INTO purge_protected_tokens (token) VALUES (?)`, m); err != nil {
+			n, _ := res.RowsAffected()
+			deleted = n
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if deleted < int64(clearPage) {
+			return nil
+		}
+	}
+}
+
+func (s *Store) storeProtectedTokensPaged(ctx context.Context, tokens []string, writePage int) error {
+	for start := 0; start < len(tokens); start += writePage {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.yieldOnPressure(ctx)
+		end := start + writePage
+		if end > len(tokens) {
+			end = len(tokens)
+		}
+		chunk := tokens[start:end]
+		if err := s.write(ctx, func(tx *sql.Tx) error {
+			for _, token := range chunk {
+				if _, err := tx.Exec(`INSERT OR IGNORE INTO purge_protected_tokens (token) VALUES (?)`, token); err != nil {
 					return err
 				}
 			}
 			return nil
+		}); err != nil {
+			return err
 		}
-		for _, t := range texts {
-			if err := insert(t.rawJSON); err != nil {
-				return err
-			}
-			if err := insert(t.reason); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	}
+	return nil
 }
 
 // recordPurgeState persists per-table progress in the same transaction
@@ -405,6 +567,31 @@ func recordPurgeState(tx *sql.Tx, table string, now, cutoff, added int64) error 
 	return err
 }
 
+// addPurgeRunCounts adds one batch's counts to its ledger row in the
+// same transaction. Interim attribution survives a crash even when the
+// run never reaches terminal finalization.
+func addPurgeRunCounts(tx *sql.Tx, runID int64, report PurgeReport) error {
+	_, err := tx.Exec(`UPDATE purge_runs SET
+		briefing_links_deleted = briefing_links_deleted + ?,
+		briefings_deleted = briefings_deleted + ?,
+		groups_deleted = groups_deleted + ?,
+		group_links_deleted = group_links_deleted + ?,
+		ports_deleted = ports_deleted + ?,
+		observations_deleted = observations_deleted + ?,
+		progress_deleted = progress_deleted + ?,
+		raw_events_deleted = raw_events_deleted + ?,
+		subjects_deleted = subjects_deleted + ?,
+		sources_deleted = sources_deleted + ?,
+		pseudonyms_deleted = pseudonyms_deleted + ?,
+		bookkeeping_writes = bookkeeping_writes + ?
+		WHERE run_id = ?`,
+		report.BriefingLinks, report.Briefings, report.Groups, report.GroupLinks,
+		report.Ports, report.Observations, report.Progress, report.RawEvents,
+		report.Subjects, report.Sources, report.Pseudonyms, report.Bookkeeping,
+		runID)
+	return err
+}
+
 // PurgeOnce drains all eligible retention work in bounded transactions,
 // yielding while writer pressure passes half the queue cap so retention
 // never starves ingest. It returns the summed per-table counts and
@@ -413,6 +600,12 @@ func recordPurgeState(tx *sql.Tx, table string, now, cutoff, added int64) error 
 // commit before the failure, so a later run safely deletes the rest;
 // only cumulative counts transfer, and the stored cutoff must not be
 // read as a resume position.
+//
+// The run ledger opens before reference discovery, so a discovery
+// failure is recorded instead of escaping run history. When discovery
+// cannot establish completeness, token expiry is skipped while every
+// independently safe stage still drains; the skip is noted in the run
+// and surfaced to the caller, and a later run retries expiry.
 func (s *Store) PurgeOnce(ctx context.Context, settings PurgeSettings, now time.Time) (PurgeReport, error) {
 	rawCut := nanos(now.Add(-settings.BriefingRetention))
 	plan := purgePlan{
@@ -425,50 +618,85 @@ func (s *Store) PurgeOnce(ctx context.Context, settings PurgeSettings, now time.
 		tokenCut:     rawCut,
 		activeSource: settings.ActiveSource,
 	}
-	if err := s.refillProtectedTokens(ctx, plan.briefingCut); err != nil {
+	runID, err := s.beginPurgeRun(ctx, nanos(now))
+	if err != nil {
 		return PurgeReport{}, err
 	}
-	return s.drainPlan(ctx, now, plan)
+	plan.runID = runID
+	fence, derr := s.refillProtectedTokens(ctx, plan.briefingCut)
+	if derr != nil {
+		plan.skipTokenExpiry = true
+	} else {
+		plan.tokenFence = fence
+	}
+	status, errText, runErr, total := s.runPurgeBatches(ctx, now, plan, PurgeReport{})
+	if derr != nil {
+		note := "token discovery incomplete; token expiry skipped: " + SanitizeErrorText(derr.Error())
+		if runErr != nil {
+			errText = errText + "; " + note
+			runErr = errors.Join(runErr, derr)
+		} else {
+			errText = note
+			runErr = derr
+		}
+	}
+	return total, s.finishPurgeRun(ctx, runID, status, errText, runErr)
 }
 
 // drainPlan runs purgeBatch until no eligible row remains. Every run is
-// recorded in purge_runs with its status, duration and per-table
-// counts, so Step 20 health can tell a completed run from one that
-// committed batches and then failed or was interrupted.
+// recorded in purge_runs with its status, duration and per-batch plus
+// final per-table counts, so Step 20 health can tell a completed run
+// from one that committed batches and then failed or was interrupted.
+// Batch counts are persisted atomically with their deletions; terminal
+// finalization uses detached bounded work so cancellation still records
+// the outcome.
 func (s *Store) drainPlan(ctx context.Context, now time.Time, plan purgePlan) (PurgeReport, error) {
 	runID, err := s.beginPurgeRun(ctx, nanos(now))
 	if err != nil {
 		return PurgeReport{}, err
 	}
-	var total PurgeReport
-	finish := func(status, errText string, runErr error) (PurgeReport, error) {
-		if ferr := s.finishPurgeRun(ctx, runID, status, errText, total); ferr != nil && runErr == nil {
-			return total, ferr
-		}
-		return total, runErr
-	}
+	plan.runID = runID
+	status, errText, runErr, total := s.runPurgeBatches(ctx, now, plan, PurgeReport{})
+	return total, s.finishPurgeRun(ctx, runID, status, errText, runErr)
+}
+
+func (s *Store) runPurgeBatches(ctx context.Context, now time.Time, plan purgePlan, total PurgeReport) (string, string, error, PurgeReport) {
 	for {
 		if err := ctx.Err(); err != nil {
-			return finish("interrupted", SanitizeErrorText(err.Error()), err)
+			return "interrupted", SanitizeErrorText(err.Error()), err, total
 		}
 		s.yieldOnPressure(ctx)
 		if err := ctx.Err(); err != nil {
-			return finish("interrupted", SanitizeErrorText(err.Error()), err)
+			return "interrupted", SanitizeErrorText(err.Error()), err, total
 		}
 		report, progress, err := s.purgeBatch(ctx, now, plan)
 		if err != nil {
-			return finish("failed", SanitizeErrorText(err.Error()), err)
+			status, statusErr := batchRunStatus(ctx, err)
+			return status, SanitizeErrorText(statusErr.Error()), statusErr, total
 		}
 		total.add(report)
 		if !progress {
-			return finish("completed", "", nil)
+			return "completed", "", nil, total
 		}
 	}
 }
 
+// batchRunStatus maps a purgeBatch error to its terminal run status. A
+// cancelled context means interrupted even when the batch itself
+// reports the failure: the store permits cancellation to race a
+// successful commit, so the batch may have committed while its caller
+// never collected the report.
+func batchRunStatus(ctx context.Context, err error) (string, error) {
+	if ctx.Err() != nil {
+		return "interrupted", ctx.Err()
+	}
+	return "failed", err
+}
+
 // beginPurgeRun inserts a running ledger row and prunes history beyond
-// the newest 30 runs. A crash between begin and finish leaves a
-// running row whose started_at still bounds the outage window.
+// the newest 30 runs. A previous process that crashed between begin and
+// finish leaves a running row; reconciling it here bounds the outage
+// window before the new run starts deleting.
 func (s *Store) beginPurgeRun(ctx context.Context, startedAt int64) (int64, error) {
 	var runID int64
 	err := s.write(ctx, func(tx *sql.Tx) error {
@@ -481,6 +709,11 @@ func (s *Store) beginPurgeRun(ctx context.Context, startedAt int64) (int64, erro
 			return err
 		}
 		runID = id
+		_, err = tx.Exec(`UPDATE purge_runs SET finished_at = ?, status = 'interrupted', error = 'previous process ended before finalizing run'
+			WHERE status = 'running' AND run_id <> ?`, startedAt, runID)
+		if err != nil {
+			return err
+		}
 		_, err = tx.Exec(`DELETE FROM purge_runs WHERE run_id NOT IN (SELECT run_id FROM purge_runs ORDER BY run_id DESC LIMIT 30)`)
 		return err
 	})
@@ -491,21 +724,28 @@ func (s *Store) beginPurgeRun(ctx context.Context, startedAt int64) (int64, erro
 }
 
 // finishPurgeRun stamps the run row with its terminal status, finish
-// time and cumulative counts.
-func (s *Store) finishPurgeRun(ctx context.Context, runID int64, status, errText string, total PurgeReport) error {
-	return s.write(ctx, func(tx *sql.Tx) error {
-		_, err := tx.Exec(`UPDATE purge_runs SET finished_at = ?, status = ?, error = ?,
-			briefing_links_deleted = ?, briefings_deleted = ?, groups_deleted = ?, group_links_deleted = ?,
-			ports_deleted = ?, observations_deleted = ?, progress_deleted = ?, raw_events_deleted = ?,
-			subjects_deleted = ?, sources_deleted = ?, pseudonyms_deleted = ?, bookkeeping_writes = ?
-			WHERE run_id = ?`,
-			nanos(s.now()), status, errText,
-			total.BriefingLinks, total.Briefings, total.Groups, total.GroupLinks,
-			total.Ports, total.Observations, total.Progress, total.RawEvents,
-			total.Subjects, total.Sources, total.Pseudonyms, total.Bookkeeping,
-			runID)
+// time and error text. It never rewrites the per-table counters:
+// batches persist their counts atomically with their deletions, and
+// those committed counters stay authoritative even when cancellation
+// raced the commit and the caller-side totals are short. It runs
+// detached from the caller's cancellation under a shutdown bound: an
+// interrupted run still needs its ledger outcome, but finalization
+// must not wait indefinitely.
+func (s *Store) finishPurgeRun(ctx context.Context, runID int64, status, errText string, runErr error) error {
+	finalizeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), purgeLedgerTimeout)
+	defer cancel()
+	err := s.write(finalizeCtx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE purge_runs SET finished_at = ?, status = ?, error = ? WHERE run_id = ?`,
+			nanos(s.now()), status, errText, runID)
 		return err
 	})
+	if err != nil {
+		if runErr != nil {
+			return errors.Join(runErr, err)
+		}
+		return err
+	}
+	return runErr
 }
 
 // purgeRun describes one ledger row for Step 20 health.
