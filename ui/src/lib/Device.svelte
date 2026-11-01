@@ -65,8 +65,8 @@
       }
       fetched = fresh;
       retired = true;
-      extraHistory = [];
-      historyCursor = null;
+      extraHistory = fresh.history ?? [];
+      historyCursor = fresh.history_next_after ?? '';
       historyError = null;
       stale = false;
     } catch (err) {

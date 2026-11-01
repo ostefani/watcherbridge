@@ -70,14 +70,17 @@
       }
       const rows = nextPageRows(reset ? [] : devices, page.devices, (d) => d.profile_id, ROW_CAP);
       if (reset) {
+        // Only a reset refreshes existing rows, so only it clears
+        // the reconnect warning; paging keeps first-seen rows and
+        // leaves the notice in place.
         retired = true;
         extra = rows;
+        stale = false;
       } else {
         extra = [...extra, ...rows];
       }
       cursorOverride = page.next_after ?? '';
       loading = false;
-      stale = false;
       resetting = false;
     } catch (err) {
       if (guard.current(token)) {
