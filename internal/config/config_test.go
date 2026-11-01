@@ -37,6 +37,28 @@ func TestDefaultPairs(t *testing.T) {
 	}
 }
 
+func TestOverviewWindowChain(t *testing.T) {
+	good := Default()
+	if err := good.Validate(); err != nil {
+		t.Fatalf("defaults rejected: %v", err)
+	}
+	cases := map[string]func(*Config){
+		"tick below range":    func(c *Config) { c.OverviewTick = 4 * time.Second },
+		"tick above range":    func(c *Config) { c.OverviewTick = 6 * time.Minute },
+		"window above max":    func(c *Config) { c.OverviewWindow = 169 * time.Hour },
+		"max above retention": func(c *Config) { c.OverviewMaxWindow = 31 * 24 * time.Hour },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := Default()
+			mutate(&c)
+			if err := c.Validate(); err == nil {
+				t.Fatal("expected rejection")
+			}
+		})
+	}
+}
+
 func TestValidateRejects(t *testing.T) {
 	cases := map[string]func(*Config){
 		"non-loopback bind":                func(c *Config) { c.Bind = "0.0.0.0:8081" },

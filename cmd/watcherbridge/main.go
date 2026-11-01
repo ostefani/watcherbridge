@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"log"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/ostefani/watcherbridge/internal/briefing"
 	"github.com/ostefani/watcherbridge/internal/config"
 	"github.com/ostefani/watcherbridge/internal/forwarder"
+	"github.com/ostefani/watcherbridge/internal/health"
 	"github.com/ostefani/watcherbridge/internal/provider"
 	"github.com/ostefani/watcherbridge/internal/redactor"
 	"github.com/ostefani/watcherbridge/internal/server"
@@ -24,6 +26,11 @@ import (
 )
 
 func main() {
+	// `status` is a read-only API client, not a bridge instance: it must
+	// not parse bridge flags, open the database, or start workers.
+	if len(os.Args) > 1 && os.Args[1] == "status" {
+		os.Exit(runStatus(os.Args[2:]))
+	}
 	def := config.Default()
 	fs := flag.NewFlagSet("watcherbridge", flag.ExitOnError)
 	bind := fs.String("bind", def.Bind, "loopback bind address")
@@ -38,6 +45,9 @@ func main() {
 	forwardKey := fs.String("forward-api-key", "", "API key injected into ScanRelay forwards/annotations (or FORWARD_API_KEY)")
 	quiet := fs.Duration("group-quiet-window", def.GroupQuietWindow, "grouping quiet window")
 	maxWindow := fs.Duration("group-max-window", def.GroupMaxWindow, "grouping hard cap")
+	overviewWindow := fs.Duration("overview-window", def.OverviewWindow, "default overview window")
+	overviewMax := fs.Duration("overview-max-window", def.OverviewMaxWindow, "configured overview maximum")
+	overviewTick := fs.Duration("overview-tick", def.OverviewTick, "overview recompute timer (5s-5m)")
 	briefRet := fs.Duration("briefing-retention", def.BriefingRetention, "retained briefing history (min 24h)")
 	subjRet := fs.Duration("subject-retention", def.SubjectRetention, "retained reported-subject context (min briefing retention)")
 	purgeEvery := fs.Duration("purge-interval", def.PurgeInterval, "purge loop interval (min 1m)")
@@ -70,6 +80,9 @@ func main() {
 	cfg.SubjectRetention = *subjRet
 	cfg.PurgeInterval = *purgeEvery
 	cfg.GrouperTick = *tick
+	cfg.OverviewWindow = *overviewWindow
+	cfg.OverviewMaxWindow = *overviewMax
+	cfg.OverviewTick = *overviewTick
 	cfg.ProcessingLease = *lease
 	cfg.AgentTimeout = *agentTimeout
 	cfg.ModelProvider = *modelProvider
@@ -115,6 +128,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("server: %v", err)
 	}
+	// Operational counters are process-lifetime: the start time travels
+	// with every reading so a restart is interpretable, never silent.
+	opHealth := health.New()
+	srv.Health = opHealth
+	srv.Viewer().Overview.SetHealth(opHealth)
 	srv.SweepOnce(ctx)
 	purgeSettings := store.PurgeSettings{BriefingRetention: cfg.BriefingRetention, SubjectRetention: cfg.SubjectRetention, ActiveSource: cfg.SourceID}
 	if rep, err := st.PurgeOnce(ctx, purgeSettings, time.Now()); err != nil {
@@ -155,6 +173,22 @@ func main() {
 		log.Print("watcherbridge: no ScanRelay URL; annotations disabled")
 	}
 	onBriefing, onGroups := viewer.Fanout(hub, pub, int64(cfg.GroupQuietWindow/time.Second))
+	srv.Viewer().Overview.SetPublisher(pub)
+
+	// The overview refresher recomputes on briefing inserts and its own
+	// timer, coalesced to 1/s, broadcasting only on hash change.
+	ov := srv.Viewer().Overview
+	overviewDone := make(chan struct{})
+	go func() {
+		defer close(overviewDone)
+		ov.Run(ctx, cfg.OverviewTick, func(body []byte) {
+			hub.Broadcast("overview", json.RawMessage(body))
+		})
+	}()
+	onBriefingChanged := func(b store.Briefing) {
+		onBriefing(b)
+		ov.Trigger()
+	}
 
 	// The purge loop sits beside the briefing worker: both share only the
 	// serialized writer, so a slow purge batch delays individual writes
@@ -178,7 +212,8 @@ func main() {
 			Provider:     prov,
 			Redaction:    redactor.Policy{Enabled: cfg.Redaction, MaxFieldChars: cfg.MaxFieldChars},
 			ModelTimeout: cfg.ProviderTimeout,
-			OnBriefing:   onBriefing,
+			Health:       opHealth,
+			OnBriefing:   onBriefingChanged,
 			OnGroups:     onGroups,
 		})
 	}()
@@ -195,8 +230,9 @@ func main() {
 	if err := srv.Start(); err != nil {
 		log.Printf("server: %v", err)
 	}
-	// Ingest stopped: drain the worker and the purge loop, then shut the
-	// publisher down so queued annotations flush before the store closes.
+	// Ingest stopped: drain the worker, the purge loop, and the overview
+	// refresher, then shut the publisher down so queued annotations
+	// flush before the store closes.
 	stop()
 	if err := <-workerDone; err != nil {
 		log.Printf("worker: %v", err)
@@ -204,6 +240,7 @@ func main() {
 	if err := <-purgeDone; err != nil {
 		log.Printf("purge loop: %v", err)
 	}
+	<-overviewDone
 	log.Print("watcherbridge: stopped")
 }
 

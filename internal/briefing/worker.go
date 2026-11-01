@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ostefani/watcherbridge/internal/health"
 	"github.com/ostefani/watcherbridge/internal/provider"
 	"github.com/ostefani/watcherbridge/internal/redactor"
 	"github.com/ostefani/watcherbridge/internal/store"
@@ -40,6 +41,9 @@ type Deps struct {
 	Provider     provider.Provider
 	Redaction    redactor.Policy
 	ModelTimeout time.Duration
+	// Health counts provider outcomes and writer-saturation refunds;
+	// nil-safe, unset in tests that do not exercise it.
+	Health *health.Counters
 
 	// OnBriefing fires after each stored briefing (model or fallback)
 	// with the exact row served and published. OnGroups fires once per
@@ -299,21 +303,23 @@ func briefOne(ctx context.Context, d Deps, groupID string) (progressed bool) {
 		if err := d.Store.InsertBriefing(ctx, b); err != nil {
 			log.Printf("briefing: group %s final insert: %s", groupID, store.SanitizeErrorText(err.Error()))
 			if transientStoreErr(ctx, err) {
-				return releaseTransient(ctx, d, taken)
+				return releaseTransientErr(ctx, d, taken, err)
 			}
 			parkFailed(ctx, d, groupID, "final insert failed")
 			return true
 		}
+		d.Health.AddProviderFallback()
 		notifyBriefing(d, taken, b)
 		return true
 	}
 	if err := d.Store.InsertBriefing(ctx, b); err != nil {
 		log.Printf("briefing: group %s insert: %s", groupID, store.SanitizeErrorText(err.Error()))
 		if transientStoreErr(ctx, err) {
-			return releaseTransient(ctx, d, taken)
+			return releaseTransientErr(ctx, d, taken, err)
 		}
 		return releaseOrPark(ctx, d, taken, "insert failed")
 	}
+	d.Health.AddProviderFallback()
 	notifyBriefing(d, taken, b)
 	if len(outcome.Skipped) > 0 {
 		log.Printf("briefing: group %s baseline %s skipped %d unknown-input rules", groupID, outcome.RuleID, len(outcome.Skipped))
@@ -368,6 +374,15 @@ func releaseOrPark(ctx context.Context, d Deps, taken store.TakenGroup, reason s
 		log.Printf("briefing: group %s parked failed (%s) after %d attempts", taken.GroupID, reason, taken.RetryCount)
 	}
 	return true
+}
+
+// releaseTransientErr refunds like releaseTransient, counting the refunds
+// whose cause was the saturated writer queue rather than shutdown.
+func releaseTransientErr(ctx context.Context, d Deps, taken store.TakenGroup, err error) bool {
+	if errors.Is(err, store.ErrQueueSaturated) {
+		d.Health.AddWriterSaturated()
+	}
+	return releaseTransient(ctx, d, taken)
 }
 
 // releaseTransient refunds one take and requeues with a backoff. The

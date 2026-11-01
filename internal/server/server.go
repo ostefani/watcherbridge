@@ -25,6 +25,7 @@ import (
 
 	"github.com/ostefani/watcherbridge/internal/config"
 	"github.com/ostefani/watcherbridge/internal/forwarder"
+	"github.com/ostefani/watcherbridge/internal/health"
 	"github.com/ostefani/watcherbridge/internal/store"
 	"github.com/ostefani/watcherbridge/internal/viewer"
 )
@@ -56,6 +57,9 @@ type Server struct {
 	events *store.Store
 	gate   *forwarder.Gate
 	viewer *viewer.Viewer
+	// Health counts ingest outcomes; main sets it after New (nil-safe),
+	// and every ingest path below records its coarse outcome.
+	Health *health.Counters
 	now    func() time.Time
 
 	sem   chan struct{} // in-flight cap; acquired before reading the body
@@ -118,6 +122,11 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 		hosts = viewer.LoopbackHosts(port)
 	}
 	s.viewer.AllowedHosts = hosts
+	// The overview refresher computes /api/overview, /api/health, and the
+	// connect-time `overview` event from retained rows. Health and the
+	// annotation publisher attach later in main once both exist.
+	s.viewer.Overview = viewer.NewRefresher(events, nil, nil,
+		cfg.OverviewWindow, cfg.OverviewMaxWindow, cfg.BriefingRetention)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook", s.handleWebhook)
 	// GET needs an explicit route: without it the viewer mount below
@@ -208,6 +217,7 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 }
 
 func (s *Server) writeSaturated(w http.ResponseWriter, msg string) {
+	s.Health.AddSaturated()
 	w.Header().Set("Retry-After", strconv.Itoa(s.cfg.RetryAfterSecs))
 	writeError(w, http.StatusServiceUnavailable, msg)
 }
@@ -229,6 +239,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		s.Health.AddRejected()
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
@@ -245,6 +256,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	signature := r.Header.Get("X-SubnetLens-Signature-256")
 	sigTime, err := parseAndValidate(s.now(), s.cfg.TimestampTolerance, timestamp, eventID, eventKey, eventType, body)
 	if err != nil {
+		s.Health.AddRejected()
 		var malformed *malformedError
 		if errors.As(err, &malformed) {
 			writeError(w, http.StatusBadRequest, malformed.Error())
@@ -254,6 +266,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !validSignature(s.secret, timestamp, eventID, eventKey, eventType, body, signature) {
+		s.Health.AddRejected()
 		writeError(w, http.StatusUnauthorized, "invalid signature")
 		return
 	}
@@ -344,6 +357,7 @@ func (s *Server) persistAndReply(ctx context.Context, w http.ResponseWriter, bod
 		// otherwise forward inline — this is Pro's outbox retry
 		// doing its job. In-flight duplicates never reach here:
 		// they wait on the gate and follow the stored state.
+		s.Health.AddDuplicate()
 		if fwd, _, _, ferr := s.events.ForwardState(ctx, eventID); ferr == nil && fwd {
 			writeAccepted(w, eventID, eventType)
 			return nil
@@ -357,10 +371,12 @@ func (s *Server) persistAndReply(ctx context.Context, w http.ResponseWriter, bod
 	}
 
 	if s.cfg.Mode == config.ModeTap {
+		s.Health.AddAccepted()
 		writeAccepted(w, eventID, eventType)
 		return nil
 	}
 	if s.forwardOne(ctx, body, headerMap(r.Header), eventID) {
+		s.Health.AddAccepted()
 		writeAccepted(w, eventID, eventType)
 		return nil
 	}
@@ -373,6 +389,7 @@ func (s *Server) persistAndReply(ctx context.Context, w http.ResponseWriter, bod
 // 503 so Pro retries, and the failure is logged without request content.
 func (s *Server) reportPersistError(w http.ResponseWriter, eventID string, err error) {
 	if errors.Is(err, errMalformedBody) {
+		s.Health.AddRejected()
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -384,6 +401,7 @@ func (s *Server) reportPersistError(w http.ResponseWriter, eventID string, err e
 // the event landed at ScanRelay, 502 when it did not so Pro retries. It never
 // forwards inline — a second forward inside this deadline could exceed it.
 func (s *Server) replyForStoredState(ctx context.Context, w http.ResponseWriter, eventID, eventType string) {
+	s.Health.AddDuplicate()
 	forwarded, _, _, err := s.events.ForwardState(ctx, eventID)
 	if err != nil || !forwarded {
 		writeError(w, http.StatusBadGateway, "scanrelay delivery failed")

@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ostefani/watcherbridge/internal/overview"
 	"github.com/ostefani/watcherbridge/internal/store"
 )
 
@@ -193,16 +194,29 @@ type Viewer struct {
 	// HMAC-protected and stays outside this gate.
 	AllowedHosts []string
 
+	// Overview is the Step 20 refresher behind /api/overview, /api/health,
+	// and the `overview` SSE event. Nil means unconfigured: both routes
+	// answer 503, and the connect sequence skips the overview event.
+	Overview *Refresher
+
 	done      chan struct{}
 	closeOnce sync.Once
 }
 
 // New returns a Viewer over store, fanning worker callbacks into hub.
+// It attaches a default overview refresher (24h window, 168h maximum,
+// retention equal to the maximum so the default validates) so the
+// connect sequence and both routes work before the server replaces it
+// with the configured one; health and publisher stay detached until
+// main attaches them.
 func New(s *store.Store, hub *Hub) *Viewer {
 	if hub == nil {
 		hub = NewHub()
 	}
-	return &Viewer{store: s, hub: hub, done: make(chan struct{})}
+	v := &Viewer{store: s, hub: hub, done: make(chan struct{})}
+	v.Overview = NewRefresher(s, nil, nil,
+		overview.DefaultWindow, overview.DefaultMaxWindow, overview.DefaultMaxWindow)
+	return v
 }
 
 // Close unblocks every open stream handler so server shutdown never waits
@@ -229,6 +243,7 @@ func (v *Viewer) Attach(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/devices", v.handleDevices)
 	mux.HandleFunc("GET /api/devices/{id}", v.handleDevice)
 	mux.HandleFunc("GET /api/overview", v.handleOverview)
+	mux.HandleFunc("GET /api/health", v.handleHealth)
 }
 
 // Handler returns the viewer subtree with Host validation applied ahead
@@ -348,29 +363,6 @@ func (v *Viewer) guardStateChanging(next http.HandlerFunc) http.HandlerFunc {
 		r.Body = http.MaxBytesReader(w, r.Body, maxPostBytes)
 		next(w, r)
 	}
-}
-
-// overviewStub is the Step 15 placeholder for GET /api/overview and the
-// connect-time `overview` event. Top-level keys are frozen for the Step 22
-// client; Step 20 fills in the computation. Every value stays honestly
-// unknown — "quiet" is never shown without receipts, and "healthy" never
-// without a liveness signal.
-func stubOverview() map[string]any {
-	return map[string]any{
-		"verdict":   "unknown",
-		"headline":  "Overview computation lands in Step 20 — this stream carries live briefings only.",
-		"receipts":  0,
-		"coverage":  "unknown",
-		"liveness":  "unknown",
-		"attention": []any{},
-		"digest":    []any{},
-	}
-}
-
-// handleOverview serves the overview stub. The `window` query is accepted
-// and ignored until Step 20 validates it against OVERVIEW_WINDOW_MAX.
-func (v *Viewer) handleOverview(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, stubOverview())
 }
 
 func (v *Viewer) serveAsset(name, contentType string) func(http.ResponseWriter, *http.Request) {
@@ -531,8 +523,24 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	} else {
 		log.Printf("viewer: initial group snapshot: %s", store.SanitizeErrorText(err.Error()))
 	}
-	if !write(Event{Name: "overview", Data: mustJSON(stubOverview())}) {
-		return
+	// Connect-time overview: the cached computation when the refresher
+	// has run, a fresh default-window computation before the first tick
+	// otherwise. A store failure skips the event — the client loads the
+	// overview over the API — never a fabricated unknown.
+	if ov := v.Overview; ov != nil {
+		body := ov.Cached()
+		if body == nil {
+			var err error
+			if body, _, err = ov.compute(streamCtx, ov.window); err != nil {
+				log.Printf("viewer: connect overview: %s", store.SanitizeErrorText(err.Error()))
+				body = nil
+			}
+		}
+		if body != nil {
+			if !write(Event{Name: "overview", Data: body}) {
+				return
+			}
+		}
 	}
 	if !v.replay(streamCtx, w, r, replayMax, write) {
 		return

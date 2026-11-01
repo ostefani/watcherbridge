@@ -174,10 +174,11 @@ func insertFallback(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 	if err := d.Store.InsertBriefing(ctx, b); err != nil {
 		log.Printf("briefing: group %s fallback insert: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
 		if transientStoreErr(ctx, err) {
-			return releaseTransient(ctx, d, taken)
+			return releaseTransientErr(ctx, d, taken, err)
 		}
 		return releaseOrPark(ctx, d, taken, "fallback insert failed")
 	}
+	d.Health.AddProviderFallback()
 	notifyBriefing(d, taken, b)
 	if len(outcome.Skipped) > 0 {
 		log.Printf("briefing: group %s baseline %s skipped %d unknown-input rules", taken.GroupID, outcome.RuleID, len(outcome.Skipped))
@@ -232,6 +233,7 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 		// A hit aborts the provider call — no send, fallback instead.
 		if hits, err := redactor.ScanOutboundLeaks(raw, issued, bundle.EventIDs); err != nil || len(hits) > 0 {
 			log.Printf("briefing: group %s redaction blocked at %v", taken.GroupID, hits)
+			d.Health.AddRedactionBlocked()
 			return insertFallback(ctx, d, taken, outcome, "redaction blocked the model call; briefing from deterministic baseline only")
 		}
 	}
@@ -244,6 +246,7 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 	}
 	modelCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	d.Health.AddProviderCall()
 	answer, err := d.Provider.Brief(modelCtx, raw, valid)
 	if err != nil {
 		log.Printf("briefing: group %s provider: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
@@ -309,7 +312,7 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 	if err := d.Store.InsertBriefing(ctx, b); err != nil {
 		log.Printf("briefing: group %s insert: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
 		if transientStoreErr(ctx, err) {
-			return releaseTransient(ctx, d, taken)
+			return releaseTransientErr(ctx, d, taken, err)
 		}
 		return releaseOrPark(ctx, d, taken, "insert failed")
 	}

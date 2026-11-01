@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ostefani/watcherbridge/internal/limits"
+	"github.com/ostefani/watcherbridge/internal/overview"
 )
 
 // Mode selects tap (persist + 202, all work async) or proxy (persist,
@@ -181,6 +182,9 @@ type Config struct {
 	PurgeInterval     time.Duration
 
 	GrouperTick          time.Duration
+	OverviewWindow       time.Duration // default overview window; window <= max <= briefing retention
+	OverviewMaxWindow    time.Duration // configured overview maximum; 168h initial
+	OverviewTick         time.Duration // overview recompute timer; 5s-5m
 	ProcessingLease      time.Duration // stale processing age; must exceed 2 x agent timeout + margin
 	AgentTimeout         time.Duration // per-turn agent budget; must cover the provider timeout
 	EstablishedAge       time.Duration // first-seen age for established; dormant until Pro ships the field
@@ -251,6 +255,9 @@ func Default() Config {
 		PurgeInterval:     6 * time.Hour,
 
 		GrouperTick:          1 * time.Second,
+		OverviewWindow:       24 * time.Hour,
+		OverviewMaxWindow:    168 * time.Hour,
+		OverviewTick:         30 * time.Second,
 		ProcessingLease:      210 * time.Second,
 		AgentTimeout:         90 * time.Second,
 		EstablishedAge:       1 * time.Hour,
@@ -635,6 +642,15 @@ func (c Config) Validate() error {
 	}
 	if c.GrouperTick >= c.ProcessingLease {
 		return fmt.Errorf("grouper tick %v must be below the processing lease %v, or a stale worker is never reaped in time", c.GrouperTick, c.ProcessingLease)
+	}
+	// Designv9 §3.3: the timer range is 5s-5m, and window <= max <=
+	// briefing retention — the same chain the API and CLI validate per
+	// request, checked here once for the configured defaults.
+	if c.OverviewTick < 5*time.Second || c.OverviewTick > 5*time.Minute {
+		return fmt.Errorf("overview tick %v must be between 5s and 5m", c.OverviewTick)
+	}
+	if _, err := overview.ValidateWindow(c.OverviewWindow, c.OverviewMaxWindow, c.BriefingRetention); err != nil {
+		return fmt.Errorf("overview window: %w", err)
 	}
 	if c.EstablishedAge <= 0 || c.StrongHistoryAge <= 0 {
 		return fmt.Errorf("established and strong-history ages must be positive")

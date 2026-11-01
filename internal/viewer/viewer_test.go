@@ -12,10 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ostefani/watcherbridge/internal/health"
 	"github.com/ostefani/watcherbridge/internal/store"
 )
 
-func openViewerStore(t *testing.T) *store.Store {
+func openViewerStore(t testing.TB) *store.Store {
 	t.Helper()
 	s, err := store.Open(t.TempDir() + "/viewer.db")
 	if err != nil {
@@ -25,7 +26,7 @@ func openViewerStore(t *testing.T) *store.Store {
 	return s
 }
 
-func seedOpenGroup(t *testing.T, s *store.Store, anchor, eventID string) {
+func seedOpenGroup(t testing.TB, s *store.Store, anchor, eventID string) {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
 	_, err := s.PersistEventAndGroup(context.Background(), store.RawEvent{
@@ -41,7 +42,7 @@ func seedOpenGroup(t *testing.T, s *store.Store, anchor, eventID string) {
 	}
 }
 
-func seedBriefing(t *testing.T, s *store.Store, anchor, eventID string) string {
+func seedBriefing(t testing.TB, s *store.Store, anchor, eventID string) string {
 	t.Helper()
 	seedOpenGroup(t, s, anchor, eventID)
 	groups, err := s.OpenGroupSnapshots(context.Background())
@@ -1062,22 +1063,27 @@ func TestFanoutDedupsUnchangedSnapshot(t *testing.T) {
 	}
 }
 
-func TestOverviewStubShape(t *testing.T) {
+func TestOverviewFrozenKeys(t *testing.T) {
 	s := openViewerStore(t)
 	v := New(s, NewHub())
+	// Step 20 retires the Step 15 stub: the computation is live, so the
+	// durable contract is the frozen client keys, the honesty rule (no
+	// receipts means quiet, never act or review), and the headers —
+	// not the placeholder verdict.
+	v.Overview = NewRefresher(s, health.New(), nil, 24*time.Hour, 168*time.Hour, 30*24*time.Hour)
 	rec := httptest.NewRecorder()
 	v.handleOverview(rec, httptest.NewRequest("GET", "/api/overview", nil))
 	var body map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("overview = %q", rec.Body.String())
 	}
-	for _, key := range []string{"verdict", "headline", "receipts", "coverage", "liveness", "attention", "digest"} {
+	for _, key := range []string{"verdict", "headline", "receipts", "coverage", "sources", "attention", "digest", "window"} {
 		if _, ok := body[key]; !ok {
-			t.Fatalf("overview stub missing frozen key %q: %v", key, body)
+			t.Fatalf("overview missing frozen key %q: %v", key, body)
 		}
 	}
-	if body["verdict"] == "quiet" || body["verdict"] == "review" || body["verdict"] == "act" {
-		t.Fatalf("stub must never claim a computed verdict: %v", body["verdict"])
+	if body["verdict"] != "quiet" {
+		t.Fatalf("empty store must read quiet, got %v", body["verdict"])
 	}
 	if rec.Header().Get("Content-Security-Policy") != csp {
 		t.Fatalf("overview CSP = %q", rec.Header().Get("Content-Security-Policy"))
