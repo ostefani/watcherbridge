@@ -364,10 +364,10 @@ func TestShippedJSRendersTextOnly(t *testing.T) {
 	// runtime sets innerHTML on static compiled templates (never on
 	// hostile data), so a bundle substring check cannot distinguish
 	// framework machinery from a data sink. The enforceable invariant
-	// is at the source level: no {@html} block may exist (primary
-	// enforcement is `npm run lint` via svelte/no-at-html-tags, which
-	// CI runs; this test keeps a checkout honest when the bundle is
-	// rebuilt without lint).
+	// is at the source level: no {@html} directive may exist, with or
+	// without an expression (primary enforcement is `npm run lint` via
+	// svelte/no-at-html-tags, which CI runs; this test keeps a checkout
+	// honest when the bundle is rebuilt without lint).
 	entries, err := os.ReadDir("../../ui/src")
 	if err != nil {
 		t.Fatal(err)
@@ -380,7 +380,7 @@ func TestShippedJSRendersTextOnly(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(string(raw), "{@html}") {
+		if strings.Contains(string(raw), "{@html") {
 			t.Fatalf("ui/src/%s uses {@html}: hostile strings must stay inert", e.Name())
 		}
 	}

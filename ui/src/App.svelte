@@ -7,6 +7,7 @@
   let state = $state('connecting');
   let lastEvent = $state('none');
   let source = null;
+  let retryTimer = 0;
 
   const STATUS = {
     connecting: 'Connecting to the bridge event stream…',
@@ -24,7 +25,7 @@
       state = 'retrying';
       source?.close();
       source = null;
-      window.setTimeout(connect, 2000);
+      retryTimer = window.setTimeout(connect, 2000);
     };
     for (const name of ['briefing', 'group', 'overview', 'resync']) {
       source.addEventListener(name, () => {
@@ -35,7 +36,11 @@
 
   onMount(() => {
     connect();
-    return () => source?.close();
+    return () => {
+      window.clearTimeout(retryTimer);
+      source?.close();
+      source = null;
+    };
   });
 </script>
 

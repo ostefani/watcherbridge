@@ -16,7 +16,10 @@ export default [
     rules: {
       'no-unsanitized/method': 'error',
       'no-unsanitized/property': 'error',
-      'svelte/no-at-html-tags': 'error'
+      'svelte/no-at-html-tags': 'error',
+      // The recommended set leaves this off; without it a template
+      // that does not compile is a lint pass and only fails the build.
+      'svelte/valid-compile': 'error'
     },
     languageOptions: {
       globals: { ...globals.browser }
