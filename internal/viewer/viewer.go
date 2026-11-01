@@ -849,7 +849,9 @@ type devicesEnvelope struct {
 // handleDevices serves GET /api/devices?limit&after: one page of reported
 // subjects oldest-first. limit defaults to 50 and 200 is refused, not
 // clamped; after is "<last_report_at nanos>:<profile id>" ("" starts at
-// the oldest). Malformed cursors are 400.
+// the oldest). Malformed cursors are 400, including a well-formed shape
+// with a non-profile ID suffix; a well-shaped cursor for an unknown or
+// deleted profile simply pages past retained rows to an empty page.
 func (v *Viewer) handleDevices(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit := 50
@@ -866,7 +868,7 @@ func (v *Viewer) handleDevices(w http.ResponseWriter, r *http.Request) {
 	if s := q.Get("after"); s != "" {
 		var err error
 		afterNanos, afterID, err = parseTupleCursor(s)
-		if err != nil {
+		if err != nil || !validProfileID(afterID) {
 			writeViewerError(w, "invalid after", http.StatusBadRequest)
 			return
 		}

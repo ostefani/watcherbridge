@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -210,5 +211,142 @@ func TestLatestObservationPortsBounded(t *testing.T) {
 	}
 	if latest.Attributes["ports_total"] != float64(600) || latest.Attributes["ports_truncated"] != true {
 		t.Fatalf("snapshot flags must agree: %v", latest.Attributes)
+	}
+}
+
+// History items carry the snapshot's port summary, so a history page
+// never reports zero ports alongside a snapshot that captured some.
+func TestSubjectHistoryCarriesPortTotals(t *testing.T) {
+	s := openTestStore(t)
+	at := time.Now().UTC().Truncate(time.Second)
+	host := `{"mac":"10:20:30:40:50:65","host_id":"mac:10:20:30:40:50:65","identity_source":"mac","identity_confidence":"high","ports":[{"number":22,"protocol":"tcp","state":"open","service":"ssh"},{"number":80,"protocol":"tcp","state":"open","service":"http"}]}`
+	seedSubject(t, s, "lab", "evt-ports", host, at)
+	subs, _, err := s.ReportedSubjectsPage(context.Background(), 0, "", 10)
+	if err != nil || len(subs) != 1 {
+		t.Fatalf("subjects = %+v %v", subs, err)
+	}
+	page, _, err := s.SubjectHistoryPage(context.Background(), subs[0].ProfileID, 0, 0, 50)
+	if err != nil || len(page) != 1 {
+		t.Fatalf("history = %+v %v", page, err)
+	}
+	if page[0].PortsTotal != 2 || page[0].PortsTruncated {
+		t.Fatalf("history must carry snapshot totals: %+v attrs %v", page[0], page[0].Attributes)
+	}
+}
+
+// Fifty fat snapshots exceed the page byte budget: the page stops at
+// the last fitting item, continues from there, and the walk still
+// covers every observation exactly once.
+func TestSubjectHistoryByteBudget(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-72 * time.Hour).Truncate(time.Second)
+	const items = 20
+	for i := 0; i < items; i++ {
+		seedSubject(t, s, "lab", fmt.Sprintf("evt-fat-%02d", i), subjectMAC("10:20:30:40:50:66"), base.Add(time.Duration(i)*time.Second))
+	}
+	subs, _, err := s.ReportedSubjectsPage(ctx, 0, "", 10)
+	if err != nil || len(subs) != 1 {
+		t.Fatalf("subjects = %+v %v", subs, err)
+	}
+	profileID := subs[0].ProfileID
+	fat, err := json.Marshal(map[string]any{"ports_total": 0, "ports_truncated": false, "pad": strings.Repeat("x", 100<<10)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE reported_observations SET attributes_json = ? WHERE profile_id = ?`, string(fat), profileID); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	var afterNanos, afterID int64
+	pages := 0
+	for {
+		page, next, err := s.SubjectHistoryPage(ctx, profileID, afterNanos, afterID, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) == 0 {
+			if next != "" {
+				t.Fatal("empty page must not carry a cursor")
+			}
+			break
+		}
+		pages++
+		wire, err := json.Marshal(page)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(wire) > maxHistoryPageBytes+(100<<10) {
+			t.Fatalf("page %d escapes the byte budget: %d bytes", pages, len(wire))
+		}
+		for _, obs := range page {
+			if seen[obs.EventID] {
+				t.Fatalf("overlap at %s", obs.EventID)
+			}
+			seen[obs.EventID] = true
+		}
+		if next == "" {
+			break
+		}
+		last := page[len(page)-1]
+		// The published cursor must decode to the last included
+		// item: continuation resumes exactly behind it.
+		n, idStr, err := parseTestCursor(next)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var id int64
+		if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+			t.Fatal(err)
+		}
+		if n != nanos(last.ReportedAt) || id != last.ObservationID {
+			t.Fatalf("cursor %q skips the last item %+v", next, last)
+		}
+		afterNanos, afterID = n, id
+		if pages > items {
+			t.Fatal("history walk does not converge")
+		}
+	}
+	if len(seen) != items {
+		t.Fatalf("walk covered %d of %d observations in %d pages", len(seen), items, pages)
+	}
+	if pages < 2 {
+		t.Fatalf("20x100KiB must not fit one page: %d pages", pages)
+	}
+}
+
+// Serving reads behind /api/devices must stay indexed as history
+// grows: no serving query scans an association or observation table.
+func TestServingQueriesUseIndexes(t *testing.T) {
+	s := openTestStore(t)
+	queries := []string{
+		`EXPLAIN QUERY PLAN SELECT ` + subjectColumns + ` FROM reported_subjects WHERE (last_report_at, profile_id) > (0, '') ORDER BY last_report_at, profile_id LIMIT 50`,
+		`EXPLAIN QUERY PLAN SELECT observation_id, event_id, view_role, profile_id, reported_at, received_at, attributes_json FROM reported_observations WHERE profile_id = 'prof-x' AND (reported_at, observation_id) > (0, 0) ORDER BY reported_at, observation_id LIMIT 50`,
+		`EXPLAIN QUERY PLAN SELECT observation_id, event_id, view_role, profile_id, reported_at, received_at, attributes_json FROM reported_observations WHERE profile_id = 'prof-x' ORDER BY received_at DESC, observation_id DESC LIMIT 1`,
+		`EXPLAIN QUERY PLAN SELECT proto, port, reported_state, reported_service FROM reported_ports WHERE observation_id = 1 ORDER BY port, proto LIMIT 501`,
+	}
+	for _, q := range queries {
+		rows, err := s.db.Query(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var id, parent, notused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+				rows.Close()
+				t.Fatal(err)
+			}
+			for _, table := range []string{"group_subjects", "briefing_subjects", "reported_observations", "reported_ports", "reported_subjects"} {
+				if strings.Contains(detail, "SCAN "+table) {
+					rows.Close()
+					t.Fatalf("serving query scans %s: %s\n%s", table, detail, q)
+				}
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

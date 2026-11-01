@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"time"
 )
 
@@ -68,12 +69,20 @@ const failedEventFloor = 7 * 24 * time.Hour
 type PurgeSettings struct {
 	BriefingRetention time.Duration
 	SubjectRetention  time.Duration
+	// ActiveSource names the configured SOURCE_ID. A quiet-but-live
+	// registration is never retired by inactivity alone (Designv9 §4.6);
+	// when empty, source cleanup keeps its legacy behavior for tests.
+	ActiveSource string
 }
 
 // PurgeReport counts committed deletions per table for Step 20 health.
 // Relation, observation, queue and progress rows are counted in their
 // own statements; cascades are kept empty by childless gating, never
-// relied on for accounting.
+// relied on for accounting. Bookkeeping counts the purge_state
+// upserts that share the transaction's row budget: a 200-row delete
+// commits at least 201 affected rows. total (and therefore the drain
+// progress check) counts deletions only, so an idle pass with no
+// deletions terminates even though no bookkeeping row is written.
 type PurgeReport struct {
 	BriefingLinks int64
 	Briefings     int64
@@ -86,6 +95,7 @@ type PurgeReport struct {
 	Subjects      int64
 	Sources       int64
 	Pseudonyms    int64
+	Bookkeeping   int64 // purge_state upserts sharing the row budget
 }
 
 func (r *PurgeReport) add(o PurgeReport) {
@@ -100,6 +110,7 @@ func (r *PurgeReport) add(o PurgeReport) {
 	r.Subjects += o.Subjects
 	r.Sources += o.Sources
 	r.Pseudonyms += o.Pseudonyms
+	r.Bookkeeping += o.Bookkeeping
 }
 
 func (r PurgeReport) total() int64 {
@@ -129,19 +140,27 @@ type purgePlan struct {
 	subjectCut  int64
 	sourceCut   int64
 	tokenCut    int64
+	// activeSource names the configured SOURCE_ID. A quiet-but-live
+	// registration is never retired by inactivity alone (Designv9 §4.6).
+	activeSource string
 }
 
 // eligibleEvents selects raw events old enough to purge: not pending
-// projection, and not evidence for a retained briefing. Failed groups
-// use the longer debug floor. Oldest first with a small batch cap so
-// the IN lists stay bounded; per-statement LIMITs enforce the row
-// budget regardless of per-event fan-out.
+// projection, not evidence for a retained briefing, and not evidence
+// for a group that has not reached a terminal state (Designv9 §4.6).
+// Open and closed-unbriefed groups pin their aged observations, ports
+// and projection markers until the group closes and briefs or fails;
+// processing groups likewise keep their full context across restarts.
+// Failed groups use the longer debug floor. Oldest first with a small
+// batch cap so the IN lists stay bounded; per-statement LIMITs enforce
+// the row budget regardless of per-event fan-out.
 const eligibleEvents = `event_id IN (SELECT DISTINCT re.event_id FROM raw_events re
 	LEFT JOIN group_events ge0 ON ge0.event_id = re.event_id
 	LEFT JOIN active_groups ag0 ON ag0.group_id = ge0.group_id
 	WHERE re.received_at < CASE WHEN ag0.status = 'failed' THEN MIN(?, ?) ELSE ? END
 	AND NOT EXISTS (SELECT 1 FROM projection_pending p WHERE p.event_id = re.event_id)
 	AND NOT EXISTS (SELECT 1 FROM group_events ge JOIN briefings b ON b.group_id = ge.group_id WHERE ge.event_id = re.event_id)
+	AND COALESCE(ag0.status, 'done') NOT IN ('open', 'closed', 'processing')
 	ORDER BY re.received_at, re.rowid LIMIT 64)`
 
 // purgeBatch deletes at most maxPurgeRowsPerTxn rows in one transaction,
@@ -160,7 +179,16 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 			if err != nil {
 				return err
 			}
+			if n == 0 {
+				return nil
+			}
 			remaining -= n
+			// The purge_state upsert is a real write in the same
+			// transaction, so it shares the row budget: a 200-row
+			// delete commits at least 201 affected rows, and the
+			// report charges it instead of hiding it.
+			remaining--
+			report.Bookkeeping++
 			if err := recordPurgeState(tx, table, nanos(now), cutoff, n); err != nil {
 				return err
 			}
@@ -252,11 +280,18 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				AND NOT EXISTS (SELECT 1 FROM briefing_subjects WHERE briefing_subjects.profile_id = reported_subjects.profile_id) ORDER BY last_report_at, rowid LIMIT ?)`, plan.subjectCut, remaining); err != nil {
 				return err
 			}
-			if err := take("report_sources", plan.sourceCut, `DELETE FROM report_sources WHERE rowid IN (SELECT rowid FROM report_sources WHERE last_report_at IS NOT NULL AND last_report_at < ?
-				AND NOT EXISTS (SELECT 1 FROM reported_subjects WHERE reported_subjects.source_scope = report_sources.source_scope) ORDER BY last_report_at, rowid LIMIT ?)`, plan.sourceCut, remaining); err != nil {
+			sourceScope := "last_report_at IS NOT NULL AND last_report_at < ?\n\t\t\t\tAND NOT EXISTS (SELECT 1 FROM reported_subjects WHERE reported_subjects.source_scope = report_sources.source_scope)"
+			sourceArgs := []any{plan.sourceCut}
+			if plan.activeSource != "" {
+				sourceScope += " AND source_scope <> ?"
+				sourceArgs = append(sourceArgs, plan.activeSource)
+			}
+			sourceArgs = append(sourceArgs, remaining)
+			if err := take("report_sources", plan.sourceCut, `DELETE FROM report_sources WHERE rowid IN (SELECT rowid FROM report_sources WHERE `+sourceScope+` ORDER BY last_report_at, rowid LIMIT ?)`, sourceArgs...); err != nil {
 				return err
 			}
-			if err := take("pseudonym_map", plan.tokenCut, `DELETE FROM pseudonym_map WHERE rowid IN (SELECT rowid FROM pseudonym_map WHERE last_used_at < ? ORDER BY last_used_at, rowid LIMIT ?)`, plan.tokenCut, remaining); err != nil {
+			if err := take("pseudonym_map", plan.tokenCut, `DELETE FROM pseudonym_map WHERE rowid IN (SELECT rowid FROM pseudonym_map WHERE last_used_at < ?
+				AND NOT EXISTS (SELECT 1 FROM purge_protected_tokens WHERE purge_protected_tokens.token = pseudonym_map.token) ORDER BY last_used_at, rowid LIMIT ?)`, plan.tokenCut, remaining); err != nil {
 				return err
 			}
 		}
@@ -283,9 +318,84 @@ func deleteBounded(tx *sql.Tx, stmt string, args ...any) (int64, error) {
 	return n, nil
 }
 
+// protectedTokenRe matches issued tokens (IP_1, MAC_2, HOST_3, NET_4)
+// named inside retained briefing text. priority_reason and
+// model_raw_json are stored tokenized, so they must be scanned too:
+// deleting a token they name would corrupt the retained rendering.
+var protectedTokenRe = regexp.MustCompile(`\b(?:IP|MAC|HOST|NET)_[0-9]+\b`)
+
+// maxProtectedRefsPerBriefing caps candidate references scanned from
+// one briefing. Only distinct tokens insert, so the worst-case scratch
+// refill per briefing is this many rows.
+const maxProtectedRefsPerBriefing = 256
+
+// refillProtectedTokens rebuilds the per-run protected-token scratch
+// set from every retained briefing (created_at >= briefingCut). A
+// stale scratch row only over-protects, so the rebuild runs once per
+// PurgeOnce outside the batch budget; per-batch exclusion then keeps
+// referenced tokens alive while expiry deletes the rest.
+func (s *Store) refillProtectedTokens(ctx context.Context, briefingCut int64) error {
+	type briefingText struct {
+		rawJSON string
+		reason  string
+	}
+	// Plain read outside the writer: the scan only collects text for
+	// the scratch rebuild below and must not hold the write queue.
+	rows, err := s.db.QueryContext(ctx, `SELECT model_raw_json, priority_reason FROM briefings WHERE created_at >= ?`, briefingCut)
+	if err != nil {
+		return err
+	}
+	var texts []briefingText
+	for rows.Next() {
+		var t briefingText
+		if err := rows.Scan(&t.rawJSON, &t.reason); err != nil {
+			rows.Close()
+			return err
+		}
+		texts = append(texts, t)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	return s.write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DELETE FROM purge_protected_tokens`); err != nil {
+			return err
+		}
+		seen := map[string]bool{}
+		insert := func(s string) error {
+			matches := protectedTokenRe.FindAllString(s, maxProtectedRefsPerBriefing+1)
+			if len(matches) > maxProtectedRefsPerBriefing {
+				matches = matches[:maxProtectedRefsPerBriefing]
+			}
+			for _, m := range matches {
+				if seen[m] {
+					continue
+				}
+				seen[m] = true
+				if _, err := tx.Exec(`INSERT OR IGNORE INTO purge_protected_tokens (token) VALUES (?)`, m); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		for _, t := range texts {
+			if err := insert(t.rawJSON); err != nil {
+				return err
+			}
+			if err := insert(t.reason); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // recordPurgeState persists per-table progress in the same transaction
-// as the deletions it describes, so a restart resumes from recorded
-// cutoffs instead of re-scanning retained history.
+// as the deletions it describes. The rows carry cumulative totals for
+// Step 20 health, not resume checkpoints: each batch reselects its own
+// remaining work, so a restart deletes whatever is still eligible.
 func recordPurgeState(tx *sql.Tx, table string, now, cutoff, added int64) error {
 	_, err := tx.Exec(`INSERT INTO purge_state (table_name, last_run_at, last_cutoff, rows_deleted_total)
 		VALUES (?, ?, ?, ?) ON CONFLICT(table_name) DO UPDATE SET
@@ -297,36 +407,134 @@ func recordPurgeState(tx *sql.Tx, table string, now, cutoff, added int64) error 
 
 // PurgeOnce drains all eligible retention work in bounded transactions,
 // yielding while writer pressure passes half the queue cap so retention
-// never starves ingest. It returns the summed per-table counts.
+// never starves ingest. It returns the summed per-table counts and
+// records a run row: completed when the drain finishes, interrupted
+// when ctx ends mid-run, failed when a batch errors. Partial batches
+// commit before the failure, so a later run safely deletes the rest;
+// only cumulative counts transfer, and the stored cutoff must not be
+// read as a resume position.
 func (s *Store) PurgeOnce(ctx context.Context, settings PurgeSettings, now time.Time) (PurgeReport, error) {
 	rawCut := nanos(now.Add(-settings.BriefingRetention))
 	plan := purgePlan{
-		stages:      stageAll,
-		briefingCut: rawCut,
-		rawCut:      rawCut,
-		failedCut:   min(rawCut, nanos(now.Add(-failedEventFloor))),
-		subjectCut:  nanos(now.Add(-settings.SubjectRetention)),
-		sourceCut:   nanos(now.Add(-heartbeatRetention)),
-		tokenCut:    rawCut,
+		stages:       stageAll,
+		briefingCut:  rawCut,
+		rawCut:       rawCut,
+		failedCut:    min(rawCut, nanos(now.Add(-failedEventFloor))),
+		subjectCut:   nanos(now.Add(-settings.SubjectRetention)),
+		sourceCut:    nanos(now.Add(-heartbeatRetention)),
+		tokenCut:     rawCut,
+		activeSource: settings.ActiveSource,
+	}
+	if err := s.refillProtectedTokens(ctx, plan.briefingCut); err != nil {
+		return PurgeReport{}, err
+	}
+	return s.drainPlan(ctx, now, plan)
+}
+
+// drainPlan runs purgeBatch until no eligible row remains. Every run is
+// recorded in purge_runs with its status, duration and per-table
+// counts, so Step 20 health can tell a completed run from one that
+// committed batches and then failed or was interrupted.
+func (s *Store) drainPlan(ctx context.Context, now time.Time, plan purgePlan) (PurgeReport, error) {
+	runID, err := s.beginPurgeRun(ctx, nanos(now))
+	if err != nil {
+		return PurgeReport{}, err
 	}
 	var total PurgeReport
+	finish := func(status, errText string, runErr error) (PurgeReport, error) {
+		if ferr := s.finishPurgeRun(ctx, runID, status, errText, total); ferr != nil && runErr == nil {
+			return total, ferr
+		}
+		return total, runErr
+	}
 	for {
 		if err := ctx.Err(); err != nil {
-			return total, err
+			return finish("interrupted", SanitizeErrorText(err.Error()), err)
 		}
 		s.yieldOnPressure(ctx)
 		if err := ctx.Err(); err != nil {
-			return total, err
+			return finish("interrupted", SanitizeErrorText(err.Error()), err)
 		}
 		report, progress, err := s.purgeBatch(ctx, now, plan)
 		if err != nil {
-			return total, err
+			return finish("failed", SanitizeErrorText(err.Error()), err)
 		}
 		total.add(report)
 		if !progress {
-			return total, nil
+			return finish("completed", "", nil)
 		}
 	}
+}
+
+// beginPurgeRun inserts a running ledger row and prunes history beyond
+// the newest 30 runs. A crash between begin and finish leaves a
+// running row whose started_at still bounds the outage window.
+func (s *Store) beginPurgeRun(ctx context.Context, startedAt int64) (int64, error) {
+	var runID int64
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		res, err := tx.Exec(`INSERT INTO purge_runs (started_at) VALUES (?)`, startedAt)
+		if err != nil {
+			return err
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		runID = id
+		_, err = tx.Exec(`DELETE FROM purge_runs WHERE run_id NOT IN (SELECT run_id FROM purge_runs ORDER BY run_id DESC LIMIT 30)`)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return runID, nil
+}
+
+// finishPurgeRun stamps the run row with its terminal status, finish
+// time and cumulative counts.
+func (s *Store) finishPurgeRun(ctx context.Context, runID int64, status, errText string, total PurgeReport) error {
+	return s.write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE purge_runs SET finished_at = ?, status = ?, error = ?,
+			briefing_links_deleted = ?, briefings_deleted = ?, groups_deleted = ?, group_links_deleted = ?,
+			ports_deleted = ?, observations_deleted = ?, progress_deleted = ?, raw_events_deleted = ?,
+			subjects_deleted = ?, sources_deleted = ?, pseudonyms_deleted = ?, bookkeeping_writes = ?
+			WHERE run_id = ?`,
+			nanos(s.now()), status, errText,
+			total.BriefingLinks, total.Briefings, total.Groups, total.GroupLinks,
+			total.Ports, total.Observations, total.Progress, total.RawEvents,
+			total.Subjects, total.Sources, total.Pseudonyms, total.Bookkeeping,
+			runID)
+		return err
+	})
+}
+
+// purgeRun describes one ledger row for Step 20 health.
+type purgeRun struct {
+	runID      int64
+	startedAt  int64
+	finishedAt int64
+	status     string
+	errText    string
+	total      PurgeReport
+}
+
+// LatestPurgeRun returns the newest ledger row, or sql.ErrNoRows when no
+// purge has run yet.
+func (s *Store) LatestPurgeRun(ctx context.Context) (purgeRun, error) {
+	var run purgeRun
+	err := s.db.QueryRowContext(ctx, `SELECT run_id, started_at, finished_at, status, error,
+		briefing_links_deleted, briefings_deleted, groups_deleted, group_links_deleted,
+		ports_deleted, observations_deleted, progress_deleted, raw_events_deleted,
+		subjects_deleted, sources_deleted, pseudonyms_deleted, bookkeeping_writes
+		FROM purge_runs ORDER BY run_id DESC LIMIT 1`).Scan(
+		&run.runID, &run.startedAt, &run.finishedAt, &run.status, &run.errText,
+		&run.total.BriefingLinks, &run.total.Briefings, &run.total.Groups, &run.total.GroupLinks,
+		&run.total.Ports, &run.total.Observations, &run.total.Progress, &run.total.RawEvents,
+		&run.total.Subjects, &run.total.Sources, &run.total.Pseudonyms, &run.total.Bookkeeping)
+	if err != nil {
+		return purgeRun{}, err
+	}
+	return run, nil
 }
 
 // yieldOnPressure sleeps while the writer backlog passes half the queue
@@ -355,20 +563,11 @@ func (s *Store) PurgeBriefings(ctx context.Context, now, cutoff time.Time) (int6
 		return 0, fmt.Errorf("briefing purge cutoff must be at least %s old", briefingPurgeFloor)
 	}
 	plan := purgePlan{stages: stageBriefings, briefingCut: nanos(cutoff)}
-	var affected int64
-	for {
-		if err := ctx.Err(); err != nil {
-			return affected, err
-		}
-		report, progress, err := s.purgeBatch(ctx, now, plan)
-		if err != nil {
-			return affected, err
-		}
-		affected += report.Briefings
-		if !progress {
-			return affected, nil
-		}
+	report, err := s.drainPlan(ctx, now, plan)
+	if err != nil {
+		return report.Briefings, err
 	}
+	return report.Briefings, nil
 }
 
 // PurgeRawEvents deletes raw events received before cutoff, but only those
@@ -392,18 +591,9 @@ func (s *Store) PurgeRawEvents(ctx context.Context, now, cutoff time.Time, minAg
 		rawCut:    nanos(cutoff),
 		failedCut: min(nanos(cutoff), nanos(now.Add(-failedEventFloor))),
 	}
-	var affected int64
-	for {
-		if err := ctx.Err(); err != nil {
-			return affected, err
-		}
-		report, progress, err := s.purgeBatch(ctx, now, plan)
-		if err != nil {
-			return affected, err
-		}
-		affected += report.RawEvents
-		if !progress {
-			return affected, nil
-		}
+	report, err := s.drainPlan(ctx, now, plan)
+	if err != nil {
+		return report.RawEvents, err
 	}
+	return report.RawEvents, nil
 }

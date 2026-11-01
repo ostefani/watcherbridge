@@ -184,11 +184,22 @@ func (s *Store) LatestSubjectObservation(ctx context.Context, profileID string) 
 	return obs, true, nil
 }
 
+// maxHistoryPageBytes caps one history page's cumulative snapshot
+// bytes. Fifty bounded snapshots stay small in practice, but aliases
+// and liveness collections are attacker-influenced; the page stops at
+// the last item that fits and continues from there instead of
+// materializing an unbounded response (Designv9 §4.6 heap budget).
+const maxHistoryPageBytes = 1 << 20
+
 // SubjectHistoryPage pages one subject's retained observations oldest-first
 // by the (reported_at, observation_id) tuple. Items carry the bounded
 // attributes snapshot, which already reports port truncation; per-item
 // port lists stay in the latest-evidence section so a 50-item page stays
-// small. limit clamps to the history ceiling.
+// small. The snapshot's ports_total/ports_truncated populate the item
+// summary fields, so history never reports zero ports alongside a
+// snapshot that captured hundreds. limit clamps to the history ceiling;
+// the cumulative byte budget can end the page early with continuation
+// at the last included item.
 func (s *Store) SubjectHistoryPage(ctx context.Context, profileID string, afterReportedAt int64, afterObservationID int64, limit int) ([]SubjectObservation, string, error) {
 	if afterReportedAt < 0 || afterObservationID < 0 {
 		return nil, "", fmt.Errorf("negative history cursor")
@@ -207,19 +218,35 @@ func (s *Store) SubjectHistoryPage(ctx context.Context, profileID string, afterR
 	}
 	defer rows.Close()
 	var out []SubjectObservation
+	var pageBytes int64
+	cutShort := false
 	for rows.Next() {
 		var obs SubjectObservation
+		var attrsRaw string
 		if err := rows.Scan(&obs.ObservationID, &obs.EventID, &obs.ViewRole, &obs.ProfileID,
-			(*nanosTime)(&obs.ReportedAt), (*nanosTime)(&obs.ReceivedAt), (*jsonText)(&obs.Attributes)); err != nil {
+			(*nanosTime)(&obs.ReportedAt), (*nanosTime)(&obs.ReceivedAt), &attrsRaw); err != nil {
 			return nil, "", err
 		}
+		if pageBytes+int64(len(attrsRaw)) > maxHistoryPageBytes && len(out) > 0 {
+			cutShort = true
+			break
+		}
+		pageBytes += int64(len(attrsRaw))
+		attrs := map[string]any{}
+		if err := json.Unmarshal([]byte(attrsRaw), &attrs); err != nil {
+			return nil, "", err
+		}
+		obs.Attributes = attrs
+		obs.PortsTotal, obs.PortsTruncated = snapshotPorts(attrs, 0, false)
 		out = append(out, obs)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, "", err
 	}
 	nextAfter := ""
-	if len(out) == limit {
+	// A byte-budget cut still has retained rows behind it, so it
+	// continues at the last included item exactly like a full page.
+	if len(out) == limit || (cutShort && len(out) > 0) {
 		last := out[len(out)-1]
 		nextAfter = encodeTupleCursor(nanos(last.ReportedAt), fmt.Sprintf("%d", last.ObservationID))
 	}

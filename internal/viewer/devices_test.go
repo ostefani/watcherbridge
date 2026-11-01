@@ -95,6 +95,7 @@ func TestDevicesRejects(t *testing.T) {
 		"/api/devices?after=nope",
 		"/api/devices?after=-5:x",
 		"/api/devices?after=5",
+		"/api/devices?after=5:not-a-profile",
 	} {
 		if rec := serveMux(mux, "GET", target, "127.0.0.1:8081", nil, ""); rec.Code != http.StatusBadRequest {
 			t.Fatalf("%s = %d, want 400", target, rec.Code)

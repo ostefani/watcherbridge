@@ -116,7 +116,7 @@ func main() {
 		log.Fatalf("server: %v", err)
 	}
 	srv.SweepOnce(ctx)
-	purgeSettings := store.PurgeSettings{BriefingRetention: cfg.BriefingRetention, SubjectRetention: cfg.SubjectRetention}
+	purgeSettings := store.PurgeSettings{BriefingRetention: cfg.BriefingRetention, SubjectRetention: cfg.SubjectRetention, ActiveSource: cfg.SourceID}
 	if rep, err := st.PurgeOnce(ctx, purgeSettings, time.Now()); err != nil {
 		log.Fatalf("startup purge: %v", err)
 	} else {

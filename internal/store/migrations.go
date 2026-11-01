@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 13
+const supportedSchemaVersion = 14
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -134,6 +134,8 @@ func migrate(db *sql.DB) error {
 			})
 		case 12:
 			err = applyMigration(db, 13, migrateV13)
+		case 13:
+			err = applyMigration(db, 14, migrateV14)
 		}
 		if err != nil {
 			return err
@@ -165,8 +167,9 @@ func migrateV12(tx *sql.Tx, phase5 bool) error {
 
 // migrateV13 adds purge-run state, purge-serving indexes, and token
 // usage tracking (Designv9 §4.6). purge_state persists per-table purge
-// progress so Step 20 health can report it and a restart resumes from
-// the recorded cutoff. pseudonym_map gains last_used_at: creation age
+// totals so Step 20 health can report them; each batch reselects its
+// own remaining work, so a restart deletes whatever is still eligible.
+// pseudonym_map gains last_used_at: creation age
 // alone cannot prove a token is still referenced, so assignment and
 // every later lookup bump it, and expiry compares against it. Rows
 // predating tracking get the migration instant as their last known use:
@@ -184,6 +187,50 @@ func migrateV13(tx *sql.Tx) error {
 		`UPDATE pseudonym_map SET last_used_at = CAST(strftime('%s','now') AS INTEGER) * 1000000000`,
 		`CREATE INDEX IF NOT EXISTS reported_observations_received ON reported_observations(received_at)`,
 		`CREATE INDEX IF NOT EXISTS reported_subjects_last_report ON reported_subjects(last_report_at)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV14 adds the purge run ledger, the protected-token scratch
+// table, and profile-leading association indexes (Designv9 §§3.3, 4.6).
+// purge_runs records per-run status, duration and per-table counts so
+// Step 20 health can distinguish a completed run from one that
+// committed batches and then failed; only the latest 30 rows are kept.
+// purge_protected_tokens is a per-run scratch set of tokens named by
+// retained briefings, rebuilt at each purge start (stale rows only ever
+// over-protect). The association indexes serve the read API's
+// per-subject counts without scanning the relation tables.
+func migrateV14(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE purge_runs (
+			run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			started_at INTEGER NOT NULL,
+			finished_at INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','completed','failed','interrupted')),
+			error TEXT NOT NULL DEFAULT '',
+			briefing_links_deleted INTEGER NOT NULL DEFAULT 0,
+			briefings_deleted INTEGER NOT NULL DEFAULT 0,
+			groups_deleted INTEGER NOT NULL DEFAULT 0,
+			group_links_deleted INTEGER NOT NULL DEFAULT 0,
+			ports_deleted INTEGER NOT NULL DEFAULT 0,
+			observations_deleted INTEGER NOT NULL DEFAULT 0,
+			progress_deleted INTEGER NOT NULL DEFAULT 0,
+			raw_events_deleted INTEGER NOT NULL DEFAULT 0,
+			subjects_deleted INTEGER NOT NULL DEFAULT 0,
+			sources_deleted INTEGER NOT NULL DEFAULT 0,
+			pseudonyms_deleted INTEGER NOT NULL DEFAULT 0,
+			bookkeeping_writes INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE purge_protected_tokens (
+			token TEXT PRIMARY KEY
+		)`,
+		`CREATE INDEX IF NOT EXISTS group_subjects_profile ON group_subjects(profile_id)`,
+		`CREATE INDEX IF NOT EXISTS briefing_subjects_profile ON briefing_subjects(profile_id)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt); err != nil {

@@ -31,6 +31,8 @@ func dropProjectionSchema(t *testing.T, db *sql.DB) {
 		`DROP TABLE IF EXISTS reported_subjects`,
 		`DROP TABLE IF EXISTS report_sources`,
 		`DROP TABLE IF EXISTS legacy_profile_state`,
+		`DROP TABLE IF EXISTS purge_runs`,
+		`DROP TABLE IF EXISTS purge_protected_tokens`,
 		`DROP TABLE IF EXISTS purge_state`,
 		`ALTER TABLE raw_events DROP COLUMN source_scope`,
 	} {
@@ -47,13 +49,19 @@ func dropGroupingProvenance(t *testing.T, db *sql.DB) {
 			t.Fatal(err)
 		}
 	}
-	// Rewinding past v12 must also drop the v13 purge table, or the
-	// replayed v13 migration meets its own table. The v13 indexes are
-	// idempotent (CREATE INDEX IF NOT EXISTS) and stay, and the token
-	// column rewinds through dropColumnIfExists: intermediate versions
-	// predate it.
-	if _, err := db.Exec(`DROP TABLE IF EXISTS purge_state`); err != nil {
-		t.Fatal(err)
+	// Rewinding past v12 must also drop the v13/v14 purge tables, or
+	// the replayed migrations meet their own tables. The v13/v14
+	// indexes are idempotent (CREATE INDEX IF NOT EXISTS) and stay,
+	// and the token column rewinds through dropColumnIfExists:
+	// intermediate versions predate it.
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS purge_runs`,
+		`DROP TABLE IF EXISTS purge_protected_tokens`,
+		`DROP TABLE IF EXISTS purge_state`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
 	}
 	dropColumnIfExists(t, db, "pseudonym_map", "last_used_at")
 }

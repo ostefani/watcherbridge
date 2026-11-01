@@ -121,20 +121,22 @@ func (s *Store) GetOrAssignPseudonyms(ctx context.Context, category string, real
 	if err != nil {
 		return nil, err
 	}
-	result := make(map[string]string, len(realValues))
 	type pending struct{ normalized, original string }
 	var missing []pending // input order: token numbering is deterministic
 	seenMissing := map[string]bool{}
 	for _, v := range realValues {
 		n := normalizePseudonymValue(category, v)
-		if token, ok := found[n]; ok {
-			result[v] = token
-		} else if !seenMissing[n] {
+		if _, ok := found[n]; !ok && !seenMissing[n] {
 			seenMissing[n] = true
 			missing = append(missing, pending{n, originalOf[n]})
 		}
 	}
-	assigned := map[string]string{}
+	// final holds tokens re-read inside the write transaction. The
+	// pre-read above is a fast-path hint only: retention can delete a
+	// hit between that read and the commit, so the returned mapping
+	// always comes from this in-transaction validation, never from the
+	// pre-read (Designv9 §4.6: touch-then-recheck).
+	final := map[string]string{}
 	err = s.write(ctx, func(tx *sql.Tx) error {
 		// One timestamp for the whole transaction: the touch and the
 		// assignment agree exactly, regardless of queue delay.
@@ -173,7 +175,6 @@ func (s *Store) GetOrAssignPseudonyms(ctx context.Context, category string, real
 			var token string
 			err := tx.QueryRow(`SELECT token FROM pseudonym_map WHERE category = ? AND real_value = ?`, category, normalized).Scan(&token)
 			if err == nil {
-				assigned[normalized] = token
 				continue
 			}
 			if err != sql.ErrNoRows {
@@ -191,17 +192,55 @@ func (s *Store) GetOrAssignPseudonyms(ctx context.Context, category string, real
 			if _, err := tx.Exec(`INSERT INTO pseudonym_map (category, real_value, display_value, token, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?)`, category, normalized, original, token, now, now); err != nil {
 				return err
 			}
-			assigned[normalized] = token
+		}
+		// Revalidate every requested mapping inside the transaction:
+		// a purge that raced the pre-read touch leaves the update
+		// rowless, and the re-read below then finds no row instead of
+		// returning a deleted token.
+		uniq := touch
+		for start := 0; start < len(uniq); start += pseudonymLookupBatch {
+			end := start + pseudonymLookupBatch
+			if end > len(uniq) {
+				end = len(uniq)
+			}
+			placeholders := strings.Repeat("?,", len(uniq[start:end]))
+			args := make([]any, 0, len(uniq[start:end])+1)
+			args = append(args, category)
+			for _, n := range uniq[start:end] {
+				args = append(args, n)
+			}
+			rows, err := tx.Query(`SELECT real_value, token FROM pseudonym_map WHERE category = ? AND real_value IN (`+
+				placeholders[:len(placeholders)-1]+`)`, args...)
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var realValue, token string
+				if err := rows.Scan(&realValue, &token); err != nil {
+					rows.Close()
+					return err
+				}
+				final[realValue] = token
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return err
+			}
+			rows.Close()
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	result := make(map[string]string, len(realValues))
 	for _, v := range realValues {
-		if _, ok := result[v]; !ok {
-			result[v] = assigned[normalizePseudonymValue(category, v)]
+		n := normalizePseudonymValue(category, v)
+		token, ok := final[n]
+		if !ok {
+			return nil, fmt.Errorf("pseudonym for %q vanished during assignment; retry", n)
 		}
+		result[v] = token
 	}
 	return result, nil
 }
