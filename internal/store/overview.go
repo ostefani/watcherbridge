@@ -46,26 +46,40 @@ func (s *Store) LastReceipt(ctx context.Context) (time.Time, bool, error) {
 	return fromNanos(received.Int64), true, nil
 }
 
-// LastPurgeRun reads the newest purge_runs row. HaveRun is false when no
-// purge has ever completed a ledger entry.
-func (s *Store) LastPurgeRun(ctx context.Context) (PurgeRunHealth, error) {
-	var h PurgeRunHealth
+// purgeRunColumns pairs purge_runs deletion columns with their table
+// names for the health breakdown.
+var purgeRunColumns = []struct {
+	column string
+	table  string
+}{
+	{"briefing_links_deleted", "briefing_subjects"},
+	{"briefings_deleted", "briefings"},
+	{"groups_deleted", "active_groups"},
+	{"group_links_deleted", "group_subjects"},
+	{"ports_deleted", "reported_ports"},
+	{"observations_deleted", "reported_observations"},
+	{"progress_deleted", "projection_progress"},
+	{"raw_events_deleted", "raw_events"},
+	{"subjects_deleted", "reported_subjects"},
+	{"sources_deleted", "report_sources"},
+	{"pseudonyms_deleted", "pseudonym_map"},
+}
+
+// scanPurgeRun reads one purge_runs row; ok is false on no match.
+func scanPurgeRun(row *sql.Row) (h PurgeRunHealth, ok bool, err error) {
 	var started, finished int64
 	var status, errText string
-	var links, briefings, groups, groupLinks, ports, obs, progress, raw, subjects, sources, pseudonyms int64
-	err := s.db.QueryRowContext(ctx, `SELECT started_at, finished_at, status, error,
-		briefing_links_deleted, briefings_deleted, groups_deleted, group_links_deleted,
-		ports_deleted, observations_deleted, progress_deleted, raw_events_deleted,
-		subjects_deleted, sources_deleted, pseudonyms_deleted
-		FROM purge_runs ORDER BY run_id DESC LIMIT 1`).Scan(
-		&started, &finished, &status, &errText,
-		&links, &briefings, &groups, &groupLinks, &ports, &obs, &progress,
-		&raw, &subjects, &sources, &pseudonyms)
-	if err == sql.ErrNoRows {
-		return PurgeRunHealth{}, nil
+	counts := make([]int64, len(purgeRunColumns))
+	dest := make([]any, 0, 4+len(counts))
+	dest = append(dest, &started, &finished, &status, &errText)
+	for i := range counts {
+		dest = append(dest, &counts[i])
 	}
-	if err != nil {
-		return PurgeRunHealth{}, err
+	if err := row.Scan(dest...); err != nil {
+		if err == sql.ErrNoRows {
+			return PurgeRunHealth{}, false, nil
+		}
+		return PurgeRunHealth{}, false, err
 	}
 	h.HaveRun = true
 	h.StartedAt = fromNanos(started)
@@ -73,9 +87,37 @@ func (s *Store) LastPurgeRun(ctx context.Context) (PurgeRunHealth, error) {
 	if finished > 0 {
 		h.FinishedAt = fromNanos(finished)
 	}
-	h.RowsDeleted = links + briefings + groups + groupLinks + ports + obs +
-		progress + raw + subjects + sources + pseudonyms
-	return h, nil
+	h.ByTable = map[string]int64{}
+	for i, c := range purgeRunColumns {
+		if counts[i] != 0 {
+			h.ByTable[c.table] = counts[i]
+		}
+		h.RowsDeleted += counts[i]
+	}
+	return h, true, nil
+}
+
+func purgeRunSelect(where string) string {
+	cols := "started_at, finished_at, status, error"
+	for _, c := range purgeRunColumns {
+		cols += ", " + c.column
+	}
+	return `SELECT ` + cols + ` FROM purge_runs ` + where
+}
+
+// LastPurgeRun reads the newest purge_runs row. HaveRun is false when no
+// purge has ever written a ledger entry.
+func (s *Store) LastPurgeRun(ctx context.Context) (PurgeRunHealth, error) {
+	h, _, err := scanPurgeRun(s.db.QueryRowContext(ctx, purgeRunSelect(`ORDER BY run_id DESC LIMIT 1`)))
+	return h, err
+}
+
+// LastSuccessfulPurgeRun reads the newest completed purge_runs row: the
+// last known-good state, which survives newer failed or running rows.
+// HaveRun is false when no run has completed yet.
+func (s *Store) LastSuccessfulPurgeRun(ctx context.Context) (PurgeRunHealth, error) {
+	h, _, err := scanPurgeRun(s.db.QueryRowContext(ctx, purgeRunSelect(`WHERE status = 'completed' ORDER BY run_id DESC LIMIT 1`)))
+	return h, err
 }
 
 // Overview read models for Step 20 (Designv9 §3.3). All queries are
@@ -96,9 +138,10 @@ type SourceHealth struct {
 	DeliveryStatus   string
 }
 
-// PurgeRunHealth is the latest purge_runs row: status, duration, and
-// per-table counts, so health distinguishes a completed run from one
-// that committed batches and then failed.
+// PurgeRunHealth is one purge_runs row: status, duration, and per-table
+// counts, so health distinguishes a completed run from one that
+// committed batches and then failed. ByTable carries the per-table
+// breakdown; RowsDeleted is its sum.
 type PurgeRunHealth struct {
 	HaveRun     bool
 	StartedAt   time.Time
@@ -106,6 +149,67 @@ type PurgeRunHealth struct {
 	Status      string
 	Error       string
 	RowsDeleted int64
+	ByTable     map[string]int64
+}
+
+// AttentionCandidate is the narrow overview projection: only the four
+// columns the verdict ordering needs. Restored text, model audit JSON,
+// and event IDs never leave the database on this path.
+type AttentionCandidate struct {
+	BriefingID string
+	Priority   string
+	CreatedAt  time.Time
+	Kind       string
+}
+
+// AttentionCandidates returns up to limit briefings created at or after
+// since, in display order: priority rank descending, newest first,
+// stable ID tiebreaker. Verdict and headline counts come from the
+// full-window PriorityCounts instead, so rows past the cap still vote.
+func (s *Store) AttentionCandidates(ctx context.Context, since time.Time, limit int) ([]AttentionCandidate, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT briefing_id, priority, created_at, kind FROM briefings
+		WHERE created_at >= ?
+		ORDER BY CASE priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END DESC,
+			created_at DESC, briefing_id ASC
+		LIMIT ?`, nanos(since), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AttentionCandidate
+	for rows.Next() {
+		var c AttentionCandidate
+		var created int64
+		if err := rows.Scan(&c.BriefingID, &c.Priority, &created, &c.Kind); err != nil {
+			return nil, err
+		}
+		c.CreatedAt = fromNanos(created)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// PriorityCounts counts briefings by priority at or after since, across
+// the entire window. The verdict and headline derive from these counts,
+// never from the capped candidate list, so a high-priority briefing is
+// never outvoted by newer low-priority rows past the cap.
+func (s *Store) PriorityCounts(ctx context.Context, since time.Time) (map[string]int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT priority, COUNT(*) FROM briefings
+		WHERE created_at >= ? GROUP BY priority`, nanos(since))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var priority string
+		var n int
+		if err := rows.Scan(&priority, &n); err != nil {
+			return nil, err
+		}
+		out[priority] = n
+	}
+	return out, rows.Err()
 }
 
 // OverviewInputs bundles the retained-row evidence behind one health
@@ -124,27 +228,6 @@ type OverviewInputs struct {
 	LastPurge     PurgeRunHealth
 	LastChange    time.Time
 	HasLastChange bool
-}
-
-// RecentBriefings returns up to limit briefings created at or after
-// since, newest first. The caller caps the attention candidate set;
-// ordering and the visible-7 cut happen in the pure computation.
-func (s *Store) RecentBriefings(ctx context.Context, since time.Time, limit int) ([]Briefing, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+briefingColumns+` FROM briefings
-		WHERE created_at >= ? ORDER BY created_at DESC, briefing_id ASC LIMIT ?`, nanos(since), limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Briefing
-	for rows.Next() {
-		var b Briefing
-		if err := scanBriefing(rows, &b); err != nil {
-			return nil, err
-		}
-		out = append(out, b)
-	}
-	return out, rows.Err()
 }
 
 // BriefingDigest counts briefings by kind at or after since. The

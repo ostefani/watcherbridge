@@ -18,12 +18,19 @@ import (
 	"github.com/ostefani/watcherbridge/internal/overview"
 )
 
-// statusResult is the minimal overview shape the CLI needs: verdict for
-// the exit code, headline and coverage for humans, raw body for --json.
+// statusResult is the overview shape the CLI needs: verdict for the exit
+// code, and headline plus coverage, liveness, receipts, window, and
+// last reported change for humans, so a quiet result always carries its
+// context and never reads as a presence claim. --json prints the raw
+// body instead.
 type statusResult struct {
-	Verdict  string `json:"verdict"`
-	Headline string `json:"headline"`
-	Coverage string `json:"coverage"`
+	Verdict    string `json:"verdict"`
+	Headline   string `json:"headline"`
+	Coverage   string `json:"coverage"`
+	Liveness   string `json:"liveness"`
+	Receipts   int    `json:"receipts"`
+	Window     string `json:"window"`
+	LastChange string `json:"last_change"`
 }
 
 // runStatus implements the status subcommand; it returns the exit code.
@@ -78,7 +85,12 @@ func statusExit(httpStatus int, body []byte, jsonOut bool) int {
 	switch res.Verdict {
 	case overview.VerdictQuiet, overview.VerdictReview, overview.VerdictAct:
 		if !jsonOut {
-			fmt.Printf("%s: %s (coverage %s)\n", res.Verdict, res.Headline, res.Coverage)
+			fmt.Printf("%s: %s (coverage %s, liveness %s)\n", res.Verdict, res.Headline, res.Coverage, res.Liveness)
+			fmt.Printf("  receipts %d, window %s", res.Receipts, res.Window)
+			if res.LastChange != "" {
+				fmt.Printf(", last change %s", res.LastChange)
+			}
+			fmt.Println()
 		}
 		return overview.ExitCodeFor(res.Verdict)
 	default:

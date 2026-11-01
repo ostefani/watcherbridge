@@ -54,8 +54,29 @@ type overviewWire struct {
 	Window     string          `json:"window"`
 	LastChange string          `json:"last_change,omitempty"`
 	Coverage   string          `json:"coverage"`
+	Liveness   string          `json:"liveness"`
 	Sources    []sourceWire    `json:"sources"`
 	Reasons    []string        `json:"reasons,omitempty"`
+}
+
+// aggregateLiveness folds per-source liveness into one top-level value:
+// the shared value when sources agree, "mixed" when they differ, and
+// "unknown" with no sources. Until H1 every source reads unknown, so
+// the aggregate honestly reports unknown instead of implying presence.
+func aggregateLiveness(sources []sourceWire) string {
+	seen := map[string]bool{}
+	for _, s := range sources {
+		seen[s.Liveness] = true
+	}
+	switch len(seen) {
+	case 1:
+		for l := range seen {
+			return l
+		}
+	case 0:
+		return overview.LivenessUnknown
+	}
+	return "mixed"
 }
 
 // fallbackWire reports the 1h fallback share from retained rows.
@@ -67,16 +88,32 @@ type fallbackWire struct {
 
 // purgeWire reports per-table totals and the latest run.
 type purgeWire struct {
-	Totals map[string]int64 `json:"totals"`
-	Last   *purgeRunWire    `json:"last,omitempty"`
+	Totals      map[string]int64 `json:"totals"`
+	Last        *purgeRunWire    `json:"last,omitempty"`
+	LastSuccess *purgeRunWire    `json:"last_success,omitempty"`
 }
 
 type purgeRunWire struct {
-	Status     string `json:"status"`
-	StartedAt  string `json:"started_at"`
-	FinishedAt string `json:"finished_at,omitempty"`
-	Rows       int64  `json:"rows_deleted"`
-	Error      string `json:"error,omitempty"`
+	Status     string           `json:"status"`
+	StartedAt  string           `json:"started_at"`
+	FinishedAt string           `json:"finished_at,omitempty"`
+	Rows       int64            `json:"rows_deleted"`
+	Tables     map[string]int64 `json:"tables,omitempty"`
+	Error      string           `json:"error,omitempty"`
+}
+
+func purgeRunWireOf(run store.PurgeRunHealth) *purgeRunWire {
+	lw := &purgeRunWire{
+		Status: run.Status, Rows: run.RowsDeleted, Tables: run.ByTable,
+		StartedAt: run.StartedAt.UTC().Format(time.RFC3339),
+	}
+	if !run.FinishedAt.IsZero() {
+		lw.FinishedAt = run.FinishedAt.UTC().Format(time.RFC3339)
+	}
+	if run.Error != "" {
+		lw.Error = run.Error
+	}
+	return lw
 }
 
 // handleOverview serves the computed overview for the requested window.
@@ -152,6 +189,11 @@ func (v *Viewer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeViewerError(w, "health failed", http.StatusInternalServerError)
 		return
 	}
+	lastSuccess, err := ov.store.LastSuccessfulPurgeRun(ctx)
+	if err != nil {
+		writeViewerError(w, "health failed", http.StatusInternalServerError)
+		return
+	}
 	hw := healthWire{
 		Sources: sources, Coverage: assessed.Status, CoverageReasons: assessed.Reasons,
 		Fallback:     fallbackWire{Used: used, Total: total},
@@ -164,17 +206,10 @@ func (v *Viewer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		hw.Fallback.Ratio = float64(used) / float64(total)
 	}
 	if lastRun.HaveRun {
-		lw := &purgeRunWire{
-			Status: lastRun.Status, Rows: lastRun.RowsDeleted,
-			StartedAt: lastRun.StartedAt.UTC().Format(time.RFC3339),
-		}
-		if !lastRun.FinishedAt.IsZero() {
-			lw.FinishedAt = lastRun.FinishedAt.UTC().Format(time.RFC3339)
-		}
-		if lastRun.Error != "" {
-			lw.Error = lastRun.Error
-		}
-		hw.Purge.Last = lw
+		hw.Purge.Last = purgeRunWireOf(lastRun)
+	}
+	if lastSuccess.HaveRun {
+		hw.Purge.LastSuccess = purgeRunWireOf(lastSuccess)
 	}
 	if p := ov.publisher.Load(); p != nil {
 		hw.Publisher = &publisherWire{Posted: p.Posted(), Dropped: p.Dropped(), Failed: p.Failed()}
@@ -276,15 +311,36 @@ func (r *Refresher) Cached() []byte {
 
 // Run refreshes on triggers and the timer until ctx ends, calling
 // onChange with the fresh body whenever its hash changes. Refreshes
-// coalesce to at most one per second no matter the trigger rate.
+// coalesce to at most one per second no matter the trigger rate — but
+// a throttled trigger is never dropped: it marks the view dirty and a
+// delayed refresh runs when the throttle interval expires, so a
+// briefing inserted during the interval reaches subscribers without
+// waiting for the next periodic tick.
 func (r *Refresher) Run(ctx context.Context, tick time.Duration, onChange func([]byte)) {
 	t := time.NewTicker(tick)
 	defer t.Stop()
+	var delay *time.Timer
+	var delayCh <-chan time.Time
+	var dirty bool
 	last := time.Time{}
 	refresh := func() {
 		if time.Since(last) < time.Second {
+			dirty = true
+			if delay == nil {
+				remaining := time.Until(last.Add(time.Second))
+				if remaining < 0 {
+					remaining = 0
+				}
+				delay = time.NewTimer(remaining)
+				delayCh = delay.C
+			}
 			return
 		}
+		if delay != nil {
+			delay.Stop()
+			delay, delayCh = nil, nil
+		}
+		dirty = false
 		last = time.Now()
 		body, hash, err := r.compute(ctx, r.window)
 		if err != nil {
@@ -305,11 +361,19 @@ func (r *Refresher) Run(ctx context.Context, tick time.Duration, onChange func([
 	for {
 		select {
 		case <-ctx.Done():
+			if delay != nil {
+				delay.Stop()
+			}
 			return
 		case <-t.C:
 			refresh()
 		case <-r.trigger:
 			refresh()
+		case <-delayCh:
+			delay, delayCh = nil, nil
+			if dirty {
+				refresh()
+			}
 		}
 	}
 }
@@ -329,7 +393,13 @@ func (r *Refresher) compute(ctx context.Context, window time.Duration) ([]byte, 
 	}
 	now := r.now().UTC()
 	since := now.Add(-window)
-	recent, err := r.store.RecentBriefings(ctx, since, overview.CandidateCap)
+	// Verdict and headline count across the entire window: the
+	// candidate list below is only the display cut.
+	rankCounts, err := r.store.PriorityCounts(ctx, since)
+	if err != nil {
+		return nil, 0, err
+	}
+	candidates, err := r.store.AttentionCandidates(ctx, since, overview.CandidateCap)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -349,26 +419,30 @@ func (r *Refresher) compute(ctx context.Context, window time.Duration) ([]byte, 
 	if haveReceipt {
 		last = lastReceipt
 	}
-	items := make([]overview.Item, 0, len(recent))
-	for _, b := range recent {
+	items := make([]overview.Item, 0, len(candidates))
+	for _, c := range candidates {
 		items = append(items, overview.Item{
-			ID: b.BriefingID, Priority: b.Priority,
-			CreatedAt: b.CreatedAt, ChangeKind: b.Kind,
+			ID: c.BriefingID, Priority: c.Priority,
+			CreatedAt: c.CreatedAt, ChangeKind: c.Kind,
 		})
-		if b.CreatedAt.After(last) {
-			last = b.CreatedAt
+		if c.CreatedAt.After(last) {
+			last = c.CreatedAt
 		}
 	}
 	// Decisions and incidents are typed but empty until Steps 25-29;
 	// their behavior is exercised through synthetic pure inputs.
+	// Compute orders the display cut; Summarize derives the verdict
+	// from window-wide counts so rows past the cap still vote.
 	computed := overview.Compute(items, nil, digest, receipts, window, last, cov, now)
+	verdict, headline, _ := overview.Summarize(rankCounts, 0)
 	wire := overviewWire{
-		Verdict:   computed.Verdict,
-		Headline:  computed.Headline,
+		Verdict:   verdict,
+		Headline:  headline,
 		Digest:    computed.Digest,
 		Receipts:  computed.Receipts,
 		Window:    window.String(),
 		Coverage:  computed.Coverage.Status,
+		Liveness:  aggregateLiveness(sources),
 		Sources:   sources,
 		Reasons:   computed.Coverage.Reasons,
 		Attention: make([]attentionWire, 0, len(computed.Attention)),

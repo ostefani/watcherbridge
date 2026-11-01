@@ -44,13 +44,22 @@ func seedOpenGroup(t testing.TB, s *store.Store, anchor, eventID string) {
 
 func seedBriefing(t testing.TB, s *store.Store, anchor, eventID string) string {
 	t.Helper()
+	return seedPriorityBriefing(t, s, anchor, eventID, "high", time.Now().UTC())
+}
+
+// seedPriorityBriefing seeds one briefing with an explicit priority and
+// report time, closing and taking its group like production.
+func seedPriorityBriefing(t testing.TB, s *store.Store, anchor, eventID, priority string, at time.Time) string {
+	t.Helper()
 	seedOpenGroup(t, s, anchor, eventID)
 	groups, err := s.OpenGroupSnapshots(context.Background())
 	if err != nil || len(groups) == 0 {
 		t.Fatalf("seed group missing: %v", groups)
 	}
 	gid := groups[len(groups)-1].GroupID
-	// Advance past the quiet window so TakeGroup accepts the group.
+	// Advance past the quiet window so TakeGroup accepts the group. The
+	// horizon is wall-clock based, independent of the briefing's report
+	// time, so backdated seeds close too.
 	if _, err := s.CloseDue(context.Background(), time.Now().UTC().Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
@@ -60,9 +69,9 @@ func seedBriefing(t testing.TB, s *store.Store, anchor, eventID string) string {
 	}
 	if err := s.InsertBriefing(context.Background(), store.Briefing{
 		BriefingID: "brf-" + taken.GroupID, GroupID: taken.GroupID, HostAnchorKey: anchor,
-		Baseline: "medium", Priority: "high", PriorityReason: "r", Clamped: true,
+		Baseline: "medium", Priority: priority, PriorityReason: "r", Clamped: true,
 		FallbackUsed: false, WhatChanged: "w", Context: "c", RecommendedCheck: "k",
-		CreatedAt: time.Now().UTC(),
+		CreatedAt: at,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1077,7 +1086,7 @@ func TestOverviewFrozenKeys(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("overview = %q", rec.Body.String())
 	}
-	for _, key := range []string{"verdict", "headline", "receipts", "coverage", "sources", "attention", "digest", "window"} {
+	for _, key := range []string{"verdict", "headline", "receipts", "coverage", "liveness", "sources", "attention", "digest", "window"} {
 		if _, ok := body[key]; !ok {
 			t.Fatalf("overview missing frozen key %q: %v", key, body)
 		}

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -42,12 +43,29 @@ func TestOverviewReads(t *testing.T) {
 	brief(1, old, "other", "low", true)
 	brief(2, now, "other", "medium", false)
 
-	recent, err := s.RecentBriefings(ctx, now.Add(-time.Hour), 10)
+	counts, err := s.PriorityCounts(ctx, old.Add(-time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(recent) != 1 || recent[0].Kind != "other" || recent[0].Priority != "medium" {
-		t.Fatalf("recent = %+v, want the one in-window briefing", recent)
+	if counts["low"] != 1 || counts["high"] != 1 || counts["medium"] != 1 || len(counts) != 3 {
+		t.Fatalf("priority counts = %v, want full-window counts", counts)
+	}
+	candidates, err := s.AttentionCandidates(ctx, now.Add(-time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].Kind != "other" || candidates[0].Priority != "medium" {
+		t.Fatalf("candidates = %+v, want the one in-window briefing", candidates)
+	}
+	// The narrow projection serves the ordering from the created_at
+	// index, not a table scan.
+	for _, row := range explainQuery(t, s, `SELECT briefing_id, priority, created_at, kind FROM briefings
+		WHERE created_at >= 0
+		ORDER BY CASE priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END DESC,
+			created_at DESC, briefing_id ASC LIMIT 10`) {
+		if strings.Contains(strings.ToUpper(row), "SCAN briefings") && !strings.Contains(strings.ToUpper(row), "USING") {
+			t.Fatalf("candidates scan briefings:\n%s", row)
+		}
 	}
 
 	digest, err := s.BriefingDigest(ctx, old.Add(-time.Minute))
@@ -111,6 +129,39 @@ func TestOverviewReads(t *testing.T) {
 	}
 	if run, err := s.LastPurgeRun(ctx); err != nil || !run.HaveRun || run.Status != "completed" {
 		t.Fatalf("last purge = %+v, %v", run, err)
+	}
+}
+
+// A newer failed run must not hide the last successful completion:
+// health reports the latest attempt and the last success separately,
+// with per-table visibility on both.
+func TestPurgeLastSuccessSurvivesFailure(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	if _, err := s.PurgeOnce(ctx, PurgeSettings{BriefingRetention: 30 * 24 * time.Hour, SubjectRetention: 90 * 24 * time.Hour}, now); err != nil {
+		t.Fatal(err)
+	}
+	runID, err := s.beginPurgeRun(ctx, nanos(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Finalization reports the run's own error to the caller; the ledger
+	// row still records the failure for health.
+	if err := s.finishPurgeRun(ctx, runID, "failed", "boom", errors.New("boom")); err == nil {
+		t.Fatal("expected the run error back")
+	}
+	last, err := s.LastPurgeRun(ctx)
+	if err != nil || !last.HaveRun || last.Status != "failed" || last.Error != "boom" {
+		t.Fatalf("latest = %+v, %v", last, err)
+	}
+	success, err := s.LastSuccessfulPurgeRun(ctx)
+	if err != nil || !success.HaveRun || success.Status != "completed" {
+		t.Fatalf("last success = %+v, %v", success, err)
+	}
+	if success.ByTable == nil {
+		t.Fatal("success must carry the per-table breakdown, even when empty")
 	}
 }
 

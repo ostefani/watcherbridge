@@ -3,6 +3,7 @@ package viewer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -102,6 +103,10 @@ func TestOverviewAndHealth(t *testing.T) {
 	if hw.Purge.Last == nil || hw.Purge.Last.Status != "completed" {
 		t.Fatalf("purge last = %+v", hw.Purge.Last)
 	}
+	// No failure yet, so the latest attempt is also the last success.
+	if hw.Purge.LastSuccess == nil || hw.Purge.LastSuccess.Status != "completed" {
+		t.Fatalf("purge last success = %+v", hw.Purge.LastSuccess)
+	}
 }
 
 // The refresher broadcasts only on hash change and coalesces triggers.
@@ -159,7 +164,19 @@ func TestRefresherHashChange(t *testing.T) {
 // digest, and a few scalar counts — the number ingest budgeting needs.
 func BenchmarkOverviewHandler(b *testing.B) {
 	s := openViewerStore(b)
-	seedBriefing(b, s, "host:bench", "evt-bench")
+	now := time.Now().UTC().Truncate(time.Second)
+	// Retained load: 200 briefings across priorities, so the number
+	// reflects a populated window rather than a single row.
+	for i := 0; i < 200; i++ {
+		pri := "low"
+		switch i % 10 {
+		case 0:
+			pri = "high"
+		case 1:
+			pri = "medium"
+		}
+		seedPriorityBriefing(b, s, "host:bench", fmt.Sprintf("evt-bench-%d", i), pri, now.Add(-time.Duration(i)*time.Minute))
+	}
 	v := New(s, NewHub())
 	v.Overview = NewRefresher(s, health.New(), nil, 24*time.Hour, 168*time.Hour, 30*24*time.Hour)
 	req := httptest.NewRequest("GET", "/api/overview?window=24h", nil)
@@ -171,6 +188,77 @@ func BenchmarkOverviewHandler(b *testing.B) {
 			b.Fatalf("status = %d", rec.Code)
 		}
 	}
+}
+
+// One high briefing followed by dozens of low briefings still reads
+// act: the verdict counts the whole window, and the attention list
+// leads with priority even though the high row is the oldest.
+func TestOverviewWindowWideVerdict(t *testing.T) {
+	s := openViewerStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	seedPriorityBriefing(t, s, "host:wide-high", "evt-wide-high", "high", now.Add(-time.Hour))
+	for i := 0; i < 59; i++ {
+		seedPriorityBriefing(t, s, "host:wide-low", fmt.Sprintf("evt-wide-low-%d", i),
+			"low", now.Add(-30*time.Minute))
+	}
+	v := New(s, NewHub())
+	v.Overview = NewRefresher(s, health.New(), nil, 24*time.Hour, 168*time.Hour, 30*24*time.Hour)
+	req := httptest.NewRequest("GET", "/api/overview?window=24h", nil)
+	rec := httptest.NewRecorder()
+	v.handleOverview(rec, req)
+	res := rec.Result()
+	defer res.Body.Close()
+	var wire overviewWire
+	if err := json.NewDecoder(res.Body).Decode(&wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.Verdict != "act" || wire.Headline != "1 need a check now" {
+		t.Fatalf("verdict = %q headline = %q, want act over the full window", wire.Verdict, wire.Headline)
+	}
+	if len(wire.Attention) == 0 || wire.Attention[0].Priority != "high" {
+		t.Fatalf("attention does not lead with priority: %+v", wire.Attention)
+	}
+	if wire.Receipts != 60 {
+		t.Fatalf("receipts = %d, want the full window", wire.Receipts)
+	}
+	if wire.Liveness != "unknown" {
+		t.Fatalf("liveness = %q, want unknown until H1", wire.Liveness)
+	}
+}
+
+// A trigger throttled by the 1/s coalescing still refreshes when the
+// interval expires: the test tick is an hour, so only the delayed
+// refresh can deliver the new briefing.
+func TestRefresherDelayedRefresh(t *testing.T) {
+	s := openViewerStore(t)
+	r := NewRefresher(s, health.New(), nil, 24*time.Hour, 168*time.Hour, 30*24*time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	changed := make(chan []byte, 4)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.Run(ctx, time.Hour, func(body []byte) {
+			changed <- body
+		})
+	}()
+	select {
+	case <-changed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no initial overview")
+	}
+	seedBriefing(t, s, "host:delay", "evt-delay")
+	r.Trigger()
+	select {
+	case body := <-changed:
+		if !strings.Contains(string(body), `"verdict":"act"`) {
+			t.Fatalf("delayed refresh missed the briefing: %s", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("throttled trigger never refreshed")
+	}
+	cancel()
+	<-done
 }
 
 // Quiet with no receipts carries counts, window, and no presence claim.

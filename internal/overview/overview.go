@@ -350,6 +350,27 @@ func ValidateWindow(window, max, retention time.Duration) (time.Duration, error)
 	return window, nil
 }
 
+// Summarize derives the verdict and headline from full-window priority
+// counts plus the flagged count, never from the capped candidate list.
+// A high or critical briefing anywhere in the window drives act even
+// when newer low-priority rows would fill the candidate cap; flagged
+// items floor review and never escalate it on their own.
+func Summarize(rankCounts map[string]int, flagged int) (verdict, headline string, attention int) {
+	attention = flagged
+	for pri, n := range rankCounts {
+		if rank(pri) >= 1 {
+			attention += n
+		}
+	}
+	if attention == 0 {
+		return VerdictQuiet, "Nothing needs review", 0
+	}
+	if rankCounts[PriorityHigh]+rankCounts[PriorityCritical] > 0 {
+		return VerdictAct, fmt.Sprintf("%d need a check now", attention), attention
+	}
+	return VerdictReview, fmt.Sprintf("%d things to review", attention), attention
+}
+
 // ExitCodeFor maps a verdict to the `status` exit code. Failures to
 // obtain status never use these codes; they exit 3 instead.
 func ExitCodeFor(verdict string) int {

@@ -171,6 +171,38 @@ func TestAssessCoverage(t *testing.T) {
 	}
 }
 
+// Summarize derives the verdict from full-window counts, never from
+// the capped candidate list: one high briefing among hundreds of low
+// rows still drives act.
+func TestSummarize(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		counts  map[string]int
+		flagged int
+		want    string
+		wantN   int
+	}{
+		{"empty quiet", nil, 0, VerdictQuiet, 0},
+		{"low only quiet", map[string]int{"low": 500}, 0, VerdictQuiet, 0},
+		{"unknown priorities ignored", map[string]int{"bogus": 9}, 0, VerdictQuiet, 0},
+		{"medium review", map[string]int{"low": 10, "medium": 2}, 0, VerdictReview, 2},
+		{"high past the cap act", map[string]int{"low": 500, "high": 1}, 0, VerdictAct, 1},
+		{"critical act", map[string]int{"critical": 1}, 0, VerdictAct, 1},
+		{"flagged floors review", map[string]int{"low": 3}, 2, VerdictReview, 2},
+		{"flagged never escalates", map[string]int{"low": 3}, 1, VerdictReview, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			verdict, headline, n := Summarize(tc.counts, tc.flagged)
+			if verdict != tc.want || n != tc.wantN {
+				t.Fatalf("Summarize = %q/%d, want %q/%d", verdict, n, tc.want, tc.wantN)
+			}
+			if tc.want == VerdictQuiet && headline != "Nothing needs review" {
+				t.Fatalf("headline = %q", headline)
+			}
+		})
+	}
+}
+
 func TestExitCodeFor(t *testing.T) {
 	if ExitCodeFor(VerdictQuiet) != 0 || ExitCodeFor(VerdictReview) != 1 || ExitCodeFor(VerdictAct) != 2 {
 		t.Fatal("verdict exit mapping wrong")
