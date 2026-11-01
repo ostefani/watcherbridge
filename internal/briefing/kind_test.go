@@ -2,6 +2,7 @@ package briefing
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/ostefani/watcherbridge/internal/store"
@@ -202,6 +203,59 @@ func TestKindPrefersReportedChanges(t *testing.T) {
 		}
 		if got := KindForTaken(taken, RuleDefault); got != KindHostnameChange {
 			t.Fatalf("KindForTaken = %q, want hostname_change", got)
+		}
+	})
+}
+
+// An oversized changes[] array must not amplify allocation in the
+// briefing path: only a bounded set of reported field names is kept
+// and excess entries are skipped without materializing them.
+func TestDecodeEventBoundsChangesArray(t *testing.T) {
+	open := `{"number":22,"protocol":"tcp","state":"open"}`
+	closed := `{"number":22,"protocol":"tcp","state":"closed"}`
+	build := func(changes string) []byte {
+		return []byte(`{"previous":{"hostname":"a","ports":[` + open + `]},` +
+			`"current":{"hostname":"a","ports":[` + closed + `]},` +
+			`"changes":` + changes + `}`)
+	}
+	var junk strings.Builder
+	junk.WriteString(`[{"field":"ports"}`)
+	for i := 0; i < 50000; i++ {
+		switch i % 3 {
+		case 0:
+			junk.WriteString(`,{}`)
+		case 1:
+			junk.WriteString(`,{"field":"ports"}`)
+		default:
+			junk.WriteString(`,{"field":"bogus"}`)
+		}
+	}
+	junk.WriteString(`]`)
+	t.Run("valid prefix honored past junk", func(t *testing.T) {
+		payload := build(junk.String())
+		taken := store.TakenGroup{
+			GroupID: "grp-kind",
+			Anchor:  "mac:aa",
+			Events:  []store.RawEvent{{EventID: "e1", EventType: "host.changed", Payload: payload}},
+		}
+		if got := KindForTaken(taken, RuleDefault); got != KindPortClosed {
+			t.Fatalf("KindForTaken = %q, want port_closed", got)
+		}
+		if n := testing.AllocsPerRun(10, func() { DecodeEvent("host.changed", payload) }); n > 5000 {
+			t.Fatalf("DecodeEvent allocated %v times, want at most 5000", n)
+		}
+	})
+	t.Run("junk only stays unknown", func(t *testing.T) {
+		steady := []byte(`{"previous":{"hostname":"a","ports":[` + open + `]},` +
+			`"current":{"hostname":"a","ports":[` + open + `]},` +
+			`"changes":[{},{},{"field":""}, {"field":"bogus"}]}`)
+		payload := steady
+		if got := KindForTaken(store.TakenGroup{
+			GroupID: "grp-kind",
+			Anchor:  "mac:aa",
+			Events:  []store.RawEvent{{EventID: "e1", EventType: "host.changed", Payload: payload}},
+		}, RuleDefault); got != KindOther {
+			t.Fatalf("KindForTaken = %q, want other", got)
 		}
 	})
 }

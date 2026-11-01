@@ -8,11 +8,19 @@
 package briefing
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
 )
+
+// maxReportedChangeFields bounds how many changes[] entries DecodeEvent
+// materializes. The producer emits about fifteen fields; entries past the
+// cap are scanned but never parsed, so a hostile array of empty or
+// repeated entries cannot amplify allocation in the briefing path. The
+// original payload is preserved untouched for audit.
+const maxReportedChangeFields = 32
 
 // Policy carries the baseline knobs. Ages apply to first_strong_seen_at
 // once Pro ships it; until then the age clauses pass vacuously and the
@@ -63,24 +71,82 @@ type GroupEvent struct {
 
 // DecodeEvent decodes one stored payload. Undecodable payloads yield views
 // of nil so the group degrades to unknown-input instead of erroring.
+// Reported change fields are extracted with a bounded scan so an
+// oversized changes[] array cannot amplify allocation.
 func DecodeEvent(eventType string, payload []byte) GroupEvent {
 	ev := GroupEvent{EventType: eventType}
 	var body struct {
-		Host     *hostView `json:"host"`
-		Current  *hostView `json:"current"`
-		Previous *hostView `json:"previous"`
-		Changes  []struct {
-			Field string `json:"field"`
-		} `json:"changes"`
+		Host     *hostView       `json:"host"`
+		Current  *hostView       `json:"current"`
+		Previous *hostView       `json:"previous"`
+		Changes  json.RawMessage `json:"changes"`
 	}
 	if err := json.Unmarshal(payload, &body); err != nil {
 		return ev
 	}
 	ev.Host, ev.Current, ev.Previous = body.Host, body.Current, body.Previous
-	for _, c := range body.Changes {
-		ev.Changes = append(ev.Changes, c.Field)
-	}
+	ev.Changes = decodeChangeFields(body.Changes, maxReportedChangeFields)
 	return ev
+}
+
+// decodeChangeFields returns up to max field names from a raw changes[]
+// array. The bytes are walked once with depth- and escape-aware scanning;
+// only spans within the cap are parsed, later elements are skipped without
+// materializing them, and no per-skipped-entry allocation occurs.
+func decodeChangeFields(raw json.RawMessage, max int) []string {
+	s := bytes.TrimSpace(raw)
+	if len(s) < 2 || s[0] != '[' || s[len(s)-1] != ']' {
+		return nil
+	}
+	var out []string
+	depth, start, count := 0, 1, 0
+	emit := func(end int) {
+		span := bytes.TrimSpace(s[start:end])
+		start = end + 1
+		if len(span) == 0 || count >= max {
+			return
+		}
+		count++
+		var c struct {
+			Field string `json:"field"`
+		}
+		if err := json.Unmarshal(span, &c); err != nil {
+			return
+		}
+		out = append(out, c.Field)
+	}
+	inStr, esc := false, false
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			switch {
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{', '[':
+			depth++
+		case '}', ']':
+			if depth == 0 {
+				emit(i)
+				return out
+			}
+			depth--
+		case ',':
+			if depth == 0 {
+				emit(i)
+			}
+		}
+	}
+	return out
 }
 
 // effective returns the host view that describes the event outcome.
