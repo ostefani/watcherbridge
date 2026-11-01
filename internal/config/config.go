@@ -173,6 +173,13 @@ type Config struct {
 	GroupMaxWindow   time.Duration
 	GroupMaxEvents   int
 
+	// Retention horizons (Designv9 §4.6). Subjects must outlive the
+	// briefings that reference them; the purge interval bounds how
+	// often the purge loop wakes.
+	BriefingRetention time.Duration
+	SubjectRetention  time.Duration
+	PurgeInterval     time.Duration
+
 	GrouperTick          time.Duration
 	ProcessingLease      time.Duration // stale processing age; must exceed 2 x agent timeout + margin
 	AgentTimeout         time.Duration // per-turn agent budget; must cover the provider timeout
@@ -238,6 +245,10 @@ func Default() Config {
 		GroupQuietWindow: 45 * time.Second,
 		GroupMaxWindow:   120 * time.Second,
 		GroupMaxEvents:   10,
+
+		BriefingRetention: 30 * 24 * time.Hour,
+		SubjectRetention:  90 * 24 * time.Hour,
+		PurgeInterval:     6 * time.Hour,
 
 		GrouperTick:          1 * time.Second,
 		ProcessingLease:      210 * time.Second,
@@ -573,6 +584,20 @@ func (c Config) Validate() error {
 	}
 	if c.GroupMaxWindow < c.GroupQuietWindow {
 		return fmt.Errorf("group max window must be >= quiet window")
+	}
+	// Designv9 §4.6: briefing history is pageable client history, so a
+	// sub-day horizon would page into gaps; subjects must outlive the
+	// briefings whose relations reference them, or purge orphans
+	// briefing links. The interval floor keeps a misconfigured purge
+	// from hot-looping the writer.
+	if c.BriefingRetention < 24*time.Hour {
+		return fmt.Errorf("briefing retention %v must be at least 24h", c.BriefingRetention)
+	}
+	if c.SubjectRetention < c.BriefingRetention {
+		return fmt.Errorf("subject retention %v must cover briefing retention %v", c.SubjectRetention, c.BriefingRetention)
+	}
+	if c.PurgeInterval < time.Minute {
+		return fmt.Errorf("purge interval %v must be at least 1m", c.PurgeInterval)
 	}
 	if c.MaxBodyBytes > limits.MaxGroupBytes {
 		return fmt.Errorf("max body bytes %d must fit the %d-byte group budget, or a single event never fits a fresh group",

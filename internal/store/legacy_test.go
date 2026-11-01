@@ -218,6 +218,50 @@ func TestGroupingVersionChangeClosesPriorGroup(t *testing.T) {
 	}
 }
 
+// v13 adds purge-run state, purge-serving indexes, and token usage
+// tracking. Rows predating tracking get the migration instant as last
+// known use, never zero (which would read as long-unused) and never
+// creation (which would expire steadily-used tokens on upgrade).
+func TestMigrateV13PurgeStateAndTokenUsage(t *testing.T) {
+	s := openTestStore(t)
+	var version int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 13 {
+		t.Fatalf("user_version = %d, %v; want 13", version, err)
+	}
+	var tables int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'purge_state'`).Scan(&tables); err != nil || tables != 1 {
+		t.Fatalf("purge_state table missing: %d %v", tables, err)
+	}
+	var indexes int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('reported_observations_received','reported_subjects_last_report')`).Scan(&indexes); err != nil || indexes != 2 {
+		t.Fatalf("purge-serving indexes missing: %d %v", indexes, err)
+	}
+	ctx := context.Background()
+	tok, err := s.GetOrAssignPseudonym(ctx, "ip", "10.9.9.9")
+	if err != nil || tok == "" {
+		t.Fatal(err)
+	}
+	var created, used int64
+	if err := s.db.QueryRow(`SELECT created_at, last_used_at FROM pseudonym_map WHERE token = ?`, tok).Scan(&created, &used); err != nil {
+		t.Fatal(err)
+	}
+	if used < created || used == 0 {
+		t.Fatalf("usage must start at assignment: created=%d used=%d", created, used)
+	}
+	if _, err := s.db.Exec(`UPDATE pseudonym_map SET last_used_at = 0 WHERE token = ?`, tok); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetOrAssignPseudonyms(ctx, "ip", "10.9.9.9"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT last_used_at FROM pseudonym_map WHERE token = ?`, tok).Scan(&used); err != nil {
+		t.Fatal(err)
+	}
+	if used == 0 {
+		t.Fatal("a lookup hit must refresh usage, or steady devices expire")
+	}
+}
+
 func TestGroupingProvenanceUpgrade(t *testing.T) {
 	for _, from := range []int{9, 11} {
 		t.Run(fmt.Sprint(from), func(t *testing.T) {

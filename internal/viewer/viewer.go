@@ -8,6 +8,7 @@ package viewer
 
 import (
 	"context"
+	"database/sql"
 	"embed"
 	"encoding/binary"
 	"encoding/json"
@@ -225,6 +226,8 @@ func (v *Viewer) Attach(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/briefings", v.handleBriefings)
 	mux.HandleFunc("GET /api/briefing", v.handleBriefing)
 	mux.HandleFunc("GET /api/groups", v.handleGroups)
+	mux.HandleFunc("GET /api/devices", v.handleDevices)
+	mux.HandleFunc("GET /api/devices/{id}", v.handleDevice)
 	mux.HandleFunc("GET /api/overview", v.handleOverview)
 }
 
@@ -788,6 +791,218 @@ func (v *Viewer) handleBriefing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, viewOf(b))
+}
+
+// deviceWire is one reported subject: class, provenance and association
+// status are explicit, and identity fields are the scanner's reported
+// values — never inferred replacements. Times are RFC3339 like the
+// briefing view; cursors stay numeric and tuple-shaped.
+type deviceWire struct {
+	ProfileID          string            `json:"profile_id"`
+	Class              string            `json:"class"`
+	SourceScope        string            `json:"source_scope"`
+	Namespace          string            `json:"namespace"`
+	ReportedID         string            `json:"reported_id"`
+	ReportedSource     string            `json:"reported_source"`
+	ReportedConfidence string            `json:"reported_confidence"`
+	AssociationStatus  string            `json:"association_status"`
+	Associations       map[string]int64  `json:"associations"`
+	OperatorLabel      *string           `json:"operator_label"`
+	FirstReportAt      string            `json:"first_report_at"`
+	LastReportAt       string            `json:"last_report_at"`
+	Latest             *observationWire  `json:"latest"`
+	History            []observationWire `json:"history,omitempty"`
+	HistoryNextAfter   string            `json:"history_next_after,omitempty"`
+}
+
+// observationWire is one retained event view: the bounded attributes
+// snapshot plus, for the latest-evidence section only, the retained
+// port list. History items carry no per-item port list; the snapshot's
+// ports_total/ports_truncated says what exists.
+type observationWire struct {
+	ObservationID  int64          `json:"observation_id"`
+	EventID        string         `json:"event_id"`
+	ViewRole       string         `json:"view_role"`
+	ReportedAt     string         `json:"reported_at"`
+	ReceivedAt     string         `json:"received_at"`
+	Attributes     map[string]any `json:"attributes"`
+	Ports          []portWire     `json:"ports,omitempty"`
+	PortsTotal     int64          `json:"ports_total"`
+	PortsTruncated bool           `json:"ports_truncated"`
+}
+
+// portWire is one retained port state.
+type portWire struct {
+	Proto   string `json:"proto"`
+	Port    int    `json:"port"`
+	State   string `json:"state"`
+	Service string `json:"service"`
+}
+
+// devicesEnvelope is the compatibility list envelope: the subject page
+// plus the tuple cursor for the next one, "" when exhausted.
+type devicesEnvelope struct {
+	Devices   []deviceWire `json:"devices"`
+	NextAfter string       `json:"next_after"`
+}
+
+// handleDevices serves GET /api/devices?limit&after: one page of reported
+// subjects oldest-first. limit defaults to 50 and 200 is refused, not
+// clamped; after is "<last_report_at nanos>:<profile id>" ("" starts at
+// the oldest). Malformed cursors are 400.
+func (v *Viewer) handleDevices(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit := 50
+	if s := q.Get("limit"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n <= 0 || n > 200 {
+			writeViewerError(w, "invalid limit", http.StatusBadRequest)
+			return
+		}
+		limit = n
+	}
+	var afterNanos int64
+	var afterID string
+	if s := q.Get("after"); s != "" {
+		var err error
+		afterNanos, afterID, err = parseTupleCursor(s)
+		if err != nil {
+			writeViewerError(w, "invalid after", http.StatusBadRequest)
+			return
+		}
+	}
+	rows, nextAfter, err := v.store.ReportedSubjectsPage(r.Context(), afterNanos, afterID, limit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	out := make([]deviceWire, 0, len(rows))
+	for _, sub := range rows {
+		out = append(out, deviceWireOf(sub, nil, nil, ""))
+	}
+	writeJSON(w, devicesEnvelope{Devices: out, NextAfter: nextAfter})
+}
+
+// handleDevice serves GET /api/devices/{id}: one reported profile with
+// its latest retained evidence and one independently paged history
+// window. Unknown IDs are 404; malformed IDs and cursors are 400.
+// history_limit defaults to 50 and is refused above 50.
+func (v *Viewer) handleDevice(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validProfileID(id) {
+		writeViewerError(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+	q := r.URL.Query()
+	historyLimit := 50
+	if s := q.Get("history_limit"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n <= 0 || n > 50 {
+			writeViewerError(w, "invalid history_limit", http.StatusBadRequest)
+			return
+		}
+		historyLimit = n
+	}
+	var historyAfterNanos, historyAfterID int64
+	var historyAfterStr string
+	if s := q.Get("history_after"); s != "" {
+		var err error
+		historyAfterNanos, historyAfterStr, err = parseTupleCursor(s)
+		if err != nil {
+			writeViewerError(w, "invalid history_after", http.StatusBadRequest)
+			return
+		}
+		var idErr error
+		historyAfterID, idErr = strconv.ParseInt(historyAfterStr, 10, 64)
+		if idErr != nil || historyAfterID < 0 {
+			writeViewerError(w, "invalid history_after", http.StatusBadRequest)
+			return
+		}
+	}
+	sub, err := v.store.ReportedProfile(r.Context(), id)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			writeViewerError(w, "unknown profile", http.StatusNotFound)
+			return
+		}
+		writeError(w, err)
+		return
+	}
+	var latest *observationWire
+	if obs, ok, err := v.store.LatestSubjectObservation(r.Context(), id); err != nil {
+		writeError(w, err)
+		return
+	} else if ok {
+		wire := observationWireOf(obs)
+		latest = &wire
+	}
+	history, historyNext, err := v.store.SubjectHistoryPage(r.Context(), id, historyAfterNanos, historyAfterID, historyLimit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	historyWire := make([]observationWire, 0, len(history))
+	for _, obs := range history {
+		historyWire = append(historyWire, observationWireOf(obs))
+	}
+	writeJSON(w, deviceWireOf(sub, latest, historyWire, historyNext))
+}
+
+// parseTupleCursor splits "<nanos>:<id>" and validates both halves.
+// Profile IDs are prof-<hex> and observation IDs are decimal rowids;
+// anything else is malformed, never a lookup miss.
+func parseTupleCursor(s string) (int64, string, error) {
+	nanosPart, id, ok := strings.Cut(s, ":")
+	if !ok || nanosPart == "" || id == "" {
+		return 0, "", fmt.Errorf("malformed cursor %q", s)
+	}
+	nanosValue, err := strconv.ParseInt(nanosPart, 10, 64)
+	if err != nil || nanosValue < 0 {
+		return 0, "", fmt.Errorf("malformed cursor %q", s)
+	}
+	return nanosValue, id, nil
+}
+
+// validProfileID allowlists locally generated profile IDs: prof- plus
+// 16 lowercase hex digits. Anything else is malformed (400), never a
+// store lookup, so unknown schemes cannot probe the table.
+func validProfileID(id string) bool {
+	if len(id) != len("prof-")+16 || !strings.HasPrefix(id, "prof-") {
+		return false
+	}
+	for _, c := range id[len("prof-"):] {
+		if c < '0' || (c > '9' && c < 'a') || c > 'f' {
+			return false
+		}
+	}
+	return true
+}
+
+func deviceWireOf(sub store.ReportedSubject, latest *observationWire, history []observationWire, historyNext string) deviceWire {
+	return deviceWire{
+		ProfileID: sub.ProfileID, Class: sub.ReferenceClass, SourceScope: sub.SourceScope,
+		Namespace: sub.IdentityNamespace, ReportedID: sub.UpstreamReference,
+		ReportedSource: sub.ReportedIdentitySource, ReportedConfidence: sub.ReportedConfidence,
+		AssociationStatus: sub.AssociationStatus,
+		Associations:      map[string]int64{"groups": sub.Groups, "briefings": sub.Briefings},
+		OperatorLabel:     sub.OperatorLabel,
+		FirstReportAt:     sub.FirstReportAt.UTC().Format(time.RFC3339),
+		LastReportAt:      sub.LastReportAt.UTC().Format(time.RFC3339),
+		Latest:            latest, History: history, HistoryNextAfter: historyNext,
+	}
+}
+
+func observationWireOf(obs store.SubjectObservation) observationWire {
+	ports := make([]portWire, 0, len(obs.Ports))
+	for _, p := range obs.Ports {
+		ports = append(ports, portWire{Proto: p.Proto, Port: p.Port, State: p.State, Service: p.Service})
+	}
+	return observationWire{
+		ObservationID: obs.ObservationID, EventID: obs.EventID, ViewRole: obs.ViewRole,
+		ReportedAt: obs.ReportedAt.UTC().Format(time.RFC3339), ReceivedAt: obs.ReceivedAt.UTC().Format(time.RFC3339),
+		Attributes: obs.Attributes, Ports: ports,
+		PortsTotal: obs.PortsTotal, PortsTruncated: obs.PortsTruncated,
+	}
 }
 
 // handleGroups serves the current group snapshot: open, closed (queued)

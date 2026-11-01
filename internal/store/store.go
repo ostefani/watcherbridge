@@ -53,6 +53,7 @@ func WithQueueCap(n int) Option { return func(o *options) { o.queueCap = n } }
 type Store struct {
 	db       *sql.DB
 	jobs     chan writeJob // never closed; quit signals shutdown
+	queueCap int           // jobs capacity; the purge loop yields past half
 	quit     chan struct{}
 	wg       sync.WaitGroup
 	closeMu  sync.Mutex
@@ -61,6 +62,15 @@ type Store struct {
 	groupSeq atomic.Int64
 	now      func() time.Time
 }
+
+// QueueDepth reports the current writer backlog without blocking. The
+// purge loop yields while the backlog passes half the cap so retention
+// never starves ingest; the value is advisory, never a gate.
+func (s *Store) QueueDepth() int { return len(s.jobs) }
+
+// QueueCap reports the writer queue capacity QueueDepth is measured
+// against. Zero on a Store that bypassed Open, which never purges.
+func (s *Store) QueueCap() int { return s.queueCap }
 
 func nanos(t time.Time) int64 { return t.UTC().UnixNano() }
 func fromNanos(n int64) time.Time {
@@ -210,7 +220,7 @@ func openStore(path string, opts ...Option) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("tighten database permissions: %w", err)
 	}
-	s := &Store{db: db, jobs: make(chan writeJob, o.queueCap), quit: make(chan struct{}), now: time.Now}
+	s := &Store{db: db, jobs: make(chan writeJob, o.queueCap), queueCap: o.queueCap, quit: make(chan struct{}), now: time.Now}
 	s.wg.Add(1)
 	go s.writer()
 	return s, nil

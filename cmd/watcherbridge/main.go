@@ -38,6 +38,9 @@ func main() {
 	forwardKey := fs.String("forward-api-key", "", "API key injected into ScanRelay forwards/annotations (or FORWARD_API_KEY)")
 	quiet := fs.Duration("group-quiet-window", def.GroupQuietWindow, "grouping quiet window")
 	maxWindow := fs.Duration("group-max-window", def.GroupMaxWindow, "grouping hard cap")
+	briefRet := fs.Duration("briefing-retention", def.BriefingRetention, "retained briefing history (min 24h)")
+	subjRet := fs.Duration("subject-retention", def.SubjectRetention, "retained reported-subject context (min briefing retention)")
+	purgeEvery := fs.Duration("purge-interval", def.PurgeInterval, "purge loop interval (min 1m)")
 	tick := fs.Duration("grouper-tick", def.GrouperTick, "worker tick")
 	lease := fs.Duration("processing-lease", def.ProcessingLease, "stale processing lease")
 	agentTimeout := fs.Duration("agent-timeout", def.AgentTimeout, "per-turn agent budget (Step 26 uses it)")
@@ -63,6 +66,9 @@ func main() {
 	cfg.ForwardAPIKey = config.Secret(firstNonEmpty(*forwardKey, os.Getenv("FORWARD_API_KEY")))
 	cfg.GroupQuietWindow = *quiet
 	cfg.GroupMaxWindow = *maxWindow
+	cfg.BriefingRetention = *briefRet
+	cfg.SubjectRetention = *subjRet
+	cfg.PurgeInterval = *purgeEvery
 	cfg.GrouperTick = *tick
 	cfg.ProcessingLease = *lease
 	cfg.AgentTimeout = *agentTimeout
@@ -74,6 +80,9 @@ func main() {
 	cfg.ProviderTimeout = *modelTimeout
 	cfg.Redaction = *redaction
 	cfg.StableIdentityFields = strings.Split(*stableFields, ",")
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	st, err := store.Open(*db)
 	if err != nil {
@@ -92,9 +101,26 @@ func main() {
 		}
 	}()
 
+	// Startup ordering is a synchronization boundary, not launch order:
+	// recovery first, then the completed startup sweep, then the initial
+	// purge — only afterwards do serving and the background loops start.
+	// Each step runs to completion so retained work is never purged on
+	// a stale view and the sweep never races the first purge.
+	if recovered, err := st.Recover(ctx, time.Now()); err != nil {
+		log.Fatalf("startup recovery: %v", err)
+	} else if len(recovered) > 0 {
+		log.Printf("startup recovery: requeued %d groups", len(recovered))
+	}
 	srv, err := server.New(cfg, st, forwarder.NewGate())
 	if err != nil {
 		log.Fatalf("server: %v", err)
+	}
+	srv.SweepOnce(ctx)
+	purgeSettings := store.PurgeSettings{BriefingRetention: cfg.BriefingRetention, SubjectRetention: cfg.SubjectRetention}
+	if rep, err := st.PurgeOnce(ctx, purgeSettings, time.Now()); err != nil {
+		log.Fatalf("startup purge: %v", err)
+	} else {
+		log.Printf("startup purge: %+v", rep)
 	}
 	srv.RegisterOnShutdown(srv.Viewer().Close)
 	hub := srv.Viewer().Hub()
@@ -130,8 +156,13 @@ func main() {
 	}
 	onBriefing, onGroups := viewer.Fanout(hub, pub, int64(cfg.GroupQuietWindow/time.Second))
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	// The purge loop sits beside the briefing worker: both share only the
+	// serialized writer, so a slow purge batch delays individual writes
+	// but never blocks provider calls or the briefing tick. Small batches
+	// plus pressure yield provide the isolation; join before the store.
+	purgeDone := make(chan error, 1)
+	go func() { purgeDone <- runPurgeLoop(ctx, st, cfg, purgeSettings) }()
+
 	workerDone := make(chan error, 1)
 	go func() {
 		workerDone <- briefing.Run(ctx, briefing.Deps{
@@ -164,13 +195,39 @@ func main() {
 	if err := srv.Start(); err != nil {
 		log.Printf("server: %v", err)
 	}
-	// Ingest stopped: drain the worker, then shut the publisher down so
-	// queued annotations flush before the store closes.
+	// Ingest stopped: drain the worker and the purge loop, then shut the
+	// publisher down so queued annotations flush before the store closes.
 	stop()
 	if err := <-workerDone; err != nil {
 		log.Printf("worker: %v", err)
 	}
+	if err := <-purgeDone; err != nil {
+		log.Printf("purge loop: %v", err)
+	}
 	log.Print("watcherbridge: stopped")
+}
+
+// runPurgeLoop ticks PurgeOnce until ctx ends. Errors are logged and
+// retried next tick: a transient failure must not kill the process,
+// and the next pass resumes from recorded purge_state cutoffs.
+func runPurgeLoop(ctx context.Context, st *store.Store, cfg config.Config, settings store.PurgeSettings) error {
+	tick := time.NewTicker(cfg.PurgeInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-tick.C:
+		}
+		rep, err := st.PurgeOnce(ctx, settings, time.Now())
+		if err != nil {
+			log.Printf("purge: %v", err)
+			continue
+		}
+		if rep != (store.PurgeReport{}) {
+			log.Printf("purge: %+v", rep)
+		}
+	}
 }
 
 func firstNonEmpty(vals ...string) string {

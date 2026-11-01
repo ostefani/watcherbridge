@@ -20,6 +20,7 @@ import (
 func dropProjectionSchema(t *testing.T, db *sql.DB) {
 	t.Helper()
 	dropGroupingProvenance(t, db)
+	dropColumnIfExists(t, db, "pseudonym_map", "last_used_at")
 	for _, stmt := range []string{
 		`DROP TABLE IF EXISTS reported_ports`,
 		`DROP TABLE IF EXISTS reported_observations`,
@@ -30,6 +31,7 @@ func dropProjectionSchema(t *testing.T, db *sql.DB) {
 		`DROP TABLE IF EXISTS reported_subjects`,
 		`DROP TABLE IF EXISTS report_sources`,
 		`DROP TABLE IF EXISTS legacy_profile_state`,
+		`DROP TABLE IF EXISTS purge_state`,
 		`ALTER TABLE raw_events DROP COLUMN source_scope`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
@@ -44,6 +46,46 @@ func dropGroupingProvenance(t *testing.T, db *sql.DB) {
 		if _, err := db.Exec(`ALTER TABLE ` + table + ` DROP COLUMN grouping_version`); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// Rewinding past v12 must also drop the v13 purge table, or the
+	// replayed v13 migration meets its own table. The v13 indexes are
+	// idempotent (CREATE INDEX IF NOT EXISTS) and stay, and the token
+	// column rewinds through dropColumnIfExists: intermediate versions
+	// predate it.
+	if _, err := db.Exec(`DROP TABLE IF EXISTS purge_state`); err != nil {
+		t.Fatal(err)
+	}
+	dropColumnIfExists(t, db, "pseudonym_map", "last_used_at")
+}
+
+// dropColumnIfExists rewinds an added column only when a newer schema
+// actually carries it: chain tests park the database at versions that
+// predate the column.
+func dropColumnIfExists(t *testing.T, db *sql.DB, table, column string) {
+	t.Helper()
+	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		return
+	}
+	if _, err := db.Exec(`ALTER TABLE ` + table + ` DROP COLUMN ` + column); err != nil {
+		t.Fatal(err)
 	}
 }
 

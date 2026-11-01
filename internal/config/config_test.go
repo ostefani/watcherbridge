@@ -39,13 +39,16 @@ func TestDefaultPairs(t *testing.T) {
 
 func TestValidateRejects(t *testing.T) {
 	cases := map[string]func(*Config){
-		"non-loopback bind":       func(c *Config) { c.Bind = "0.0.0.0:8081" },
-		"bad mode":                func(c *Config) { c.Mode = "stream" },
-		"proxy without URL":       func(c *Config) { c.Mode = ModeProxy; c.ScanRelayURL = "" },
-		"proxy bad scheme":        func(c *Config) { c.Mode = ModeProxy; c.ScanRelayURL = "ftp://x/" },
-		"proxy URL no host":       func(c *Config) { c.Mode = ModeProxy; c.ScanRelayURL = "http://" },
-		"tolerance above relay":   func(c *Config) { c.TimestampTolerance = c.ScanRelayTolerance + time.Second },
-		"handler below chain sum": func(c *Config) { c.HandlerDeadline-- },
+		"non-loopback bind":                func(c *Config) { c.Bind = "0.0.0.0:8081" },
+		"bad mode":                         func(c *Config) { c.Mode = "stream" },
+		"briefing retention below a day":   func(c *Config) { c.BriefingRetention = 23 * time.Hour },
+		"subject retention below briefing": func(c *Config) { c.SubjectRetention = c.BriefingRetention - time.Hour },
+		"purge interval below a minute":    func(c *Config) { c.PurgeInterval = 30 * time.Second },
+		"proxy without URL":                func(c *Config) { c.Mode = ModeProxy; c.ScanRelayURL = "" },
+		"proxy bad scheme":                 func(c *Config) { c.Mode = ModeProxy; c.ScanRelayURL = "ftp://x/" },
+		"proxy URL no host":                func(c *Config) { c.Mode = ModeProxy; c.ScanRelayURL = "http://" },
+		"tolerance above relay":            func(c *Config) { c.TimestampTolerance = c.ScanRelayTolerance + time.Second },
+		"handler below chain sum":          func(c *Config) { c.HandlerDeadline-- },
 		"tolerance plus handler above relay": func(c *Config) {
 			c.TimestampTolerance = c.ScanRelayTolerance
 		},

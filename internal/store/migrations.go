@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 12
+const supportedSchemaVersion = 13
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -132,6 +132,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 12, func(tx *sql.Tx) error {
 				return migrateV12(tx, initialVersion <= 9)
 			})
+		case 12:
+			err = applyMigration(db, 13, migrateV13)
 		}
 		if err != nil {
 			return err
@@ -154,6 +156,36 @@ func migrateV12(tx *sql.Tx, phase5 bool) error {
 	}
 	for _, table := range []string{"active_groups", "briefings"} {
 		stmt := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN grouping_version INTEGER NOT NULL DEFAULT %d CHECK(grouping_version IN (0,1,2))`, table, version)
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV13 adds purge-run state, purge-serving indexes, and token
+// usage tracking (Designv9 §4.6). purge_state persists per-table purge
+// progress so Step 20 health can report it and a restart resumes from
+// the recorded cutoff. pseudonym_map gains last_used_at: creation age
+// alone cannot prove a token is still referenced, so assignment and
+// every later lookup bump it, and expiry compares against it. Rows
+// predating tracking get the migration instant as their last known use:
+// usage before tracking began is unknown, and deleting a token that a
+// retained briefing still references would break viewer restoration.
+func migrateV13(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE purge_state (
+			table_name TEXT PRIMARY KEY,
+			last_run_at INTEGER NOT NULL DEFAULT 0,
+			last_cutoff INTEGER NOT NULL DEFAULT 0,
+			rows_deleted_total INTEGER NOT NULL DEFAULT 0
+		)`,
+		`ALTER TABLE pseudonym_map ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0`,
+		`UPDATE pseudonym_map SET last_used_at = CAST(strftime('%s','now') AS INTEGER) * 1000000000`,
+		`CREATE INDEX IF NOT EXISTS reported_observations_received ON reported_observations(received_at)`,
+		`CREATE INDEX IF NOT EXISTS reported_subjects_last_report ON reported_subjects(last_report_at)`,
+	}
+	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt); err != nil {
 			return err
 		}

@@ -11,9 +11,9 @@ import (
 // Pseudonym assignment and restoration (tokens.go, not pseudonyms.go:
 // the ancient runtime-data glob pseudonyms.* in .gitignore would swallow
 // that name and once hid this file from a commit, breaking the build.
-// Restored from 9386cc2 (where it lived in store.go); v9-schema
-// compatible — no last_used_at, which arrived with the removed Step-18
-// v10 line.
+// Restored from 9386cc2 (where it lived in store.go). v13 adds
+// last_used_at so expiry can tell a still-referenced token from a
+// dead one; assignment and every later lookup bump it.
 
 var tokenPrefixes = map[string]string{"ip": "IP", "mac": "MAC", "hostname": "HOST", "net": "NET"}
 
@@ -134,11 +134,40 @@ func (s *Store) GetOrAssignPseudonyms(ctx context.Context, category string, real
 			missing = append(missing, pending{n, originalOf[n]})
 		}
 	}
-	if len(missing) == 0 {
-		return result, nil
-	}
 	assigned := map[string]string{}
 	err = s.write(ctx, func(tx *sql.Tx) error {
+		// One timestamp for the whole transaction: the touch and the
+		// assignment agree exactly, regardless of queue delay.
+		now := nanos(s.now())
+		// Usage tracking runs in the same transaction as assignment, so
+		// a token's last use advances exactly when it is (re)issued.
+		// The touch covers every requested value, not just misses: an
+		// all-hit call must still prove the tokens are referenced, or
+		// steady-state devices would expire while actively reported.
+		touch := make([]string, 0, len(normalized))
+		seen := map[string]bool{}
+		for _, n := range normalized {
+			if !seen[n] {
+				seen[n] = true
+				touch = append(touch, n)
+			}
+		}
+		for start := 0; start < len(touch); start += pseudonymLookupBatch {
+			end := start + pseudonymLookupBatch
+			if end > len(touch) {
+				end = len(touch)
+			}
+			placeholders := strings.Repeat("?,", len(touch[start:end]))
+			args := make([]any, 0, len(touch[start:end])+2)
+			args = append(args, now, category)
+			for _, n := range touch[start:end] {
+				args = append(args, n)
+			}
+			if _, err := tx.Exec(`UPDATE pseudonym_map SET last_used_at = ? WHERE category = ? AND real_value IN (`+
+				placeholders[:len(placeholders)-1]+`)`, args...); err != nil {
+				return err
+			}
+		}
 		for _, m := range missing {
 			normalized, original := m.normalized, m.original
 			var token string
@@ -159,7 +188,7 @@ func (s *Store) GetOrAssignPseudonyms(ctx context.Context, category string, real
 			if _, err := tx.Exec(`INSERT INTO pseudonym_counters (category, next) VALUES (?, ?) ON CONFLICT(category) DO UPDATE SET next = next + 1`, category, next+1); err != nil {
 				return err
 			}
-			if _, err := tx.Exec(`INSERT INTO pseudonym_map (category, real_value, display_value, token, created_at) VALUES (?, ?, ?, ?, ?)`, category, normalized, original, token, nanos(s.now())); err != nil {
+			if _, err := tx.Exec(`INSERT INTO pseudonym_map (category, real_value, display_value, token, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?)`, category, normalized, original, token, now, now); err != nil {
 				return err
 			}
 			assigned[normalized] = token
