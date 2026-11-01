@@ -16,6 +16,11 @@ export function createFetchGuard() {
     streamed() {
       streamGen += 1;
     },
+    // Void every in-flight token: route changes, unmounts and manual
+    // reloads must never let an older response overwrite newer state.
+    invalidate() {
+      latest += 1;
+    },
     // True when this completion is still the newest fetch and no stream
     // frame arrived after it started.
     current(token) {

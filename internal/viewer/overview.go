@@ -31,15 +31,21 @@ type attentionWire struct {
 }
 
 // sourceWire is one source's coverage and liveness with reasons.
+// IdentityNamespace and Capabilities mirror the stored registration;
+// both stay empty until the upstream identity work (Step 21) reports
+// them, and empty reads as unknown, never as a granted capability.
+// Heartbeat enablement and identity capability are different claims.
 type sourceWire struct {
-	Scope            string   `json:"scope"`
-	Status           string   `json:"status"`
-	Liveness         string   `json:"liveness"`
-	LastReportAt     string   `json:"last_report_at,omitempty"`
-	HeartbeatEnabled bool     `json:"heartbeat_enabled"`
-	LastHeartbeatAt  string   `json:"last_heartbeat_at,omitempty"`
-	DeliveryStatus   string   `json:"delivery_status,omitempty"`
-	Reasons          []string `json:"reasons"`
+	Scope             string   `json:"scope"`
+	Status            string   `json:"status"`
+	Liveness          string   `json:"liveness"`
+	IdentityNamespace string   `json:"identity_namespace,omitempty"`
+	Capabilities      string   `json:"capabilities,omitempty"`
+	LastReportAt      string   `json:"last_report_at,omitempty"`
+	HeartbeatEnabled  bool     `json:"heartbeat_enabled"`
+	LastHeartbeatAt   string   `json:"last_heartbeat_at,omitempty"`
+	DeliveryStatus    string   `json:"delivery_status,omitempty"`
+	Reasons           []string `json:"reasons"`
 }
 
 // overviewWire is the GET /api/overview body and the `overview` SSE
@@ -202,6 +208,13 @@ func (v *Viewer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Process:    ov.health.Load().Snapshot(),
 		QueueDepth: ov.store.QueueDepth(), QueueCap: ov.store.QueueCap(),
 	}
+	if ov.retention > 0 {
+		hw.Retention = &retentionWire{ReportsSeconds: int64(ov.retention / time.Second)}
+		if ov.subjectRetention > 0 {
+			sub := int64(ov.subjectRetention / time.Second)
+			hw.Retention.SubjectsSeconds = &sub
+		}
+	}
 	if total > 0 {
 		hw.Fallback.Ratio = float64(used) / float64(total)
 	}
@@ -217,6 +230,15 @@ func (v *Viewer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, hw)
 }
 
+// retentionWire states the configured retention policy in whole
+// seconds: the report/briefing horizon and, when configured, the
+// subject horizon. Policy alone never proves a per-profile boundary;
+// the purge section carries the completed work separately.
+type retentionWire struct {
+	ReportsSeconds  int64  `json:"reports_seconds"`
+	SubjectsSeconds *int64 `json:"subjects_seconds,omitempty"`
+}
+
 // healthWire is the GET /api/health body.
 type healthWire struct {
 	Sources         []sourceWire    `json:"sources"`
@@ -226,6 +248,7 @@ type healthWire struct {
 	ParkedGroups    int             `json:"parked_groups"`
 	ForwardErrors   int             `json:"forward_errors_1h"`
 	Purge           purgeWire       `json:"purge"`
+	Retention       *retentionWire  `json:"retention,omitempty"`
 	Publisher       *publisherWire  `json:"publisher,omitempty"`
 	Process         health.Snapshot `json:"process"`
 	QueueDepth      int             `json:"queue_depth"`
@@ -253,7 +276,11 @@ type Refresher struct {
 	window    time.Duration
 	maxWindow time.Duration
 	retention time.Duration
-	now       func() time.Time
+	// subjectRetention is the reported-subject horizon from config;
+	// zero means unconfigured and the health retention section omits
+	// subject ages rather than claiming a policy.
+	subjectRetention time.Duration
+	now              func() time.Time
 
 	trigger chan struct{}
 
@@ -290,6 +317,13 @@ func (r *Refresher) SetPublisher(p *Publisher) {
 	if p != nil {
 		r.publisher.Store(p)
 	}
+}
+
+// SetSubjectRetention attaches the reported-subject retention horizon
+// from config for the health retention section. Zero leaves the
+// subject age out of the response.
+func (r *Refresher) SetSubjectRetention(d time.Duration) {
+	r.subjectRetention = d
 }
 
 // Trigger requests a refresh, coalesced: a full trigger channel means a
@@ -507,10 +541,12 @@ func (r *Refresher) coverage(ctx context.Context) (overview.Coverage, []sourceWi
 	for _, s := range sources {
 		w := sourceWire{
 			Scope: s.Scope, Status: overview.CoverageOK,
-			Liveness:         overview.LivenessUnknown,
-			HeartbeatEnabled: s.HeartbeatEnabled,
-			DeliveryStatus:   s.DeliveryStatus,
-			Reasons:          []string{},
+			Liveness:          overview.LivenessUnknown,
+			IdentityNamespace: s.ConfiguredNS,
+			Capabilities:      s.Capabilities,
+			HeartbeatEnabled:  s.HeartbeatEnabled,
+			DeliveryStatus:    s.DeliveryStatus,
+			Reasons:           []string{},
 		}
 		si := overview.SourceInput{Scope: s.Scope}
 		if s.HeartbeatEnabled {

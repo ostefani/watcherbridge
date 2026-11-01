@@ -256,6 +256,26 @@ func TestBriefingEndpointsShapeAndHeaders(t *testing.T) {
 	if one["kind"] != "other" || one["source"] != "model" {
 		t.Fatalf("kind/source missing from detail: %v", one)
 	}
+	// Step 24: persisted links, the event index and the retained
+	// observations ride the detail; empty sections stay arrays.
+	profiles, ok := one["profiles"].([]any)
+	if !ok {
+		t.Fatalf("profiles not an array: %v", one["profiles"])
+	}
+	if len(profiles) != 0 {
+		t.Fatalf("event-local seed must link no profiles: %v", profiles)
+	}
+	refs, ok := one["referenced_events"].([]any)
+	if !ok || len(refs) != 1 {
+		t.Fatalf("referenced_events = %v, want the one group event", one["referenced_events"])
+	}
+	ref, ok := refs[0].(map[string]any)
+	if !ok || ref["event_id"] != "evt-api" || ref["event_type"] != "host.appeared" {
+		t.Fatalf("referenced pair = %v, want id+type", refs[0])
+	}
+	if _, ok := one["observations"].([]any); !ok {
+		t.Fatalf("observations not an array: %v", one["observations"])
+	}
 	if one["grouping_version"] != rows[0]["grouping_version"] {
 		t.Fatalf("detail/list grouping provenance disagree: %v", one)
 	}

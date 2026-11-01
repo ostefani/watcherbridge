@@ -22,14 +22,34 @@ for (const name of readdirSync(lib)) {
   const source = readFileSync(join(lib, name), 'utf8');
   const { js } = compile(source, { generate: 'server', filename: name });
   // Compiled output keeps the .svelte specifier; rewrite to the compiled sibling.
-  const code = js.code.replaceAll(/from '(\.\/[^']+)\.svelte'/g, "from '$1.js'");
+  const code = js.code
+    .replaceAll(/from '(\.\/[^']+)\.svelte'/g, "from '$1.js'")
+    .replaceAll("from '../api.js'", "from './api.js'");
   writeFileSync(join(out, name.replace(/\.svelte$/, '.js')), code);
+}
+// Plain JS siblings the screens import at runtime, copied next to the
+// compiled output so bare relative specifiers resolve inside .smoke-tmp.
+for (const [from, to] of [
+  [join(root, 'src', 'api.js'), join(out, 'api.js')],
+  [join(lib, 'freshness.js'), join(out, 'freshness.js')],
+  [join(lib, 'format.js'), join(out, 'format.js')],
+  [join(lib, 'roving.js'), join(out, 'roving.js')]
+]) {
+  writeFileSync(to, readFileSync(from, 'utf8'));
 }
 
 // The specifier is built from constants (own temp dir, fixed name),
 // never from network or user input.
 // eslint-disable-next-line no-unsanitized/method
 const { default: Home } = await import(pathToFileURL(join(out, 'Home.js')).href);
+// eslint-disable-next-line no-unsanitized/method
+const { default: Detail } = await import(pathToFileURL(join(out, 'Detail.js')).href);
+// eslint-disable-next-line no-unsanitized/method
+const { default: Devices } = await import(pathToFileURL(join(out, 'Devices.js')).href);
+// eslint-disable-next-line no-unsanitized/method
+const { default: Device } = await import(pathToFileURL(join(out, 'Device.js')).href);
+// eslint-disable-next-line no-unsanitized/method
+const { default: Health } = await import(pathToFileURL(join(out, 'Health.js')).href);
 
 const zeroDigest = {
   weak_appearance: 0,
@@ -65,7 +85,188 @@ const attentionItem = {
   status: 'attention'
 };
 
+const hostile = `<img src=x onerror=alert(1)>`;
+const hostileAttr = { [`key${hostile}`]: `<b>${hostile}</b>` };
+
+const detailFixture = {
+  briefing_id: 'brf-grp-1',
+  group_id: 'grp-1',
+  host: 'mac:aa:bb:cc:dd:ee:ff',
+  baseline: 'low',
+  model_suggestion: 'medium',
+  priority: 'medium',
+  priority_reason: `Escalated because ${hostile}`,
+  baseline_rule: 'LOW_NEW_HOST',
+  kind: 'port_closed',
+  source: 'model',
+  clamped: true,
+  fallback_used: false,
+  what_changed: `Port 22 closed ${hostile}`,
+  context: 'New host with one closed port.',
+  recommended_check: 'Verify the host with your asset list.',
+  created_at: '2026-11-01T00:00:00Z',
+  event_ids: ['evt-1', 'evt-2'],
+  seq: 7,
+  profiles: [{ profile_id: 'prof-0000000000000001', role: 'current' }],
+  profiles_truncated: true,
+  referenced_events: [
+    { event_id: 'evt-1', event_type: 'host.appeared' },
+    { event_id: 'evt-2', event_type: 'host.changed' }
+  ],
+  observations: [
+    {
+      event_id: 'evt-2',
+      view_role: 'current',
+      reported_at: '2026-11-01T00:00:00Z',
+      received_at: '2026-11-01T00:01:00Z',
+      attributes: hostileAttr,
+      ports: [{ proto: 'tcp', port: 22, state: 'closed', service: '' }],
+      ports_total: 600,
+      ports_truncated: true
+    }
+  ],
+  observations_truncated: false
+};
+
+const legacyDevice = {
+  profile_id: 'prof-0000000000000002',
+  class: 'legacy',
+  source_scope: 'lab',
+  namespace: '',
+  reported_id: 'mac:aa:bb:cc:dd:ee:ff',
+  reported_source: 'subnetlens-pro',
+  reported_confidence: 'high',
+  association_status: 'active',
+  associations: {},
+  operator_label: `My printer ${hostile}`,
+  first_report_at: '2026-10-01T00:00:00Z',
+  last_report_at: '2026-11-01T00:00:00Z',
+  latest: null,
+  history: [
+    {
+      observation_id: 3,
+      event_id: 'evt-9',
+      view_role: 'host',
+      reported_at: '2026-11-01T00:00:00Z',
+      received_at: '2026-11-01T00:01:00Z',
+      attributes: { hostname: `evil${hostile}` },
+      ports_total: 0,
+      ports_truncated: false
+    }
+  ],
+  history_next_after: ''
+};
+
+const healthFixture = {
+  sources: [
+    {
+      scope: 'lab',
+      status: 'degraded',
+      liveness: 'unknown',
+      reasons: ['reported delivery gap'],
+      heartbeat_enabled: false
+    }
+  ],
+  coverage: 'degraded',
+  coverage_reasons: ['reported delivery gap'],
+  fallback_1h: { used: 1, total: 4, ratio: 0.25 },
+  parked_groups: 1,
+  forward_errors_1h: 2,
+  purge: {
+    totals: { raw_events: 10 },
+    last: { status: 'failed', started_at: '2026-11-01T00:00:00Z', rows_deleted: 5, error: 'disk I/O' },
+    last_success: { status: 'completed', started_at: '2026-10-31T00:00:00Z', rows_deleted: 9 }
+  },
+  retention: { reports_seconds: 2592000, subjects_seconds: 7776000 },
+  process: {
+    started_at: '2026-11-01T00:00:00Z',
+    ingest_accepted: 100,
+    ingest_duplicates: 2,
+    ingest_rejected: 1,
+    ingest_saturated: 0,
+    provider_calls: 5,
+    provider_fallbacks: 1,
+    redaction_blocked: 0,
+    writer_saturated: 0
+  },
+  queue_depth: 0,
+  queue_cap: 64
+};
+
 const cases = [
+  {
+    component: Detail,
+    name: 'detail full with hostile text',
+    props: { id: 'brf-grp-1', initial: detailFixture },
+    expect: [
+      'Why this priority',
+      'Baseline floor',
+      'clamped to one step above baseline',
+      'Referenced events',
+      'evt-1 — host.appeared',
+      'Reported evidence',
+      'Retained reported context',
+      'prof-0000000000000001',
+      'More profile links exist',
+      'Recommended check',
+      'No agent trace is available',
+      'Provenance',
+      'Snapshot covers 600 ports (truncated)'
+    ],
+    absent: ['<img', '<b>']
+  },
+  {
+    component: Devices,
+    name: 'devices list',
+    props: {
+      stream: 'live',
+      initial: {
+        devices: [
+          { ...legacyDevice, history: undefined },
+          {
+            profile_id: 'prof-0000000000000003',
+            class: 'address',
+            source_scope: 'lab',
+            last_report_at: '2026-11-01T00:00:00Z'
+          }
+        ],
+        next_after: ''
+      }
+    },
+    expect: ['Reported hosts', 'Legacy profile', 'Address context', 'End of retained list'],
+    absent: ['<img']
+  },
+  {
+    component: Device,
+    name: 'legacy device with hostile label',
+    props: { id: legacyDevice.profile_id, stream: 'live', initial: legacyDevice },
+    expect: [
+      'Earlier bridge-inferred association; not used for current identity',
+      'Your label',
+      'Latest evidence',
+      'No retained observation',
+      'End of retained history',
+      'Health'
+    ],
+    absent: ['<img']
+  },
+  {
+    component: Health,
+    name: 'health with purge failure',
+    props: { stream: 'live', initial: healthFixture },
+    expect: [
+      'Coverage: degraded',
+      'Stuck groups awaiting operator: 1',
+      'Latest purge run failed',
+      'disk I/O',
+      'Latest fully successful purge',
+      'Configured retention: 30 days for reports, 90 days for subjects',
+      'unknown — Step 21 has not reported one',
+      'Heartbeat',
+      'disabled',
+      'Ingest accepted'
+    ]
+  },
   {
     name: 'quiet empty',
     props: { overview: base(), loadError: null },
@@ -145,14 +346,18 @@ const cases = [
 
 let failed = 0;
 for (const c of cases) {
-  const { body } = render(Home, { props: c.props });
+  const { body } = render(c.component ?? Home, { props: c.props });
+  // Strip SSR hydration markers, which split copy across expressions.
+  const stripped = body.replaceAll(/<!--.*?-->/g, '');
   // Server text is HTML-escaped; unescape the entities our copy uses.
-  const text = body
+  const text = stripped
     .replaceAll('&quot;', '"')
     .replaceAll('&#39;', "'")
     .replaceAll('&amp;', '&')
     .replaceAll('&lt;', '<')
     .replaceAll('&gt;', '>');
+  // Absence checks run on entity-escaped text: escaped hostile input
+  // (&lt;img) must never read as a literal tag.
   for (const s of c.expect) {
     if (!text.includes(s)) {
       console.error(`[${c.name}] missing ${JSON.stringify(s)}`);
@@ -160,7 +365,7 @@ for (const c of cases) {
     }
   }
   for (const s of c.absent ?? []) {
-    if (text.includes(s)) {
+    if (stripped.includes(s)) {
       console.error(`[${c.name}] must not contain ${JSON.stringify(s)}`);
       failed++;
     }
@@ -201,6 +406,10 @@ console.log(`smoke: ${cases.length} states render`);
   const h = createFetchGuard();
   const only = h.start();
   check('clean completion current', h.current(only));
+  h.invalidate();
+  check('invalidate voids in-flight fetch', !h.current(only));
+  const after = h.start();
+  check('fetch after invalidate current', h.current(after));
 }
 if (failed > 0) {
   console.error(`${failed} freshness assertion(s) failed`);

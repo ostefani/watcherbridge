@@ -1,7 +1,7 @@
 <script>
   // Attention list: server-ordered (flagged, priority, incident, newest,
-  // stable ID). Items are not links — the detail screen lands in Step 24,
-  // so nothing here implies navigation that does not exist yet.
+  // stable ID). Briefing rows link to their detail screen; other kinds
+  // stay text until their screens exist.
   let { items = [] } = $props();
 </script>
 
@@ -10,16 +10,28 @@
   {#if items.length === 0}
     <p>Nothing flagged. New briefings appear here when the bridge reports them.</p>
   {:else}
-    <ol class="attention">
+    <ol class="attention" data-rows>
       {#each items as item (item.id)}
         <li data-status={item.status}>
-          <span class="pill">Priority: {item.priority}</span>
-          <span class="pill">Status: {item.status}</span>
-          <span class="kind">{item.change_kind}</span>
-          <code>{item.id}</code>
-          <time datetime={item.created_at} title={item.created_at}
-            >{new Date(item.created_at).toLocaleString()}</time
-          >
+          {#if item.kind === 'briefing'}
+            <a data-row href={`#/briefing/${item.id}`}>
+              <span class="pill">Priority: {item.priority}</span>
+              <span class="pill">Status: {item.status}</span>
+              <span class="kind">{item.change_kind}</span>
+              <code>{item.id}</code>
+              <time datetime={item.created_at} title={item.created_at}
+                >{new Date(item.created_at).toLocaleString()}</time
+              >
+            </a>
+          {:else}
+            <span class="pill">Priority: {item.priority}</span>
+            <span class="pill">Status: {item.status}</span>
+            <span class="kind">{item.change_kind}</span>
+            <code>{item.id}</code>
+            <time datetime={item.created_at} title={item.created_at}
+              >{new Date(item.created_at).toLocaleString()}</time
+            >
+          {/if}
         </li>
       {/each}
     </ol>

@@ -107,6 +107,34 @@ func TestOverviewAndHealth(t *testing.T) {
 	if hw.Purge.LastSuccess == nil || hw.Purge.LastSuccess.Status != "completed" {
 		t.Fatalf("purge last success = %+v", hw.Purge.LastSuccess)
 	}
+	// Step 24: identity namespace/capabilities mirror the stored
+	// registration; nothing writes them yet, so the API must read
+	// empty rather than inventing a capability. Heartbeat enablement
+	// and identity capability stay separate claims.
+	if hw.Sources[0].IdentityNamespace != "" || hw.Sources[0].Capabilities != "" {
+		t.Fatalf("identity fields = %q/%q, want unset until Step 21",
+			hw.Sources[0].IdentityNamespace, hw.Sources[0].Capabilities)
+	}
+	// Retention states policy, never a per-profile boundary: the
+	// report horizon mirrors the configured retention and the subject
+	// horizon appears once the server wires it.
+	if hw.Retention == nil || hw.Retention.ReportsSeconds != int64((30*24*time.Hour)/time.Second) {
+		t.Fatalf("retention = %+v, want configured report horizon", hw.Retention)
+	}
+	if hw.Retention.SubjectsSeconds != nil {
+		t.Fatalf("subject horizon = %v, want absent until wired", *hw.Retention.SubjectsSeconds)
+	}
+	v.Overview.SetSubjectRetention(90 * 24 * time.Hour)
+	rec = httptest.NewRecorder()
+	v.handleHealth(rec, httptest.NewRequest("GET", "/api/health", nil))
+	var hw2 healthWire
+	if err := json.NewDecoder(rec.Body).Decode(&hw2); err != nil {
+		t.Fatal(err)
+	}
+	if hw2.Retention == nil || hw2.Retention.SubjectsSeconds == nil ||
+		*hw2.Retention.SubjectsSeconds != int64((90*24*time.Hour)/time.Second) {
+		t.Fatalf("wired retention = %+v, want both horizons", hw2.Retention)
+	}
 }
 
 // The refresher broadcasts only on hash change and coalesces triggers.

@@ -39,8 +39,10 @@
  * @property {string} scope
  * @property {string} status ok|degraded|blind
  * @property {string} liveness
+ * @property {string} [identity_namespace] absent until Step 21 reports it
+ * @property {string} [capabilities] absent until Step 21 reports it
  * @property {string} [last_report_at] RFC 3339
- * @property {boolean} heartbeat_enabled
+ * @property {boolean} heartbeat_enabled heartbeat opt-in, not identity proof
  * @property {string} [last_heartbeat_at] RFC 3339
  * @property {string} [delivery_status]
  * @property {string[]} reasons
@@ -56,10 +58,81 @@
  * @property {number} parked_groups
  * @property {number} forward_errors_1h
  * @property {{totals: Record<string, number>, last?: object, last_success?: object}} purge
+ * @property {{reports_seconds: number, subjects_seconds?: number}} [retention] policy, never a per-profile boundary
  * @property {{posted: number, dropped: number, failed: number}} [publisher]
  * @property {object} process
  * @property {number} queue_depth
  * @property {number} queue_cap
+ */
+
+// wire: briefingView (internal/viewer/viewer.go)
+/**
+ * @typedef {object} BriefingDetail
+ * @property {string} briefing_id
+ * @property {string} group_id
+ * @property {string} host
+ * @property {string} baseline
+ * @property {string|null} model_suggestion
+ * @property {string} priority
+ * @property {string} priority_reason
+ * @property {string} baseline_rule
+ * @property {string} kind
+ * @property {string} source rules|model|agent|fallback|legacy
+ * @property {boolean} clamped
+ * @property {boolean} fallback_used
+ * @property {string} what_changed
+ * @property {string} context retained reported context, not raw evidence
+ * @property {string} recommended_check text only, never an action
+ * @property {string} created_at RFC 3339
+ * @property {string[]} event_ids
+ * @property {number} seq
+ * @property {{profile_id: string, role: string}[]} profiles persisted links only
+ * @property {boolean} [profiles_truncated]
+ * @property {{event_id: string, event_type: string}[]} referenced_events index, not evidence
+ * @property {boolean} [referenced_truncated]
+ * @property {Observation[]} observations retained views for exactly those events
+ * @property {boolean} [observations_truncated]
+ */
+
+// wire: deviceWire (internal/viewer/viewer.go)
+/**
+ * @typedef {object} Observation
+ * @property {number} observation_id
+ * @property {string} event_id
+ * @property {string} view_role
+ * @property {string} reported_at RFC 3339
+ * @property {string} received_at RFC 3339
+ * @property {Record<string, any>} attributes
+ * @property {Array<{proto: string, port: number, state: string, service: string}>} [ports] latest evidence only
+ * @property {number} ports_total
+ * @property {boolean} ports_truncated
+ */
+
+// wire: deviceWire (internal/viewer/viewer.go)
+/**
+ * @typedef {object} DeviceProfile
+ * @property {string} profile_id
+ * @property {string} class reported_device|address|event|legacy
+ * @property {string} source_scope
+ * @property {string} namespace
+ * @property {string} reported_id
+ * @property {string} reported_source
+ * @property {string} reported_confidence
+ * @property {string} association_status
+ * @property {Record<string, number>} associations
+ * @property {string|null} operator_label your label, never identity
+ * @property {string} first_report_at RFC 3339
+ * @property {string} last_report_at RFC 3339
+ * @property {Observation|null} latest
+ * @property {Observation[]} [history]
+ * @property {string} [history_next_after]
+ */
+
+// wire: devicesEnvelope (internal/viewer/viewer.go)
+/**
+ * @typedef {object} DevicesPage
+ * @property {DeviceProfile[]} devices
+ * @property {string} next_after "" when exhausted
  */
 
 export {};

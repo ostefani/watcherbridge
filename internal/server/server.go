@@ -127,6 +127,7 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 	// annotation publisher attach later in main once both exist.
 	s.viewer.Overview = viewer.NewRefresher(events, nil, nil,
 		cfg.OverviewWindow, cfg.OverviewMaxWindow, cfg.BriefingRetention)
+	s.viewer.Overview.SetSubjectRetention(cfg.SubjectRetention)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook", s.handleWebhook)
 	// GET needs an explicit route: without it the viewer mount below

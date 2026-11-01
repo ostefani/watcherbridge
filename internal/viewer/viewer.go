@@ -684,6 +684,33 @@ type briefingView struct {
 	CreatedAt        string   `json:"created_at"`
 	EventIDs         []string `json:"event_ids"`
 	Seq              int64    `json:"seq"`
+	// Profiles carries the persisted briefing-to-profile links only;
+	// ProfilesTruncated reports links beyond the read cap.
+	Profiles          []briefingSubjectWire `json:"profiles"`
+	ProfilesTruncated bool                  `json:"profiles_truncated,omitempty"`
+	// ReferencedEvents pairs each group event ID with its recorded
+	// type: an evidence index, not the evidence itself.
+	// ReferencedTruncated reports pairs beyond the read cap.
+	ReferencedEvents    []referencedEventWire `json:"referenced_events"`
+	ReferencedTruncated bool                  `json:"referenced_truncated,omitempty"`
+	// Observations is the bounded retained projection for exactly the
+	// referenced events. ObservationsTruncated reports entries dropped
+	// by the count cap or the snapshot byte budget.
+	Observations          []observationWire `json:"observations"`
+	ObservationsTruncated bool              `json:"observations_truncated,omitempty"`
+}
+
+// briefingSubjectWire is one persisted profile link with its
+// projection role (host, previous or current).
+type briefingSubjectWire struct {
+	ProfileID string `json:"profile_id"`
+	Role      string `json:"role"`
+}
+
+// referencedEventWire pairs one group event ID with its type.
+type referencedEventWire struct {
+	EventID   string `json:"event_id"`
+	EventType string `json:"event_type"`
 }
 
 func viewOf(b store.Briefing) briefingView {
@@ -695,6 +722,8 @@ func viewOf(b store.Briefing) briefingView {
 		FallbackUsed: b.FallbackUsed, WhatChanged: b.WhatChanged, Context: b.Context,
 		RecommendedCheck: b.RecommendedCheck, CreatedAt: b.CreatedAt.UTC().Format(time.RFC3339),
 		EventIDs: append([]string(nil), b.EventIDs...), Seq: b.Seq,
+		Profiles: []briefingSubjectWire{}, ReferencedEvents: []referencedEventWire{},
+		Observations: []observationWire{},
 	}
 }
 
@@ -805,19 +834,65 @@ func parseCursor(s string) (int64, error) {
 	return int64(n), nil
 }
 
-// handleBriefing serves one briefing by ?id= (briefing or group ID).
+// handleBriefing serves one briefing by ?id= (briefing or group ID)
+// with its persisted profile links, referenced event index, and the
+// retained observations for exactly those events. Every association
+// comes from stored link rows; nothing is re-matched from the host
+// string, and a profile's latest observation is never substituted for
+// an older event's retained view.
 func (v *Viewer) handleBriefing(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {
 		writeViewerError(w, "missing id", http.StatusBadRequest)
 		return
 	}
-	b, err := v.store.BriefingForGroup(r.Context(), id)
+	ctx := r.Context()
+	b, err := v.store.BriefingForGroup(ctx, id)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, viewOf(b))
+	view := viewOf(b)
+	subjects, subjectsTruncated, err := v.store.BriefingSubjects(ctx, b.BriefingID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	view.Profiles = make([]briefingSubjectWire, 0, len(subjects))
+	for _, s := range subjects {
+		view.Profiles = append(view.Profiles, briefingSubjectWire{ProfileID: s.ProfileID, Role: s.Role})
+	}
+	view.ProfilesTruncated = subjectsTruncated
+	refs, refsTruncated, err := v.store.BriefingReferencedEvents(ctx, b.GroupID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	view.ReferencedEvents = make([]referencedEventWire, 0, len(refs))
+	eventIDs := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		view.ReferencedEvents = append(view.ReferencedEvents, referencedEventWire{EventID: ref.EventID, EventType: ref.EventType})
+		eventIDs = append(eventIDs, ref.EventID)
+	}
+	view.ReferencedTruncated = refsTruncated
+	obs, obsTruncated, err := v.store.ObservationsForEvents(ctx, eventIDs)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	view.Observations = make([]observationWire, 0, len(obs))
+	for _, o := range obs {
+		wire := observationWire{
+			EventID: o.EventID, ViewRole: o.ViewRole,
+			ReportedAt: o.ReportedAt.UTC().Format(time.RFC3339),
+			ReceivedAt: o.ReceivedAt.UTC().Format(time.RFC3339),
+			Attributes: o.Attributes,
+			PortsTotal: o.PortsTotal, PortsTruncated: o.PortsTruncated,
+		}
+		view.Observations = append(view.Observations, wire)
+	}
+	view.ObservationsTruncated = obsTruncated
+	writeJSON(w, view)
 }
 
 // deviceWire is one reported subject: class, provenance and association

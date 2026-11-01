@@ -1,33 +1,53 @@
 <script>
   import { onMount } from 'svelte';
   import Home from './lib/Home.svelte';
+  import Detail from './lib/Detail.svelte';
+  import Devices from './lib/Devices.svelte';
+  import Device from './lib/Device.svelte';
+  import Health from './lib/Health.svelte';
   import ConnectionStatus from './lib/ConnectionStatus.svelte';
   import { createFetchGuard } from './lib/freshness.js';
+  import { moveRowFocus, typingTarget } from './lib/roving.js';
   import { fetchOverview } from './api.js';
 
-  // Step 23 app: hash routes (#/ home now; #/devices/:id and #/health
-  // land in Step 24). The bridge owns all verdict logic — the app
-  // renders the overview envelope and refreshes it from `overview`
-  // stream events, refetching only on connect.
-  let route = $state(window.location.hash || '#/');
+  // Step 24 shell: hash routes for home, briefing detail, reported
+  // hosts (list + profile) and health. The bridge owns all verdict
+  // logic — the app renders envelopes and refreshes them from
+  // `overview` stream frames, refetching only on connect. Detail
+  // screens are immutable once briefed; live screens refetch or mark
+  // stale on the reconnect edge themselves.
+  let routeKey = $state(window.location.hash || '#/');
   let overview = $state(null);
   let loadError = $state(null);
   let stream = $state('connecting');
+  let showHelp = $state(false);
   let source = null;
   let retryTimer = 0;
+  let pendingG = false;
+  let pendingTimer = 0;
 
   const guard = createFetchGuard();
 
-  function currentRoute() {
-    const hash = window.location.hash || '#/';
-    if (hash === '#/devices' || hash.startsWith('#/devices/')) {
-      return 'devices';
+  function parseRoute(hash) {
+    const h = hash || '#/';
+    let m = h.match(/^#\/briefing\/(.+)$/);
+    if (m) {
+      return { name: 'briefing', id: decodeURIComponent(m[1]) };
     }
-    if (hash === '#/health') {
-      return 'health';
+    m = h.match(/^#\/devices\/(.+)$/);
+    if (m) {
+      return { name: 'device', id: decodeURIComponent(m[1]) };
     }
-    return 'home';
+    if (h === '#/devices' || h === '#/devices/') {
+      return { name: 'devices' };
+    }
+    if (h === '#/health') {
+      return { name: 'health' };
+    }
+    return { name: 'home' };
   }
+
+  const route = $derived(parseRoute(routeKey));
 
   async function load() {
     const token = guard.start();
@@ -70,17 +90,57 @@
     };
   }
 
+  // Navigation-only shortcuts, added where their controls exist.
+  // Decision keys arrive with Step 25; only working keys are listed.
+  function onKey(/** @type {KeyboardEvent} */ ev) {
+    if (ev.key === '?' && !typingTarget(ev)) {
+      showHelp = !showHelp;
+      ev.preventDefault();
+      return;
+    }
+    if (typingTarget(ev)) {
+      pendingG = false;
+      return;
+    }
+    if (pendingG) {
+      pendingG = false;
+      window.clearTimeout(pendingTimer);
+      if (ev.key === 'h') {
+        window.location.hash = '#/';
+      } else if (ev.key === 'd') {
+        window.location.hash = '#/devices';
+      }
+      return;
+    }
+    if (ev.key === 'g') {
+      pendingG = true;
+      window.clearTimeout(pendingTimer);
+      pendingTimer = window.setTimeout(() => {
+        pendingG = false;
+      }, 1000);
+      return;
+    }
+    if (ev.key === 'j' || ev.key === 'k') {
+      if (moveRowFocus(ev.key === 'j' ? 1 : -1)) {
+        ev.preventDefault();
+      }
+    }
+  }
+
   onMount(() => {
     const onHash = () => {
-      route = currentRoute();
+      routeKey = window.location.hash || '#/';
     };
     window.addEventListener('hashchange', onHash);
-    route = currentRoute();
+    window.addEventListener('keydown', onKey);
+    routeKey = window.location.hash || '#/';
     load();
     connect();
     return () => {
       window.removeEventListener('hashchange', onHash);
+      window.removeEventListener('keydown', onKey);
       window.clearTimeout(retryTimer);
+      window.clearTimeout(pendingTimer);
       source?.close();
       source = null;
     };
@@ -90,19 +150,37 @@
 <main>
   <h1>WatcherBridge</h1>
   <nav aria-label="Views">
-    <a href="#/" aria-current={route === 'home' ? 'page' : undefined}>Home</a>
-    <a href="#/devices" aria-current={route === 'devices' ? 'page' : undefined}>Reported hosts</a>
-    <a href="#/health" aria-current={route === 'health' ? 'page' : undefined}>Health</a>
+    <a href="#/" aria-current={route.name === 'home' ? 'page' : undefined}>Home</a>
+    <a href="#/devices" aria-current={route.name === 'devices' || route.name === 'device' ? 'page' : undefined}>Reported hosts</a>
+    <a href="#/health" aria-current={route.name === 'health' ? 'page' : undefined}>Health</a>
+    <button type="button" onclick={() => (showHelp = !showHelp)} aria-expanded={showHelp}>Shortcuts</button>
   </nav>
-  <ConnectionStatus state={stream} />
-  {#if route === 'home'}
-    <Home {overview} {loadError} />
-  {:else}
-    <section aria-label="Not yet available">
-      <h2>{route === 'devices' ? 'Reported hosts' : 'Health'}</h2>
-      <p>This screen arrives in Step 24. The bridge API already serves its data.</p>
+  {#if showHelp}
+    <section aria-label="Keyboard shortcuts">
+      <h2>Keyboard shortcuts</h2>
+      <ul>
+        <li><kbd>j</kbd> / <kbd>k</kbd> — move between rows in a list</li>
+        <li><kbd>g</kbd> then <kbd>h</kbd> — Home</li>
+        <li><kbd>g</kbd> then <kbd>d</kbd> — Reported hosts</li>
+        <li><kbd>?</kbd> — toggle this list</li>
+      </ul>
+      <p>Shortcuts stay silent while typing. Decision shortcuts arrive with Step 25.</p>
     </section>
   {/if}
+  <ConnectionStatus state={stream} />
+  {#key routeKey}
+    {#if route.name === 'home'}
+      <Home {overview} {loadError} />
+    {:else if route.name === 'briefing'}
+      <Detail id={route.id} />
+    {:else if route.name === 'devices'}
+      <Devices {stream} />
+    {:else if route.name === 'device'}
+      <Device id={route.id} {stream} />
+    {:else if route.name === 'health'}
+      <Health {stream} />
+    {/if}
+  {/key}
 </main>
 
 <style>
@@ -127,9 +205,14 @@
   nav a[aria-current='page'] {
     font-weight: 700;
   }
-  :global(a:focus-visible, button:focus-visible) {
+  :global(a:focus-visible, button:focus-visible, summary:focus-visible) {
     outline: 2px solid #1a1a1a;
     outline-offset: 2px;
+  }
+  kbd {
+    border: 1px solid #999;
+    padding: 0 0.3rem;
+    font-size: 0.85rem;
   }
   @media (prefers-color-scheme: dark) {
     main {
@@ -139,8 +222,14 @@
     :global(a) {
       color: #8ab4f8;
     }
-    :global(a:focus-visible, button:focus-visible) {
+    :global(a:focus-visible, button:focus-visible, summary:focus-visible) {
       outline-color: #e8e8e8;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    :global(*) {
+      transition: none;
+      animation: none;
     }
   }
 </style>
