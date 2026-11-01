@@ -15,24 +15,19 @@
   );
 </script>
 
-{#if loadError !== null}
+{#if loadError !== null && overview === null}
   <section aria-label="Overview unavailable">
     <h2>Overview unavailable</h2>
     <p>The bridge did not return an overview ({loadError}). The stream below keeps retrying.</p>
   </section>
 {:else if overview === null}
   <p role="status">Loading overview…</p>
-{:else if overview.receipts === 0}
-  <section aria-label="No reports">
-    <h2>No reports in the last {overview.window}</h2>
-    <p>
-      The bridge has no receipts in this window. Quiet here means no data,
-      not a secure network. Coverage: {overview.coverage}, liveness:
-      {overview.liveness}.
-    </p>
-  </section>
-  <SourceCoverage sources={overview.sources} />
 {:else}
+  {#if overview.receipts === 0}
+    <p class="coverage-note">
+      No receipts in the last {overview.window} — quiet here means no data, not a secure network.
+    </p>
+  {/if}
   {#if degraded}
     <p role="alert" class="coverage-note">
       Coverage is {overview.coverage}. Treat quiet results with caution until the reasons below clear.

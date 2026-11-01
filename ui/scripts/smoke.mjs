@@ -69,7 +69,14 @@ const cases = [
   {
     name: 'quiet empty',
     props: { overview: base(), loadError: null },
-    expect: ['No reports in the last 24h0m0s', 'no receipts', 'Coverage: ok', 'liveness:', 'unknown']
+    expect: [
+      'Nothing needs review',
+      'No receipts in the last 24h0m0s',
+      'quiet here means no data',
+      'Coverage: ok',
+      'Liveness: unknown',
+      'No sources registered yet'
+    ]
   },
   {
     name: 'quiet with receipts',
@@ -98,17 +105,41 @@ const cases = [
         receipts: 2,
         attention: [attentionItem],
         coverage: 'degraded',
+        liveness: 'unknown',
         reasons: ['fallback ratio high'],
-        digest: { ...zeroDigest, port_closed: 2 }
+        digest: { ...zeroDigest, port_closed: 2 },
+        sources: [
+          {
+            scope: 'lab',
+            status: 'ok',
+            liveness: 'unknown',
+            reasons: [],
+            last_report_at: '2026-11-01T00:00:00Z'
+          }
+        ]
       }),
       loadError: null
     },
-    expect: ['1 need a check now', 'port_closed', 'fallback ratio high', 'Coverage is degraded']
+    expect: [
+      '1 need a check now',
+      'port_closed',
+      'fallback ratio high',
+      'Coverage is degraded',
+      'lab',
+      'Status: ok',
+      'Liveness: unknown'
+    ]
   },
   {
     name: 'load error',
     props: { overview: null, loadError: 'overview 500' },
     expect: ['Overview unavailable', 'overview 500']
+  },
+  {
+    name: 'stale error keeps overview',
+    props: { overview: base({ verdict: 'review', headline: '1 things to review', receipts: 1 }), loadError: 'overview 500' },
+    expect: ['1 things to review'],
+    absent: ['Overview unavailable']
   }
 ];
 
@@ -128,6 +159,12 @@ for (const c of cases) {
       failed++;
     }
   }
+  for (const s of c.absent ?? []) {
+    if (text.includes(s)) {
+      console.error(`[${c.name}] must not contain ${JSON.stringify(s)}`);
+      failed++;
+    }
+  }
   // Hostile strings would render escaped; our copy never injects HTML.
   if (/<script/.test(body)) {
     console.error(`[${c.name}] unexpected script element`);
@@ -140,3 +177,33 @@ if (failed > 0) {
   process.exit(1);
 }
 console.log(`smoke: ${cases.length} states render`);
+
+// Fetch/stream freshness: a stale fetch completion must not overwrite
+// newer state, and a stream frame must invalidate fetches started
+// before it.
+{
+  const { createFetchGuard } = await import('../src/lib/freshness.js');
+  const check = (name, cond) => {
+    if (!cond) {
+      console.error(`[freshness] ${name}`);
+      failed++;
+    }
+  };
+  const g = createFetchGuard();
+  const first = g.start();
+  const second = g.start();
+  check('older fetch dropped', !g.current(first));
+  check('newest fetch current', g.current(second));
+  g.streamed();
+  check('stream invalidates in-flight fetch', !g.current(second));
+  const third = g.start();
+  check('fetch after frame current', g.current(third));
+  const h = createFetchGuard();
+  const only = h.start();
+  check('clean completion current', h.current(only));
+}
+if (failed > 0) {
+  console.error(`${failed} freshness assertion(s) failed`);
+  process.exit(1);
+}
+console.log('smoke: freshness guard holds');

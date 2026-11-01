@@ -3,10 +3,13 @@
 // never clamped or widened silently.
 
 /**
+ * Window is intentionally not a client parameter: the request omits it
+ * so the server default applies, matching the window of the `overview`
+ * stream frames. A server-side window change never desyncs the two.
  * @returns {Promise<import('./wire.js').Overview>}
  */
-export async function fetchOverview(window = '24h') {
-  const res = await fetch(`/api/overview?window=${encodeURIComponent(window)}`);
+export async function fetchOverview() {
+  const res = await fetch('/api/overview');
   if (!res.ok) {
     throw new Error(`overview ${res.status}`);
   }

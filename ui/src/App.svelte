@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import Home from './lib/Home.svelte';
   import ConnectionStatus from './lib/ConnectionStatus.svelte';
+  import { createFetchGuard } from './lib/freshness.js';
   import { fetchOverview } from './api.js';
 
   // Step 23 app: hash routes (#/ home now; #/devices/:id and #/health
@@ -15,9 +16,11 @@
   let source = null;
   let retryTimer = 0;
 
+  const guard = createFetchGuard();
+
   function currentRoute() {
     const hash = window.location.hash || '#/';
-    if (hash.startsWith('#/devices/')) {
+    if (hash === '#/devices' || hash.startsWith('#/devices/')) {
       return 'devices';
     }
     if (hash === '#/health') {
@@ -27,11 +30,19 @@
   }
 
   async function load() {
+    const token = guard.start();
     try {
-      overview = await fetchOverview();
-      loadError = null;
+      const fresh = await fetchOverview();
+      if (guard.current(token)) {
+        overview = fresh;
+        loadError = null;
+      }
     } catch (err) {
-      loadError = err instanceof Error ? err.message : String(err);
+      // A stale failure must never hide a valid overview; a current
+      // failure only surfaces when no overview exists yet.
+      if (guard.current(token) && overview === null) {
+        loadError = err instanceof Error ? err.message : String(err);
+      }
     }
   }
 
@@ -45,6 +56,7 @@
     source.addEventListener('overview', (/** @type {MessageEvent} */ ev) => {
       try {
         overview = JSON.parse(ev.data);
+        guard.streamed();
         loadError = null;
       } catch {
         // A malformed frame degrades to the next refresh, never a crash.

@@ -1,6 +1,8 @@
 package overview
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -200,6 +202,28 @@ func TestSummarize(t *testing.T) {
 				t.Fatalf("headline = %q", headline)
 			}
 		})
+	}
+}
+
+// The wire contract is arrays, never null: a healthy source and clean
+// coverage must serialize `reasons: []` so clients read `.length`
+// without a guard.
+func TestAssessCoverageEmitsEmptyReasons(t *testing.T) {
+	got := AssessCoverage(CoverageInput{AsOf: time.Now()})
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"reasons":[]`) {
+		t.Fatalf("coverage serializes nullable reasons: %s", raw)
+	}
+	got = AssessCoverage(CoverageInput{Sources: []SourceInput{{Scope: "s"}}, AsOf: time.Now()})
+	raw, err = json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"reasons":[]`) {
+		t.Fatalf("source serializes nullable reasons: %s", raw)
 	}
 }
 

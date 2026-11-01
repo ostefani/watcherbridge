@@ -106,18 +106,18 @@ type AttentionItem struct {
 // reasons. Liveness is unknown until heartbeat capability exists
 // (Step 21); a quiet event stream never implies host presence.
 type Coverage struct {
-	Status  string // ok|degraded|blind
-	Sources []SourceCoverage
-	Reasons []string
+	Status  string           `json:"status"` // ok|degraded|blind
+	Sources []SourceCoverage `json:"sources"`
+	Reasons []string         `json:"reasons"`
 }
 
 // SourceCoverage tracks one authenticated source independently: one
 // healthy source never masks a silent one.
 type SourceCoverage struct {
-	Scope    string
-	Status   string // ok|degraded|blind
-	Liveness string // unknown until heartbeat capability exists
-	Reasons  []string
+	Scope    string   `json:"scope"`
+	Status   string   `json:"status"`   // ok|degraded|blind
+	Liveness string   `json:"liveness"` // unknown until heartbeat capability exists
+	Reasons  []string `json:"reasons"`
 }
 
 // CoverageInput feeds AssessCoverage. Heartbeat fields stay unset until
@@ -160,9 +160,12 @@ const (
 // group, forwarding error, reported delivery gap, or writer saturation
 // degrades.
 func AssessCoverage(in CoverageInput) Coverage {
-	cov := Coverage{Status: CoverageOK}
+	// The wire contract carries arrays, never null: healthy sources and
+	// clean coverage serialize `reasons: []`, so clients can read
+	// `.length` without a guard.
+	cov := Coverage{Status: CoverageOK, Reasons: []string{}}
 	for _, s := range in.Sources {
-		sc := SourceCoverage{Scope: s.Scope, Status: CoverageOK, Liveness: LivenessUnknown}
+		sc := SourceCoverage{Scope: s.Scope, Status: CoverageOK, Liveness: LivenessUnknown, Reasons: []string{}}
 		if s.HeartbeatCapable && s.HeartbeatStale {
 			sc.Status = CoverageBlind
 			sc.Reasons = append(sc.Reasons, "heartbeat stale")
