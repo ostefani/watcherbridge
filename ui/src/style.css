@@ -1,0 +1,6 @@
+/* Step 22 shell styles: plain system type, no motion, no decoration.
+   Visual identity arrives with the Step 23 screens. */
+body {
+  margin: 0;
+  background: #fff;
+}

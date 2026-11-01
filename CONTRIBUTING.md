@@ -23,14 +23,22 @@ Requirements:
 Clone, then from the repository root:
 
 ```sh
-go test ./...
-go vet ./...
+go test $(go list ./... | grep -v '/node_modules/')
+go vet $(go list ./... | grep -v '/node_modules/')
 ```
 
 For anything touching concurrency or lifecycle code, also run:
 
 ```sh
-go test -race ./...
+go test -race $(go list ./... | grep -v '/node_modules/')
+```
+
+The `grep -v` filters out Go code shipped inside `ui/node_modules`
+(third-party JavaScript dependencies); it is never part of the build.
+Formatting is checked over tracked files only:
+
+```sh
+test -z "$(gofmt -l $(git ls-files '*.go'))"
 ```
 
 There is no released binary yet; the current code is the persistence and forwarding core (`internal/store`, `internal/forwarder`) with its test suites.

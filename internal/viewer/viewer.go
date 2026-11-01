@@ -18,6 +18,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,7 +29,7 @@ import (
 	"github.com/ostefani/watcherbridge/internal/store"
 )
 
-//go:embed web/index.html web/app.js web/style.css
+//go:embed web/dist
 var assets embed.FS
 
 // csp is the restrictive policy on every viewer response (Designv8 §2.4):
@@ -234,8 +235,7 @@ func (v *Viewer) Hub() *Hub { return v.hub }
 // wrapping cannot reach.
 func (v *Viewer) Attach(mux *http.ServeMux) {
 	mux.HandleFunc("GET /", v.handleIndex)
-	mux.HandleFunc("GET /app.js", v.serveAsset("web/app.js", "text/javascript; charset=utf-8"))
-	mux.HandleFunc("GET /style.css", v.serveAsset("web/style.css", "text/css; charset=utf-8"))
+	mux.HandleFunc("GET /assets/", v.handleAssets)
 	mux.HandleFunc("GET /events", v.handleEvents)
 	mux.HandleFunc("GET /api/briefings", v.handleBriefings)
 	mux.HandleFunc("GET /api/briefing", v.handleBriefing)
@@ -365,27 +365,44 @@ func (v *Viewer) guardStateChanging(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (v *Viewer) serveAsset(name, contentType string) func(http.ResponseWriter, *http.Request) {
-	raw, err := assets.ReadFile(name)
-	if err != nil {
-		// Embedded at compile time; a missing asset is a build bug.
-		panic(fmt.Sprintf("viewer: embedded asset %s missing: %v", name, err))
-	}
-	return func(w http.ResponseWriter, _ *http.Request) {
-		SetSecurityHeaders(w)
-		w.Header().Set("Content-Type", contentType)
-		w.Header().Set("Cache-Control", "no-store")
-		_, _ = w.Write(raw)
-	}
-}
-
 func (v *Viewer) handleIndex(w http.ResponseWriter, _ *http.Request) {
-	raw, err := assets.ReadFile("web/index.html")
+	raw, err := assets.ReadFile("web/dist/index.html")
 	if err != nil {
-		panic(fmt.Sprintf("viewer: embedded asset web/index.html missing: %v", err))
+		panic(fmt.Sprintf("viewer: embedded asset web/dist/index.html missing: %v", err))
 	}
 	SetSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(raw)
+}
+
+// handleAssets serves the committed Vite bundle. Only .js and .css
+// under web/dist/assets/ are reachable, and the request path is
+// cleaned and confined — nothing outside the bundle directory can be
+// named, and no other extension is served.
+func (v *Viewer) handleAssets(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/assets/")
+	if rest == "" || strings.Contains(rest, "..") || rest != path.Clean(rest) {
+		writeViewerError(w, "not found", http.StatusNotFound)
+		return
+	}
+	var contentType string
+	switch path.Ext(rest) {
+	case ".js":
+		contentType = "text/javascript; charset=utf-8"
+	case ".css":
+		contentType = "text/css; charset=utf-8"
+	default:
+		writeViewerError(w, "not found", http.StatusNotFound)
+		return
+	}
+	raw, err := assets.ReadFile("web/dist/assets/" + rest)
+	if err != nil {
+		writeViewerError(w, "not found", http.StatusNotFound)
+		return
+	}
+	SetSecurityHeaders(w)
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(raw)
 }

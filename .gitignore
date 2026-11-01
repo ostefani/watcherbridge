@@ -34,6 +34,9 @@ config.local.*
 *.log
 pseudonyms.*
 
+# --- UI toolchain (project-local, never commit) ---
+ui/node_modules/
+
 # --- Editors and IDEs ---
 .idea/
 .vscode/

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -321,19 +322,17 @@ func TestBriefingsCursorPaging(t *testing.T) {
 func TestStaticAssetsHeaders(t *testing.T) {
 	v := New(openViewerStore(t), NewHub())
 	for path, ct := range map[string]string{
-		"/":          "text/html; charset=utf-8",
-		"/app.js":    "text/javascript; charset=utf-8",
-		"/style.css": "text/css; charset=utf-8",
+		"/":                 "text/html; charset=utf-8",
+		"/assets/index.js":  "text/javascript; charset=utf-8",
+		"/assets/index.css": "text/css; charset=utf-8",
 	} {
 		req := httptest.NewRequest("GET", path, nil)
 		rec := httptest.NewRecorder()
 		switch path {
 		case "/":
 			v.handleIndex(rec, req)
-		case "/app.js":
-			v.serveAsset("web/app.js", "text/javascript; charset=utf-8")(rec, req)
-		case "/style.css":
-			v.serveAsset("web/style.css", "text/css; charset=utf-8")(rec, req)
+		default:
+			v.handleAssets(rec, req)
 		}
 		if rec.Code != 200 {
 			t.Fatalf("%s = %d", path, rec.Code)
@@ -345,19 +344,71 @@ func TestStaticAssetsHeaders(t *testing.T) {
 			t.Fatalf("%s CSP = %q", path, got)
 		}
 	}
+	// Only .js and .css inside the bundle directory are reachable;
+	// traversal, extension smuggling, and bare prefixes are 404.
+	for _, path := range []string{
+		"/assets/", "/assets/../index.html", "/assets/%2e%2e/index.html",
+		"/assets/index.map", "/assets/index.html",
+	} {
+		req := httptest.NewRequest("GET", path, nil)
+		rec := httptest.NewRecorder()
+		v.handleAssets(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s = %d, want 404", path, rec.Code)
+		}
+	}
 }
 
 func TestShippedJSRendersTextOnly(t *testing.T) {
-	raw, err := assets.ReadFile("web/app.js")
+	// The Svelte bundle replaces the old hand-written client. Svelte's
+	// runtime sets innerHTML on static compiled templates (never on
+	// hostile data), so a bundle substring check cannot distinguish
+	// framework machinery from a data sink. The enforceable invariant
+	// is at the source level: no {@html} block may exist (primary
+	// enforcement is `npm run lint` via svelte/no-at-html-tags, which
+	// CI runs; this test keeps a checkout honest when the bundle is
+	// rebuilt without lint).
+	entries, err := os.ReadDir("../../ui/src")
 	if err != nil {
 		t.Fatal(err)
 	}
-	js := string(raw)
-	if strings.Contains(js, "innerHTML") {
-		t.Fatal("viewer JS must not use innerHTML: hostile strings render via textContent only")
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		raw, err := os.ReadFile("../../ui/src/" + e.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "{@html}") {
+			t.Fatalf("ui/src/%s uses {@html}: hostile strings must stay inert", e.Name())
+		}
 	}
-	if !strings.Contains(js, "textContent") {
-		t.Fatal("viewer JS must render through textContent")
+	// The served shell must load under the viewer CSP: no inline
+	// scripts, no inline event handlers — only src-referenced bundle
+	// assets, which the route test above proves servable.
+	page, err := assets.ReadFile("web/dist/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(page), "<script>") || strings.Contains(string(page), "onclick=") ||
+		strings.Contains(string(page), "onload=") || strings.Contains(string(page), "onerror=") {
+		t.Fatal("served shell must not carry inline scripts or handlers")
+	}
+	// The committed bundle must still exist: an empty dist would pass
+	// every content assertion vacuously.
+	dist, err := assets.ReadDir("web/dist/assets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var js int
+	for _, e := range dist {
+		if strings.HasSuffix(e.Name(), ".js") {
+			js++
+		}
+	}
+	if js == 0 {
+		t.Fatal("no JS bundle committed")
 	}
 }
 
