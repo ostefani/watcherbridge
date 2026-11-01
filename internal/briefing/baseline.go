@@ -49,12 +49,16 @@ type hostView struct {
 // GroupEvent is one taken event with its payload decoded. Type comes from
 // the store column (allowlisted at ingest); host views are nil when the
 // stored payload does not decode — that event then takes the unknown-input
-// path instead of failing the group.
+// path instead of failing the group. Changes carries the producer's own
+// change fields ({field, before, after} at the envelope level) when the
+// payload carries them; a non-empty list means the producer reported what
+// changed and the bridge trusts that report instead of re-deriving it.
 type GroupEvent struct {
 	EventType string
 	Host      *hostView
 	Current   *hostView
 	Previous  *hostView
+	Changes   []string
 }
 
 // DecodeEvent decodes one stored payload. Undecodable payloads yield views
@@ -65,11 +69,17 @@ func DecodeEvent(eventType string, payload []byte) GroupEvent {
 		Host     *hostView `json:"host"`
 		Current  *hostView `json:"current"`
 		Previous *hostView `json:"previous"`
+		Changes  []struct {
+			Field string `json:"field"`
+		} `json:"changes"`
 	}
 	if err := json.Unmarshal(payload, &body); err != nil {
 		return ev
 	}
 	ev.Host, ev.Current, ev.Previous = body.Host, body.Current, body.Previous
+	for _, c := range body.Changes {
+		ev.Changes = append(ev.Changes, c.Field)
+	}
 	return ev
 }
 

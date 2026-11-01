@@ -72,6 +72,14 @@ func KindOf(events []GroupEvent, ruleID string) string {
 // host.changed events in fixed precedence: hostname, closed port,
 // OS/device refinement. The second return is false when no changed
 // event carries a usable previous/current pair with a difference.
+//
+// When the payload carries the producer's own changes[] the bridge
+// trusts that report: a reported field sets its flag directly and the
+// raw values are never re-compared, so the producer's normalization
+// (case-insensitive, trailing-dot-insensitive hostnames) cannot be
+// contradicted. Payloads without changes[] fall back to conservative
+// raw comparison. Port states still decide closures in both paths: a
+// reported ports change means the set differs, not that a port closed.
 func changedKind(events []GroupEvent) (string, bool) {
 	var hostname, portClosed, osRefined bool
 	for _, e := range events {
@@ -79,11 +87,22 @@ func changedKind(events []GroupEvent) (string, bool) {
 			continue
 		}
 		prev, cur := e.Previous, e.Current
-		if prev.Hostname != cur.Hostname && (prev.Hostname != "" || cur.Hostname != "") {
-			hostname = true
-		}
 		if portWasClosed(prev.Ports, cur.Ports) {
 			portClosed = true
+		}
+		if len(e.Changes) > 0 {
+			for _, field := range e.Changes {
+				switch field {
+				case "hostname":
+					hostname = true
+				case "os", "device":
+					osRefined = true
+				}
+			}
+			continue
+		}
+		if prev.Hostname != cur.Hostname && (prev.Hostname != "" || cur.Hostname != "") {
+			hostname = true
 		}
 		if (prev.OS != cur.OS && (prev.OS != "" || cur.OS != "")) ||
 			(prev.Device != cur.Device && (prev.Device != "" || cur.Device != "")) {
@@ -102,26 +121,35 @@ func changedKind(events []GroupEvent) (string, bool) {
 	}
 }
 
-// portWasClosed reports whether a port open in prev is no longer open
-// in cur, compared by number and protocol. Non-open states never
-// qualify on either side: only a reported open-to-not-open transition
-// counts, so filtered noise cannot manufacture a closure.
+// portWasClosed reports whether a port open in prev carries an explicit
+// closed state in cur, compared by number and protocol. Filtered,
+// unstated, or missing current state is not closure evidence: without a
+// complete-snapshot guarantee the bridge cannot tell removal from a
+// partial view, so those degrade to unknown instead of a closure.
 func portWasClosed(prev, cur []portView) bool {
 	type portKey struct {
 		number   int
 		protocol string
 	}
+	closed := map[portKey]bool{}
 	open := map[portKey]bool{}
 	for _, p := range cur {
-		if p.State == "open" {
+		switch p.State {
+		case "open":
 			open[portKey{p.Number, p.Protocol}] = true
+		case "closed":
+			closed[portKey{p.Number, p.Protocol}] = true
 		}
 	}
 	for _, p := range prev {
 		if p.State != "open" {
 			continue
 		}
-		if !open[portKey{p.Number, p.Protocol}] {
+		key := portKey{p.Number, p.Protocol}
+		if open[key] {
+			continue
+		}
+		if closed[key] {
 			return true
 		}
 	}
