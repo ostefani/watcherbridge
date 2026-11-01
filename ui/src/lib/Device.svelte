@@ -2,6 +2,7 @@
   import { onDestroy, onMount } from 'svelte';
   import { fetchDevice } from '../api.js';
   import { createFetchGuard } from './freshness.js';
+  import { nextPageRows } from './paging.js';
   import { displayTime, classLabel } from './format.js';
 
   // Reported profile (Designv9 §8.2): upstream facts, provenance, last
@@ -24,6 +25,7 @@
   let retired = $state(false);
   let historyError = $state(null);
   let error = $state(null);
+  let refreshError = $state(null);
   let stale = $state(false);
 
   // Rendered profile: snapshot until the fetch completes. History is
@@ -48,24 +50,33 @@
     }
   });
 
+  // A failed refresh keeps existing data visible with a notice and
+  // Retry; the snapshot retires and history resets only on success,
+  // so a failure never empties the page.
   async function load() {
     guard.invalidate();
     const token = guard.start();
     error = null;
-    stale = false;
-    retired = true;
-    extraHistory = [];
-    historyCursor = null;
+    refreshError = null;
     try {
       const fresh = await fetchDevice(id);
       if (!guard.current(token)) {
         return;
       }
       fetched = fresh;
+      retired = true;
+      extraHistory = [];
+      historyCursor = null;
       historyError = null;
+      stale = false;
     } catch (err) {
-      if (guard.current(token) && profile === null) {
-        error = err instanceof Error ? err.message : String(err);
+      if (guard.current(token)) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (profile === null) {
+          error = message;
+        } else {
+          refreshError = message;
+        }
       }
     }
   }
@@ -79,8 +90,7 @@
       if (!guard.current(token)) {
         return;
       }
-      const room = HISTORY_CAP - history.length;
-      extraHistory = [...extraHistory, ...page.history.slice(0, Math.max(room, 0))];
+      extraHistory = [...extraHistory, ...nextPageRows(history, page.history, (o) => o.observation_id, HISTORY_CAP)];
       historyCursor = page.history_next_after ?? '';
     } catch (err) {
       if (guard.current(token)) {
@@ -113,6 +123,9 @@
     <p><a href="#/devices">Back to reported hosts</a></p>
     {#if stale}
       <p role="status">Connection recovered — this page may miss new reports. <button type="button" onclick={load}>Reload</button></p>
+    {/if}
+    {#if refreshError !== null}
+      <p role="alert">Refresh failed ({refreshError}) — showing retained data. <button type="button" onclick={load}>Retry</button></p>
     {/if}
     <h2>{profile.profile_id} — {classLabel(profile.class)}</h2>
     {#if profile.class === 'legacy'}
@@ -184,7 +197,7 @@
       {#if historyCapped}
         <p>History capped at {HISTORY_CAP} rows; use the API for the full set.</p>
       {:else if !historyExhausted}
-        <button type="button" onclick={older}>Show older reports</button>
+        <button type="button" onclick={older}>Load more reports</button>
       {:else}
         <p>End of retained history. Retention policy lives on the <a href="#/health">Health</a> screen.</p>
       {/if}

@@ -163,7 +163,7 @@
         <p>No profile links persisted for this briefing.</p>
       {:else}
         <ul>
-          {#each shown.profiles as link (link.profile_id)}
+          {#each shown.profiles as link (`${link.profile_id}:${link.role}`)}
             <li>
               <a href={`#/devices/${link.profile_id}`}>{link.profile_id}</a> ({link.role})
             </li>

@@ -2,6 +2,7 @@
   import { onDestroy, onMount } from 'svelte';
   import { fetchHealth } from '../api.js';
   import { createFetchGuard } from './freshness.js';
+  import { latestRunNeedsAttention } from './purge.js';
   import { displayTime } from './format.js';
 
   // Health (Designv9 §8.2): concise summary with expandable structured
@@ -17,23 +18,32 @@
 
   let health = $state(null);
   let error = $state(null);
+  let refreshError = $state(null);
 
   // Rendered health: fetched completion wins, snapshot fills in until
   // (or instead of) the fetch.
   const shown = $derived(health ?? initial);
 
+  // A failed refresh keeps existing data visible with a notice and
+  // Retry; the first load still fails into the error state.
   async function load() {
     guard.invalidate();
     const token = guard.start();
     error = null;
+    refreshError = null;
     try {
       const fresh = await fetchHealth();
       if (guard.current(token)) {
         health = fresh;
       }
     } catch (err) {
-      if (guard.current(token) && health === null) {
-        error = err instanceof Error ? err.message : String(err);
+      if (guard.current(token)) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (shown === null) {
+          error = message;
+        } else {
+          refreshError = message;
+        }
       }
     }
   }
@@ -86,12 +96,15 @@
           {/each}
         </ul>
       {/if}
-      {#if shown.purge.last !== undefined && shown.purge.last !== null && shown.purge.last.status !== 'completed'}
+      {#if latestRunNeedsAttention(shown.purge.last)}
         {@const finished = displayTime(shown.purge.last.finished_at ?? shown.purge.last.started_at)}
         <p role="alert">
           Latest purge run {shown.purge.last.status}
           ({finished.local}){shown.purge.last.error ? `: ${shown.purge.last.error}` : ''}.
         </p>
+      {/if}
+      {#if refreshError !== null}
+        <p role="alert">Refresh failed ({refreshError}) — showing retained data. <button type="button" onclick={load}>Retry</button></p>
       {/if}
     </section>
 
@@ -169,19 +182,17 @@
           <dd>{count}</dd>
         {/each}
       </dl>
-      {#if shown.purge.last}
-        {@const lastRun = displayTime(shown.purge.last.finished_at ?? shown.purge.last.started_at)}
+      {#if shown.retention}
         <p>
-          Latest clean purge completed at {lastRun.local}.
-          {#if shown.retention}
-            Configured retention: {days(shown.retention.reports_seconds)} for reports{#if shown.retention.subjects_seconds !== undefined}, {days(shown.retention.subjects_seconds)} for subjects{/if};
-            policy only — ask the API for per-profile history.
-          {/if}
+          Configured retention: {days(shown.retention.reports_seconds)} for reports{#if shown.retention.subjects_seconds !== undefined}, {days(shown.retention.subjects_seconds)} for subjects{/if};
+          policy only — it never proves a per-profile boundary. Ask the API for per-profile history.
         </p>
       {/if}
       {#if shown.purge.last_success}
         {@const ok = displayTime(shown.purge.last_success.finished_at ?? shown.purge.last_success.started_at)}
         <p>Latest fully successful purge: {ok.local}.</p>
+      {:else}
+        <p>No fully successful purge recorded yet.</p>
       {/if}
     </details>
 

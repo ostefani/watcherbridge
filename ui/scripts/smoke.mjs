@@ -33,7 +33,9 @@ for (const [from, to] of [
   [join(root, 'src', 'api.js'), join(out, 'api.js')],
   [join(lib, 'freshness.js'), join(out, 'freshness.js')],
   [join(lib, 'format.js'), join(out, 'format.js')],
-  [join(lib, 'roving.js'), join(out, 'roving.js')]
+  [join(lib, 'roving.js'), join(out, 'roving.js')],
+  [join(lib, 'paging.js'), join(out, 'paging.js')],
+  [join(lib, 'purge.js'), join(out, 'purge.js')]
 ]) {
   writeFileSync(to, readFileSync(from, 'utf8'));
 }
@@ -245,6 +247,8 @@ const cases = [
       'Your label',
       'Latest evidence',
       'No retained observation',
+      'evt-9 (host)',
+      '0 ports',
       'End of retained history',
       'Health'
     ],
@@ -410,6 +414,26 @@ console.log(`smoke: ${cases.length} states render`);
   check('invalidate voids in-flight fetch', !h.current(only));
   const after = h.start();
   check('fetch after invalidate current', h.current(after));
+
+  // Paging merges by key with first-seen positions: repeats across
+  // mutable-order pages drop out, the cap binds the total.
+  // eslint-disable-next-line no-unsanitized/method
+  const { nextPageRows } = await import(pathToFileURL(join(lib, 'paging.js')).href);
+  const key = (r) => r.id;
+  const cur = [{ id: 'a' }, { id: 'b' }];
+  const appended = nextPageRows(cur, [{ id: 'b' }, { id: 'c' }, { id: 'a' }], key, 10);
+  check('repeats dropped, order kept', JSON.stringify(appended) === JSON.stringify([{ id: 'c' }]));
+  const capped = nextPageRows(cur, [{ id: 'c' }, { id: 'd' }], key, 3);
+  check('cap binds total', JSON.stringify(capped) === JSON.stringify([{ id: 'c' }]));
+
+  // A completed purge run can still carry error text (skipped token
+  // expiry): status alone never proves clean work.
+  // eslint-disable-next-line no-unsanitized/method
+  const { latestRunNeedsAttention } = await import(pathToFileURL(join(lib, 'purge.js')).href);
+  check('failed run needs attention', latestRunNeedsAttention({ status: 'failed', error: 'x' }));
+  check('completed-with-error needs attention', latestRunNeedsAttention({ status: 'completed', error: 'skipped token expiry' }));
+  check('clean completed needs none', !latestRunNeedsAttention({ status: 'completed', error: '' }));
+  check('absent run needs none', !latestRunNeedsAttention(null));
 }
 if (failed > 0) {
   console.error(`${failed} freshness assertion(s) failed`);
