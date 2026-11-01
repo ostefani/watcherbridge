@@ -36,6 +36,7 @@ pseudonyms.*
 
 # --- UI toolchain (project-local, never commit) ---
 ui/node_modules/
+ui/.smoke-tmp/
 
 # --- Editors and IDEs ---
 .idea/

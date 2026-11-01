@@ -9,7 +9,7 @@ ui:
 	cd ui && npm ci --no-audit --no-fund && npm run build
 
 ui-check:
-	cd ui && npm ci --no-audit --no-fund && npm run lint && npm run build && npm run size
+	cd ui && npm ci --no-audit --no-fund && npm run lint && npm run build && npm run smoke && npm run size
 
 # ui-drift rebuilds the bundle and fails when the committed output
 # differs: internal/viewer/web/dist must always match ui/ sources.

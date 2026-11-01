@@ -11,7 +11,8 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint . --max-warnings 0",
-    "size": "node ./scripts/size.mjs"
+    "size": "node ./scripts/size.mjs",
+    "smoke": "node ./scripts/smoke.mjs"
   },
   "dependencies": {
     "svelte": "5.57.3"
