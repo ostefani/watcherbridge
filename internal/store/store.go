@@ -51,16 +51,17 @@ func WithQueueCap(n int) Option { return func(o *options) { o.queueCap = n } }
 
 // Store owns the database. The zero value is invalid; use Open.
 type Store struct {
-	db       *sql.DB
-	jobs     chan writeJob // never closed; quit signals shutdown
-	queueCap int           // jobs capacity; the purge loop yields past half
-	quit     chan struct{}
-	wg       sync.WaitGroup
-	closeMu  sync.Mutex
-	closed   bool
-	closeErr error
-	groupSeq atomic.Int64
-	now      func() time.Time
+	db          *sql.DB
+	jobs        chan writeJob // never closed; quit signals shutdown
+	queueCap    int           // jobs capacity; the purge loop yields past half
+	quit        chan struct{}
+	wg          sync.WaitGroup
+	closeMu     sync.Mutex
+	closed      bool
+	closeErr    error
+	groupSeq    atomic.Int64
+	decisionSeq atomic.Int64
+	now         func() time.Time
 }
 
 // QueueDepth reports the current writer backlog without blocking. The

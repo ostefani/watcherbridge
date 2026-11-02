@@ -44,7 +44,7 @@
     lastChange={overview.last_change}
   />
   <AttentionList items={overview.attention} />
-  <DigestBar digest={overview.digest} />
+  <DigestBar digest={overview.digest} explained={overview.explained ?? {}} />
   <SourceCoverage sources={overview.sources} />
 {/if}
 

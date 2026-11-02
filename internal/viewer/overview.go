@@ -56,6 +56,7 @@ type overviewWire struct {
 	Headline   string          `json:"headline"`
 	Attention  []attentionWire `json:"attention"`
 	Digest     map[string]int  `json:"digest"`
+	Explained  map[string]int  `json:"explained"`
 	Receipts   int             `json:"receipts"`
 	Window     string          `json:"window"`
 	LastChange string          `json:"last_change,omitempty"`
@@ -427,9 +428,10 @@ func (r *Refresher) compute(ctx context.Context, window time.Duration) ([]byte, 
 	}
 	now := r.now().UTC()
 	since := now.Add(-window)
-	// Verdict and headline count across the entire window: the
-	// candidate list below is only the display cut.
-	rankCounts, err := r.store.PriorityCounts(ctx, since)
+	// Verdict, headline and explained counts cover the entire window
+	// through decision-aware SQL: the candidate list below is only the
+	// display cut, and acknowledged or actively-snoozed rows never vote.
+	rankCounts, flagged, err := r.store.EffectivePriorityCounts(ctx, since, now)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -440,6 +442,14 @@ func (r *Refresher) compute(ctx context.Context, window time.Duration) ([]byte, 
 	digest, err := r.store.BriefingDigest(ctx, since)
 	if err != nil {
 		return nil, 0, err
+	}
+	explainedCounts, err := r.store.ExplainedDigest(ctx, since, now)
+	if err != nil {
+		return nil, 0, err
+	}
+	explained := map[string]int{}
+	for _, k := range overview.DigestKinds {
+		explained[k] = explainedCounts[k]
 	}
 	receipts, err := r.store.ReceiptCount(ctx, since)
 	if err != nil {
@@ -455,24 +465,30 @@ func (r *Refresher) compute(ctx context.Context, window time.Duration) ([]byte, 
 	}
 	items := make([]overview.Item, 0, len(candidates))
 	for _, c := range candidates {
-		items = append(items, overview.Item{
+		item := overview.Item{
 			ID: c.BriefingID, Priority: c.Priority,
 			CreatedAt: c.CreatedAt, ChangeKind: c.Kind,
-		})
+			Flagged: c.Flagged, Acknowledged: c.Acknowledged,
+		}
+		if !c.SnoozedUntil.IsZero() {
+			item.SnoozedUntil = c.SnoozedUntil
+		}
+		items = append(items, item)
 		if c.CreatedAt.After(last) {
 			last = c.CreatedAt
 		}
 	}
-	// Decisions and incidents are typed but empty until Steps 25-29;
-	// their behavior is exercised through synthetic pure inputs.
-	// Compute orders the display cut; Summarize derives the verdict
-	// from window-wide counts so rows past the cap still vote.
+	// Incidents stay typed but empty until Step 29; their behavior is
+	// exercised through synthetic pure inputs. Compute orders the
+	// display cut; Summarize derives the verdict from the full-window
+	// effective counts so rows past the cap still vote.
 	computed := overview.Compute(items, nil, digest, receipts, window, last, cov, now)
-	verdict, headline, _ := overview.Summarize(rankCounts, 0)
+	verdict, headline, _ := overview.Summarize(rankCounts, flagged)
 	wire := overviewWire{
 		Verdict:   verdict,
 		Headline:  headline,
 		Digest:    computed.Digest,
+		Explained: explained,
 		Receipts:  computed.Receipts,
 		Window:    window.String(),
 		Coverage:  computed.Coverage.Status,

@@ -42,10 +42,14 @@ type ReportedSubject struct {
 	ReportedConfidence     string
 	AssociationStatus      string
 	OperatorLabel          *string
-	FirstReportAt          time.Time
-	LastReportAt           time.Time
-	Groups                 int64
-	Briefings              int64
+	// LabelOwner is the decision ID that set the materialized label,
+	// or "" when no label decision owns it. Plain state, never joined:
+	// it may name a purged audit row after audit expiry.
+	LabelOwner    string
+	FirstReportAt time.Time
+	LastReportAt  time.Time
+	Groups        int64
+	Briefings     int64
 }
 
 // ReportedPort is one retained port state for an observation.
@@ -83,7 +87,7 @@ type SubjectProfile struct {
 }
 
 const subjectColumns = `profile_id, source_scope, reference_class, identity_namespace, upstream_reference,
-	reported_identity_source, reported_confidence, association_status, operator_label,
+	reported_identity_source, reported_confidence, association_status, operator_label, label_owner,
 	first_report_at, last_report_at,
 	(SELECT COUNT(*) FROM group_subjects WHERE group_subjects.profile_id = reported_subjects.profile_id),
 	(SELECT COUNT(*) FROM briefing_subjects WHERE briefing_subjects.profile_id = reported_subjects.profile_id)`
@@ -91,16 +95,17 @@ const subjectColumns = `profile_id, source_scope, reference_class, identity_name
 func scanSubject(row interface {
 	Scan(dest ...any) error
 }, s *ReportedSubject) error {
-	var label sql.NullString
+	var label, owner sql.NullString
 	var first, last int64
 	if err := row.Scan(&s.ProfileID, &s.SourceScope, &s.ReferenceClass, &s.IdentityNamespace,
 		&s.UpstreamReference, &s.ReportedIdentitySource, &s.ReportedConfidence, &s.AssociationStatus,
-		&label, &first, &last, &s.Groups, &s.Briefings); err != nil {
+		&label, &owner, &first, &last, &s.Groups, &s.Briefings); err != nil {
 		return err
 	}
 	if label.Valid {
 		s.OperatorLabel = &label.String
 	}
+	s.LabelOwner = owner.String
 	s.FirstReportAt = fromNanos(first)
 	s.LastReportAt = fromNanos(last)
 	return nil

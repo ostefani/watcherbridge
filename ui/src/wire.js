@@ -24,6 +24,7 @@
  * @property {string} headline
  * @property {OverviewAttention[]} attention
  * @property {Record<string, number>} digest
+ * @property {Record<string, number>} [explained] explicitly-expected briefings per kind
  * @property {number} receipts
  * @property {string} window Go duration string
  * @property {string} [last_change] RFC 3339, absent before any receipt
@@ -65,9 +66,32 @@
  * @property {number} queue_cap
  */
 
+// wire: decisionWire + reviewWire (internal/viewer/decisions.go)
+/**
+ * @typedef {object} Decision
+ * @property {string} decision_id
+ * @property {string} subject_kind briefing|reported_subject
+ * @property {string} subject_id
+ * @property {string} kind expected|not_expected|snooze|note|label|undo
+ * @property {string} [until] RFC 3339, snooze only
+ * @property {string} [text] note|label only
+ * @property {string} created_at RFC 3339
+ * @property {string} [supersedes] undo target
+ * @property {boolean} undone
+ */
+
+/**
+ * @typedef {object} EffectiveReview
+ * @property {string} kind expected|not_expected|snooze
+ * @property {string} [until] RFC 3339, snooze only
+ * @property {string} decision_id
+ */
+
 // wire: briefingView (internal/viewer/viewer.go)
 /**
  * @typedef {object} BriefingDetail
+ * @property {EffectiveReview} [effective_review] absent without live review
+ * @property {Decision[]} decisions newest-first audit trail
  * @property {string} briefing_id
  * @property {string} group_id
  * @property {string} host
@@ -126,6 +150,7 @@
  * @property {Observation|null} latest
  * @property {Observation[]} [history]
  * @property {string} [history_next_after]
+ * @property {Decision[]} [decisions] newest-first audit trail
  */
 
 // wire: devicesEnvelope (internal/viewer/viewer.go)

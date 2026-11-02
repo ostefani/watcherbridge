@@ -222,8 +222,8 @@ func TestPurgeGroupEventsCounted(t *testing.T) {
 		t.Fatalf("cumulative totals omit group_events: %v, %v", totals, err)
 	}
 	var v int
-	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil || v != 17 {
-		t.Fatalf("schema version = %d, %v; want 17", v, err)
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil || v != supportedSchemaVersion {
+		t.Fatalf("schema version = %d, %v; want %d", v, err, supportedSchemaVersion)
 	}
 }
 

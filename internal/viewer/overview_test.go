@@ -137,6 +137,67 @@ func TestOverviewAndHealth(t *testing.T) {
 	}
 }
 
+// Step 25: decisions recompute the overview end to end. An expected
+// high briefing stops voting (verdict quiet, explained counts it);
+// a later not_expected floors review without escalating to act.
+func TestOverviewDecisions(t *testing.T) {
+	s := openViewerStore(t)
+	high := seedPriorityBriefing(t, s, "host:dec-hi", "evt-dec-hi", "high", time.Now().UTC())
+	low := seedPriorityBriefing(t, s, "host:dec-lo", "evt-dec-lo", "medium", time.Now().UTC())
+	v := New(s, NewHub())
+	v.Overview = NewRefresher(s, health.New(), nil, 24*time.Hour, 168*time.Hour, 30*24*time.Hour)
+
+	fetch := func() overviewWire {
+		t.Helper()
+		req := httptest.NewRequest("GET", "/api/overview?window=24h", nil)
+		rec := httptest.NewRecorder()
+		v.handleOverview(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("overview status = %d", rec.Code)
+		}
+		var wire overviewWire
+		if err := json.NewDecoder(rec.Body).Decode(&wire); err != nil {
+			t.Fatal(err)
+		}
+		return wire
+	}
+	mustDecide := func(in store.DecisionInput) {
+		t.Helper()
+		if _, err := s.AppendDecision(context.Background(), in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	decide := func(subject, kind string) {
+		t.Helper()
+		mustDecide(store.DecisionInput{SubjectKind: store.DecisionSubjectBriefing, SubjectID: subject, Kind: kind})
+	}
+
+	if got := fetch(); got.Verdict != "act" {
+		t.Fatalf("undecided verdict = %q, want act", got.Verdict)
+	}
+	decide("brf-"+high, store.DecisionExpected)
+	got := fetch()
+	if got.Verdict != "review" || got.Headline != "1 things to review" {
+		t.Fatalf("expected high: verdict = %q headline = %q, want review floor from low row", got.Verdict, got.Headline)
+	}
+	if got.Explained["other"] != 1 {
+		t.Fatalf("explained = %v, want the expected briefing counted", got.Explained)
+	}
+	for _, k := range []string{"weak_appearance", "weak_disappearance", "port_closed", "hostname_change", "os_refinement", "other"} {
+		if _, ok := got.Explained[k]; !ok {
+			t.Fatalf("explained map missing kind %q", k)
+		}
+	}
+	decide("brf-"+low, store.DecisionNotExpected)
+	got = fetch()
+	if got.Verdict != "review" {
+		t.Fatalf("flagged low: verdict = %q, want review floor without act", got.Verdict)
+	}
+	if len(got.Attention) == 0 || got.Attention[0].Status != "flagged" {
+		t.Fatalf("attention = %+v, want flagged first", got.Attention)
+	}
+}
+
 // The refresher broadcasts only on hash change and coalesces triggers.
 func TestRefresherHashChange(t *testing.T) {
 	s := openViewerStore(t)

@@ -306,6 +306,7 @@ func TestGroupingProvenanceUpgrade(t *testing.T) {
 			} else {
 				dropGroupingProvenance(t, db)
 			}
+			dropDecisionSchema(t, db)
 			if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, from)); err != nil {
 				t.Fatal(err)
 			}
@@ -413,6 +414,7 @@ func TestMigrateSupportedFromV13(t *testing.T) {
 	for _, stmt := range []string{
 		`DROP TABLE IF EXISTS purge_runs`,
 		`DROP TABLE IF EXISTS purge_protected_tokens`,
+		`DROP TABLE IF EXISTS operator_decisions`,
 		`DROP INDEX IF EXISTS group_subjects_profile`,
 		`DROP INDEX IF EXISTS briefing_subjects_profile`,
 		`DROP INDEX IF EXISTS reported_observations_profile_received`,
@@ -426,6 +428,7 @@ func TestMigrateSupportedFromV13(t *testing.T) {
 	}
 	dropColumnIfExists(t, raw, "briefings", "kind")
 	dropColumnIfExists(t, raw, "briefings", "source")
+	dropColumnIfExists(t, raw, "reported_subjects", "label_owner")
 	if err := raw.Close(); err != nil {
 		t.Fatal(err)
 	}

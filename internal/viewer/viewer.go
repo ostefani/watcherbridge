@@ -188,6 +188,11 @@ type Viewer struct {
 	// countdowns, set once by the server from config.
 	GroupWindowSeconds int64
 
+	// SnoozeDefault is the horizon applied when a snooze arrives
+	// without an explicit until, set once by the server from config.
+	// Zero means 24h (tests that build a Viewer directly).
+	SnoozeDefault time.Duration
+
 	// AllowedHosts gates every viewer route (Designv8 §2.4): r.Host must
 	// match an entry exactly (case-insensitive) or the answer is 403.
 	// Empty denies all — the server always derives it from the loopback
@@ -244,6 +249,9 @@ func (v *Viewer) Attach(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/devices/{id}", v.handleDevice)
 	mux.HandleFunc("GET /api/overview", v.handleOverview)
 	mux.HandleFunc("GET /api/health", v.handleHealth)
+	mux.HandleFunc("GET /api/decisions", v.listDecisions)
+	mux.HandleFunc("POST /api/decisions", v.appendDecisionGuarded)
+	mux.HandleFunc("POST /api/decisions/{id}/undo", v.handleDecisionUndo)
 }
 
 // Handler returns the viewer subtree with Host validation applied ahead
@@ -698,6 +706,11 @@ type briefingView struct {
 	// by the count cap or the snapshot byte budget.
 	Observations          []observationWire `json:"observations"`
 	ObservationsTruncated bool              `json:"observations_truncated,omitempty"`
+	// EffectiveReview is the live review-lane state (absent when no
+	// operator review applies); Decisions is the newest-first audit
+	// trail with undone markers for the list and undo buttons.
+	EffectiveReview *reviewWire    `json:"effective_review,omitempty"`
+	Decisions       []decisionWire `json:"decisions"`
 }
 
 // briefingSubjectWire is one persisted profile link with its
@@ -892,6 +905,25 @@ func (v *Viewer) handleBriefing(w http.ResponseWriter, r *http.Request) {
 		view.Observations = append(view.Observations, wire)
 	}
 	view.ObservationsTruncated = obsTruncated
+	// Operator decisions ride the subject view so the dossier shows
+	// live review state and the audit trail without a second fetch;
+	// the raw list endpoint stays for API parity and the CLI.
+	trail, err := v.store.DecisionsForSubject(ctx, store.DecisionSubjectBriefing, b.BriefingID, 50)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	view.Decisions = make([]decisionWire, 0, len(trail))
+	for _, d := range trail {
+		view.Decisions = append(view.Decisions, decisionWireOf(d))
+	}
+	if eff, err := v.store.EffectiveReview(ctx, store.DecisionSubjectBriefing, []string{b.BriefingID}, time.Now().UTC()); err != nil {
+		writeError(w, err)
+		return
+	} else if state, ok := eff[b.BriefingID]; ok {
+		wire := reviewWireOf(state)
+		view.EffectiveReview = &wire
+	}
 	writeJSON(w, view)
 }
 
@@ -915,6 +947,9 @@ type deviceWire struct {
 	Latest             *observationWire  `json:"latest"`
 	History            []observationWire `json:"history,omitempty"`
 	HistoryNextAfter   string            `json:"history_next_after,omitempty"`
+	// Decisions is the newest-first audit trail with undone markers;
+	// the materialized label head stays in operator_label above.
+	Decisions []decisionWire `json:"decisions"`
 }
 
 // observationWire is one retained event view: the bounded attributes
@@ -1049,7 +1084,18 @@ func (v *Viewer) handleDevice(w http.ResponseWriter, r *http.Request) {
 	for _, obs := range history {
 		historyWire = append(historyWire, observationWireOf(obs))
 	}
-	writeJSON(w, deviceWireOf(sub, latest, historyWire, historyNext))
+	trail, err := v.store.DecisionsForSubject(r.Context(), store.DecisionSubjectProfile, id, 50)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	decisions := make([]decisionWire, 0, len(trail))
+	for _, d := range trail {
+		decisions = append(decisions, decisionWireOf(d))
+	}
+	wire := deviceWireOf(sub, latest, historyWire, historyNext)
+	wire.Decisions = decisions
+	writeJSON(w, wire)
 }
 
 // parseTupleCursor splits "<nanos>:<id>" and validates both halves.

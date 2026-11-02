@@ -1,0 +1,527 @@
+package store
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+	"unicode/utf8"
+)
+
+// Operator decisions (Designv9 §5.1, Plan Step 25). Decisions are
+// local, immutable audit rows; undo appends an explicit undo record
+// instead of mutating history. Nothing here modifies events, scanner
+// state, identity confidence or priority; labels materialize onto the
+// exact profile only, never through MAC/name matching.
+const (
+	DecisionSubjectBriefing = "briefing"
+	DecisionSubjectProfile  = "reported_subject"
+
+	DecisionExpected    = "expected"
+	DecisionNotExpected = "not_expected"
+	DecisionSnooze      = "snooze"
+	DecisionNote        = "note"
+	DecisionLabel       = "label"
+	DecisionUndo        = "undo"
+)
+
+var (
+	// ErrUnsupportedSubject rejects decision kinds and subject kinds
+	// outside the Step 25 matrix, and undo addressed at non-records.
+	ErrUnsupportedSubject = errors.New("unsupported decision subject")
+	// ErrUnknownSubject means the briefing or profile does not exist.
+	ErrUnknownSubject = errors.New("unknown decision subject")
+	// ErrInvalidDecision rejects malformed decision input.
+	ErrInvalidDecision = errors.New("invalid decision")
+	// ErrRequestConflict means a request ID was reused with different
+	// content; identical replays return the original row instead.
+	ErrRequestConflict = errors.New("conflicting request id")
+	// ErrUnknownDecision means the undo target does not exist.
+	// Purged targets read the same: without tombstones there is no
+	// 410, only 404 at the API.
+	ErrUnknownDecision = errors.New("unknown decision")
+	// ErrInvalidUndo rejects undo addressed at another undo row.
+	// Undo rows are terminal; redo by appending a fresh decision.
+	ErrInvalidUndo = errors.New("invalid undo target")
+	// ErrUndoConflict means the materialization head moved on: another
+	// label owns the profile now, so restoring this target would
+	// clobber newer state. It is a 409, never silent success.
+	ErrUndoConflict = errors.New("undo conflicts with newer state")
+)
+
+const (
+	maxLabelRunes = 256
+	maxNoteRunes  = 2000
+	maxRequestID  = 128
+)
+
+var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// Decision is one immutable audit row. Until applies to snooze only.
+// Supersedes names the undo target for undo rows. PriorLabel and
+// PriorOwner capture the materialization a label row replaced,
+// including NULLs, atomically with its own insert — the only basis
+// on which undo may restore, so restoration never depends on rows
+// purge may already have deleted.
+type Decision struct {
+	DecisionID  string
+	SubjectKind string
+	SubjectID   string
+	Kind        string
+	Until       time.Time
+	HasUntil    bool
+	Text        string
+	CreatedAt   time.Time
+	Supersedes  string
+	RequestID   string
+	PriorLabel  *string
+	PriorOwner  string
+	Undone      bool
+}
+
+// DecisionInput carries a new non-undo decision. IDs are assigned by
+// the store; undo travels through UndoDecision instead.
+type DecisionInput struct {
+	SubjectKind string
+	SubjectID   string
+	Kind        string
+	HasUntil    bool
+	Until       time.Time
+	Text        string
+	RequestID   string
+}
+
+// DecisionResult reports the stored row and whether the call changed
+// state. Applied=false with a reason means the valid end-state
+// already held (identical replay, already-neutralized target), never
+// a masked validation failure — those stay errors.
+type DecisionResult struct {
+	Decision Decision
+	Applied  bool
+	Reason   string
+}
+
+const decisionColumns = `decision_id, subject_kind, subject_id, kind, until,
+	text, created_at, supersedes, request_id, content_hash, prior_label, prior_owner`
+
+func scanDecision(row interface {
+	Scan(dest ...any) error
+}) (Decision, string, error) {
+	var d Decision
+	var until, created sql.NullInt64
+	var text, supersedes, requestID, hash, priorOwner sql.NullString
+	var priorLabel sql.NullString
+	if err := row.Scan(&d.DecisionID, &d.SubjectKind, &d.SubjectID, &d.Kind,
+		&until, &text, &created, &supersedes, &requestID, &hash, &priorLabel, &priorOwner); err != nil {
+		return Decision{}, "", err
+	}
+	if until.Valid {
+		d.Until, d.HasUntil = fromNanos(until.Int64), true
+	}
+	d.Text = text.String
+	if created.Valid {
+		d.CreatedAt = fromNanos(created.Int64)
+	}
+	d.Supersedes = supersedes.String
+	d.RequestID = requestID.String
+	if priorLabel.Valid {
+		d.PriorLabel = &priorLabel.String
+	}
+	d.PriorOwner = priorOwner.String
+	return d, hash.String, nil
+}
+
+// decisionHash fingerprints the idempotency-relevant content: a
+// request-ID replay with a different hash is a conflict, not a retry.
+func decisionHash(subjectKind, subjectID, kind string, until int64, hasUntil bool, text, supersedes string) string {
+	untilPart := "none"
+	if hasUntil {
+		untilPart = fmt.Sprintf("%d", until)
+	}
+	sum := sha256.Sum256([]byte(subjectKind + "\x00" + subjectID + "\x00" + kind + "\x00" + untilPart + "\x00" + text + "\x00" + supersedes))
+	return hex.EncodeToString(sum[:])
+}
+
+// checkDecisionMatrix enforces the Step 25 action-by-subject matrix:
+// snooze and review verdicts are briefing-only (never profile-wide
+// suppression or propagation), labels belong to exact profiles.
+// Undo never travels through the append path.
+func checkDecisionMatrix(kind, subjectKind string) error {
+	switch subjectKind {
+	case DecisionSubjectBriefing:
+		switch kind {
+		case DecisionExpected, DecisionNotExpected, DecisionSnooze, DecisionNote:
+			return nil
+		}
+	case DecisionSubjectProfile:
+		switch kind {
+		case DecisionNote, DecisionLabel:
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: kind %q on %q", ErrUnsupportedSubject, kind, subjectKind)
+}
+
+func checkDecisionText(kind, text string) error {
+	trimmed := strings.TrimSpace(text)
+	switch kind {
+	case DecisionNote, DecisionLabel:
+		if trimmed == "" {
+			return fmt.Errorf("%w: kind %q requires text", ErrInvalidDecision, kind)
+		}
+		cap := maxNoteRunes
+		if kind == DecisionLabel {
+			cap = maxLabelRunes
+		}
+		if utf8.RuneCountInString(text) > cap {
+			return fmt.Errorf("%w: kind %q text exceeds %d runes", ErrInvalidDecision, kind, cap)
+		}
+	default:
+		if trimmed != "" {
+			return fmt.Errorf("%w: kind %q takes no text", ErrInvalidDecision, kind)
+		}
+	}
+	return nil
+}
+
+func checkRequestID(requestID string) error {
+	if requestID == "" {
+		return nil
+	}
+	if len(requestID) > maxRequestID || !requestIDPattern.MatchString(requestID) {
+		return fmt.Errorf("%w: malformed request id", ErrInvalidDecision)
+	}
+	return nil
+}
+
+// findDecisionByRequest returns the stored row for an idempotency key,
+// or nil when the key is new. Same key with a different content hash
+// is a conflict, never a silent overwrite.
+func findDecisionByRequest(tx *sql.Tx, requestID, hash string) (*Decision, error) {
+	row := tx.QueryRow(`SELECT `+decisionColumns+` FROM operator_decisions WHERE request_id = ?`, requestID)
+	d, stored, err := scanDecision(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if stored != hash {
+		return nil, fmt.Errorf("%w: %q", ErrRequestConflict, requestID)
+	}
+	return &d, nil
+}
+
+// canonicalBriefingID resolves a briefing or group ID to the stored
+// briefing ID, so one briefing never acquires two decision histories.
+// The briefing ID (not the group ID) is the decision subject key,
+// matching every read path that already speaks briefing IDs.
+func canonicalBriefingID(tx *sql.Tx, id string) (string, error) {
+	gid := strings.TrimPrefix(id, "brf-")
+	var one int
+	if err := tx.QueryRow(`SELECT 1 FROM briefings WHERE group_id = ?`, gid).Scan(&one); err != nil {
+		if err == sql.ErrNoRows {
+			return "", fmt.Errorf("%w: %q", ErrUnknownSubject, id)
+		}
+		return "", err
+	}
+	return "brf-" + gid, nil
+}
+
+// AppendDecision stores one non-undo decision atomically with its
+// label materialization. Label text lands on the exact profile with
+// the prior value and owner captured; review and note rows only
+// append audit. Identical request-ID replays return the original row
+// with Applied=false instead of duplicating.
+func (s *Store) AppendDecision(ctx context.Context, in DecisionInput) (DecisionResult, error) {
+	now := s.now()
+	if err := checkDecisionMatrix(in.Kind, in.SubjectKind); err != nil {
+		return DecisionResult{}, err
+	}
+	if err := checkDecisionText(in.Kind, in.Text); err != nil {
+		return DecisionResult{}, err
+	}
+	if err := checkRequestID(in.RequestID); err != nil {
+		return DecisionResult{}, err
+	}
+	var untilNanos int64
+	if in.Kind == DecisionSnooze {
+		if !in.HasUntil || !in.Until.After(now) {
+			return DecisionResult{}, fmt.Errorf("%w: snooze requires a future until", ErrInvalidDecision)
+		}
+		untilNanos = in.Until.UnixNano()
+	} else if in.HasUntil {
+		return DecisionResult{}, fmt.Errorf("%w: kind %q takes no until", ErrInvalidDecision, in.Kind)
+	}
+	hash := decisionHash(in.SubjectKind, in.SubjectID, in.Kind, untilNanos, in.HasUntil, in.Text, "")
+
+	var res DecisionResult
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		if in.RequestID != "" {
+			if existing, err := findDecisionByRequest(tx, in.RequestID, hash); err != nil {
+				return err
+			} else if existing != nil {
+				res = DecisionResult{Decision: *existing, Applied: false, Reason: "duplicate_request"}
+				return nil
+			}
+		}
+		subjectID := in.SubjectID
+		if in.SubjectKind == DecisionSubjectBriefing {
+			bid, err := canonicalBriefingID(tx, in.SubjectID)
+			if err != nil {
+				return err
+			}
+			subjectID = bid
+		} else {
+			var label, owner sql.NullString
+			if err := tx.QueryRow(`SELECT operator_label, label_owner FROM reported_subjects WHERE profile_id = ?`,
+				in.SubjectID).Scan(&label, &owner); err != nil {
+				if err == sql.ErrNoRows {
+					return fmt.Errorf("%w: %q", ErrUnknownSubject, in.SubjectID)
+				}
+				return err
+			}
+		}
+		id := fmt.Sprintf("dec-%d-%d", now.UnixNano(), s.decisionSeq.Add(1))
+		var priorLabel, priorOwner sql.NullString
+		if in.Kind == DecisionLabel {
+			var curLabel, curOwner sql.NullString
+			if err := tx.QueryRow(`SELECT operator_label, label_owner FROM reported_subjects WHERE profile_id = ?`,
+				subjectID).Scan(&curLabel, &curOwner); err != nil {
+				return err
+			}
+			priorLabel, priorOwner = curLabel, curOwner
+			if _, err := tx.Exec(`UPDATE reported_subjects SET operator_label = ?, label_owner = ? WHERE profile_id = ?`,
+				in.Text, id, subjectID); err != nil {
+				return err
+			}
+		}
+		var untilVal sql.NullInt64
+		if in.Kind == DecisionSnooze {
+			untilVal = sql.NullInt64{Int64: untilNanos, Valid: true}
+		}
+		if _, err := tx.Exec(`INSERT INTO operator_decisions (decision_id, subject_kind, subject_id, kind,
+			until, text, created_at, supersedes, request_id, content_hash, prior_label, prior_owner)
+			VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)`,
+			id, in.SubjectKind, subjectID, in.Kind, untilVal, in.Text, now.UnixNano(),
+			nullString(in.RequestID), hash, priorLabel, priorOwner); err != nil {
+			return err
+		}
+		d := Decision{DecisionID: id, SubjectKind: in.SubjectKind, SubjectID: subjectID, Kind: in.Kind,
+			Text: in.Text, CreatedAt: now, RequestID: in.RequestID}
+		if in.Kind == DecisionSnooze {
+			d.Until, d.HasUntil = in.Until, true
+		}
+		if priorLabel.Valid {
+			d.PriorLabel = &priorLabel.String
+		}
+		d.PriorOwner = priorOwner.String
+		res = DecisionResult{Decision: d, Applied: true}
+		return nil
+	})
+	if err != nil {
+		return DecisionResult{}, err
+	}
+	return res, nil
+}
+
+// UndoDecision appends an explicit undo record for one decision.
+// Undo rows are terminal: undoing an undo is rejected, redo by
+// appending a fresh decision. A live undo already targeting the row
+// reports applied:false; a moved-on label head reports conflict;
+// purged targets read as unknown, leaving state untouched.
+func (s *Store) UndoDecision(ctx context.Context, targetID, requestID string) (DecisionResult, error) {
+	now := s.now()
+	if err := checkRequestID(requestID); err != nil {
+		return DecisionResult{}, err
+	}
+	hash := decisionHash("undo", targetID, DecisionUndo, 0, false, "", targetID)
+
+	var res DecisionResult
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		if requestID != "" {
+			if existing, err := findDecisionByRequest(tx, requestID, hash); err != nil {
+				return err
+			} else if existing != nil {
+				res = DecisionResult{Decision: *existing, Applied: false, Reason: "duplicate_request"}
+				return nil
+			}
+		}
+		row := tx.QueryRow(`SELECT `+decisionColumns+` FROM operator_decisions WHERE decision_id = ?`, targetID)
+		target, _, err := scanDecision(row)
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("%w: %q", ErrUnknownDecision, targetID)
+		}
+		if err != nil {
+			return err
+		}
+		if target.Kind == DecisionUndo {
+			return fmt.Errorf("%w: %q", ErrInvalidUndo, targetID)
+		}
+		var live int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM operator_decisions
+			WHERE kind = 'undo' AND supersedes = ?`, targetID).Scan(&live); err != nil {
+			return err
+		}
+		if live > 0 {
+			res = DecisionResult{Decision: target, Applied: false, Reason: "already_undone"}
+			return nil
+		}
+		if target.Kind == DecisionLabel {
+			var owner sql.NullString
+			if err := tx.QueryRow(`SELECT label_owner FROM reported_subjects WHERE profile_id = ?`,
+				target.SubjectID).Scan(&owner); err != nil {
+				if err == sql.ErrNoRows {
+					return fmt.Errorf("%w: %q", ErrUnknownSubject, target.SubjectID)
+				}
+				return err
+			}
+			if !owner.Valid || owner.String != targetID {
+				return fmt.Errorf("%w: label %q is no longer current", ErrUndoConflict, targetID)
+			}
+			var priorLabel, priorOwner sql.NullString
+			if target.PriorLabel != nil {
+				priorLabel = sql.NullString{String: *target.PriorLabel, Valid: true}
+			}
+			if target.PriorOwner != "" {
+				priorOwner = sql.NullString{String: target.PriorOwner, Valid: true}
+			}
+			if _, err := tx.Exec(`UPDATE reported_subjects SET operator_label = ?, label_owner = ?
+				WHERE profile_id = ?`, priorLabel, priorOwner, target.SubjectID); err != nil {
+				return err
+			}
+		}
+		id := fmt.Sprintf("dec-%d-%d", now.UnixNano(), s.decisionSeq.Add(1))
+		if _, err := tx.Exec(`INSERT INTO operator_decisions (decision_id, subject_kind, subject_id, kind,
+			until, text, created_at, supersedes, request_id, content_hash, prior_label, prior_owner)
+			VALUES (?, ?, ?, 'undo', NULL, '', ?, ?, ?, ?, NULL, NULL)`,
+			id, target.SubjectKind, target.SubjectID, now.UnixNano(), targetID,
+			nullString(requestID), hash); err != nil {
+			return err
+		}
+		res = DecisionResult{Decision: Decision{DecisionID: id, SubjectKind: target.SubjectKind,
+			SubjectID: target.SubjectID, Kind: DecisionUndo, CreatedAt: now,
+			Supersedes: targetID, RequestID: requestID}, Applied: true}
+		return nil
+	})
+	if err != nil {
+		return DecisionResult{}, err
+	}
+	return res, nil
+}
+
+func nullString(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: s, Valid: true}
+}
+
+// ReviewState is the effective review-lane outcome for one subject:
+// the latest non-undone expected/not_expected/snooze record, with
+// lapsed snoozes already excluded by the query.
+type ReviewState struct {
+	Kind       string
+	Until      time.Time
+	HasUntil   bool
+	DecisionID string
+}
+
+// EffectiveReview returns the review-lane outcome per subject. Only
+// surviving audit rows are read, so purged (audit-expired) decisions
+// simply stop applying; snooze rows past their until are excluded up
+// front so an earlier expected or not_expected resumes.
+func (s *Store) EffectiveReview(ctx context.Context, subjectKind string, subjectIDs []string, now time.Time) (map[string]ReviewState, error) {
+	out := map[string]ReviewState{}
+	if len(subjectIDs) == 0 {
+		return out, nil
+	}
+	placeholders := strings.Repeat("?,", len(subjectIDs))
+	placeholders = strings.TrimSuffix(placeholders, ",")
+	args := make([]any, 0, len(subjectIDs)+2)
+	args = append(args, subjectKind)
+	for _, id := range subjectIDs {
+		args = append(args, id)
+	}
+	args = append(args, now.UnixNano())
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`SELECT subject_id, kind, until, decision_id FROM (
+			SELECT subject_id, kind, until, decision_id,
+				ROW_NUMBER() OVER (PARTITION BY subject_id ORDER BY created_at DESC, decision_id DESC) AS rn
+			FROM operator_decisions d
+			WHERE subject_kind = ? AND subject_id IN (%s)
+				AND kind IN ('expected','not_expected','snooze')
+				AND NOT EXISTS (SELECT 1 FROM operator_decisions u WHERE u.kind = 'undo' AND u.supersedes = d.decision_id)
+				AND (d.kind != 'snooze' OR d.until > ?)
+		) WHERE rn = 1`, placeholders), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var subjectID, kind, decisionID string
+		var until sql.NullInt64
+		if err := rows.Scan(&subjectID, &kind, &until, &decisionID); err != nil {
+			return nil, err
+		}
+		st := ReviewState{Kind: kind, DecisionID: decisionID}
+		if until.Valid {
+			st.Until, st.HasUntil = fromNanos(until.Int64), true
+		}
+		out[subjectID] = st
+	}
+	return out, rows.Err()
+}
+
+// DecisionsForSubject lists one subject's audit trail newest-first
+// with each row's undone marker. limit clamps to the serving bound;
+// notes and labels coexist — only the undone flag changes reads.
+func (s *Store) DecisionsForSubject(ctx context.Context, subjectKind, subjectID string, limit int) ([]Decision, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+decisionColumns+`,
+		EXISTS(SELECT 1 FROM operator_decisions u WHERE u.kind = 'undo' AND u.supersedes = operator_decisions.decision_id) AS undone
+		FROM operator_decisions
+		WHERE subject_kind = ? AND subject_id = ?
+		ORDER BY created_at DESC, decision_id DESC LIMIT ?`, subjectKind, subjectID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Decision
+	for rows.Next() {
+		var d Decision
+		var until, created sql.NullInt64
+		var text, supersedes, requestID, hash, priorOwner sql.NullString
+		var priorLabel sql.NullString
+		var undone bool
+		if err := rows.Scan(&d.DecisionID, &d.SubjectKind, &d.SubjectID, &d.Kind,
+			&until, &text, &created, &supersedes, &requestID, &hash, &priorLabel, &priorOwner, &undone); err != nil {
+			return nil, err
+		}
+		if until.Valid {
+			d.Until, d.HasUntil = fromNanos(until.Int64), true
+		}
+		d.Text = text.String
+		if created.Valid {
+			d.CreatedAt = fromNanos(created.Int64)
+		}
+		d.Supersedes = supersedes.String
+		d.RequestID = requestID.String
+		if priorLabel.Valid {
+			d.PriorLabel = &priorLabel.String
+		}
+		d.PriorOwner = priorOwner.String
+		d.Undone = undone
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}

@@ -929,3 +929,130 @@ func TestPurgeBatchPersistsRunCountsAtomically(t *testing.T) {
 		t.Fatalf("ledger must carry the committed batch: db=(%d,%d) report=%+v", deleted, writes, report)
 	}
 }
+
+// Step 25 retention: operator-decision audit expires purely by row age
+// with no exemption for rows the effective view still uses. An undo
+// never purges while its target survives (targets are older, batches
+// run oldest-first, and the pair gate defers the orphan case);
+// materialized labels live on reported_subjects and survive audit
+// expiry; a retained decision pins its profile subject against
+// subject expiry.
+func TestPurgeDecisionAuditExpiresByAge(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	old := now.Add(-25 * time.Hour)
+	keep := PurgeSettings{BriefingRetention: 400 * 24 * time.Hour, SubjectRetention: 400 * 24 * time.Hour, DecisionRetention: 24 * time.Hour}
+
+	pid := seedDecisionProfile(t, s, "lab", "evt-pdec-1", "aa:bb:cc:dd:ee:41", old)
+	if _, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectProfile, SubjectID: pid, Kind: DecisionLabel, Text: "iot"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectProfile, SubjectID: pid, Kind: DecisionNote, Text: "look"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE operator_decisions SET created_at = ?`, nanos(old)); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := s.PurgeOnce(ctx, keep, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Decisions != 2 {
+		t.Fatalf("purged decisions = %d, want 2 (label and note)", rep.Decisions)
+	}
+	if ds, err := s.DecisionsForSubject(ctx, DecisionSubjectProfile, pid, 10); err != nil || len(ds) != 0 {
+		t.Fatalf("audit after expiry = %d, %v; want empty", len(ds), err)
+	}
+	sub, err := s.ReportedProfile(ctx, pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sub.OperatorLabel == nil || *sub.OperatorLabel != "iot" {
+		t.Fatalf("materialized label after audit expiry = %v, want iot", sub.OperatorLabel)
+	}
+}
+
+// An undo whose target still exists is deferred even when the undo
+// itself is expired; once the target expires too, one pass takes the
+// pair together, oldest-first within the shared row budget.
+func TestPurgeDecisionUndoWaitsForTarget(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	old := now.Add(-25 * time.Hour)
+	keep := PurgeSettings{BriefingRetention: 400 * 24 * time.Hour, SubjectRetention: 400 * 24 * time.Hour, DecisionRetention: 24 * time.Hour}
+
+	pid := seedDecisionProfile(t, s, "lab", "evt-pdec-2", "aa:bb:cc:dd:ee:42", now)
+	lbl, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectProfile, SubjectID: pid, Kind: DecisionLabel, Text: "iot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	undo, err := s.UndoDecision(ctx, lbl.Decision.DecisionID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE operator_decisions SET created_at = ? WHERE decision_id = ?`, nanos(old), undo.Decision.DecisionID); err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := s.PurgeOnce(ctx, keep, now); err != nil || rep.Decisions != 0 {
+		t.Fatalf("purge with live target = %+v, %v; want no decision deletions", rep, err)
+	}
+	if ds, err := s.DecisionsForSubject(ctx, DecisionSubjectProfile, pid, 10); err != nil || len(ds) != 2 {
+		t.Fatalf("audit with live target = %d, %v; want label and undo", len(ds), err)
+	}
+	if _, err := s.db.Exec(`UPDATE operator_decisions SET created_at = ? WHERE decision_id = ?`, nanos(old), lbl.Decision.DecisionID); err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := s.PurgeOnce(ctx, keep, now); err != nil || rep.Decisions != 2 {
+		t.Fatalf("purge of expired pair = %+v, %v; want 2", rep, err)
+	}
+}
+
+// A retained decision pins its profile subject: the subject survives
+// subject expiry while the audit references it, and becomes eligible
+// once that audit expires.
+func TestPurgeDecisionPinsSubject(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	old := now.Add(-25 * time.Hour)
+
+	pid := seedDecisionProfile(t, s, "lab", "evt-pdec-3", "aa:bb:cc:dd:ee:43", old)
+	if _, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectProfile, SubjectID: pid, Kind: DecisionNote, Text: "keep"}); err != nil {
+		t.Fatal(err)
+	}
+	// Leave only the decision reference behind: drop the projected
+	// evidence links and age the subject past its horizon.
+	for _, stmt := range []struct {
+		query string
+		args  []any
+	}{
+		{`DELETE FROM reported_observations WHERE profile_id = ?`, []any{pid}},
+		{`DELETE FROM group_subjects WHERE profile_id = ?`, []any{pid}},
+		{`DELETE FROM briefing_subjects WHERE profile_id = ?`, []any{pid}},
+		{`UPDATE reported_subjects SET last_report_at = ? WHERE profile_id = ?`, []any{nanos(old), pid}},
+	} {
+		if _, err := s.db.Exec(stmt.query, stmt.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pin := PurgeSettings{BriefingRetention: 400 * 24 * time.Hour, SubjectRetention: 24 * time.Hour, DecisionRetention: 400 * 24 * time.Hour}
+	if rep, err := s.PurgeOnce(ctx, pin, now); err != nil || rep.Subjects != 0 {
+		t.Fatalf("purge of pinned subject = %+v, %v; want subject retained", rep, err)
+	}
+	if _, err := s.ReportedProfile(ctx, pid); err != nil {
+		t.Fatalf("pinned subject missing: %v", err)
+	}
+	if _, err := s.db.Exec(`UPDATE operator_decisions SET created_at = ?`, nanos(old)); err != nil {
+		t.Fatal(err)
+	}
+	release := PurgeSettings{BriefingRetention: 400 * 24 * time.Hour, SubjectRetention: 24 * time.Hour, DecisionRetention: 24 * time.Hour}
+	rep, err := s.PurgeOnce(ctx, release, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Decisions != 1 || rep.Subjects != 1 {
+		t.Fatalf("purge after audit expiry = %+v; want 1 decision and 1 subject", rep)
+	}
+}

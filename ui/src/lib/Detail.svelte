@@ -1,8 +1,10 @@
 <script>
-  import { onDestroy } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { fetchBriefing } from '../api.js';
   import { createFetchGuard } from './freshness.js';
+  import { typingTarget } from './roving.js';
   import { displayTime, sourceLabel } from './format.js';
+  import DecisionPanel from './DecisionPanel.svelte';
 
   // Briefing detail (Planv4 Step 24 order): Summary -> Why this
   // priority -> Reported evidence -> Retained reported context ->
@@ -19,6 +21,11 @@
 
   let detail = $state(null);
   let error = $state(null);
+  // Shortcut preset for the decision composer: e/s/x choose the kind
+  // and focus submit, never submit on their own. A fresh object per
+  // keypress so repeats refire the panel effect.
+  let preset = $state(/** @type {{kind: string, seq: number}|null} */ (null));
+  let presetSeq = 0;
 
   // Rendered briefing: fetched completion wins, snapshot fills in
   // until (or instead of) the fetch. Reads the prop inside a
@@ -67,6 +74,27 @@
   });
 
   const created = $derived(shown === null ? null : displayTime(shown.created_at));
+
+  // Dossier shortcuts: e expected, s snooze, x not-expected. Silent
+  // while typing; they preset the composer, the operator submits.
+  function onKey(/** @type {KeyboardEvent} */ ev) {
+    if (typingTarget(ev) || ev.metaKey || ev.ctrlKey || ev.altKey) {
+      return;
+    }
+    const map = { e: 'expected', s: 'snooze', x: 'not_expected' };
+    const next = map[ev.key];
+    if (next !== undefined && shown !== null) {
+      presetSeq += 1;
+      preset = { kind: next, seq: presetSeq };
+    }
+  }
+
+  onMount(() => {
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+    };
+  });
 </script>
 
 {#if error !== null && shown === null}
@@ -179,6 +207,16 @@
       <h3>Recommended check</h3>
       <p>{shown.recommended_check}</p>
     </section>
+
+    <DecisionPanel
+      subjectKind="briefing"
+      subjectId={shown.briefing_id}
+      kinds={['expected', 'not_expected', 'snooze', 'note']}
+      decisions={shown.decisions ?? []}
+      effective={shown.effective_review ?? null}
+      {preset}
+      reload={load}
+    />
 
     <section aria-label="How I checked this">
       <h3>How I checked this</h3>

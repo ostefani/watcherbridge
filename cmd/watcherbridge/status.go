@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/ostefani/watcherbridge/internal/overview"
@@ -24,13 +25,15 @@ import (
 // context and never reads as a presence claim. --json prints the raw
 // body instead.
 type statusResult struct {
-	Verdict    string `json:"verdict"`
-	Headline   string `json:"headline"`
-	Coverage   string `json:"coverage"`
-	Liveness   string `json:"liveness"`
-	Receipts   int    `json:"receipts"`
-	Window     string `json:"window"`
-	LastChange string `json:"last_change"`
+	Verdict    string         `json:"verdict"`
+	Headline   string         `json:"headline"`
+	Coverage   string         `json:"coverage"`
+	Liveness   string         `json:"liveness"`
+	Receipts   int            `json:"receipts"`
+	Window     string         `json:"window"`
+	LastChange string         `json:"last_change"`
+	Digest     map[string]int `json:"digest"`
+	Explained  map[string]int `json:"explained"`
 }
 
 // runStatus implements the status subcommand; it returns the exit code.
@@ -91,11 +94,29 @@ func statusExit(httpStatus int, body []byte, jsonOut bool) int {
 				fmt.Printf(", last change %s", res.LastChange)
 			}
 			fmt.Println()
+			printExplained(res.Digest, res.Explained)
 		}
 		return overview.ExitCodeFor(res.Verdict)
 	default:
 		fmt.Fprintf(os.Stderr, "status: unknown verdict %q\n", res.Verdict)
 		return 3
+	}
+}
+
+// printExplained reports the explained share of the digest: per-kind
+// totals with the expected count alongside, in stable kind order, so
+// CLI readers see the same numbers as the API and UI. Silent when the
+// window holds nothing.
+func printExplained(digest, explained map[string]int) {
+	var parts []string
+	for _, k := range overview.DigestKinds {
+		if digest[k] == 0 && explained[k] == 0 {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s %d (%d explained)", k, digest[k], explained[k]))
+	}
+	if len(parts) > 0 {
+		fmt.Printf("  digest: %s\n", strings.Join(parts, ", "))
 	}
 }
 

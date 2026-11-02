@@ -157,25 +157,53 @@ type PurgeRunHealth struct {
 }
 
 // AttentionCandidate is the narrow overview projection: only the four
+// effectiveReviewCTE selects the current review-lane record per
+// briefing: latest non-undone expected/not_expected/snooze, with
+// lapsed snoozes excluded before the pick so an earlier record
+// resumes. Expired audit never reaches this query — purge deletes it
+// — so exclusion here covers only the time-based snooze lapse.
+const effectiveReviewCTE = `eff AS (
+	SELECT subject_id, kind, until FROM (
+		SELECT d.subject_id, d.kind, d.until,
+			ROW_NUMBER() OVER (PARTITION BY d.subject_id ORDER BY d.created_at DESC, d.decision_id DESC) AS rn
+		FROM operator_decisions d
+		WHERE d.subject_kind = 'briefing'
+			AND d.kind IN ('expected','not_expected','snooze')
+			AND NOT EXISTS (SELECT 1 FROM operator_decisions u WHERE u.kind = 'undo' AND u.supersedes = d.decision_id)
+			AND (d.kind != 'snooze' OR d.until > ?)
+	) WHERE rn = 1
+)`
+
 // columns the verdict ordering needs. Restored text, model audit JSON,
-// and event IDs never leave the database on this path.
+// and event IDs never leave the database on this path. Decision
+// fields mirror the effective review lane: flagged (not_expected)
+// orders before priority rank so a flagged low-priority briefing is
+// never cut by the display cap.
 type AttentionCandidate struct {
-	BriefingID string
-	Priority   string
-	CreatedAt  time.Time
-	Kind       string
+	BriefingID   string
+	Priority     string
+	CreatedAt    time.Time
+	Kind         string
+	Flagged      bool
+	Acknowledged bool
+	SnoozedUntil time.Time
 }
 
 // AttentionCandidates returns up to limit briefings created at or after
-// since, in display order: priority rank descending, newest first,
-// stable ID tiebreaker. Verdict and headline counts come from the
-// full-window PriorityCounts instead, so rows past the cap still vote.
+// since, in display order: flagged first, then priority rank
+// descending, newest first, stable ID tiebreaker. Verdict and headline
+// counts come from the full-window effective counts instead, so rows
+// past the cap still vote.
 func (s *Store) AttentionCandidates(ctx context.Context, since time.Time, limit int) ([]AttentionCandidate, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT briefing_id, priority, created_at, kind FROM briefings
-		WHERE created_at >= ?
-		ORDER BY CASE priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END DESC,
-			created_at DESC, briefing_id ASC
-		LIMIT ?`, nanos(since), limit)
+	now := s.now()
+	rows, err := s.db.QueryContext(ctx, `WITH `+effectiveReviewCTE+` SELECT
+		b.briefing_id, b.priority, b.created_at, b.kind, e.kind, e.until
+		FROM briefings b LEFT JOIN eff e ON e.subject_id = b.briefing_id
+		WHERE b.created_at >= ?
+		ORDER BY (e.kind = 'not_expected') DESC,
+			CASE b.priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END DESC,
+			b.created_at DESC, b.briefing_id ASC
+		LIMIT ?`, nanos(now), nanos(since), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -184,11 +212,85 @@ func (s *Store) AttentionCandidates(ctx context.Context, since time.Time, limit 
 	for rows.Next() {
 		var c AttentionCandidate
 		var created int64
-		if err := rows.Scan(&c.BriefingID, &c.Priority, &created, &c.Kind); err != nil {
+		var revKind sql.NullString
+		var revUntil sql.NullInt64
+		if err := rows.Scan(&c.BriefingID, &c.Priority, &created, &c.Kind, &revKind, &revUntil); err != nil {
 			return nil, err
 		}
 		c.CreatedAt = fromNanos(created)
+		switch revKind.String {
+		case "not_expected":
+			c.Flagged = true
+		case "expected":
+			c.Acknowledged = true
+		case "snooze":
+			if revUntil.Valid {
+				c.SnoozedUntil = fromNanos(revUntil.Int64)
+			}
+		}
 		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// EffectivePriorityCounts counts in-window briefings by priority for
+// the verdict, excluding acknowledged and actively-snoozed rows, and
+// separately counts flagged rows for the review floor. Flagged rows
+// never escalate on their own: their priority stays out of the map,
+// mirroring Compute. Both numbers cover the full window, never the
+// capped candidate list.
+func (s *Store) EffectivePriorityCounts(ctx context.Context, since, now time.Time) (map[string]int, int, error) {
+	rows, err := s.db.QueryContext(ctx, `WITH `+effectiveReviewCTE+` SELECT
+		b.priority, e.kind, COUNT(*)
+		FROM briefings b LEFT JOIN eff e ON e.subject_id = b.briefing_id
+		WHERE b.created_at >= ?
+		GROUP BY b.priority, e.kind`, nanos(now), nanos(since))
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	counts := map[string]int{}
+	flagged := 0
+	for rows.Next() {
+		var priority string
+		var revKind sql.NullString
+		var n int
+		if err := rows.Scan(&priority, &revKind, &n); err != nil {
+			return nil, 0, err
+		}
+		switch revKind.String {
+		case "not_expected":
+			flagged += n
+		case "expected", "snooze":
+			// Explained or deferred: no verdict vote.
+		default:
+			counts[priority] += n
+		}
+	}
+	return counts, flagged, rows.Err()
+}
+
+// ExplainedDigest counts in-window briefings per reported-change kind
+// that carry an effective expected decision — the "explained" share of
+// the digest. Snooze, notes, labels and descriptive evidence never
+// count; the viewer zero-fills absent kinds for a stable wire.
+func (s *Store) ExplainedDigest(ctx context.Context, since, now time.Time) (map[string]int, error) {
+	rows, err := s.db.QueryContext(ctx, `WITH `+effectiveReviewCTE+` SELECT b.kind, COUNT(*)
+		FROM briefings b JOIN eff e ON e.subject_id = b.briefing_id
+		WHERE b.created_at >= ? AND e.kind = 'expected'
+		GROUP BY b.kind`, nanos(now), nanos(since))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var kind string
+		var n int
+		if err := rows.Scan(&kind, &n); err != nil {
+			return nil, err
+		}
+		out[kind] = n
 	}
 	return out, rows.Err()
 }

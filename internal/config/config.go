@@ -176,10 +176,16 @@ type Config struct {
 
 	// Retention horizons (Designv9 §4.6). Subjects must outlive the
 	// briefings that reference them; the purge interval bounds how
-	// often the purge loop wakes.
+	// often the purge loop wakes. Decision audit (180d) outlives
+	// subjects so undo stays interpretable while subjects are
+	// retained; materialized labels live in reported_subjects and
+	// survive audit expiry. Snooze stays within the audit horizon so
+	// a snooze never silently outlives the row that justifies it.
 	BriefingRetention time.Duration
 	SubjectRetention  time.Duration
 	PurgeInterval     time.Duration
+	SnoozeDefault     time.Duration
+	DecisionRetention time.Duration
 
 	GrouperTick          time.Duration
 	OverviewWindow       time.Duration // default overview window; window <= max <= briefing retention
@@ -253,6 +259,8 @@ func Default() Config {
 		BriefingRetention: 30 * 24 * time.Hour,
 		SubjectRetention:  90 * 24 * time.Hour,
 		PurgeInterval:     6 * time.Hour,
+		SnoozeDefault:     24 * time.Hour,
+		DecisionRetention: 180 * 24 * time.Hour,
 
 		GrouperTick:          1 * time.Second,
 		OverviewWindow:       24 * time.Hour,
@@ -602,6 +610,12 @@ func (c Config) Validate() error {
 	}
 	if c.SubjectRetention < c.BriefingRetention {
 		return fmt.Errorf("subject retention %v must cover briefing retention %v", c.SubjectRetention, c.BriefingRetention)
+	}
+	if c.DecisionRetention < 24*time.Hour {
+		return fmt.Errorf("decision retention %v must be at least 24h", c.DecisionRetention)
+	}
+	if c.SnoozeDefault <= 0 || c.SnoozeDefault > c.DecisionRetention {
+		return fmt.Errorf("snooze default %v must be positive and within decision retention %v", c.SnoozeDefault, c.DecisionRetention)
 	}
 	if c.PurgeInterval < time.Minute {
 		return fmt.Errorf("purge interval %v must be at least 1m", c.PurgeInterval)

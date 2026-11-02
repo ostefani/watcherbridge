@@ -1,0 +1,263 @@
+package viewer
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/ostefani/watcherbridge/internal/store"
+)
+
+// Decision routes (Step 25, Designv9 §5.1): local operator memory over
+// briefings and reported profiles. Mutations ride guardStateChanging
+// (Step 16: POST, JSON, 8 KiB cap, exact Origin, Fetch-Metadata when
+// present); those checks defend against browser-origin attacks, not
+// against local processes or OS users, and are documented as such.
+
+// decisionWire is one decision record as served: audit content plus
+// the undone marker. Prior-label restoration internals stay
+// server-side; undo needs only the target ID.
+type decisionWire struct {
+	DecisionID  string `json:"decision_id"`
+	SubjectKind string `json:"subject_kind"`
+	SubjectID   string `json:"subject_id"`
+	Kind        string `json:"kind"`
+	Until       string `json:"until,omitempty"`
+	Text        string `json:"text,omitempty"`
+	CreatedAt   string `json:"created_at"`
+	Supersedes  string `json:"supersedes,omitempty"`
+	Undone      bool   `json:"undone"`
+}
+
+// reviewWire is the effective review-lane state for one subject: the
+// latest non-undone expected/not_expected/snooze row, with lapsed
+// snoozes already excluded by the store query. Absent means no live
+// operator review; the audit trail (with undone markers) carries the
+// rest. Profiles have no review lane, so theirs is always absent.
+type reviewWire struct {
+	Kind       string `json:"kind"`
+	Until      string `json:"until,omitempty"`
+	DecisionID string `json:"decision_id"`
+}
+
+func reviewWireOf(state store.ReviewState) reviewWire {
+	out := reviewWire{Kind: state.Kind, DecisionID: state.DecisionID}
+	if state.HasUntil {
+		out.Until = state.Until.UTC().Format(time.RFC3339)
+	}
+	return out
+}
+
+// mutationWire reports a POST outcome. Applied=false with a reason
+// means the valid request changed nothing (identical replay, already
+// neutralized target) — never a masked validation failure, which
+// stays a 4xx, and never a lost race, which is a 409.
+type mutationWire struct {
+	Decision decisionWire `json:"decision"`
+	Applied  bool         `json:"applied"`
+	Reason   string       `json:"reason,omitempty"`
+}
+
+func decisionWireOf(d store.Decision) decisionWire {
+	w := decisionWire{
+		DecisionID: d.DecisionID, SubjectKind: d.SubjectKind, SubjectID: d.SubjectID,
+		Kind: d.Kind, Text: d.Text, CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
+		Supersedes: d.Supersedes, Undone: d.Undone,
+	}
+	if d.HasUntil {
+		w.Until = d.Until.UTC().Format(time.RFC3339)
+	}
+	return w
+}
+
+// appendDecisionGuarded enforces the Step 16 POST contract before
+// appendDecision; registered as its own method-qualified pattern so
+// the mux never sees an unqualified overlap with GET /.
+func (v *Viewer) appendDecisionGuarded(w http.ResponseWriter, r *http.Request) {
+	v.guardStateChanging(v.appendDecision)(w, r)
+}
+
+func (v *Viewer) listDecisions(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	kind, subject := q.Get("subject_kind"), q.Get("subject_id")
+	if kind == "" || subject == "" {
+		writeViewerError(w, "subject_kind and subject_id are required", http.StatusBadRequest)
+		return
+	}
+	if !validDecisionSubject(kind, subject) {
+		writeViewerError(w, "unknown decision subject", http.StatusBadRequest)
+		return
+	}
+	limit := 50
+	if s := q.Get("limit"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n <= 0 || n > 200 {
+			writeViewerError(w, "invalid limit", http.StatusBadRequest)
+			return
+		}
+		limit = n
+	}
+	rows, err := v.store.DecisionsForSubject(r.Context(), kind, canonicalSubjectID(kind, subject), limit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	out := make([]decisionWire, 0, len(rows))
+	for _, d := range rows {
+		out = append(out, decisionWireOf(d))
+	}
+	writeJSON(w, out)
+}
+
+// appendDecision stores one non-undo decision. 201 on a state change;
+// 200 with applied:false and a reason on an identical replay.
+// Validation failures are 4xx; a reused request ID with different
+// content is a 409, never a silent overwrite.
+func (v *Viewer) appendDecision(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SubjectKind string `json:"subject_kind"`
+		SubjectID   string `json:"subject_id"`
+		Kind        string `json:"kind"`
+		Until       string `json:"until"`
+		Text        string `json:"text"`
+		RequestID   string `json:"request_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeViewerError(w, "invalid decision body", http.StatusBadRequest)
+		return
+	}
+	if !validDecisionSubject(body.SubjectKind, body.SubjectID) {
+		writeViewerError(w, "unknown decision subject", http.StatusBadRequest)
+		return
+	}
+	in := store.DecisionInput{
+		SubjectKind: body.SubjectKind,
+		SubjectID:   canonicalSubjectID(body.SubjectKind, body.SubjectID),
+		Kind:        body.Kind,
+		Text:        body.Text,
+		RequestID:   body.RequestID,
+	}
+	if body.Until != "" {
+		until, err := time.Parse(time.RFC3339, body.Until)
+		if err != nil {
+			writeViewerError(w, "until must be RFC 3339", http.StatusBadRequest)
+			return
+		}
+		in.HasUntil, in.Until = true, until
+	} else if body.Kind == store.DecisionSnooze {
+		// A snooze without until inherits the configured default
+		// horizon; the store still rejects an explicit past until.
+		def := v.SnoozeDefault
+		if def <= 0 {
+			def = 24 * time.Hour
+		}
+		in.HasUntil, in.Until = true, time.Now().UTC().Add(def)
+	}
+	res, err := v.store.AppendDecision(r.Context(), in)
+	if err != nil {
+		writeDecisionError(w, err)
+		return
+	}
+	v.Overview.Trigger()
+	out := mutationWire{Decision: decisionWireOf(res.Decision), Applied: res.Applied, Reason: res.Reason}
+	if res.Applied {
+		w.WriteHeader(http.StatusCreated)
+	}
+	writeJSON(w, out)
+}
+
+// handleDecisionUndo serves POST /api/decisions/{id}/undo. The body
+// is an optional JSON object carrying request_id for retry safety;
+// an empty body undoes without an idempotency key.
+func (v *Viewer) handleDecisionUndo(w http.ResponseWriter, r *http.Request) {
+	v.guardStateChanging(func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if id == "" || !validDecisionID(id) {
+			writeViewerError(w, "invalid id", http.StatusBadRequest)
+			return
+		}
+		var body struct {
+			RequestID string `json:"request_id"`
+		}
+		if r.ContentLength != 0 {
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeViewerError(w, "invalid undo body", http.StatusBadRequest)
+				return
+			}
+		}
+		res, err := v.store.UndoDecision(r.Context(), id, body.RequestID)
+		if err != nil {
+			writeDecisionError(w, err)
+			return
+		}
+		v.Overview.Trigger()
+		writeJSON(w, mutationWire{Decision: decisionWireOf(res.Decision), Applied: res.Applied, Reason: res.Reason})
+	})(w, r)
+}
+
+// validDecisionSubject allowlists subject reference shapes before any
+// store lookup: briefing IDs in either spelling and locally generated
+// profile IDs. Anything else is malformed (400), never a store probe.
+// Well-formed but unsupported combinations (incident subjects, labels
+// on briefings) travel to the store, which rejects them as 422 with
+// an explicit reason instead of silently storing them.
+func validDecisionSubject(kind, id string) bool {
+	switch kind {
+	case store.DecisionSubjectBriefing:
+		return strings.HasPrefix(id, "brf-") || strings.HasPrefix(id, "grp-")
+	case store.DecisionSubjectProfile:
+		return validProfileID(id)
+	case "incident", "legacy":
+		return strings.HasPrefix(id, "brf-") || strings.HasPrefix(id, "grp-") || validProfileID(id)
+	}
+	return false
+}
+
+// canonicalSubjectID normalizes the briefing-ID prefix alias so both
+// spellings address one history; the store keys briefing decisions by
+// briefing ID. Profile IDs pass through.
+func canonicalSubjectID(kind, id string) string {
+	if kind == store.DecisionSubjectBriefing {
+		return "brf-" + strings.TrimPrefix(id, "brf-")
+	}
+	return id
+}
+
+// validDecisionID allowlists generated decision IDs: dec- plus digits.
+func validDecisionID(id string) bool {
+	rest, ok := strings.CutPrefix(id, "dec-")
+	if !ok || rest == "" {
+		return false
+	}
+	for _, c := range rest {
+		if (c < '0' || c > '9') && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// writeDecisionError maps decision-domain failures to status codes:
+// unknown subjects and targets are 404 (no tombstones, so no 410);
+// matrix and input violations are 400/422; stale-head and
+// conflicting-reuse races are 409; replays surface as 200 bodies,
+// never errors.
+func writeDecisionError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrUnknownSubject), errors.Is(err, store.ErrUnknownDecision):
+		writeViewerError(w, "unknown decision subject", http.StatusNotFound)
+	case errors.Is(err, store.ErrInvalidDecision):
+		writeViewerError(w, "invalid decision", http.StatusBadRequest)
+	case errors.Is(err, store.ErrRequestConflict), errors.Is(err, store.ErrUndoConflict):
+		writeViewerError(w, "decision conflict", http.StatusConflict)
+	case errors.Is(err, store.ErrInvalidUndo):
+		writeViewerError(w, "invalid undo target", http.StatusUnprocessableEntity)
+	case errors.Is(err, store.ErrUnsupportedSubject):
+		writeViewerError(w, "unsupported decision", http.StatusUnprocessableEntity)
+	default:
+		writeError(w, err)
+	}
+}

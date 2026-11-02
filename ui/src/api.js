@@ -33,6 +33,56 @@ export function fetchBriefing(id) {
 }
 
 /**
+ * Append an operator decision. The server is the matrix authority:
+ * unknown kinds, text where none belongs, and past snooze horizons
+ * come back as 4xx the caller surfaces. requestId makes a retry after
+ * a network failure replay-safe; rotate it after a success.
+ * @param {{subjectKind: string, subjectId: string, kind: string, until?: string, text?: string, requestId: string}} d
+ * @returns {Promise<{decision: import('./wire.js').Decision, applied: boolean, reason?: string}>}
+ */
+export async function postDecision(d) {
+  const body = {
+    subject_kind: d.subjectKind,
+    subject_id: d.subjectId,
+    kind: d.kind,
+    request_id: d.requestId
+  };
+  if (d.until !== undefined) {
+    body.until = d.until;
+  }
+  if (d.text !== undefined) {
+    body.text = d.text;
+  }
+  const res = await fetch('/api/decisions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    throw new Error(`decision ${res.status}: ${await res.text()}`);
+  }
+  return res.json();
+}
+
+/**
+ * Undo one decision by ID. Undoing a stale label head is a 409, never
+ * a silent overwrite; the caller surfaces the status.
+ * @param {string} id decision ID
+ * @param {string} requestId retry key, rotated after success
+ */
+export async function postUndo(id, requestId) {
+  const res = await fetch(`/api/decisions/${encodeURIComponent(id)}/undo`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ request_id: requestId })
+  });
+  if (!res.ok) {
+    throw new Error(`undo ${res.status}: ${await res.text()}`);
+  }
+  return res.json();
+}
+
+/**
  * @param {string} after tuple cursor, "" starts at the oldest
  * @returns {Promise<import('./wire.js').DevicesPage>}
  */

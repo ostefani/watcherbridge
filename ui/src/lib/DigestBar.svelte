@@ -11,7 +11,10 @@
     'other'
   ];
 
-  let { digest = {} } = $props();
+  // explained counts briefings the operator explicitly marked
+  // expected, per kind; the rest still need review. Both maps are
+  // server-computed, zero-filled across the same six kinds.
+  let { digest = {}, explained = {} } = $props();
 </script>
 
 <section aria-label="Change digest">
@@ -20,7 +23,7 @@
     {#each KINDS as kind (kind)}
       <div>
         <dt>{kind}</dt>
-        <dd>{digest[kind] ?? 0}</dd>
+        <dd>{digest[kind] ?? 0} <span class="expected">expected {explained[kind] ?? 0}</span></dd>
       </div>
     {/each}
   </dl>
@@ -43,5 +46,9 @@
   dd {
     margin: 0;
     font-size: 1.1rem;
+  }
+  .expected {
+    display: block;
+    font-size: 0.8rem;
   }
 </style>

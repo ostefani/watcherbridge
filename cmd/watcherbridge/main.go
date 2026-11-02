@@ -51,6 +51,8 @@ func main() {
 	briefRet := fs.Duration("briefing-retention", def.BriefingRetention, "retained briefing history (min 24h)")
 	subjRet := fs.Duration("subject-retention", def.SubjectRetention, "retained reported-subject context (min briefing retention)")
 	purgeEvery := fs.Duration("purge-interval", def.PurgeInterval, "purge loop interval (min 1m)")
+	snoozeDefault := fs.Duration("snooze-default", def.SnoozeDefault, "default briefing snooze horizon")
+	decisionRet := fs.Duration("decision-retention", def.DecisionRetention, "retained operator-decision audit (min 24h)")
 	tick := fs.Duration("grouper-tick", def.GrouperTick, "worker tick")
 	lease := fs.Duration("processing-lease", def.ProcessingLease, "stale processing lease")
 	agentTimeout := fs.Duration("agent-timeout", def.AgentTimeout, "per-turn agent budget (Step 26 uses it)")
@@ -79,6 +81,8 @@ func main() {
 	cfg.BriefingRetention = *briefRet
 	cfg.SubjectRetention = *subjRet
 	cfg.PurgeInterval = *purgeEvery
+	cfg.SnoozeDefault = *snoozeDefault
+	cfg.DecisionRetention = *decisionRet
 	cfg.GrouperTick = *tick
 	cfg.OverviewWindow = *overviewWindow
 	cfg.OverviewMaxWindow = *overviewMax
@@ -134,7 +138,7 @@ func main() {
 	srv.Health = opHealth
 	srv.Viewer().Overview.SetHealth(opHealth)
 	srv.SweepOnce(ctx)
-	purgeSettings := store.PurgeSettings{BriefingRetention: cfg.BriefingRetention, SubjectRetention: cfg.SubjectRetention, ActiveSource: cfg.SourceID}
+	purgeSettings := store.PurgeSettings{BriefingRetention: cfg.BriefingRetention, SubjectRetention: cfg.SubjectRetention, DecisionRetention: cfg.DecisionRetention, ActiveSource: cfg.SourceID}
 	if rep, err := st.PurgeOnce(ctx, purgeSettings, time.Now()); err != nil {
 		log.Fatalf("startup purge: %v", err)
 	} else {

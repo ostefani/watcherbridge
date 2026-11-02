@@ -77,10 +77,27 @@ const failedEventFloor = 7 * 24 * time.Hour
 type PurgeSettings struct {
 	BriefingRetention time.Duration
 	SubjectRetention  time.Duration
+	// DecisionRetention bounds the operator-decision audit horizon;
+	// materialized labels are columns on reported_subjects and survive
+	// audit expiry. Zero means the 180d default, so existing callers
+	// keep history. Audit expires purely by row age with no exemption
+	// for rows the effective view still uses.
+	DecisionRetention time.Duration
 	// ActiveSource names the configured SOURCE_ID. A quiet-but-live
 	// registration is never retired by inactivity alone (Designv9 §4.6);
 	// when empty, source cleanup keeps its legacy behavior for tests.
 	ActiveSource string
+}
+
+// defaultDecisionRetention is the operator-decision audit horizon when
+// PurgeSettings leaves DecisionRetention unset.
+const defaultDecisionRetention = 180 * 24 * time.Hour
+
+func decisionRetentionOf(settings PurgeSettings) time.Duration {
+	if settings.DecisionRetention > 0 {
+		return settings.DecisionRetention
+	}
+	return defaultDecisionRetention
 }
 
 // PurgeReport counts committed deletions per table for Step 20 health.
@@ -104,6 +121,7 @@ type PurgeReport struct {
 	Subjects      int64
 	Sources       int64
 	Pseudonyms    int64
+	Decisions     int64 // expired operator-decision audit rows; labels survive in reported_subjects
 	Bookkeeping   int64 // purge_state upserts sharing the row budget
 }
 
@@ -120,12 +138,13 @@ func (r *PurgeReport) add(o PurgeReport) {
 	r.Subjects += o.Subjects
 	r.Sources += o.Sources
 	r.Pseudonyms += o.Pseudonyms
+	r.Decisions += o.Decisions
 	r.Bookkeeping += o.Bookkeeping
 }
 
 func (r PurgeReport) total() int64 {
 	return r.BriefingLinks + r.Briefings + r.Groups + r.GroupLinks + r.GroupEvents + r.Ports +
-		r.Observations + r.Progress + r.RawEvents + r.Subjects + r.Sources + r.Pseudonyms
+		r.Observations + r.Progress + r.RawEvents + r.Subjects + r.Sources + r.Pseudonyms + r.Decisions
 }
 
 // purgeStages selects which table families one batch transaction covers.
@@ -150,6 +169,7 @@ type purgePlan struct {
 	subjectCut  int64
 	sourceCut   int64
 	tokenCut    int64
+	decisionCut int64
 	// activeSource names the configured SOURCE_ID. A quiet-but-live
 	// registration is never retired by inactivity alone (Designv9 §4.6).
 	activeSource string
@@ -252,6 +272,8 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				report.Sources += n
 			case "pseudonym_map":
 				report.Pseudonyms += n
+			case "operator_decisions":
+				report.Decisions += n
 			}
 			return nil
 		}
@@ -327,7 +349,21 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 			if err := take("reported_subjects", plan.subjectCut, `DELETE FROM reported_subjects WHERE rowid IN (SELECT rowid FROM reported_subjects WHERE last_report_at < ?
 				AND NOT EXISTS (SELECT 1 FROM reported_observations WHERE reported_observations.profile_id = reported_subjects.profile_id)
 				AND NOT EXISTS (SELECT 1 FROM group_subjects WHERE group_subjects.profile_id = reported_subjects.profile_id)
-				AND NOT EXISTS (SELECT 1 FROM briefing_subjects WHERE briefing_subjects.profile_id = reported_subjects.profile_id) ORDER BY last_report_at, rowid LIMIT ?)`, limit, plan.subjectCut, limit); err != nil {
+				AND NOT EXISTS (SELECT 1 FROM briefing_subjects WHERE briefing_subjects.profile_id = reported_subjects.profile_id)
+				AND NOT EXISTS (SELECT 1 FROM operator_decisions WHERE operator_decisions.subject_kind = 'reported_subject' AND operator_decisions.subject_id = reported_subjects.profile_id AND operator_decisions.created_at >= ?) ORDER BY last_report_at, rowid LIMIT ?)`, limit, plan.subjectCut, plan.decisionCut, limit); err != nil {
+				return err
+			}
+			// Decision audit expires purely by row age: the effective
+			// view never exempts a row, so no backup audit is needed.
+			// An undo outlives its target by construction (the target
+			// is always older, and the batch order is oldest-first),
+			// but the pair gate below defers an undo while its target
+			// row still exists, so a bounded pass never orphans one.
+			// Materialized labels are columns on reported_subjects,
+			// never audit rows, so they survive this delete.
+			limit = deleteLimit()
+			if err := take("operator_decisions", plan.decisionCut, `DELETE FROM operator_decisions WHERE rowid IN (SELECT rowid FROM operator_decisions WHERE created_at < ?
+				AND NOT (kind = 'undo' AND EXISTS (SELECT 1 FROM operator_decisions target WHERE target.decision_id = operator_decisions.supersedes)) ORDER BY created_at, rowid LIMIT ?)`, limit, plan.decisionCut, limit); err != nil {
 				return err
 			}
 			sourceScope := "last_report_at IS NOT NULL AND last_report_at < ?\n\t\t\t\tAND NOT EXISTS (SELECT 1 FROM reported_subjects WHERE reported_subjects.source_scope = report_sources.source_scope)"
@@ -622,6 +658,7 @@ func (s *Store) PurgeOnce(ctx context.Context, settings PurgeSettings, now time.
 		subjectCut:   nanos(now.Add(-settings.SubjectRetention)),
 		sourceCut:    nanos(now.Add(-heartbeatRetention)),
 		tokenCut:     rawCut,
+		decisionCut:  nanos(now.Add(-decisionRetentionOf(settings))),
 		activeSource: settings.ActiveSource,
 	}
 	runID, err := s.beginPurgeRun(ctx, nanos(now))

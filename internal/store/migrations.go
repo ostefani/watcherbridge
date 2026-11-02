@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 17
+const supportedSchemaVersion = 18
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -142,6 +142,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 16, migrateV16)
 		case 16:
 			err = applyMigration(db, 17, migrateV17)
+		case 17:
+			err = applyMigration(db, 18, migrateV18)
 		}
 		if err != nil {
 			return err
@@ -286,6 +288,42 @@ func migrateV16(tx *sql.Tx) error {
 func migrateV17(tx *sql.Tx) error {
 	if _, err := tx.Exec(`ALTER TABLE purge_runs ADD COLUMN group_events_deleted INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
+	}
+	return nil
+}
+
+// migrateV18 adds operator decisions (Designv9 §5.1): immutable local
+// audit rows with an explicit undo record instead of mutation, plus
+// the durable label-ownership head on reported subjects. supersedes
+// carries no foreign key: audit rows and their targets purge as
+// age-selected pairs in one batch, so the pointer never needs the
+// database to enforce it. label_owner is plain state, never joined —
+// it may name a purged audit row, which only reads as "undo
+// unavailable" (404), never as corruption.
+func migrateV18(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE operator_decisions (
+			decision_id TEXT PRIMARY KEY,
+			subject_kind TEXT NOT NULL CHECK(subject_kind IN ('briefing','reported_subject')),
+			subject_id TEXT NOT NULL,
+			kind TEXT NOT NULL CHECK(kind IN ('expected','not_expected','snooze','note','label','undo')),
+			until INTEGER,
+			text TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			supersedes TEXT NOT NULL DEFAULT '',
+			request_id TEXT UNIQUE,
+			content_hash TEXT NOT NULL DEFAULT '',
+			prior_label TEXT,
+			prior_owner TEXT
+		)`,
+		`CREATE INDEX decisions_subject ON operator_decisions(subject_kind, subject_id, created_at)`,
+		`CREATE INDEX decisions_created ON operator_decisions(created_at)`,
+		`ALTER TABLE reported_subjects ADD COLUMN label_owner TEXT`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -91,7 +91,7 @@
   }
 
   // Navigation-only shortcuts, added where their controls exist.
-  // Decision keys arrive with Step 25; only working keys are listed.
+  // Briefing decision keys live in Detail, scoped to that screen.
   function onKey(/** @type {KeyboardEvent} */ ev) {
     if (ev.key === '?' && !typingTarget(ev)) {
       showHelp = !showHelp;
@@ -163,8 +163,9 @@
         <li><kbd>g</kbd> then <kbd>h</kbd> — Home</li>
         <li><kbd>g</kbd> then <kbd>d</kbd> — Reported hosts</li>
         <li><kbd>?</kbd> — toggle this list</li>
+        <li><kbd>e</kbd> / <kbd>s</kbd> / <kbd>x</kbd> — on a briefing: preset expected / snooze / not-expected, then confirm</li>
       </ul>
-      <p>Shortcuts stay silent while typing. Decision shortcuts arrive with Step 25.</p>
+      <p>Shortcuts stay silent while typing. Briefing keys preset the composer; nothing submits on its own.</p>
     </section>
   {/if}
   <ConnectionStatus state={stream} />

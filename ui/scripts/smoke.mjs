@@ -68,6 +68,7 @@ function base(over = {}) {
     headline: 'Nothing needs review',
     attention: [],
     digest: { ...zeroDigest },
+    explained: { ...zeroDigest },
     receipts: 0,
     window: '24h0m0s',
     coverage: 'ok',
@@ -109,6 +110,26 @@ const detailFixture = {
   created_at: '2026-11-01T00:00:00Z',
   event_ids: ['evt-1', 'evt-2'],
   seq: 7,
+  effective_review: { kind: 'expected', decision_id: 'dec-11' },
+  decisions: [
+    {
+      decision_id: 'dec-12',
+      subject_kind: 'briefing',
+      subject_id: 'brf-grp-1',
+      kind: 'note',
+      text: `operator note ${hostile}`,
+      created_at: '2026-11-01T01:00:00Z',
+      undone: false
+    },
+    {
+      decision_id: 'dec-11',
+      subject_kind: 'briefing',
+      subject_id: 'brf-grp-1',
+      kind: 'expected',
+      created_at: '2026-11-01T00:30:00Z',
+      undone: false
+    }
+  ],
   profiles: [{ profile_id: 'prof-0000000000000001', role: 'current' }],
   profiles_truncated: true,
   referenced_events: [
@@ -141,6 +162,17 @@ const legacyDevice = {
   association_status: 'active',
   associations: {},
   operator_label: `My printer ${hostile}`,
+  decisions: [
+    {
+      decision_id: 'dec-21',
+      subject_kind: 'reported_subject',
+      subject_id: 'prof-0000000000000002',
+      kind: 'label',
+      text: `My printer ${hostile}`,
+      created_at: '2026-11-01T00:00:00Z',
+      undone: false
+    }
+  ],
   first_report_at: '2026-10-01T00:00:00Z',
   last_report_at: '2026-11-01T00:00:00Z',
   latest: null,
@@ -211,6 +243,11 @@ const cases = [
       'prof-0000000000000001',
       'More profile links exist',
       'Recommended check',
+      'Operator decisions',
+      'Status: Reviewed: expected',
+      'Record decision',
+      'operator note',
+      'Undo',
       'No agent trace is available',
       'Provenance',
       'Snapshot covers 600 ports (truncated)'
@@ -245,6 +282,9 @@ const cases = [
     expect: [
       'Earlier bridge-inferred association; not used for current identity',
       'Your label',
+      'Operator decisions',
+      'Status: No operator review',
+      'Record decision',
       'Latest evidence',
       'No retained observation',
       'evt-9 (host)',
@@ -313,6 +353,7 @@ const cases = [
         liveness: 'unknown',
         reasons: ['fallback ratio high'],
         digest: { ...zeroDigest, port_closed: 2 },
+        explained: { ...zeroDigest, port_closed: 1 },
         sources: [
           {
             scope: 'lab',
@@ -328,6 +369,7 @@ const cases = [
     expect: [
       '1 need a check now',
       'port_closed',
+      'expected 1',
       'fallback ratio high',
       'Coverage is degraded',
       'lab',

@@ -4,6 +4,7 @@
   import { createFetchGuard } from './freshness.js';
   import { nextPageRows } from './paging.js';
   import { displayTime, classLabel } from './format.js';
+  import DecisionPanel from './DecisionPanel.svelte';
 
   // Reported profile (Designv9 §8.2): upstream facts, provenance, last
   // report, ports in retained events and independently paged history.
@@ -151,6 +152,14 @@
       <dt>Last report</dt>
       <dd><time datetime={profile.last_report_at} title={last?.utc}>{last?.local}</time></dd>
     </dl>
+
+    <DecisionPanel
+      subjectKind="reported_subject"
+      subjectId={profile.profile_id}
+      kinds={['note', 'label']}
+      decisions={profile.decisions ?? []}
+      reload={load}
+    />
 
     <section aria-label="Latest evidence">
       <h3>Latest evidence</h3>
