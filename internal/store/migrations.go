@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 19
+const supportedSchemaVersion = 20
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -146,6 +146,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 18, migrateV18)
 		case 18:
 			err = applyMigration(db, 19, migrateV19)
+		case 19:
+			err = applyMigration(db, 20, migrateV20)
 		}
 		if err != nil {
 			return err
@@ -336,6 +338,20 @@ func migrateV18(tx *sql.Tx) error {
 // rows. A plain ADD COLUMN suffices — no table rebuild.
 func migrateV19(tx *sql.Tx) error {
 	if _, err := tx.Exec(`ALTER TABLE purge_runs ADD COLUMN decisions_deleted INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migrateV20 records the resulting review head on every undo row.
+// Repeat-undo conflict detection compares the current head against
+// the head as the undo left it; recomputing that baseline from
+// surviving rows cannot tell "no head existed" from "the head was
+// purged", so the baseline must be pinned at commit time. NULL marks
+// pre-migration undo rows with unavailable history, which repeat
+// handling rejects conservatively. A plain ADD COLUMN suffices.
+func migrateV20(tx *sql.Tx) error {
+	if _, err := tx.Exec(`ALTER TABLE operator_decisions ADD COLUMN head_asof TEXT`); err != nil {
 		return err
 	}
 	return nil

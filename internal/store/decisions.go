@@ -377,39 +377,16 @@ func reviewHead(tx *sql.Tx, subjectKind, subjectID string, now time.Time, cutoff
 	return head, err == nil, err
 }
 
-// reviewHeadAsOf is reviewHead restricted to rows committed no later
-// than the given undo position: the head as the undo left it.
-// Storage order bounds the window, so equal timestamps cannot admit
-// a row the undo never saw. Snooze lapse and the audit cutoff are
-// evaluated at the undo time, not now: a snooze that lapsed after
-// the undo was live for the baseline but gone today, and the
-// comparison must see that change instead of erasing it.
-func reviewHeadAsOf(tx *sql.Tx, subjectKind, subjectID string, asofNanos, cutoffAsof, undoCreated, undoRowID int64) (head string, ok bool, err error) {
-	err = tx.QueryRow(`SELECT decision_id FROM (
-		SELECT decision_id, ROW_NUMBER() OVER (ORDER BY created_at DESC, rowid DESC) AS rn
-		FROM operator_decisions
-		WHERE subject_kind = ? AND subject_id = ?
-			AND kind IN ('expected','not_expected','snooze')
-			AND NOT EXISTS (SELECT 1 FROM operator_decisions u WHERE u.kind = 'undo' AND u.supersedes = operator_decisions.decision_id
-				AND (u.created_at, u.rowid) <= (?, ?))
-			AND (kind != 'snooze' OR until > ?)
-			AND created_at >= ?
-			AND (created_at, rowid) <= (?, ?)
-	) WHERE rn = 1`, subjectKind, subjectID, undoCreated, undoRowID, asofNanos, cutoffAsof, undoCreated, undoRowID).Scan(&head)
-	if err == sql.ErrNoRows {
-		return "", false, nil
-	}
-	return head, err == nil, err
-}
-
 // headChangedSinceUndo reports whether the effective outcome moved
-// on after the given undo row committed. Review-lane compares the
-// current head against the head as of that undo; labels compare the
-// current owner against the owner the undo restored. Later live rows
-// alone cannot prove this: an undo of a newer record changes the
-// head without adding any live row, so only the resulting state
-// comparison is sound. Notes carry no head and never count.
-func headChangedSinceUndo(tx *sql.Tx, target Decision, undoCreated, undoRowID int64, now time.Time, cutoff, cutoffAsof int64) (bool, error) {
+// on after the given undo committed, by comparing the current state
+// against the baseline the undo pinned at commit time. Review lane
+// compares decision IDs ("" means no head); labels compare the
+// current owner against the owner the undo restored. A NULL baseline
+// marks a pre-migration undo with unavailable history and always
+// conflicts: absence of proof is not proof of no change. Purged
+// history therefore fails closed instead of replaying as unchanged.
+// Notes carry no head and never reach here.
+func headChangedSinceUndo(tx *sql.Tx, target Decision, baseline sql.NullString, now time.Time, cutoff int64) (bool, error) {
 	if target.Kind == DecisionLabel {
 		var owner sql.NullString
 		if err := tx.QueryRow(`SELECT label_owner FROM reported_subjects WHERE profile_id = ?`,
@@ -425,15 +402,18 @@ func headChangedSinceUndo(tx *sql.Tx, target Decision, undoCreated, undoRowID in
 		}
 		return current != target.PriorOwner, nil
 	}
-	current, currentOK, err := reviewHead(tx, target.SubjectKind, target.SubjectID, now, cutoff)
+	if !baseline.Valid {
+		return true, nil
+	}
+	head, ok, err := reviewHead(tx, target.SubjectKind, target.SubjectID, now, cutoff)
 	if err != nil {
 		return false, err
 	}
-	asof, asofOK, err := reviewHeadAsOf(tx, target.SubjectKind, target.SubjectID, undoCreated, cutoffAsof, undoCreated, undoRowID)
-	if err != nil {
-		return false, err
+	current := ""
+	if ok {
+		current = head
 	}
-	return currentOK != asofOK || current != asof, nil
+	return baseline.String != current, nil
 }
 
 // UndoDecision appends an explicit undo record for one decision.
@@ -471,10 +451,10 @@ func (s *Store) UndoDecision(ctx context.Context, targetID, requestID string) (D
 		if target.Kind == DecisionUndo {
 			return fmt.Errorf("%w: %q", ErrInvalidUndo, targetID)
 		}
-		var undoCreated, undoRowID int64
-		err = tx.QueryRow(`SELECT created_at, rowid FROM operator_decisions
+		var undoBaseline sql.NullString
+		err = tx.QueryRow(`SELECT head_asof FROM operator_decisions
 			WHERE kind = 'undo' AND supersedes = ?
-			ORDER BY created_at DESC, rowid DESC LIMIT 1`, targetID).Scan(&undoCreated, &undoRowID)
+			ORDER BY created_at DESC, rowid DESC LIMIT 1`, targetID).Scan(&undoBaseline)
 		if err != nil && err != sql.ErrNoRows {
 			return err
 		}
@@ -489,8 +469,7 @@ func (s *Store) UndoDecision(ctx context.Context, targetID, requestID string) (D
 				res = DecisionResult{Decision: target, Applied: false, Reason: "already_undone"}
 				return nil
 			}
-			moved, err := headChangedSinceUndo(tx, target, undoCreated, undoRowID, now,
-				s.decisionCutoff(now), s.decisionCutoff(fromNanos(undoCreated)))
+			moved, err := headChangedSinceUndo(tx, target, undoBaseline, now, s.decisionCutoff(now))
 			if err != nil {
 				return err
 			}
@@ -543,6 +522,22 @@ func (s *Store) UndoDecision(ctx context.Context, targetID, requestID string) (D
 			VALUES (?, ?, ?, 'undo', NULL, '', ?, ?, ?, ?, NULL, NULL)`,
 			id, target.SubjectKind, target.SubjectID, now.UnixNano(), targetID,
 			nullString(requestID), hash); err != nil {
+			return err
+		}
+		// Pin the resulting review head on the undo row itself: a
+		// later repeat compares against this baseline instead of
+		// recomputing it from surviving rows, which cannot tell "no
+		// head existed" from "the head was purged". "" records an
+		// empty head; pre-migration rows keep NULL (unknown).
+		head, ok, err := reviewHead(tx, target.SubjectKind, target.SubjectID, now, s.decisionCutoff(now))
+		if err != nil {
+			return err
+		}
+		baseline := ""
+		if ok {
+			baseline = head
+		}
+		if _, err := tx.Exec(`UPDATE operator_decisions SET head_asof = ? WHERE decision_id = ?`, baseline, id); err != nil {
 			return err
 		}
 		res = DecisionResult{Decision: Decision{DecisionID: id, SubjectKind: target.SubjectKind,

@@ -69,10 +69,14 @@
   let extraKey = $state('');
   let backStack = $state(/** @type {{rows: any[], key: string}[]} */ ([]));
   let paging = $state(false);
+  // Paging keys are reactive state alongside their values: derived
+  // UI (exhaustion, notes) depends on them, and a plain variable
+  // assignment would not invalidate it when the value itself is
+  // unchanged (for example, recording exhaustion twice in a row).
   let atEnd = $state(false);
-  let atEndKey = '';
+  let atEndKey = $state('');
   let windowNote = $state(/** @type {string|null} */ (null));
-  let windowNoteKey = '';
+  let windowNoteKey = $state('');
   // Every paging flag is keyed to the head that produced it: a parent
   // refresh with a new head automatically unhides continuation and
   // drops stale navigation, with no reset timing to get right.

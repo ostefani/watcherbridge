@@ -613,6 +613,50 @@ func TestUndoRepeatAfterUndoMovedHead(t *testing.T) {
 	}
 }
 
+// The undo baseline is pinned at commit time, not recomputed: A is
+// created on day 0, B supersedes it, undo B restores A, and purge
+// later removes A while B and its undo stay retained. Repeating undo
+// B compares the pinned head A against today's empty head and
+// conflicts. A NULL baseline (pre-migration undo with unavailable
+// history) also fails closed.
+func TestUndoRepeatAfterAuditPurgeMovesHead(t *testing.T) {
+	s := openTestStore(t)
+	s.SetDecisionRetention(24 * time.Hour)
+	ctx := context.Background()
+	t0 := time.Now().UTC().Truncate(time.Second)
+	s.now = func() time.Time { return t0 }
+	gid := seedDecisionBriefing(t, s, "lab", "evt-dec-15", subjectMAC("aa:bb:cc:dd:ee:1f"), t0)
+
+	if _, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid, Kind: DecisionExpected}); err != nil {
+		t.Fatal(err)
+	}
+	s.now = func() time.Time { return t0.Add(time.Hour) }
+	b, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid, Kind: DecisionNotExpected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.now = func() time.Time { return t0.Add(2 * time.Hour) }
+	if _, err := s.UndoDecision(ctx, b.Decision.DecisionID, "req-up-1"); err != nil {
+		t.Fatal(err)
+	}
+	purgeAt := t0.Add(25 * time.Hour)
+	s.now = func() time.Time { return purgeAt }
+	rep, err := s.PurgeOnce(ctx, PurgeSettings{BriefingRetention: 400 * 24 * time.Hour,
+		SubjectRetention: 400 * 24 * time.Hour, DecisionRetention: 24 * time.Hour}, purgeAt)
+	if err != nil || rep.Decisions != 1 {
+		t.Fatalf("purge = %+v, %v; want only the oldest decision gone", rep, err)
+	}
+	if _, err := s.UndoDecision(ctx, b.Decision.DecisionID, "req-up-2"); !errors.Is(err, ErrUndoConflict) {
+		t.Fatalf("repeat after purge moved head = %v, want conflict", err)
+	}
+	if _, err := s.db.Exec(`UPDATE operator_decisions SET head_asof = NULL WHERE kind = 'undo'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UndoDecision(ctx, b.Decision.DecisionID, "req-up-3"); !errors.Is(err, ErrUndoConflict) {
+		t.Fatalf("repeat with unknown baseline = %v, want conflict", err)
+	}
+}
+
 // The historical baseline runs on the undo-time clock: A is a live
 // snooze when undo B restores it, so a repeat of undo B after A
 // lapses compares head A against head none and conflicts instead of
