@@ -206,7 +206,7 @@ func TestProtectedTokensCoverTraces(t *testing.T) {
 	if err := s.InsertBriefing(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.refillProtectedTokens(context.Background(), now.Add(-time.Hour).UnixNano()); err != nil {
+	if _, err := s.refillProtectedTokens(context.Background(), now.Add(-time.Hour).UnixNano(), nanos(now.Add(-24*time.Hour))); err != nil {
 		t.Fatal(err)
 	}
 	var n int
@@ -223,6 +223,41 @@ func TestProtectedTokensCoverTraces(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("run alias SUBJ_1 must not pin mappings: %d", n)
+	}
+}
+
+func TestProtectedTokensCoverPinnedTraces(t *testing.T) {
+	s := openTestStore(t)
+	gid := seedFeedGroup(t, s, "host:a", "evt-a1")
+	takeFeedGroup(t, s, gid)
+	now := time.Now().UTC().Truncate(time.Second)
+	// An aged briefing with a trace naming a token that appears
+	// nowhere else: outside the window, it survives only through its
+	// decision pin, and its mappings must survive with it.
+	b := traceTestBriefing(now.Add(-2 * time.Hour))
+	b.GroupID = gid
+	b.BriefingID = "brf-" + gid
+	b.Traces = []AgentTrace{
+		{Step: 0, Tool: "get_reported_profile", ArgsJSON: `{"host":"IP_9"}`, ResultJSON: `{"tool":"get_reported_profile"}`, Status: "ok"},
+	}
+	if err := s.InsertBriefing(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendDecision(context.Background(), DecisionInput{
+		SubjectKind: DecisionSubjectBriefing, SubjectID: "brf-" + gid,
+		Kind: DecisionExpected, RequestID: "pin-req-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.refillProtectedTokens(context.Background(), now.Add(-time.Hour).UnixNano(), nanos(now.Add(-24*time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM purge_protected_tokens WHERE token = ?`, "IP_9").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatal("decision-pinned trace token must be protected at any age")
 	}
 }
 

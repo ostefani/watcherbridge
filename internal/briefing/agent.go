@@ -122,7 +122,7 @@ func runAgent(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outco
 	if taken.LastAttempt() {
 		// Final take: skip the provider and write the deterministic
 		// briefing inline, so a poison group converges to done.
-		return insertFallback(ctx, d, taken, outcome, "retry cap reached; briefing from deterministic baseline only")
+		return insertFallback(ctx, d, taken, outcome, "retry cap reached; briefing from deterministic baseline only", nil, provider.Usage{})
 	}
 	steps := d.AgentMaxSteps
 	if steps < 1 {
@@ -132,7 +132,7 @@ func runAgent(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outco
 	if !ok {
 		// Selection guarantees capability; a swap underneath it degrades
 		// to the fallback rather than inventing a path.
-		return insertFallback(ctx, d, taken, outcome, "agent capability unavailable; briefing from deterministic baseline only")
+		return insertFallback(ctx, d, taken, outcome, "agent capability unavailable; briefing from deterministic baseline only", nil, provider.Usage{})
 	}
 	budget := d.AgentTimeout
 	if budget <= 0 {
@@ -150,7 +150,7 @@ func runAgent(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outco
 	defer cancel()
 	raw, issued, display, failReason := buildScannedBundle(runCtx, d, taken, outcome)
 	if failReason != "" {
-		return insertFallback(ctx, d, taken, outcome, failReason)
+		return insertFallback(ctx, d, taken, outcome, failReason, nil, provider.Usage{})
 	}
 	now := time.Now()
 	if d.Now != nil {
@@ -158,7 +158,7 @@ func runAgent(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outco
 	}
 	env := newAgentEnv(d.Store, taken, issued, now)
 	if failReason = env.seed(runCtx, d.SourceScope); failReason != "" {
-		return insertFallback(ctx, d, taken, outcome, failReason)
+		return insertFallback(ctx, d, taken, outcome, failReason, nil, provider.Usage{})
 	}
 
 	l := &agentLoop{parent: ctx, ctx: runCtx, d: d, taken: taken, outcome: outcome, turner: turner,
@@ -187,7 +187,10 @@ func (l *agentLoop) finish() bool {
 		return false
 	}
 	if l.fallback != "" {
-		return insertFallback(l.parent, l.d, l.taken, l.outcome, l.fallback)
+		// The loop may have executed tools and billed turns before
+		// failing: their audit and accounting persist on the
+		// fallback instead of vanishing with the run.
+		return insertFallback(l.parent, l.d, l.taken, l.outcome, l.fallback, l.traces(), l.usage)
 	}
 	return true
 }

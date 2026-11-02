@@ -106,6 +106,13 @@
  * @property {boolean} clamped
  * @property {boolean} fallback_used
  * @property {string} what_changed
+ * @property {string} [likely_explanation] agent/model explanation only
+ * @property {string} [confidence] agent/model confidence label only
+ * @property {Array<{event_id?: string, tool_step?: number}>} [evidence_refs] citations only
+ * @property {number} [input_tokens] producing-call accounting only
+ * @property {number} [output_tokens] producing-call accounting only
+ * @property {number} [cost_usd] producing-call accounting only, absent while unknown
+ * @property {Array<{step: number, tool: string, args: string, result: string, status: string, duration_ms: number}>} [traces] executed tool steps, detail fetch only
  * @property {string} context retained reported context, not raw evidence
  * @property {string} recommended_check text only, never an action
  * @property {string} created_at RFC 3339

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ostefani/watcherbridge/internal/health"
 	"github.com/ostefani/watcherbridge/internal/provider"
 	"github.com/ostefani/watcherbridge/internal/redactor"
 	"github.com/ostefani/watcherbridge/internal/store"
@@ -922,5 +923,121 @@ func TestCheckModelBriefingRules(t *testing.T) {
 	off.What = "saw IP_9"
 	if _, _, err := checkModelBriefing(off, taken, redactor.TokenMap{}, false, 0); err == nil {
 		t.Fatal("token-shaped invention must fail even with redaction off")
+	}
+}
+
+// A single-call repair is a second billed send: health must count both
+// calls and sum both usages, matching the agent loop where every turn
+// counts.
+func TestSingleCallRepairCountsBothCalls(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	bad := []byte(`{"event_ids":["x"],"host":"IP_1"}`)
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		usage := provider.Usage{InputTokens: 10, OutputTokens: 5, HasUsage: true}
+		if !repair {
+			return provider.RawBriefing{JSON: bad, Usage: usage}, nil
+		}
+		// The repair call carries the correction prompt, not the
+		// bundle: rebuild a valid answer for the group's events
+		// (evt-w1, token IP_1 — the hostChangedGroup fixture).
+		m := map[string]any{
+			"event_ids": []string{"evt-w1"}, "host": "IP_1", "what_changed": "changed IP_1",
+			"context": "context for IP_1", "model_suggestion": strptr("high"),
+			"priority_reason": "because reasons", "recommended_check": "look",
+			"likely_explanation": "likely IP_1", "confidence": "high",
+			"evidence_refs": []any{map[string]any{"event_id": "evt-w1"}},
+		}
+		raw, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return provider.RawBriefing{JSON: raw, Usage: usage}, nil
+	}
+	d := modelDeps(t, s, fake)
+	d.Health = health.New()
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("repaired run must progress the group")
+	}
+	b := briefed(t, s, gid)
+	if b.FallbackUsed {
+		t.Fatalf("repaired run must store the model briefing: %+v", b)
+	}
+	snap := d.Health.Snapshot()
+	if snap.ProviderCalls != 2 {
+		t.Fatalf("initial call plus repair must count two: %+v", snap)
+	}
+	if snap.ProviderInputTokens != 20 || snap.ProviderOutputTokens != 10 {
+		t.Fatalf("both sends' usage must accumulate: %+v", snap)
+	}
+	if b.InputTokens == nil || *b.InputTokens != 20 || b.OutputTokens == nil || *b.OutputTokens != 10 {
+		t.Fatalf("briefing must sum both sends: %+v %+v", b.InputTokens, b.OutputTokens)
+	}
+}
+
+// A tokenized explanation inside the 256-char bound can still restore
+// past it: repeated short tokens expand. The restored display text is
+// bounded too, falling back when expansion breaks it.
+func TestRestoredExplanationBoundFallsBack(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		// 36 repeats at 5 runes each stay inside the tokenized bound
+		// but restore to roughly triple the display length.
+		m := map[string]any{
+			"event_ids": []string{"evt-w1"}, "host": "IP_1", "what_changed": "w",
+			"context": "c", "model_suggestion": nil,
+			"priority_reason": "r", "recommended_check": "k",
+			"likely_explanation": strings.Repeat("IP_1 ", 36),
+			"confidence":         "low",
+			"evidence_refs":      []any{map[string]any{"event_id": "evt-w1"}},
+		}
+		raw, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Sanity: the tokenized explanation itself must pass the
+		// input bound, or the test proves nothing about expansion.
+		if len([]rune(strings.Repeat("IP_1 ", 36))) > maxLikelyRunes {
+			t.Fatal("fixture must stay inside the tokenized bound")
+		}
+		return provider.RawBriefing{JSON: raw}, nil
+	}
+	d := modelDeps(t, s, fake)
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("failed run must still progress the group")
+	}
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || b.Source != "fallback" {
+		t.Fatalf("expanded explanation must fall back: %+v", b)
+	}
+	if !strings.Contains(b.Context, "exceeds 256") {
+		t.Fatalf("fallback must name the bound: %+v", b)
+	}
+}
+
+// An invalid single-call answer still bills both sends: the fallback
+// keeps their summed accounting with source fallback.
+func TestSingleCallInvalidFallbackKeepsUsage(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	usage := provider.Usage{InputTokens: 10, OutputTokens: 5, HasUsage: true}
+	bad := []byte(`{"event_ids":["x"],"host":"IP_1"}`)
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		return provider.RawBriefing{JSON: bad, Usage: usage}, nil
+	}
+	d := modelDeps(t, s, fake)
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("failed run must still progress the group")
+	}
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || b.Source != "fallback" {
+		t.Fatalf("invalid answers must fall back: %+v", b)
+	}
+	if b.InputTokens == nil || *b.InputTokens != 20 || b.OutputTokens == nil || *b.OutputTokens != 10 {
+		t.Fatalf("fallback must sum both sends: %+v %+v", b.InputTokens, b.OutputTokens)
 	}
 }

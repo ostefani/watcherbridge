@@ -322,7 +322,7 @@ func briefOne(ctx context.Context, d Deps, groupID string) (progressed bool) {
 	if d.Now != nil {
 		now = d.Now()
 	}
-	b := fallbackBriefing(taken, outcome, now, "provider unavailable; briefing from deterministic baseline only")
+	b := fallbackBriefing(taken, outcome, now, "provider unavailable; briefing from deterministic baseline only", nil, provider.Usage{})
 	if taken.LastAttempt() {
 		// Final attempt: write the deterministic briefing inline instead
 		// of releasing, so a poison group converges to done, not failed.

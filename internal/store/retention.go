@@ -472,57 +472,84 @@ const protectedTokenClearPage = maxPurgeRowsPerTxn
 // leave token deletions for a later run.
 const protectedRefillPasses = 5
 
+// retainedBriefing matches every briefing purge must keep: inside the
+// retention window, or pinned by a retained decision at any age. The
+// pin predicate mirrors the stageBriefings delete gate exactly —
+// discovery and deletion must agree on what is retained, or pinned
+// traces lose their restoration mappings while their briefing stands.
+const retainedBriefing = `(created_at >= ? OR EXISTS (SELECT 1 FROM operator_decisions d
+	WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?))`
+
 // refillProtectedTokens rebuilds the per-run protected-token scratch
-// set from every retained briefing (created_at >= briefingCut). A
-// stale scratch row only over-protects, so the rebuild runs before any
-// deletion batch; per-batch exclusion then keeps referenced tokens
-// alive while expiry deletes the rest. It returns the highest briefing
-// rowid included, fencing token deletes against briefings inserted
-// during discovery.
-func (s *Store) refillProtectedTokens(ctx context.Context, briefingCut int64) (int64, error) {
-	return s.refillProtectedTokensPaged(ctx, briefingCut, protectedTokenScanPage, protectedTokenWritePage, protectedTokenClearPage, protectedRefillPasses)
+// set from every retained briefing. A stale scratch row only
+// over-protects, so the rebuild runs before any deletion batch;
+// per-batch exclusion then keeps referenced tokens alive while expiry
+// deletes the rest. Decision-pinned briefings join at any age: their
+// traces' mappings retire with them, never before. It returns the
+// highest briefing rowid included, fencing token deletes against
+// briefings inserted during discovery.
+func (s *Store) refillProtectedTokens(ctx context.Context, briefingCut, decisionCut int64) (int64, error) {
+	return s.refillProtectedTokensPaged(ctx, briefingCut, decisionCut, protectedTokenScanPage, protectedTokenWritePage, protectedTokenClearPage, protectedRefillPasses)
 }
 
-func (s *Store) refillProtectedTokensPaged(ctx context.Context, briefingCut int64, scanPage, writePage, clearPage, maxPasses int) (int64, error) {
+func (s *Store) refillProtectedTokensPaged(ctx context.Context, briefingCut, decisionCut int64, scanPage, writePage, clearPage, maxPasses int) (int64, error) {
 	if scanPage <= 0 || writePage <= 0 || clearPage <= 0 || maxPasses <= 0 {
 		return 0, fmt.Errorf("protected token page sizes must be positive")
 	}
 	// Plain reads stay outside the writer; scratch writes use bounded
 	// transactions. A briefing inserted during discovery is handled by
 	// catch-up passes and, ultimately, by the delete-time rowid fence.
-	var fence int64
+	// A decision appended mid-pass can pin an already-scanned old
+	// briefing (rowid order cannot catch that), so the decisions table
+	// is fenced too: when it advances, the next pass rescans from the
+	// start. Rescans are idempotent (INSERT OR IGNORE) and bounded by
+	// maxPasses like every other catch-up.
+	var fence, decFence int64
 	if err := s.clearProtectedTokensPaged(ctx, clearPage); err != nil {
 		return 0, err
 	}
 	for pass := 1; pass <= maxPasses; pass++ {
-		var snapshot int64
-		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) FROM briefings WHERE created_at >= ?`, briefingCut).Scan(&snapshot); err != nil {
+		var snapshot, decSnapshot int64
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) FROM briefings WHERE `+retainedBriefing, briefingCut, decisionCut).Scan(&snapshot); err != nil {
 			return 0, err
 		}
-		if err := s.refillProtectedTokensThrough(ctx, briefingCut, fence, snapshot, scanPage, writePage); err != nil {
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) FROM operator_decisions WHERE subject_kind = 'briefing' AND created_at >= ?`, decisionCut).Scan(&decSnapshot); err != nil {
+			return 0, err
+		}
+		// Pins standing at pass start are covered by this pass's own
+		// scan; only pins appended mid-pass force a rescan.
+		decFence = decSnapshot
+		if err := s.refillProtectedTokensThrough(ctx, briefingCut, decisionCut, fence, snapshot, scanPage, writePage); err != nil {
 			return 0, err
 		}
 		fence = snapshot
-		var current int64
-		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) FROM briefings WHERE created_at >= ?`, briefingCut).Scan(&current); err != nil {
+		var current, decCurrent int64
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) FROM briefings WHERE `+retainedBriefing, briefingCut, decisionCut).Scan(&current); err != nil {
 			return 0, err
 		}
-		if current <= fence {
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) FROM operator_decisions WHERE subject_kind = 'briefing' AND created_at >= ?`, decisionCut).Scan(&decCurrent); err != nil {
+			return 0, err
+		}
+		if current <= fence && decCurrent <= decFence {
 			return fence, nil
+		}
+		if decCurrent > decFence {
+			// New pins may cover already-scanned rows: rescan.
+			decFence, fence = decCurrent, 0
 		}
 	}
 	return fence, fmt.Errorf("protected token references changed during discovery; retry purge")
 }
 
-func (s *Store) refillProtectedTokensThrough(ctx context.Context, briefingCut, afterRowID, throughRowID int64, scanPage, writePage int) error {
+func (s *Store) refillProtectedTokensThrough(ctx context.Context, briefingCut, decisionCut, afterRowID, throughRowID int64, scanPage, writePage int) error {
 	lastRowID := afterRowID
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		rows, err := s.db.QueryContext(ctx, `SELECT rowid, COALESCE(model_raw_json, ''), COALESCE(priority_reason, '') FROM briefings
-			WHERE created_at >= ? AND rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`,
-			briefingCut, lastRowID, throughRowID, scanPage)
+			WHERE `+retainedBriefing+` AND rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`,
+			briefingCut, decisionCut, lastRowID, throughRowID, scanPage)
 		if err != nil {
 			return err
 		}
@@ -553,9 +580,9 @@ func (s *Store) refillProtectedTokensThrough(ctx context.Context, briefingCut, a
 		// loop-bounded far below the page multiple, so the cap is a
 		// backstop, not a silent occurrence drop.
 		trows, err := s.db.QueryContext(ctx, `SELECT args_json, result_json FROM agent_traces
-			WHERE briefing_id IN (SELECT briefing_id FROM briefings WHERE created_at >= ? AND rowid > ? AND rowid <= ?)
+			WHERE briefing_id IN (SELECT briefing_id FROM briefings WHERE `+retainedBriefing+` AND rowid > ? AND rowid <= ?)
 			ORDER BY briefing_id, step LIMIT ?`,
-			briefingCut, pageStart, lastRowID, scanPage*8)
+			briefingCut, decisionCut, pageStart, lastRowID, scanPage*8)
 		if err != nil {
 			return err
 		}
@@ -721,7 +748,7 @@ func (s *Store) PurgeOnce(ctx context.Context, settings PurgeSettings, now time.
 		return PurgeReport{}, err
 	}
 	plan.runID = runID
-	fence, derr := s.refillProtectedTokens(ctx, plan.briefingCut)
+	fence, derr := s.refillProtectedTokens(ctx, plan.briefingCut, plan.decisionCut)
 	if derr != nil {
 		plan.skipTokenExpiry = true
 	} else {

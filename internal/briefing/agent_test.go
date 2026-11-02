@@ -1010,3 +1010,39 @@ func TestAgentConfidenceNeverSetsPriority(t *testing.T) {
 		t.Fatalf("confidence must still persist as display: %+v", b)
 	}
 }
+
+// A failed agent run keeps its audit: one executed tool plus an
+// invalid final (twice, across the single repair) falls back with the
+// step stored, the billed usage summed, and source fallback.
+func TestAgentFallbackKeepsTraceAndUsage(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	usage := provider.Usage{InputTokens: 10, OutputTokens: 5, HasUsage: true}
+	fake := provider.NewFake()
+	fake.Turns = []provider.FakeStep{
+		{JSON: []byte(`{"tool":"get_reported_profile","arguments":{"host":"IP_1"}}`), Usage: usage},
+		{JSON: []byte(agentFinal([]string{"evt-w1"}, "IP_1", []any{map[string]any{"event_id": "e9"}}, strptr("high"))), Usage: usage},
+		{JSON: []byte(agentFinal([]string{"evt-w1"}, "IP_1", []any{map[string]any{"event_id": "e9"}}, strptr("high"))), Usage: usage},
+	}
+	d := agentTestDeps(t, s, fake)
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("failed run must still progress the group")
+	}
+	if fake.TurnCalls != 3 {
+		t.Fatalf("tool plus final plus repair send: %d calls", fake.TurnCalls)
+	}
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || b.Source != "fallback" {
+		t.Fatalf("invalid final must fall back: %+v", b)
+	}
+	traces, err := s.AgentTraces(context.Background(), b.BriefingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(traces) != 1 || traces[0].Step != 0 || traces[0].Tool != "get_reported_profile" || traces[0].Status != "ok" {
+		t.Fatalf("executed step must persist on fallback: %+v", traces)
+	}
+	if b.InputTokens == nil || *b.InputTokens != 30 || b.OutputTokens == nil || *b.OutputTokens != 15 {
+		t.Fatalf("fallback must sum all three sends: %+v %+v", b.InputTokens, b.OutputTokens)
+	}
+}

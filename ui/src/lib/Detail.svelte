@@ -220,7 +220,47 @@
 
     <section aria-label="How I checked this">
       <h3>How I checked this</h3>
-      <p>No agent trace is available for this briefing.</p>
+      {#if shown.likely_explanation || (shown.evidence_refs && shown.evidence_refs.length) || (shown.traces && shown.traces.length)}
+        {#if shown.likely_explanation}
+          <p><strong>Likely explanation.</strong> {shown.likely_explanation}</p>
+        {/if}
+        {#if shown.confidence}
+          <p>Confidence: {shown.confidence}</p>
+        {/if}
+        {#if shown.input_tokens != null || shown.output_tokens != null || shown.cost_usd != null}
+          <p>
+            Accounting:{#if shown.input_tokens != null} {shown.input_tokens} input tokens{/if}{#if shown.output_tokens != null}, {shown.output_tokens} output tokens{/if}{#if shown.cost_usd != null}, ${shown.cost_usd}{/if}.
+          </p>
+        {/if}
+        {#if shown.evidence_refs && shown.evidence_refs.length}
+          <h4>Cited evidence</h4>
+          <ul>
+            {#each shown.evidence_refs as ref (ref.event_id ?? `step:${ref.tool_step}`)}
+              <li>
+                {#if ref.event_id}
+                  Event {ref.event_id}
+                {:else}
+                  Tool step {ref.tool_step}
+                {/if}
+              </li>
+            {/each}
+          </ul>
+        {/if}
+        {#if shown.traces && shown.traces.length}
+          <h4>Executed tool steps</h4>
+          <ol>
+            {#each shown.traces as step (step.step)}
+              <li>
+                Step {step.step}: {step.tool} — {step.status} ({step.duration_ms} ms)
+                <pre>Args: {step.args}</pre>
+                <pre>Result: {step.result}</pre>
+              </li>
+            {/each}
+          </ol>
+        {/if}
+      {:else}
+        <p>No agent trace is available for this briefing.</p>
+      {/if}
     </section>
 
     <section aria-label="Provenance">

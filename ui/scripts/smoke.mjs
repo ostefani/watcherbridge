@@ -151,6 +151,28 @@ const detailFixture = {
   observations_truncated: false
 };
 
+const traceFixture = {
+  ...detailFixture,
+  briefing_id: 'brf-agent-1',
+  source: 'agent',
+  likely_explanation: `Likely explanation ${hostile}`,
+  confidence: 'high',
+  evidence_refs: [{ event_id: 'evt-1' }, { tool_step: 0 }],
+  input_tokens: 1200,
+  output_tokens: 300,
+  cost_usd: 0.002,
+  traces: [
+    {
+      step: 0,
+      tool: 'fetch_event',
+      args: `{"event_id":"evt-1"} ${hostile}`,
+      result: '{"status":"ok"}',
+      status: 'ok',
+      duration_ms: 12
+    }
+  ]
+};
+
 const legacyDevice = {
   profile_id: 'prof-0000000000000002',
   class: 'legacy',
@@ -254,6 +276,23 @@ const cases = [
       'Snapshot covers 600 ports (truncated)'
     ],
     absent: ['<img', '<b>']
+  },
+  {
+    component: Detail,
+    name: 'detail with agent trace',
+    props: { id: 'brf-agent-1', initial: traceFixture },
+    expect: [
+      'Likely explanation',
+      'Confidence: high',
+      '1200 input tokens',
+      '300 output tokens',
+      'Event evt-1',
+      'Tool step 0',
+      'Step 0: fetch_event — ok (12 ms)',
+      'Cited evidence',
+      'Executed tool steps'
+    ],
+    absent: ['<img', '<b>', 'No agent trace is available']
   },
   {
     component: Devices,

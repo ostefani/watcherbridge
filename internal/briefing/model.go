@@ -225,17 +225,20 @@ func projectedRestoredSize(m modelBriefing, restored redactor.TokenMap) int {
 // baseline owns priority, the suggestion is null, the reason is the exact
 // fallback string. Storing it moves processing→done, so the group never
 // strands — a fallback always completes the group.
-func fallbackBriefing(taken store.TakenGroup, outcome Outcome, now time.Time, contextNote string) store.Briefing {
-	return deterministicBriefing(taken, outcome, now, contextNote, "fallback", true)
+func fallbackBriefing(taken store.TakenGroup, outcome Outcome, now time.Time, contextNote string, traces []store.AgentTrace, usage provider.Usage) store.Briefing {
+	return deterministicBriefing(taken, outcome, now, contextNote, "fallback", true, traces, usage)
 }
 
 // deterministicBriefing builds the model-less briefing. source names
 // the path (Designv9 §6.1): "fallback" for degraded provider paths,
 // "rules" for intentional below-floor output — fallback is distinct
 // from intentionally rules-only output, so the two never share the
-// source or the fallback flag.
-func deterministicBriefing(taken store.TakenGroup, outcome Outcome, now time.Time, contextNote, source string, fallbackUsed bool) store.Briefing {
-	return store.Briefing{
+// source or the fallback flag. Collected execution audit (traces) and
+// adapter accounting (usage) ride along when the caller supplies them:
+// a fallback still stores what the run did, with source fallback, so
+// failed runs leave no silent gap in audit or accounting.
+func deterministicBriefing(taken store.TakenGroup, outcome Outcome, now time.Time, contextNote, source string, fallbackUsed bool, traces []store.AgentTrace, usage provider.Usage) store.Briefing {
+	b := store.Briefing{
 		BriefingID:       "brf-" + taken.GroupID,
 		GroupID:          taken.GroupID,
 		HostAnchorKey:    taken.Anchor,
@@ -251,7 +254,17 @@ func deterministicBriefing(taken store.TakenGroup, outcome Outcome, now time.Tim
 		Context:          contextNote,
 		RecommendedCheck: "Review the recent changes on this host.",
 		CreatedAt:        now,
+		Traces:           traces,
 	}
+	if usage.HasUsage {
+		in, out := usage.InputTokens, usage.OutputTokens
+		b.InputTokens, b.OutputTokens = &in, &out
+	}
+	if usage.HasCost {
+		cost := usage.CostMicros
+		b.CostMicros = &cost
+	}
+	return b
 }
 
 // insertFallback stores the deterministic briefing; on storage error the
@@ -259,8 +272,8 @@ func deterministicBriefing(taken store.TakenGroup, outcome Outcome, now time.Tim
 // dead context stores nothing: a fallback for a group the model never
 // saw would be a permanent wrong record, so shutdown leaves the group
 // for the lease (or next startup) instead. Reports whether state changed.
-func insertFallback(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome, contextNote string) bool {
-	return insertDeterministic(ctx, d, taken, outcome, contextNote, "fallback", true)
+func insertFallback(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome, contextNote string, traces []store.AgentTrace, usage provider.Usage) bool {
+	return insertDeterministic(ctx, d, taken, outcome, contextNote, "fallback", true, traces, usage)
 }
 
 // insertRules stores the intentional below-floor deterministic briefing
@@ -269,10 +282,10 @@ func insertFallback(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 // threshold the bridge answers from reported context — no provider is
 // billed, nothing degraded.
 func insertRules(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome, contextNote string) bool {
-	return insertDeterministic(ctx, d, taken, outcome, contextNote, "rules", false)
+	return insertDeterministic(ctx, d, taken, outcome, contextNote, "rules", false, nil, provider.Usage{})
 }
 
-func insertDeterministic(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome, contextNote, source string, countFallback bool) bool {
+func insertDeterministic(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome, contextNote, source string, countFallback bool, traces []store.AgentTrace, usage provider.Usage) bool {
 	if ctx.Err() != nil {
 		return false
 	}
@@ -280,7 +293,7 @@ func insertDeterministic(ctx context.Context, d Deps, taken store.TakenGroup, ou
 	if d.Now != nil {
 		now = d.Now()
 	}
-	b := deterministicBriefing(taken, outcome, now, contextNote, source, countFallback)
+	b := deterministicBriefing(taken, outcome, now, contextNote, source, countFallback, traces, usage)
 	if err := d.Store.InsertBriefing(ctx, b); err != nil {
 		log.Printf("briefing: group %s %s insert: %s", taken.GroupID, source, store.SanitizeErrorText(err.Error()))
 		if transientStoreErr(ctx, err) {
@@ -358,11 +371,11 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 	if taken.LastAttempt() {
 		// Final take: skip the provider and write the deterministic
 		// briefing inline, so a poison group converges to done.
-		return insertFallback(ctx, d, taken, outcome, "retry cap reached; briefing from deterministic baseline only")
+		return insertFallback(ctx, d, taken, outcome, "retry cap reached; briefing from deterministic baseline only", nil, provider.Usage{})
 	}
 	raw, issued, display, failReason := buildScannedBundle(ctx, d, taken, outcome)
 	if failReason != "" {
-		return insertFallback(ctx, d, taken, outcome, failReason)
+		return insertFallback(ctx, d, taken, outcome, failReason, nil, provider.Usage{})
 	}
 
 	// The adapter gets the token-name set for echo validation — never
@@ -381,23 +394,27 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 	answer, err := d.Provider.Brief(modelCtx, raw, valid)
 	if err != nil {
 		log.Printf("briefing: group %s provider: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
-		return insertFallback(ctx, d, taken, outcome, "model call failed; briefing from deterministic baseline only")
+		return insertFallback(ctx, d, taken, outcome, "model call failed; briefing from deterministic baseline only", nil, provider.Usage{})
 	}
 	d.Health.AddUsage(answer.Usage)
 	usage := answer.Usage
 	// The single call executes no tools, so no tool_step ref is real.
 	a := acceptAnswer(answer.JSON, taken, issued, d.Redaction.Enabled, -1)
 	if !a.OK {
+		// The repair is a second billed send: it counts like the
+		// initial call, mirroring the agent loop where every turn —
+		// including the repair re-ask — counts.
+		d.Health.AddProviderCall()
 		repair, err := d.Provider.Repair(modelCtx, repairPrompt(a.Correction), valid)
 		if err != nil {
 			log.Printf("briefing: group %s repair: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
-			return insertFallback(ctx, d, taken, outcome, "model repair failed; briefing from deterministic baseline only")
+			return insertFallback(ctx, d, taken, outcome, "model repair failed; briefing from deterministic baseline only", nil, provider.Usage{})
 		}
 		d.Health.AddUsage(repair.Usage)
 		usage = usage.Add(repair.Usage)
 		if a = acceptAnswer(repair.JSON, taken, issued, d.Redaction.Enabled, -1); !a.OK {
 			log.Printf("briefing: group %s model invalid after repair (%s)", taken.GroupID, a.Correction)
-			return insertFallback(ctx, d, taken, outcome, "model output invalid; briefing from deterministic baseline only")
+			return insertFallback(ctx, d, taken, outcome, "model output invalid; briefing from deterministic baseline only", nil, usage)
 		}
 	}
 	return insertModelBriefing(ctx, d, taken, outcome, a, issued, display, "model", nil, usage)
@@ -430,12 +447,20 @@ func insertModelBriefing(ctx context.Context, d Deps, taken store.TakenGroup, ou
 	// restored can exceed what was just approved.
 	if projectedRestoredSize(m, effective) > maxRestoredBytes {
 		log.Printf("briefing: group %s restored text exceeds the %d-byte budget", taken.GroupID, maxRestoredBytes)
-		return insertFallback(ctx, d, taken, outcome, "restored text exceeds size budget; briefing from deterministic baseline only")
+		return insertFallback(ctx, d, taken, outcome, "restored text exceeds size budget; briefing from deterministic baseline only", traces, usage)
 	}
 	what := plainText(redactor.Restore(m.What, effective))
 	briefCtx := plainText(redactor.Restore(m.Context, effective))
 	check := plainText(redactor.Restore(m.Check, effective))
 	likely := plainText(redactor.Restore(m.Likely, effective))
+	// The 256-char explanation bound constrains the tokenized answer,
+	// but short tokens restore long: repeated tokens can expand a
+	// compliant answer well past the bound while the aggregate budget
+	// stays quiet. Enforce the final display text, not just the input.
+	if len([]rune(likely)) > maxLikelyRunes {
+		log.Printf("briefing: group %s restored explanation exceeds 256 chars", taken.GroupID)
+		return insertFallback(ctx, d, taken, outcome, "restored explanation exceeds 256 chars; briefing from deterministic baseline only", traces, usage)
+	}
 	reason := plainText(m.Reason)
 	b := store.Briefing{
 		BriefingID:        "brf-" + taken.GroupID,

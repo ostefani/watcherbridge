@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ostefani/watcherbridge/internal/provider"
 	"github.com/ostefani/watcherbridge/internal/store"
 )
 
@@ -526,7 +527,7 @@ func TestInsertFallbackDeadContextStoresNothing(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if insertFallback(ctx, d, taken, outcome, "dead context") {
+	if insertFallback(ctx, d, taken, outcome, "dead context", nil, provider.Usage{}) {
 		t.Fatal("dead-context fallback must report no progress")
 	}
 	if _, err := s.BriefingForGroup(context.Background(), gid); !errors.Is(err, sql.ErrNoRows) {

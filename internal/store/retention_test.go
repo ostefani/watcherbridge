@@ -640,7 +640,7 @@ func TestProtectedTokenRefillPagesAcrossBriefings(t *testing.T) {
 	host := `{"ip":"192.168.7.21","host_id":"ip:192.168.7.21","identity_source":"ip","identity_confidence":"high"}`
 	seedRetainedBriefing(t, s, "lab", "evt-page-a", host, `{"host":`+fmt.Sprintf("%q", first)+`}`, "audit", now)
 	seedRetainedBriefing(t, s, "lab", "evt-page-b", host, `{"host":`+fmt.Sprintf("%q", second)+`}`, "audit", now)
-	fence, err := s.refillProtectedTokensPaged(ctx, nanos(now), 1, 1, 1, protectedRefillPasses)
+	fence, err := s.refillProtectedTokensPaged(ctx, nanos(now), nanos(now), 1, 1, 1, protectedRefillPasses)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -742,7 +742,7 @@ func TestPurgeTokenFenceBlocksNewBriefings(t *testing.T) {
 	}
 	host := `{"ip":"192.168.7.31","host_id":"ip:192.168.7.31","identity_source":"ip","identity_confidence":"high"}`
 	seedRetainedBriefing(t, s, "lab", "evt-fence-a", host, "{}", "audit", now)
-	fence, err := s.refillProtectedTokens(ctx, nanos(now))
+	fence, err := s.refillProtectedTokens(ctx, nanos(now), nanos(now))
 	if err != nil {
 		t.Fatal(err)
 	}
