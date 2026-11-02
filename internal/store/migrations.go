@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 21
+const supportedSchemaVersion = 22
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -150,6 +150,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 20, migrateV20)
 		case 20:
 			err = applyMigration(db, 21, migrateV21)
+		case 21:
+			err = applyMigration(db, 22, migrateV22)
 		}
 		if err != nil {
 			return err
@@ -386,6 +388,41 @@ func migrateV21(tx *sql.Tx) error {
 		)`,
 		`CREATE INDEX agent_traces_briefing ON agent_traces(briefing_id, step)`,
 		`ALTER TABLE purge_runs ADD COLUMN traces_deleted INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV22 adds the Step 28 review-policy rule registry (Designv9
+// §5.2): one row per deterministic scope with its approval lifecycle,
+// plus the purge ledger column for rule deletes. Scopes are exact
+// source/namespace/reference snapshots with change kind and canonical
+// ports; matching is byte equality, never attribute similarity. A plain
+// new table plus one ledger column suffices — no rebuild.
+func migrateV22(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE review_rules (
+			rule_id TEXT PRIMARY KEY,
+			proposal_id TEXT NOT NULL UNIQUE,
+			source_scope TEXT NOT NULL,
+			reference_class TEXT NOT NULL CHECK(reference_class = 'reported_device'),
+			identity_namespace TEXT NOT NULL DEFAULT '',
+			upstream_reference TEXT NOT NULL,
+			reported_identity_source TEXT NOT NULL,
+			reported_confidence TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			ports_csv TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL CHECK(status IN ('approved','dismissed','revoked')),
+			decided_at INTEGER NOT NULL,
+			approved_at INTEGER,
+			expires_at INTEGER
+		)`,
+		`CREATE INDEX review_rules_scope ON review_rules(source_scope, identity_namespace, upstream_reference)`,
+		`ALTER TABLE purge_runs ADD COLUMN rules_deleted INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt); err != nil {

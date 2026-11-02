@@ -113,6 +113,8 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 	s.viewer.MaxSubscribers = cfg.SSEMaxSubscribers
 	s.viewer.GroupWindowSeconds = int64(cfg.GroupQuietWindow / time.Second)
 	s.viewer.SnoozeDefault = cfg.SnoozeDefault
+	s.viewer.RuleProposeAfter = cfg.RuleProposeAfter
+	s.viewer.RuleDefaultTTL = cfg.RuleDefaultTTL
 	hosts := cfg.ViewerAllowedHosts
 	if len(hosts) == 0 {
 		// Validate already refused non-loopback and malformed binds.

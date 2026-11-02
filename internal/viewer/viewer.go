@@ -193,6 +193,15 @@ type Viewer struct {
 	// Zero means 24h (tests that build a Viewer directly).
 	SnoozeDefault time.Duration
 
+	// RuleProposeAfter is the count of matching expected decisions
+	// that derives a review-policy proposal, set once by the server
+	// from config. Zero means 3 (tests that build a Viewer directly).
+	RuleProposeAfter int
+	// RuleDefaultTTL is the approval grant applied when approve
+	// arrives without a ttl, set once by the server from config.
+	// Zero means 90d (tests that build a Viewer directly).
+	RuleDefaultTTL time.Duration
+
 	// AllowedHosts gates every viewer route (Designv8 §2.4): r.Host must
 	// match an entry exactly (case-insensitive) or the answer is 403.
 	// Empty denies all — the server always derives it from the loopback
@@ -252,6 +261,10 @@ func (v *Viewer) Attach(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/decisions", v.listDecisions)
 	mux.HandleFunc("POST /api/decisions", v.appendDecisionGuarded)
 	mux.HandleFunc("POST /api/decisions/{id}/undo", v.handleDecisionUndo)
+	mux.HandleFunc("GET /api/rules/proposals", v.listProposals)
+	mux.HandleFunc("POST /api/rules/approve", v.approveRuleGuarded)
+	mux.HandleFunc("POST /api/rules/dismiss", v.dismissProposalGuarded)
+	mux.HandleFunc("POST /api/rules/revoke", v.revokeRuleGuarded)
 }
 
 // Handler returns the viewer subtree with Host validation applied ahead

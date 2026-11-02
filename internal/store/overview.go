@@ -66,6 +66,7 @@ var purgeRunColumns = []struct {
 	{"sources_deleted", "report_sources"},
 	{"pseudonyms_deleted", "pseudonym_map"},
 	{"decisions_deleted", "operator_decisions"},
+	{"rules_deleted", "review_rules"},
 }
 
 // scanPurgeRun reads one purge_runs row; ok is false on no match.

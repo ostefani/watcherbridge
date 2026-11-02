@@ -61,6 +61,9 @@ func TestOverviewWindowChain(t *testing.T) {
 
 func TestValidateRejects(t *testing.T) {
 	cases := map[string]func(*Config){
+		"rule propose-after below one":     func(c *Config) { c.RuleProposeAfter = 0 },
+		"rule default ttl non-positive":    func(c *Config) { c.RuleDefaultTTL = 0 },
+		"rule retention below a day":       func(c *Config) { c.RulePurgeAfter = 23 * time.Hour },
 		"non-loopback bind":                func(c *Config) { c.Bind = "0.0.0.0:8081" },
 		"bad mode":                         func(c *Config) { c.Mode = "stream" },
 		"briefing retention below a day":   func(c *Config) { c.BriefingRetention = 23 * time.Hour },

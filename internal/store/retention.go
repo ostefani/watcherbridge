@@ -83,6 +83,11 @@ type PurgeSettings struct {
 	// keep history. Audit expires purely by row age with no exemption
 	// for rows the effective view still uses.
 	DecisionRetention time.Duration
+	// RuleRetention bounds the review-policy rule horizon; unset means
+	// the 180d default. Only terminal (dismissed/revoked/expired) rows
+	// older than this drain, and only while no retained briefing still
+	// records their rule ID as its baseline.
+	RuleRetention time.Duration
 	// ActiveSource names the configured SOURCE_ID. A quiet-but-live
 	// registration is never retired by inactivity alone (Designv9 §4.6);
 	// when empty, source cleanup keeps its legacy behavior for tests.
@@ -98,6 +103,17 @@ func decisionRetentionOf(settings PurgeSettings) time.Duration {
 		return settings.DecisionRetention
 	}
 	return defaultDecisionRetention
+}
+
+// defaultRuleRetention is the review-policy rule horizon when
+// PurgeSettings leaves RuleRetention unset.
+const defaultRuleRetention = 180 * 24 * time.Hour
+
+func ruleRetentionOf(settings PurgeSettings) time.Duration {
+	if settings.RuleRetention > 0 {
+		return settings.RuleRetention
+	}
+	return defaultRuleRetention
 }
 
 // PurgeReport counts committed deletions per table for Step 20 health.
@@ -123,6 +139,7 @@ type PurgeReport struct {
 	Sources       int64
 	Pseudonyms    int64
 	Decisions     int64 // expired operator-decision audit rows; labels survive in reported_subjects
+	Rules         int64 // terminal review-policy rule rows unreferenced by retained briefings
 	Bookkeeping   int64 // purge_state upserts sharing the row budget
 }
 
@@ -141,12 +158,13 @@ func (r *PurgeReport) add(o PurgeReport) {
 	r.Sources += o.Sources
 	r.Pseudonyms += o.Pseudonyms
 	r.Decisions += o.Decisions
+	r.Rules += o.Rules
 	r.Bookkeeping += o.Bookkeeping
 }
 
 func (r PurgeReport) total() int64 {
 	return r.BriefingLinks + r.Briefings + r.Traces + r.Groups + r.GroupLinks + r.GroupEvents + r.Ports +
-		r.Observations + r.Progress + r.RawEvents + r.Subjects + r.Sources + r.Pseudonyms + r.Decisions
+		r.Observations + r.Progress + r.RawEvents + r.Subjects + r.Sources + r.Pseudonyms + r.Decisions + r.Rules
 }
 
 // purgeStages selects which table families one batch transaction covers.
@@ -172,6 +190,10 @@ type purgePlan struct {
 	sourceCut   int64
 	tokenCut    int64
 	decisionCut int64
+	ruleCut     int64
+	// now is the run's wall clock for liveness checks (expiry is
+	// relative to now; the horizon cuts are relative to retention).
+	now int64
 	// activeSource names the configured SOURCE_ID. A quiet-but-live
 	// registration is never retired by inactivity alone (Designv9 §4.6).
 	activeSource string
@@ -284,6 +306,8 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				report.Pseudonyms += n
 			case "operator_decisions":
 				report.Decisions += n
+			case "review_rules":
+				report.Rules += n
 			}
 			return nil
 		}
@@ -396,6 +420,17 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 			limit = deleteLimit()
 			if err := take("operator_decisions", plan.decisionCut, `DELETE FROM operator_decisions WHERE rowid IN (SELECT rowid FROM operator_decisions WHERE created_at < ?
 				AND NOT (kind = 'undo' AND EXISTS (SELECT 1 FROM operator_decisions target WHERE target.decision_id = operator_decisions.supersedes)) ORDER BY created_at, rowid LIMIT ?)`, limit, plan.decisionCut, limit); err != nil {
+				return err
+			}
+			// Terminal rule rows (dismissed, revoked, or approved but
+			// expired) older than the rule horizon drain while no
+			// retained briefing still records their rule ID as its
+			// baseline: referenced rules retire with their briefings,
+			// never before. Live grants are never eligible.
+			limit = deleteLimit()
+			if err := take("review_rules", plan.ruleCut, `DELETE FROM review_rules WHERE rowid IN (SELECT rowid FROM review_rules WHERE decided_at < ?
+				AND (status IN ('dismissed','revoked') OR (status = 'approved' AND expires_at IS NOT NULL AND expires_at < ?))
+				AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.baseline_rule = review_rules.rule_id) ORDER BY decided_at, rowid LIMIT ?)`, limit, plan.ruleCut, plan.now, limit); err != nil {
 				return err
 			}
 			sourceScope := "last_report_at IS NOT NULL AND last_report_at < ?\n\t\t\t\tAND NOT EXISTS (SELECT 1 FROM reported_subjects WHERE reported_subjects.source_scope = report_sources.source_scope)"
@@ -734,12 +769,13 @@ func addPurgeRunCounts(tx *sql.Tx, runID int64, report PurgeReport) error {
 		sources_deleted = sources_deleted + ?,
 		pseudonyms_deleted = pseudonyms_deleted + ?,
 		decisions_deleted = decisions_deleted + ?,
+		rules_deleted = rules_deleted + ?,
 		bookkeeping_writes = bookkeeping_writes + ?
 		WHERE run_id = ?`,
 		report.BriefingLinks, report.Briefings, report.Traces, report.Groups, report.GroupLinks,
 		report.GroupEvents,
 		report.Ports, report.Observations, report.Progress, report.RawEvents,
-		report.Subjects, report.Sources, report.Pseudonyms, report.Decisions, report.Bookkeeping,
+		report.Subjects, report.Sources, report.Pseudonyms, report.Decisions, report.Rules, report.Bookkeeping,
 		runID)
 	return err
 }
@@ -769,6 +805,8 @@ func (s *Store) PurgeOnce(ctx context.Context, settings PurgeSettings, now time.
 		sourceCut:    nanos(now.Add(-heartbeatRetention)),
 		tokenCut:     rawCut,
 		decisionCut:  nanos(now.Add(-decisionRetentionOf(settings))),
+		ruleCut:      nanos(now.Add(-ruleRetentionOf(settings))),
+		now:          nanos(now),
 		activeSource: settings.ActiveSource,
 	}
 	runID, err := s.beginPurgeRun(ctx, nanos(now))
@@ -919,13 +957,13 @@ func (s *Store) LatestPurgeRun(ctx context.Context) (purgeRun, error) {
 		briefing_links_deleted, briefings_deleted, traces_deleted, groups_deleted, group_links_deleted,
 		group_events_deleted,
 		ports_deleted, observations_deleted, progress_deleted, raw_events_deleted,
-		subjects_deleted, sources_deleted, pseudonyms_deleted, decisions_deleted, bookkeeping_writes
+		subjects_deleted, sources_deleted, pseudonyms_deleted, decisions_deleted, rules_deleted, bookkeeping_writes
 		FROM purge_runs ORDER BY run_id DESC LIMIT 1`).Scan(
 		&run.runID, &run.startedAt, &run.finishedAt, &run.status, &run.errText,
 		&run.total.BriefingLinks, &run.total.Briefings, &run.total.Traces, &run.total.Groups, &run.total.GroupLinks,
 		&run.total.GroupEvents,
 		&run.total.Ports, &run.total.Observations, &run.total.Progress, &run.total.RawEvents,
-		&run.total.Subjects, &run.total.Sources, &run.total.Pseudonyms, &run.total.Decisions, &run.total.Bookkeeping)
+		&run.total.Subjects, &run.total.Sources, &run.total.Pseudonyms, &run.total.Decisions, &run.total.Rules, &run.total.Bookkeeping)
 	if err != nil {
 		return purgeRun{}, err
 	}

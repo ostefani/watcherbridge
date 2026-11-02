@@ -25,6 +25,16 @@ func dropTraceSchema(t *testing.T, db *sql.DB) {
 	dropColumnIfExists(t, db, "purge_runs", "traces_deleted")
 }
 
+// dropRuleSchema rewinds the Step-28 review-policy registry (v22 rule
+// table and ledger column) for the same migration-chain replay.
+func dropRuleSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec(`DROP TABLE IF EXISTS review_rules`); err != nil {
+		t.Fatalf("drop rules: %v", err)
+	}
+	dropColumnIfExists(t, db, "purge_runs", "rules_deleted")
+}
+
 // takeFeedGroup closes and takes a seeded group so briefing inserts have
 // a processing group to complete, mirroring the worker take order.
 func takeFeedGroup(t *testing.T, s *Store, gid string) {

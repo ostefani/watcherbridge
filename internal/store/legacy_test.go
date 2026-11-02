@@ -308,6 +308,7 @@ func TestGroupingProvenanceUpgrade(t *testing.T) {
 			}
 			dropDecisionSchema(t, db)
 			dropTraceSchema(t, db)
+			dropRuleSchema(t, db)
 			if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, from)); err != nil {
 				t.Fatal(err)
 			}
@@ -421,6 +422,7 @@ func TestMigrateSupportedFromV13(t *testing.T) {
 		`DROP INDEX IF EXISTS reported_observations_profile_received`,
 		`DROP INDEX IF EXISTS briefings_created_kind`,
 		`DROP TABLE IF EXISTS agent_traces`,
+		`DROP TABLE IF EXISTS review_rules`,
 		`PRAGMA user_version = 13`,
 	} {
 		if _, err := raw.Exec(stmt); err != nil {

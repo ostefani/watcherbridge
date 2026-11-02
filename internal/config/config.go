@@ -186,6 +186,12 @@ type Config struct {
 	PurgeInterval     time.Duration
 	SnoozeDefault     time.Duration
 	DecisionRetention time.Duration
+	// Review-policy rules (Designv9 §5.2): matching expected
+	// decisions that derive a proposal, the default approval grant,
+	// and the terminal-row purge horizon.
+	RuleProposeAfter int
+	RuleDefaultTTL   time.Duration
+	RulePurgeAfter   time.Duration
 
 	GrouperTick          time.Duration
 	OverviewWindow       time.Duration // default overview window; window <= max <= briefing retention
@@ -265,6 +271,9 @@ func Default() Config {
 		PurgeInterval:     6 * time.Hour,
 		SnoozeDefault:     24 * time.Hour,
 		DecisionRetention: 180 * 24 * time.Hour,
+		RuleProposeAfter:  3,
+		RuleDefaultTTL:    90 * 24 * time.Hour,
+		RulePurgeAfter:    180 * 24 * time.Hour,
 
 		GrouperTick:          1 * time.Second,
 		OverviewWindow:       24 * time.Hour,
@@ -624,6 +633,15 @@ func (c Config) Validate() error {
 	}
 	if c.SnoozeDefault <= 0 || c.SnoozeDefault > c.DecisionRetention {
 		return fmt.Errorf("snooze default %v must be positive and within decision retention %v", c.SnoozeDefault, c.DecisionRetention)
+	}
+	if c.RuleProposeAfter < 1 {
+		return fmt.Errorf("rule propose-after %d must be at least 1", c.RuleProposeAfter)
+	}
+	if c.RuleDefaultTTL <= 0 {
+		return fmt.Errorf("rule default ttl %v must be positive", c.RuleDefaultTTL)
+	}
+	if c.RulePurgeAfter < 24*time.Hour {
+		return fmt.Errorf("rule retention %v must be at least 24h", c.RulePurgeAfter)
 	}
 	if c.PurgeInterval < time.Minute {
 		return fmt.Errorf("purge interval %v must be at least 1m", c.PurgeInterval)

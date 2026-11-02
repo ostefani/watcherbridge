@@ -840,6 +840,7 @@ func TestMigrateV3ToV4WithData(t *testing.T) {
 	dropProjectionSchema(t, db)
 	dropDecisionSchema(t, db)
 	dropTraceSchema(t, db)
+	dropRuleSchema(t, db)
 	if _, err := db.Exec(`PRAGMA user_version = 3`); err != nil {
 		t.Fatal(err)
 	}
@@ -1238,6 +1239,7 @@ func TestMigrationV4ToV5KeepsBackoffNull(t *testing.T) {
 	dropProjectionSchema(t, db)
 	dropDecisionSchema(t, db)
 	dropTraceSchema(t, db)
+	dropRuleSchema(t, db)
 	if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
 		t.Fatal(err)
 	}
@@ -1403,6 +1405,7 @@ func TestMigrationV5ToV6KeepsByteCounter(t *testing.T) {
 	dropProjectionSchema(t, db)
 	dropDecisionSchema(t, db)
 	dropTraceSchema(t, db)
+	dropRuleSchema(t, db)
 	if _, err := db.Exec(`PRAGMA user_version = 5`); err != nil {
 		t.Fatal(err)
 	}
@@ -1566,6 +1569,7 @@ func TestMigrateV8BackfillsByCreatedAt(t *testing.T) {
 	dropProjectionSchema(t, db)
 	dropDecisionSchema(t, db)
 	dropTraceSchema(t, db)
+	dropRuleSchema(t, db)
 	db.Close()
 
 	s2, err := Open(path)
@@ -1644,6 +1648,7 @@ func TestMigrateV9ReseedsHighWater(t *testing.T) {
 	dropProjectionSchema(t, db)
 	dropDecisionSchema(t, db)
 	dropTraceSchema(t, db)
+	dropRuleSchema(t, db)
 	db.Close()
 
 	s2, err := Open(path)

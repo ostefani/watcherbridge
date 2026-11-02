@@ -302,6 +302,15 @@ func briefOne(ctx context.Context, d Deps, groupID string) (progressed bool) {
 		log.Printf("briefing: group %s has no events", groupID)
 		return releaseOrPark(ctx, d, taken, "no events")
 	}
+	// Approved operator rules act as deterministic baseline policy
+	// (Designv9 §5.2): on exact scope match a non-critical outcome
+	// selects low before any provider floor is consulted, so
+	// operator-trusted routine never bills a call.
+	now := time.Now()
+	if d.Now != nil {
+		now = d.Now()
+	}
+	outcome = ApplyOperatorRules(ctx, d.Store, taken, outcome, now)
 	if d.Provider != nil {
 		if selectMode(outcome.Level, d.ModelMinBaseline, d.AgentMinBaseline, d.AgentEnabled, isTurner(d.Provider)) == modeAgent {
 			return runAgent(ctx, d, taken, outcome)
@@ -318,11 +327,17 @@ func briefOne(ctx context.Context, d Deps, groupID string) (progressed bool) {
 	}
 	// No provider in Step 9 scope: the deterministic minimal briefing.
 	// Resolve(level, nil) is identity, which fallbackBriefing encodes.
+<<<<<<< Updated upstream
 	now := time.Now()
 	if d.Now != nil {
 		now = d.Now()
 	}
 	b := fallbackBriefing(taken, outcome, now, "provider unavailable; briefing from deterministic baseline only", nil, provider.Usage{})
+=======
+	// now was fixed above for rule application; the same instant stamps
+	// the deterministic briefing.
+	b := fallbackBriefing(taken, outcome, now, "provider unavailable; briefing from deterministic baseline only")
+>>>>>>> Stashed changes
 	if taken.LastAttempt() {
 		// Final attempt: write the deterministic briefing inline instead
 		// of releasing, so a poison group converges to done, not failed.
