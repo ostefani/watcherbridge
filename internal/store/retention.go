@@ -514,9 +514,10 @@ func (s *Store) refillProtectedTokensPaged(ctx context.Context, briefingCut, dec
 	// catch-up passes and, ultimately, by the delete-time rowid fence.
 	// A decision appended mid-pass can pin an already-scanned old
 	// briefing (rowid order cannot catch that), so the decisions table
-	// is fenced too: when it advances, the next pass rescans from the
-	// start. Rescans are idempotent (INSERT OR IGNORE) and bounded by
-	// maxPasses like every other catch-up.
+	// is fenced too: whenever its snapshot advances beyond the covered
+	// fence — mid-pass or between passes — the next scan restarts from
+	// the beginning. Rescans are idempotent (INSERT OR IGNORE) and
+	// bounded by maxPasses like every other catch-up.
 	var fence, decFence int64
 	if err := s.clearProtectedTokensPaged(ctx, clearPage); err != nil {
 		return 0, 0, err
@@ -528,6 +529,17 @@ func (s *Store) refillProtectedTokensPaged(ctx context.Context, briefingCut, dec
 		}
 		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) FROM operator_decisions WHERE subject_kind = 'briefing' AND created_at >= ?`, decisionCut).Scan(&decSnapshot); err != nil {
 			return 0, 0, err
+		}
+		if s.protectedRefillPassHook != nil {
+			s.protectedRefillPassHook(pass)
+		}
+		if decSnapshot > decFence {
+			// A pin committed since the last covered pass may retain
+			// an already-scanned aged briefing below the scan floor:
+			// rescan from the start. The end-of-pass check catches
+			// mid-pass pins; this catches pins that landed between
+			// passes, which the briefing fence alone would mask.
+			fence = 0
 		}
 		// Pins standing at pass start are covered by this pass's own
 		// scan; only pins appended mid-pass force a rescan.
@@ -549,6 +561,9 @@ func (s *Store) refillProtectedTokensPaged(ctx context.Context, briefingCut, dec
 		if decCurrent > decFence {
 			// New pins may cover already-scanned rows: rescan.
 			decFence, fence = decCurrent, 0
+		}
+		if s.protectedRefillPassHook != nil {
+			s.protectedRefillPassHook(pass)
 		}
 	}
 	return fence, decFence, fmt.Errorf("protected token references changed during discovery; retry purge")

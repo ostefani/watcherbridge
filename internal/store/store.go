@@ -67,6 +67,16 @@ type Store struct {
 	// past it, and the effective-state queries ignore them even before
 	// the purge runs, so a stalled purge never extends a verdict.
 	decisionRetention time.Duration
+	// protectedRefillPassHook runs synchronously inside protected
+	// token discovery, with the 1-based pass number. It fires twice
+	// per pass: after the pass snapshots before scanning, and after
+	// the end-of-pass check when another pass will run. Nil in
+	// production. Tests use it to stage rows at exact pass
+	// boundaries — an interleaving a sleep-based race cannot place
+	// deterministically. Rows staged at the second site land strictly
+	// between passes: invisible to the finished pass's end-of-pass
+	// check, visible to the next pass's snapshots.
+	protectedRefillPassHook func(pass int)
 }
 
 // SetDecisionRetention attaches the operator-decision audit horizon

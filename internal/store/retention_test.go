@@ -854,6 +854,87 @@ func TestPurgeTokenFenceBlocksNewDecisions(t *testing.T) {
 	}
 }
 
+// A pin committed between discovery passes must restart the scan
+// from the beginning: the aged briefing it retains sits below the
+// pass floor, so scanning only newer briefings would leave its
+// mappings unprotected while both fences accept them for deletion.
+// The pass hook stages the interleaving deterministically — a new
+// briefing during pass one forces a second pass, and the pin lands
+// where pass one's end-of-pass check can no longer see it.
+func TestProtectedTokensRescanOnPinBetweenPasses(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	pinned, err := s.GetOrAssignPseudonym(ctx, "ip", "192.168.7.81")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := `{"ip":"192.168.7.81","host_id":"ip:192.168.7.81","identity_source":"ip","identity_confidence":"high"}`
+	seedRetainedBriefing(t, s, "lab", "evt-between-a", host, `{"host":`+fmt.Sprintf("%q", pinned)+`}`, "audit", now.Add(-48*time.Hour))
+	seedRetainedBriefing(t, s, "lab", "evt-between-b", host, "{}", "audit", now)
+	briefingCut := nanos(now.Add(-time.Hour))
+	decisionCut := nanos(now.Add(-24 * time.Hour))
+	// The hook fires after each pass's snapshots and, when another
+	// pass will run, after its end-of-pass check: call one stages a
+	// retained briefing the pass-one snapshot missed, forcing a second
+	// pass; call two lands strictly between the passes, invisible to
+	// pass one's end-of-pass check and visible to pass two's
+	// snapshots; call three is pass two's scan site and stages
+	// nothing.
+	var calls int
+	s.protectedRefillPassHook = func(pass int) {
+		calls++
+		switch calls {
+		case 1:
+			seedRetainedBriefing(t, s, "lab", "evt-between-c", host, "{}", "audit", now)
+		case 2:
+			var briefingID string
+			if err := s.db.QueryRow(`SELECT briefing_id FROM briefings ORDER BY created_at, rowid LIMIT 1`).Scan(&briefingID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.AppendDecision(ctx, DecisionInput{
+				SubjectKind: DecisionSubjectBriefing, SubjectID: briefingID,
+				Kind: DecisionExpected, RequestID: "pin-req-between",
+			}); err != nil {
+				t.Fatal(err)
+			}
+		case 3:
+		default:
+			t.Errorf("discovery hook fired %d times, want 3", calls)
+		}
+	}
+	defer func() { s.protectedRefillPassHook = nil }()
+	fence, decFence, err := s.refillProtectedTokens(ctx, briefingCut, decisionCut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 {
+		t.Fatalf("staged interleaving must fire the hook exactly 3 times, fired %d", calls)
+	}
+	var protected int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM purge_protected_tokens WHERE token = ?`, pinned).Scan(&protected); err != nil || protected != 1 {
+		t.Fatalf("between-passes pin must protect its mappings: %d %v", protected, err)
+	}
+	if _, err := s.db.Exec(`UPDATE pseudonym_map SET last_used_at = ? WHERE token = ?`, nanos(now.Add(-48*time.Hour)), pinned); err != nil {
+		t.Fatal(err)
+	}
+	report, _, err := s.purgeBatch(ctx, now, purgePlan{
+		stages:        stageSubjects,
+		subjectCut:    nanos(now.Add(time.Hour)),
+		sourceCut:     nanos(now.Add(time.Hour)),
+		tokenCut:      nanos(now.Add(-time.Hour)),
+		tokenFence:    fence,
+		tokenDecFence: decFence,
+		decisionCut:   decisionCut,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Pseudonyms != 0 {
+		t.Fatalf("between-passes pin must defer token expiry: %+v", report)
+	}
+}
+
 // A stale read-hit followed by a purge delete must surface a value-free
 // retry signal, never a mapping to the deleted row. A fresh lookup after
 // the race recovers by assigning a live token.
