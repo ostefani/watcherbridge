@@ -64,6 +64,7 @@ var purgeRunColumns = []struct {
 	{"subjects_deleted", "reported_subjects"},
 	{"sources_deleted", "report_sources"},
 	{"pseudonyms_deleted", "pseudonym_map"},
+	{"decisions_deleted", "operator_decisions"},
 }
 
 // scanPurgeRun reads one purge_runs row; ok is false on no match.
@@ -160,8 +161,8 @@ type PurgeRunHealth struct {
 // effectiveReviewCTE selects the current review-lane record per
 // briefing: latest non-undone expected/not_expected/snooze, with
 // lapsed snoozes excluded before the pick so an earlier record
-// resumes. Expired audit never reaches this query — purge deletes it
-// — so exclusion here covers only the time-based snooze lapse.
+// resumes. Audit past the retention cutoff is excluded too, so a
+// stalled purge never extends a verdict past its horizon.
 const effectiveReviewCTE = `eff AS (
 	SELECT subject_id, kind, until FROM (
 		SELECT d.subject_id, d.kind, d.until,
@@ -171,6 +172,7 @@ const effectiveReviewCTE = `eff AS (
 			AND d.kind IN ('expected','not_expected','snooze')
 			AND NOT EXISTS (SELECT 1 FROM operator_decisions u WHERE u.kind = 'undo' AND u.supersedes = d.decision_id)
 			AND (d.kind != 'snooze' OR d.until > ?)
+			AND d.created_at >= ?
 	) WHERE rn = 1
 )`
 
@@ -180,30 +182,35 @@ const effectiveReviewCTE = `eff AS (
 // orders before priority rank so a flagged low-priority briefing is
 // never cut by the display cap.
 type AttentionCandidate struct {
-	BriefingID   string
-	Priority     string
-	CreatedAt    time.Time
-	Kind         string
-	Flagged      bool
-	Acknowledged bool
-	SnoozedUntil time.Time
+	BriefingID string
+	Priority   string
+	CreatedAt  time.Time
+	Kind       string
+	// Flagged is the only decision state candidates carry:
+	// acknowledged and actively-snoozed rows are excluded in SQL
+	// before LIMIT, so they never consume display-cap slots.
+	Flagged bool
 }
 
-// AttentionCandidates returns up to limit briefings created at or after
-// since, in display order: flagged first, then priority rank
-// descending, newest first, stable ID tiebreaker. Verdict and headline
-// counts come from the full-window effective counts instead, so rows
-// past the cap still vote.
+// AttentionCandidates returns up to limit eligible briefings created
+// at or after since, in display order: flagged first, then priority
+// rank descending, newest first, stable ID tiebreaker. Eligibility is
+// decided in SQL before LIMIT: acknowledged and actively-snoozed rows
+// never consume cap slots, and the flag rank is an explicit non-null
+// CASE so NULL (undecided) never sorts after false. Verdict and
+// headline counts come from the full-window effective counts instead,
+// so rows past the cap still vote.
 func (s *Store) AttentionCandidates(ctx context.Context, since time.Time, limit int) ([]AttentionCandidate, error) {
 	now := s.now()
 	rows, err := s.db.QueryContext(ctx, `WITH `+effectiveReviewCTE+` SELECT
-		b.briefing_id, b.priority, b.created_at, b.kind, e.kind, e.until
+		b.briefing_id, b.priority, b.created_at, b.kind, e.kind
 		FROM briefings b LEFT JOIN eff e ON e.subject_id = b.briefing_id
 		WHERE b.created_at >= ?
-		ORDER BY (e.kind = 'not_expected') DESC,
+			AND (e.kind IS NULL OR e.kind = 'not_expected')
+		ORDER BY CASE WHEN e.kind = 'not_expected' THEN 0 ELSE 1 END,
 			CASE b.priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END DESC,
 			b.created_at DESC, b.briefing_id ASC
-		LIMIT ?`, nanos(now), nanos(since), limit)
+		LIMIT ?`, nanos(now), s.decisionCutoff(now), nanos(since), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -213,21 +220,11 @@ func (s *Store) AttentionCandidates(ctx context.Context, since time.Time, limit 
 		var c AttentionCandidate
 		var created int64
 		var revKind sql.NullString
-		var revUntil sql.NullInt64
-		if err := rows.Scan(&c.BriefingID, &c.Priority, &created, &c.Kind, &revKind, &revUntil); err != nil {
+		if err := rows.Scan(&c.BriefingID, &c.Priority, &created, &c.Kind, &revKind); err != nil {
 			return nil, err
 		}
 		c.CreatedAt = fromNanos(created)
-		switch revKind.String {
-		case "not_expected":
-			c.Flagged = true
-		case "expected":
-			c.Acknowledged = true
-		case "snooze":
-			if revUntil.Valid {
-				c.SnoozedUntil = fromNanos(revUntil.Int64)
-			}
-		}
+		c.Flagged = revKind.String == "not_expected"
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -244,7 +241,7 @@ func (s *Store) EffectivePriorityCounts(ctx context.Context, since, now time.Tim
 		b.priority, e.kind, COUNT(*)
 		FROM briefings b LEFT JOIN eff e ON e.subject_id = b.briefing_id
 		WHERE b.created_at >= ?
-		GROUP BY b.priority, e.kind`, nanos(now), nanos(since))
+		GROUP BY b.priority, e.kind`, nanos(now), s.decisionCutoff(now), nanos(since))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -278,7 +275,7 @@ func (s *Store) ExplainedDigest(ctx context.Context, since, now time.Time) (map[
 	rows, err := s.db.QueryContext(ctx, `WITH `+effectiveReviewCTE+` SELECT b.kind, COUNT(*)
 		FROM briefings b JOIN eff e ON e.subject_id = b.briefing_id
 		WHERE b.created_at >= ? AND e.kind = 'expected'
-		GROUP BY b.kind`, nanos(now), nanos(since))
+		GROUP BY b.kind`, nanos(now), s.decisionCutoff(now), nanos(since))
 	if err != nil {
 		return nil, err
 	}

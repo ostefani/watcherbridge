@@ -961,7 +961,16 @@ func TestPurgeDecisionAuditExpiresByAge(t *testing.T) {
 	if rep.Decisions != 2 {
 		t.Fatalf("purged decisions = %d, want 2 (label and note)", rep.Decisions)
 	}
-	if ds, err := s.DecisionsForSubject(ctx, DecisionSubjectProfile, pid, 10); err != nil || len(ds) != 0 {
+	// The ledger attributes the audit deletions to their own column,
+	// so the health breakdown and deletion total count them.
+	h, err := s.LastSuccessfulPurgeRun(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !h.HaveRun || h.ByTable["operator_decisions"] != 2 {
+		t.Fatalf("health decisions = %v, want 2", h.ByTable)
+	}
+	if ds, err := s.DecisionsForSubject(ctx, DecisionSubjectProfile, pid, 10, 0, 0); err != nil || len(ds) != 0 {
 		t.Fatalf("audit after expiry = %d, %v; want empty", len(ds), err)
 	}
 	sub, err := s.ReportedProfile(ctx, pid)
@@ -998,7 +1007,7 @@ func TestPurgeDecisionUndoWaitsForTarget(t *testing.T) {
 	if rep, err := s.PurgeOnce(ctx, keep, now); err != nil || rep.Decisions != 0 {
 		t.Fatalf("purge with live target = %+v, %v; want no decision deletions", rep, err)
 	}
-	if ds, err := s.DecisionsForSubject(ctx, DecisionSubjectProfile, pid, 10); err != nil || len(ds) != 2 {
+	if ds, err := s.DecisionsForSubject(ctx, DecisionSubjectProfile, pid, 10, 0, 0); err != nil || len(ds) != 2 {
 		t.Fatalf("audit with live target = %d, %v; want label and undo", len(ds), err)
 	}
 	if _, err := s.db.Exec(`UPDATE operator_decisions SET created_at = ? WHERE decision_id = ?`, nanos(old), lbl.Decision.DecisionID); err != nil {
@@ -1054,5 +1063,39 @@ func TestPurgeDecisionPinsSubject(t *testing.T) {
 	}
 	if rep.Decisions != 1 || rep.Subjects != 1 {
 		t.Fatalf("purge after audit expiry = %+v; want 1 decision and 1 subject", rep)
+	}
+}
+
+// A briefing a retained decision still references cannot purge: the
+// audit outlives the briefing horizon, and deleting the briefing
+// would orphan the trail and unblock evidence the decision still
+// justifies. Once the audit itself expires, the briefing goes.
+func TestPurgeBriefingPinnedByRetainedDecision(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	old := now.Add(-25 * time.Hour)
+
+	gid := seedDecidedBriefing(t, s, "evt-pdec-b1", "low", "other", old)
+	if _, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid, Kind: DecisionExpected}); err != nil {
+		t.Fatal(err)
+	}
+	pin := PurgeSettings{BriefingRetention: 24 * time.Hour, SubjectRetention: 400 * 24 * time.Hour, DecisionRetention: 400 * 24 * time.Hour}
+	if rep, err := s.PurgeOnce(ctx, pin, now); err != nil || rep.Briefings != 0 {
+		t.Fatalf("purge of pinned briefing = %+v, %v; want briefing retained", rep, err)
+	}
+	if _, err := s.BriefingForGroup(ctx, gid); err != nil {
+		t.Fatalf("pinned briefing missing: %v", err)
+	}
+	if _, err := s.db.Exec(`UPDATE operator_decisions SET created_at = ?`, nanos(old)); err != nil {
+		t.Fatal(err)
+	}
+	release := PurgeSettings{BriefingRetention: 24 * time.Hour, SubjectRetention: 400 * 24 * time.Hour, DecisionRetention: 24 * time.Hour}
+	rep, err := s.PurgeOnce(ctx, release, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Briefings != 1 || rep.Decisions != 1 {
+		t.Fatalf("purge after audit expiry = %+v; want briefing and decision", rep)
 	}
 }

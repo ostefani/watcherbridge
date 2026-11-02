@@ -3,6 +3,7 @@ package viewer
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -30,6 +31,10 @@ type decisionWire struct {
 	CreatedAt   string `json:"created_at"`
 	Supersedes  string `json:"supersedes,omitempty"`
 	Undone      bool   `json:"undone"`
+	// Cursor continues the trail past this row ("<created nanos>:<rowid>").
+	// It is paging state, never row identity: decision_id stays the
+	// only identity the UI addresses.
+	Cursor string `json:"cursor"`
 }
 
 // reviewWire is the effective review-lane state for one subject: the
@@ -66,6 +71,7 @@ func decisionWireOf(d store.Decision) decisionWire {
 		DecisionID: d.DecisionID, SubjectKind: d.SubjectKind, SubjectID: d.SubjectID,
 		Kind: d.Kind, Text: d.Text, CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
 		Supersedes: d.Supersedes, Undone: d.Undone,
+		Cursor: fmt.Sprintf("%d:%d", d.CreatedAt.UnixNano(), d.RowID),
 	}
 	if d.HasUntil {
 		w.Until = d.Until.UTC().Format(time.RFC3339)
@@ -100,7 +106,25 @@ func (v *Viewer) listDecisions(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = n
 	}
-	rows, err := v.store.DecisionsForSubject(r.Context(), kind, canonicalSubjectID(kind, subject), limit)
+	// before continues an earlier page: "<created nanos>:<rowid>",
+	// strictly older rows only. A malformed cursor is 400, never a
+	// lookup; an unknown-but-well-formed one pages past retained rows
+	// to an empty page. The response stays a bare newest-first array:
+	// a full page may have more.
+	var beforeNanos, beforeRowID int64
+	if s := q.Get("before"); s != "" {
+		nanosPart, rowPart, ok := strings.Cut(s, ":")
+		var err error
+		if beforeNanos, err = strconv.ParseInt(nanosPart, 10, 64); !ok || err != nil || beforeNanos < 0 {
+			writeViewerError(w, "invalid before", http.StatusBadRequest)
+			return
+		}
+		if beforeRowID, err = strconv.ParseInt(rowPart, 10, 64); err != nil || beforeRowID <= 0 {
+			writeViewerError(w, "invalid before", http.StatusBadRequest)
+			return
+		}
+	}
+	rows, err := v.store.DecisionsForSubject(r.Context(), kind, canonicalSubjectID(kind, subject), limit, beforeNanos, beforeRowID)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -149,12 +173,13 @@ func (v *Viewer) appendDecision(w http.ResponseWriter, r *http.Request) {
 		in.HasUntil, in.Until = true, until
 	} else if body.Kind == store.DecisionSnooze {
 		// A snooze without until inherits the configured default
-		// horizon; the store still rejects an explicit past until.
-		def := v.SnoozeDefault
-		if def <= 0 {
-			def = 24 * time.Hour
+		// horizon, passed through unresolved: the store hashes the
+		// specified content, so a retry replays against the original
+		// row instead of hashing a freshly resolved deadline.
+		in.SnoozeDefault = v.SnoozeDefault
+		if in.SnoozeDefault <= 0 {
+			in.SnoozeDefault = 24 * time.Hour
 		}
-		in.HasUntil, in.Until = true, time.Now().UTC().Add(def)
 	}
 	res, err := v.store.AppendDecision(r.Context(), in)
 	if err != nil {

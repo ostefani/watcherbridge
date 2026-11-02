@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 18
+const supportedSchemaVersion = 19
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -144,6 +144,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 17, migrateV17)
 		case 17:
 			err = applyMigration(db, 18, migrateV18)
+		case 18:
+			err = applyMigration(db, 19, migrateV19)
 		}
 		if err != nil {
 			return err
@@ -324,6 +326,17 @@ func migrateV18(tx *sql.Tx) error {
 		if _, err := tx.Exec(stmt); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// migrateV19 persists the per-run decision-audit deletion count the
+// retention engine already deletes but never attributed: without its
+// own ledger column the run totals and health breakdown omit those
+// rows. A plain ADD COLUMN suffices — no table rebuild.
+func migrateV19(tx *sql.Tx) error {
+	if _, err := tx.Exec(`ALTER TABLE purge_runs ADD COLUMN decisions_deleted INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
 	}
 	return nil
 }

@@ -78,6 +78,7 @@
  * @property {string} created_at RFC 3339
  * @property {string} [supersedes] undo target
  * @property {boolean} undone
+ * @property {string} cursor "<created nanos>:<rowid>" paging state, never identity
  */
 
 /**

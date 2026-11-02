@@ -1,5 +1,5 @@
 <script>
-  import { postDecision, postUndo } from '../api.js';
+  import { fetchDecisions, postDecision, postUndo } from '../api.js';
 
   // Operator decisions (Designv9 §5.1): explicit immutable verdicts
   // with superseding undo. The server owns the subject matrix, text
@@ -40,6 +40,16 @@
   let listError = $state(null);
   let requestId = $state(crypto.randomUUID());
   let submitButton = $state(null);
+  // Undo keys are stable per row until that undo succeeds: a retry
+  // after a network failure replays against the original undo row
+  // instead of minting a second one.
+  let undoKeys = $state(/** @type {Record<string, string>} */ ({}));
+  // Older pages past the embedded trail, fetched on demand. A parent
+  // reload replaces the embedded head, so extra pages reset then.
+  let extra = $state([]);
+  let paging = $state(false);
+  let exhausted = $state(false);
+  const trail = $derived([...decisions, ...extra]);
 
   const needsText = $derived(kind === 'note' || kind === 'label');
   const textCap = $derived(kind === 'label' ? 256 : 2000);
@@ -91,6 +101,8 @@
       chosen = null;
       untilText = '';
       text = '';
+      extra = [];
+      exhausted = false;
       if (out.applied === false) {
         formError = `Already recorded (${out.reason ?? 'duplicate'}).`;
       }
@@ -109,12 +121,39 @@
     undoPending = id;
     listError = null;
     try {
-      await postUndo(id, crypto.randomUUID());
+      undoKeys[id] ??= crypto.randomUUID();
+      await postUndo(id, undoKeys[id]);
+      const rest = { ...undoKeys };
+      delete rest[id];
+      undoKeys = rest;
+      extra = [];
+      exhausted = false;
       await reload();
     } catch (err) {
       listError = err instanceof Error ? err.message : String(err);
     } finally {
       undoPending = null;
+    }
+  }
+
+  async function older() {
+    if (paging || exhausted || trail.length === 0) {
+      return;
+    }
+    paging = true;
+    listError = null;
+    try {
+      const last = trail[trail.length - 1];
+      const page = await fetchDecisions(subjectKind, subjectId, { before: last.cursor });
+      if (page.length === 0) {
+        exhausted = true;
+      } else {
+        extra = [...extra, ...page];
+      }
+    } catch (err) {
+      listError = err instanceof Error ? err.message : String(err);
+    } finally {
+      paging = false;
     }
   }
 
@@ -155,11 +194,11 @@
     </button>
   </form>
 
-  {#if decisions.length === 0}
+  {#if trail.length === 0}
     <p>No decisions recorded.</p>
   {:else}
     <ol class="trail">
-      {#each decisions as d (d.decision_id)}
+      {#each trail as d (d.decision_id)}
         <li>
           <span class="pill">{d.kind.replace('_', ' ')}</span>
           {#if d.undone}<span class="pill">undone</span>{/if}
@@ -178,6 +217,11 @@
         </li>
       {/each}
     </ol>
+    {#if !exhausted}
+      <button type="button" onclick={older} disabled={paging}>
+        {paging ? 'Loading…' : 'Show older decisions'}
+      </button>
+    {/if}
   {/if}
   {#if listError !== null}
     <p role="alert">{listError}</p>

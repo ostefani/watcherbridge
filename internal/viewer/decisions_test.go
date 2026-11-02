@@ -213,6 +213,50 @@ func TestDecisionSubjectViewsCarryTrail(t *testing.T) {
 	}
 }
 
+// The trail pages strictly older rows through the before cursor:
+// a full page may have more, a malformed cursor is refused, and a
+// well-formed cursor past the end returns an empty page.
+func TestDecisionListBeforeCursor(t *testing.T) {
+	s := openViewerStore(t)
+	gid := seedPriorityBriefing(t, s, "host:dec-p", "evt-dec-p", "medium", time.Now().UTC())
+	_, mux := withHost(t, s, "127.0.0.1:8081")
+	origin := "http://127.0.0.1:8081"
+	for _, text := range []string{"a", "b", "c"} {
+		if rec := postDecision(t, mux, "/api/decisions",
+			`{"subject_kind":"briefing","subject_id":"`+gid+`","kind":"note","text":"`+text+`"}`, origin); rec.Code != http.StatusCreated {
+			t.Fatalf("append = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	page := func(query string) []decisionWire {
+		t.Helper()
+		rec := serveMux(mux, "GET", "/api/decisions?subject_kind=briefing&subject_id="+gid+query, "127.0.0.1:8081", nil, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("list%s = %d: %s", query, rec.Code, rec.Body.String())
+		}
+		var out []decisionWire
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	first := page("&limit=2")
+	if len(first) != 2 || first[0].Text != "c" || first[1].Text != "b" {
+		t.Fatalf("first page = %+v, want c then b", first)
+	}
+	older := page("&limit=2&before=" + first[1].Cursor)
+	if len(older) != 1 || older[0].Text != "a" {
+		t.Fatalf("second page = %+v, want only a", older)
+	}
+	if rest := page("&before=" + older[0].Cursor); len(rest) != 0 {
+		t.Fatalf("exhausted page = %+v, want empty", rest)
+	}
+	for _, bad := range []string{"&before=bogus", "&before=1:0", "&before=-1:1", "&before=1"} {
+		if rec := serveMux(mux, "GET", "/api/decisions?subject_kind=briefing&subject_id="+gid+bad, "127.0.0.1:8081", nil, ""); rec.Code != http.StatusBadRequest {
+			t.Fatalf("list%s = %d, want 400", bad, rec.Code)
+		}
+	}
+}
+
 func TestDecisionLabelUndoConflict(t *testing.T) {
 	s := openViewerStore(t)
 	ids := seedSubjects(t, s)

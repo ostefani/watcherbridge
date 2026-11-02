@@ -65,6 +65,26 @@ export async function postDecision(d) {
 }
 
 /**
+ * List one subject's audit trail, newest first. before continues an
+ * earlier page as "<created nanos>:<rowid>"; a full page may have
+ * more. Malformed cursors are 400.
+ * @param {string} subjectKind briefing|reported_subject
+ * @param {string} subjectId
+ * @param {{limit?: number, before?: string}} [page]
+ * @returns {Promise<import('./wire.js').Decision[]>}
+ */
+export function fetchDecisions(subjectKind, subjectId, page = {}) {
+  const q = new URLSearchParams({ subject_kind: subjectKind, subject_id: subjectId });
+  if (page.limit !== undefined) {
+    q.set('limit', String(page.limit));
+  }
+  if (page.before !== undefined) {
+    q.set('before', page.before);
+  }
+  return fetchJSON(`/api/decisions?${q.toString()}`, 'decisions');
+}
+
+/**
  * Undo one decision by ID. Undoing a stale label head is a 409, never
  * a silent overwrite; the caller surfaces the status.
  * @param {string} id decision ID

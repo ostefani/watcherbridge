@@ -248,6 +248,7 @@ const cases = [
       'Record decision',
       'operator note',
       'Undo',
+      'Show older decisions',
       'No agent trace is available',
       'Provenance',
       'Snapshot covers 600 ports (truncated)'

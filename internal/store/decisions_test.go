@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -72,30 +73,22 @@ func TestDecisionAwareOverview(t *testing.T) {
 	mustAppend(DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: lowSnooze,
 		Kind: DecisionSnooze, HasUntil: true, Until: at.Add(time.Hour)})
 
-	// Candidates order flagged first even though the flagged briefing
-	// is medium and a high row exists; decision fields ride along.
+	// Candidates carry only eligible rows: flagged first even though
+	// the flagged briefing is medium and a high row exists, then the
+	// undecided high row. The acknowledged and actively-snoozed rows
+	// never consume cap slots — they vote only through the counts.
 	cands, err := s.AttentionCandidates(ctx, since, 500)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cands) != 4 {
-		t.Fatalf("candidates = %d, want 4", len(cands))
+	if len(cands) != 2 {
+		t.Fatalf("candidates = %d, want flagged + undecided", len(cands))
 	}
 	if cands[0].BriefingID != "brf-"+medFlag || !cands[0].Flagged {
 		t.Fatalf("first candidate = %+v, want flagged medium", cands[0])
 	}
-	byID := map[string]AttentionCandidate{}
-	for _, c := range cands {
-		byID[c.BriefingID] = c
-	}
-	if !byID["brf-"+lowExp].Acknowledged {
-		t.Fatalf("expected briefing not marked acknowledged: %+v", byID["brf-"+lowExp])
-	}
-	if byID["brf-"+lowSnooze].SnoozedUntil.IsZero() {
-		t.Fatalf("snoozed briefing carries no until: %+v", byID["brf-"+lowSnooze])
-	}
-	if byID["brf-"+high].Flagged || byID["brf-"+high].Acknowledged {
-		t.Fatalf("plain briefing carries decision state: %+v", byID["brf-"+high])
+	if cands[1].BriefingID != "brf-"+high || cands[1].Flagged {
+		t.Fatalf("second candidate = %+v, want undecided high", cands[1])
 	}
 
 	// Full-window counts exclude explained and deferred rows; the
@@ -129,14 +122,47 @@ func TestDecisionAwareOverview(t *testing.T) {
 	}
 }
 
+// Decided rows must not consume candidate cap slots: with a cap of
+// one, an acknowledged briefing loses to an undecided one even
+// though the old NULL-last ordering would have ranked the decided
+// row first. Flagged rows still win the single slot.
+func TestAttentionCandidatesSkipDecided(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	at := time.Now().UTC().Truncate(time.Second)
+	since := at.Add(-time.Hour)
+	decided := seedDecidedBriefing(t, s, "evt-ovd-c1", "low", "other", at)
+	open := seedDecidedBriefing(t, s, "evt-ovd-c2", "low", "other", at)
+	if _, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: decided, Kind: DecisionExpected}); err != nil {
+		t.Fatal(err)
+	}
+	cands, err := s.AttentionCandidates(ctx, since, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].BriefingID != "brf-"+open {
+		t.Fatalf("capped candidates = %+v, want only the undecided row", cands)
+	}
+	if _, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: decided, Kind: DecisionNotExpected}); err != nil {
+		t.Fatal(err)
+	}
+	cands, err = s.AttentionCandidates(ctx, since, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].BriefingID != "brf-"+decided || !cands[0].Flagged {
+		t.Fatalf("capped candidates = %+v, want only the flagged row", cands)
+	}
+}
+
 func TestDecisionOverviewQueriesUseIndexes(t *testing.T) {
 	s := openTestStore(t)
 	queries := []string{
-		`EXPLAIN QUERY PLAN WITH ` + effectiveReviewCTE + ` SELECT b.briefing_id FROM briefings b LEFT JOIN eff e ON e.subject_id = b.briefing_id WHERE b.created_at >= 0 ORDER BY (e.kind = 'not_expected') DESC LIMIT 500`,
+		`EXPLAIN QUERY PLAN WITH ` + effectiveReviewCTE + ` SELECT b.briefing_id FROM briefings b LEFT JOIN eff e ON e.subject_id = b.briefing_id WHERE b.created_at >= 0 AND (e.kind IS NULL OR e.kind = 'not_expected') ORDER BY CASE WHEN e.kind = 'not_expected' THEN 0 ELSE 1 END LIMIT 500`,
 		`EXPLAIN QUERY PLAN WITH ` + effectiveReviewCTE + ` SELECT b.priority, e.kind, COUNT(*) FROM briefings b LEFT JOIN eff e ON e.subject_id = b.briefing_id WHERE b.created_at >= 0 GROUP BY b.priority, e.kind`,
 	}
 	for _, q := range queries {
-		rows, err := s.db.Query(q, 0)
+		rows, err := s.db.Query(q, 0, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -325,7 +351,7 @@ func TestDecisionUndoReview(t *testing.T) {
 	if _, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid, Kind: DecisionNote, Text: "kept"}); err != nil {
 		t.Fatal(err)
 	}
-	list, err := s.DecisionsForSubject(ctx, DecisionSubjectBriefing, "brf-"+gid, 10)
+	list, err := s.DecisionsForSubject(ctx, DecisionSubjectBriefing, "brf-"+gid, 10, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,8 +488,167 @@ func TestDecisionCanonicalAlias(t *testing.T) {
 		t.Fatalf("subjects = %q/%q, want single canonical %q",
 			byGroup.Decision.SubjectID, byBriefing.Decision.SubjectID, "brf-"+gid)
 	}
-	list, err := s.DecisionsForSubject(ctx, DecisionSubjectBriefing, "brf-"+gid, 10)
+	list, err := s.DecisionsForSubject(ctx, DecisionSubjectBriefing, "brf-"+gid, 10, 0, 0)
 	if err != nil || len(list) != 2 {
 		t.Fatalf("trail = %+v, %v, want both notes on one subject", list, err)
+	}
+}
+
+// Undoing a superseded review record conflicts: only the effective
+// head can be undone. Repeating the head undo replays as
+// already_undone, and notes carry no head, so any live note undoes.
+func TestUndoReviewStaleHead(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	at := time.Now().UTC().Truncate(time.Second)
+	gid := seedDecisionBriefing(t, s, "lab", "evt-dec-8", subjectMAC("aa:bb:cc:dd:ee:18"), at)
+
+	append := func(kind, req string) DecisionResult {
+		t.Helper()
+		res, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid, Kind: kind, RequestID: req})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	first := append(DecisionExpected, "req-sh-1")
+	second := append(DecisionNotExpected, "req-sh-2")
+	if _, err := s.UndoDecision(ctx, first.Decision.DecisionID, "req-sh-u1"); !errors.Is(err, ErrUndoConflict) {
+		t.Fatalf("undo of superseded review = %v, want conflict", err)
+	}
+	if _, err := s.UndoDecision(ctx, second.Decision.DecisionID, "req-sh-u2"); err != nil {
+		t.Fatalf("undo of head = %v, want success", err)
+	}
+	again, err := s.UndoDecision(ctx, second.Decision.DecisionID, "req-sh-u3")
+	if err != nil || again.Applied || again.Reason != "already_undone" {
+		t.Fatalf("repeat undo = %+v, %v; want already_undone", again, err)
+	}
+	n1, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid, Kind: DecisionNote, Text: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid, Kind: DecisionNote, Text: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UndoDecision(ctx, n1.Decision.DecisionID, ""); err != nil {
+		t.Fatalf("undo of older note = %v, want success", err)
+	}
+}
+
+// A default snooze resolves its horizon on first commit only: the
+// idempotency hash covers specified content, so a retry replays
+// against the original row instead of hashing a new deadline. An
+// explicit snooze retried after its horizon still replays instead of
+// failing validation.
+func TestAppendSnoozeIdempotentRetry(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	at := time.Now().UTC().Truncate(time.Second)
+	gid := seedDecisionBriefing(t, s, "lab", "evt-dec-9", subjectMAC("aa:bb:cc:dd:ee:19"), at)
+
+	first, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid,
+		Kind: DecisionSnooze, RequestID: "req-sn-1", SnoozeDefault: 24 * time.Hour})
+	if err != nil || !first.Applied {
+		t.Fatalf("default snooze = %+v, %v; want applied", first, err)
+	}
+	second, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid,
+		Kind: DecisionSnooze, RequestID: "req-sn-1", SnoozeDefault: 24 * time.Hour})
+	if err != nil || second.Applied || second.Reason != "duplicate_request" {
+		t.Fatalf("default snooze retry = %+v, %v; want duplicate replay", second, err)
+	}
+	if !second.Decision.Until.Equal(first.Decision.Until) {
+		t.Fatalf("replay until = %v, want original %v", second.Decision.Until, first.Decision.Until)
+	}
+	explicit, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid,
+		Kind: DecisionSnooze, HasUntil: true, Until: at.Add(time.Hour), RequestID: "req-sn-2"})
+	if err != nil || !explicit.Applied {
+		t.Fatalf("explicit snooze = %+v, %v; want applied", explicit, err)
+	}
+	// The horizon lapses after the commit; the retry carries the same
+	// specified content and must replay, not fail validation.
+	if _, err := s.db.Exec(`UPDATE operator_decisions SET until = ? WHERE decision_id = ?`,
+		nanos(at.Add(-time.Hour)), explicit.Decision.DecisionID); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid,
+		Kind: DecisionSnooze, HasUntil: true, Until: at.Add(time.Hour), RequestID: "req-sn-2"})
+	if err != nil || retry.Applied || retry.Reason != "duplicate_request" {
+		t.Fatalf("lapsed snooze retry = %+v, %v; want duplicate replay", retry, err)
+	}
+}
+
+// Audit past the retention cutoff stops applying even before purge
+// deletes it, so a stalled purge never extends a verdict.
+func TestEffectiveReviewIgnoresExpiredAudit(t *testing.T) {
+	s := openTestStore(t)
+	s.SetDecisionRetention(24 * time.Hour)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	old := now.Add(-25 * time.Hour)
+	since := now.Add(-time.Hour)
+	gid := seedDecisionBriefing(t, s, "lab", "evt-dec-10", subjectMAC("aa:bb:cc:dd:ee:1a"), now)
+
+	if _, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid, Kind: DecisionExpected}); err != nil {
+		t.Fatal(err)
+	}
+	if eff, err := s.EffectiveReview(ctx, DecisionSubjectBriefing, []string{"brf-" + gid}, now); err != nil || eff["brf-"+gid].Kind != DecisionExpected {
+		t.Fatalf("fresh effective = %+v, %v; want expected", eff, err)
+	}
+	if _, err := s.db.Exec(`UPDATE operator_decisions SET created_at = ?`, nanos(old)); err != nil {
+		t.Fatal(err)
+	}
+	if eff, err := s.EffectiveReview(ctx, DecisionSubjectBriefing, []string{"brf-" + gid}, now); err != nil || len(eff) != 0 {
+		t.Fatalf("expired effective = %+v, %v; want empty", eff, err)
+	}
+	cands, err := s.AttentionCandidates(ctx, since, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, c := range cands {
+		if c.BriefingID == "brf-"+gid {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("briefing with expired audit missing from candidates")
+	}
+}
+
+// A still-current head or label pushed past the first trail page
+// stays reachable: the before cursor pages strictly older rows with
+// no gaps and no repeats.
+func TestDecisionsForSubjectPages(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	at := time.Now().UTC().Truncate(time.Second)
+	gid := seedDecisionBriefing(t, s, "lab", "evt-dec-11", subjectMAC("aa:bb:cc:dd:ee:1b"), at)
+	for i := 0; i < 55; i++ {
+		if _, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid,
+			Kind: DecisionNote, Text: fmt.Sprintf("n%02d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := s.DecisionsForSubject(ctx, DecisionSubjectBriefing, "brf-"+gid, 50, 0, 0)
+	if err != nil || len(first) != 50 {
+		t.Fatalf("first page = %d, %v; want 50", len(first), err)
+	}
+	last := first[len(first)-1]
+	second, err := s.DecisionsForSubject(ctx, DecisionSubjectBriefing, "brf-"+gid, 50, last.CreatedAt.UnixNano(), last.RowID)
+	if err != nil || len(second) != 5 {
+		t.Fatalf("second page = %d, %v; want 5", len(second), err)
+	}
+	seen := map[string]bool{}
+	for _, d := range append(first, second...) {
+		if seen[d.DecisionID] {
+			t.Fatalf("duplicate row %q across pages", d.DecisionID)
+		}
+		seen[d.DecisionID] = true
+	}
+	if len(seen) != 55 {
+		t.Fatalf("paged rows = %d, want 55", len(seen))
+	}
+	if second[len(second)-1].Text != "n00" {
+		t.Fatalf("oldest row = %q, want n00", second[len(second)-1].Text)
 	}
 }

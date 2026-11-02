@@ -82,6 +82,10 @@ type Decision struct {
 	PriorLabel  *string
 	PriorOwner  string
 	Undone      bool
+	// RowID is the storage order behind the newest-first trail. It
+	// backs the history cursor; it never leaves the store on the
+	// wire, where decision_id is the only row identity.
+	RowID int64
 }
 
 // DecisionInput carries a new non-undo decision. IDs are assigned by
@@ -94,6 +98,11 @@ type DecisionInput struct {
 	Until       time.Time
 	Text        string
 	RequestID   string
+	// SnoozeDefault resolves a snooze without an explicit until. It is
+	// specified content, never stored time: the idempotency hash covers
+	// only whether an until was given, so a retry replays against the
+	// original row instead of hashing a freshly resolved deadline.
+	SnoozeDefault time.Duration
 }
 
 // DecisionResult reports the stored row and whether the call changed
@@ -240,25 +249,18 @@ func canonicalBriefingID(tx *sql.Tx, id string) (string, error) {
 // with Applied=false instead of duplicating.
 func (s *Store) AppendDecision(ctx context.Context, in DecisionInput) (DecisionResult, error) {
 	now := s.now()
-	if err := checkDecisionMatrix(in.Kind, in.SubjectKind); err != nil {
-		return DecisionResult{}, err
-	}
-	if err := checkDecisionText(in.Kind, in.Text); err != nil {
-		return DecisionResult{}, err
-	}
 	if err := checkRequestID(in.RequestID); err != nil {
 		return DecisionResult{}, err
 	}
-	var untilNanos int64
-	if in.Kind == DecisionSnooze {
-		if !in.HasUntil || !in.Until.After(now) {
-			return DecisionResult{}, fmt.Errorf("%w: snooze requires a future until", ErrInvalidDecision)
-		}
-		untilNanos = in.Until.UnixNano()
-	} else if in.HasUntil {
-		return DecisionResult{}, fmt.Errorf("%w: kind %q takes no until", ErrInvalidDecision, in.Kind)
+	// The hash covers specified content only: a default snooze carries
+	// no until, so every retry of the same operation hashes alike and
+	// replays against the original row. The deadline resolves below,
+	// after the replay check, from the same now on first commit.
+	var hashUntil int64
+	if in.HasUntil {
+		hashUntil = in.Until.UnixNano()
 	}
-	hash := decisionHash(in.SubjectKind, in.SubjectID, in.Kind, untilNanos, in.HasUntil, in.Text, "")
+	hash := decisionHash(in.SubjectKind, in.SubjectID, in.Kind, hashUntil, in.HasUntil, in.Text, "")
 
 	var res DecisionResult
 	err := s.write(ctx, func(tx *sql.Tx) error {
@@ -269,6 +271,30 @@ func (s *Store) AppendDecision(ctx context.Context, in DecisionInput) (DecisionR
 				res = DecisionResult{Decision: *existing, Applied: false, Reason: "duplicate_request"}
 				return nil
 			}
+		}
+		if err := checkDecisionMatrix(in.Kind, in.SubjectKind); err != nil {
+			return err
+		}
+		if err := checkDecisionText(in.Kind, in.Text); err != nil {
+			return err
+		}
+		var untilNanos int64
+		hasUntil := in.HasUntil
+		if in.Kind == DecisionSnooze {
+			if !hasUntil {
+				if in.SnoozeDefault <= 0 {
+					return fmt.Errorf("%w: snooze requires an until or a default horizon", ErrInvalidDecision)
+				}
+				untilNanos = now.Add(in.SnoozeDefault).UnixNano()
+				hasUntil = true
+			} else {
+				if !in.Until.After(now) {
+					return fmt.Errorf("%w: snooze requires a future until", ErrInvalidDecision)
+				}
+				untilNanos = in.Until.UnixNano()
+			}
+		} else if hasUntil {
+			return fmt.Errorf("%w: kind %q takes no until", ErrInvalidDecision, in.Kind)
 		}
 		subjectID := in.SubjectID
 		if in.SubjectKind == DecisionSubjectBriefing {
@@ -315,7 +341,7 @@ func (s *Store) AppendDecision(ctx context.Context, in DecisionInput) (DecisionR
 		d := Decision{DecisionID: id, SubjectKind: in.SubjectKind, SubjectID: subjectID, Kind: in.Kind,
 			Text: in.Text, CreatedAt: now, RequestID: in.RequestID}
 		if in.Kind == DecisionSnooze {
-			d.Until, d.HasUntil = in.Until, true
+			d.Until, d.HasUntil = fromNanos(untilNanos), true
 		}
 		if priorLabel.Valid {
 			d.PriorLabel = &priorLabel.String
@@ -333,8 +359,9 @@ func (s *Store) AppendDecision(ctx context.Context, in DecisionInput) (DecisionR
 // UndoDecision appends an explicit undo record for one decision.
 // Undo rows are terminal: undoing an undo is rejected, redo by
 // appending a fresh decision. A live undo already targeting the row
-// reports applied:false; a moved-on label head reports conflict;
-// purged targets read as unknown, leaving state untouched.
+// reports applied:false; a moved-on head — label by owner, review
+// lane by effective order — reports conflict; purged targets read as
+// unknown, leaving state untouched.
 func (s *Store) UndoDecision(ctx context.Context, targetID, requestID string) (DecisionResult, error) {
 	now := s.now()
 	if err := checkRequestID(requestID); err != nil {
@@ -371,6 +398,28 @@ func (s *Store) UndoDecision(ctx context.Context, targetID, requestID string) (D
 		if live > 0 {
 			res = DecisionResult{Decision: target, Applied: false, Reason: "already_undone"}
 			return nil
+		}
+		if target.Kind == DecisionExpected || target.Kind == DecisionNotExpected || target.Kind == DecisionSnooze {
+			// Review decisions form a head: only the effective record
+			// can be undone. Undoing a superseded record would rewrite
+			// history the head already moved past, so it conflicts
+			// instead of appending a no-op undo.
+			var head string
+			err := tx.QueryRow(`SELECT decision_id FROM (
+				SELECT decision_id, ROW_NUMBER() OVER (ORDER BY created_at DESC, decision_id DESC) AS rn
+				FROM operator_decisions
+				WHERE subject_kind = ? AND subject_id = ?
+					AND kind IN ('expected','not_expected','snooze')
+					AND NOT EXISTS (SELECT 1 FROM operator_decisions u WHERE u.kind = 'undo' AND u.supersedes = operator_decisions.decision_id)
+					AND (kind != 'snooze' OR until > ?)
+					AND created_at >= ?
+			) WHERE rn = 1`, target.SubjectKind, target.SubjectID, now.UnixNano(), s.decisionCutoff(now)).Scan(&head)
+			if err == sql.ErrNoRows || (err == nil && head != targetID) {
+				return fmt.Errorf("%w: review decision %q is no longer current", ErrUndoConflict, targetID)
+			}
+			if err != nil {
+				return err
+			}
 		}
 		if target.Kind == DecisionLabel {
 			var owner sql.NullString
@@ -432,10 +481,11 @@ type ReviewState struct {
 	DecisionID string
 }
 
-// EffectiveReview returns the review-lane outcome per subject. Only
-// surviving audit rows are read, so purged (audit-expired) decisions
-// simply stop applying; snooze rows past their until are excluded up
-// front so an earlier expected or not_expected resumes.
+// EffectiveReview returns the review-lane outcome per subject. Audit
+// past the retention cutoff is excluded even before purge deletes it,
+// so a stalled purge never extends a verdict; snooze rows past their
+// until are excluded up front so an earlier expected or not_expected
+// resumes.
 func (s *Store) EffectiveReview(ctx context.Context, subjectKind string, subjectIDs []string, now time.Time) (map[string]ReviewState, error) {
 	out := map[string]ReviewState{}
 	if len(subjectIDs) == 0 {
@@ -448,7 +498,7 @@ func (s *Store) EffectiveReview(ctx context.Context, subjectKind string, subject
 	for _, id := range subjectIDs {
 		args = append(args, id)
 	}
-	args = append(args, now.UnixNano())
+	args = append(args, now.UnixNano(), s.decisionCutoff(now))
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`SELECT subject_id, kind, until, decision_id FROM (
 			SELECT subject_id, kind, until, decision_id,
 				ROW_NUMBER() OVER (PARTITION BY subject_id ORDER BY created_at DESC, decision_id DESC) AS rn
@@ -457,6 +507,7 @@ func (s *Store) EffectiveReview(ctx context.Context, subjectKind string, subject
 				AND kind IN ('expected','not_expected','snooze')
 				AND NOT EXISTS (SELECT 1 FROM operator_decisions u WHERE u.kind = 'undo' AND u.supersedes = d.decision_id)
 				AND (d.kind != 'snooze' OR d.until > ?)
+				AND d.created_at >= ?
 		) WHERE rn = 1`, placeholders), args...)
 	if err != nil {
 		return nil, err
@@ -480,18 +531,29 @@ func (s *Store) EffectiveReview(ctx context.Context, subjectKind string, subject
 // DecisionsForSubject lists one subject's audit trail newest-first
 // with each row's undone marker. limit clamps to the serving bound;
 // notes and labels coexist — only the undone flag changes reads.
-func (s *Store) DecisionsForSubject(ctx context.Context, subjectKind, subjectID string, limit int) ([]Decision, error) {
+// beforeNanos/beforeRowID continue an earlier page: only rows
+// strictly older than that cursor return, so a still-current head or
+// label pushed past the first page stays reachable (and undoable).
+// Zero cursor starts at the newest row.
+func (s *Store) DecisionsForSubject(ctx context.Context, subjectKind, subjectID string, limit int, beforeNanos, beforeRowID int64) ([]Decision, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	if limit > 200 {
 		limit = 200
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+decisionColumns+`,
+	query := `SELECT rowid, ` + decisionColumns + `,
 		EXISTS(SELECT 1 FROM operator_decisions u WHERE u.kind = 'undo' AND u.supersedes = operator_decisions.decision_id) AS undone
 		FROM operator_decisions
-		WHERE subject_kind = ? AND subject_id = ?
-		ORDER BY created_at DESC, decision_id DESC LIMIT ?`, subjectKind, subjectID, limit)
+		WHERE subject_kind = ? AND subject_id = ?`
+	args := []any{subjectKind, subjectID}
+	if beforeRowID > 0 {
+		query += ` AND (created_at < ? OR (created_at = ? AND rowid < ?))`
+		args = append(args, beforeNanos, beforeNanos, beforeRowID)
+	}
+	query += ` ORDER BY created_at DESC, rowid DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -503,7 +565,7 @@ func (s *Store) DecisionsForSubject(ctx context.Context, subjectKind, subjectID 
 		var text, supersedes, requestID, hash, priorOwner sql.NullString
 		var priorLabel sql.NullString
 		var undone bool
-		if err := rows.Scan(&d.DecisionID, &d.SubjectKind, &d.SubjectID, &d.Kind,
+		if err := rows.Scan(&d.RowID, &d.DecisionID, &d.SubjectKind, &d.SubjectID, &d.Kind,
 			&until, &text, &created, &supersedes, &requestID, &hash, &priorLabel, &priorOwner, &undone); err != nil {
 			return nil, err
 		}

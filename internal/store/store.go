@@ -62,6 +62,24 @@ type Store struct {
 	groupSeq    atomic.Int64
 	decisionSeq atomic.Int64
 	now         func() time.Time
+	// decisionRetention bounds how long operator-decision audit stays
+	// effective; zero means the 180d default. Purge deletes audit rows
+	// past it, and the effective-state queries ignore them even before
+	// the purge runs, so a stalled purge never extends a verdict.
+	decisionRetention time.Duration
+}
+
+// SetDecisionRetention attaches the operator-decision audit horizon
+// from config. Effective-state selection and purge share it, so what
+// the UI applies always matches what retention deletes.
+func (s *Store) SetDecisionRetention(d time.Duration) { s.decisionRetention = d }
+
+func (s *Store) decisionCutoff(now time.Time) int64 {
+	ret := s.decisionRetention
+	if ret <= 0 {
+		ret = defaultDecisionRetention
+	}
+	return nanos(now.Add(-ret))
 }
 
 // QueueDepth reports the current writer backlog without blocking. The

@@ -908,7 +908,7 @@ func (v *Viewer) handleBriefing(w http.ResponseWriter, r *http.Request) {
 	// Operator decisions ride the subject view so the dossier shows
 	// live review state and the audit trail without a second fetch;
 	// the raw list endpoint stays for API parity and the CLI.
-	trail, err := v.store.DecisionsForSubject(ctx, store.DecisionSubjectBriefing, b.BriefingID, 50)
+	trail, err := v.store.DecisionsForSubject(ctx, store.DecisionSubjectBriefing, b.BriefingID, 50, 0, 0)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1084,7 +1084,7 @@ func (v *Viewer) handleDevice(w http.ResponseWriter, r *http.Request) {
 	for _, obs := range history {
 		historyWire = append(historyWire, observationWireOf(obs))
 	}
-	trail, err := v.store.DecisionsForSubject(r.Context(), store.DecisionSubjectProfile, id, 50)
+	trail, err := v.store.DecisionsForSubject(r.Context(), store.DecisionSubjectProfile, id, 50, 0, 0)
 	if err != nil {
 		writeError(w, err)
 		return

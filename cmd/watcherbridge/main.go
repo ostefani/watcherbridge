@@ -105,6 +105,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
+	// Effective-state queries share the configured audit horizon with
+	// purge, so a stalled purge never extends a verdict past retention.
+	st.SetDecisionRetention(cfg.DecisionRetention)
 	// Single-source binding: refuse to serve a database that already
 	// holds another deployment's scoped receipts instead of mixing
 	// their subjects. Pre-scope rows carry '' and stay adoptable.

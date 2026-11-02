@@ -465,13 +465,12 @@ func (r *Refresher) compute(ctx context.Context, window time.Duration) ([]byte, 
 	}
 	items := make([]overview.Item, 0, len(candidates))
 	for _, c := range candidates {
+		// Candidates arrive pre-filtered: only flagged and undecided
+		// rows survive the SQL cut, so every item here needs review.
 		item := overview.Item{
 			ID: c.BriefingID, Priority: c.Priority,
 			CreatedAt: c.CreatedAt, ChangeKind: c.Kind,
-			Flagged: c.Flagged, Acknowledged: c.Acknowledged,
-		}
-		if !c.SnoozedUntil.IsZero() {
-			item.SnoozedUntil = c.SnoozedUntil
+			Flagged: c.Flagged,
 		}
 		items = append(items, item)
 		if c.CreatedAt.After(last) {
