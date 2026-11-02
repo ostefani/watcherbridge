@@ -356,12 +356,62 @@ func (s *Store) AppendDecision(ctx context.Context, in DecisionInput) (DecisionR
 	return res, nil
 }
 
+// reviewHead returns the effective review-lane head: the latest
+// non-undone, unlapsed, audit-live expected/not_expected/snooze row.
+// Ties break by storage order, the same insertion order the audit
+// trail pages by, so history and effective state never disagree
+// about the newest decision.
+func reviewHead(tx *sql.Tx, subjectKind, subjectID string, now time.Time, cutoff int64) (head string, ok bool, err error) {
+	err = tx.QueryRow(`SELECT decision_id FROM (
+		SELECT decision_id, ROW_NUMBER() OVER (ORDER BY created_at DESC, rowid DESC) AS rn
+		FROM operator_decisions
+		WHERE subject_kind = ? AND subject_id = ?
+			AND kind IN ('expected','not_expected','snooze')
+			AND NOT EXISTS (SELECT 1 FROM operator_decisions u WHERE u.kind = 'undo' AND u.supersedes = operator_decisions.decision_id)
+			AND (kind != 'snooze' OR until > ?)
+			AND created_at >= ?
+	) WHERE rn = 1`, subjectKind, subjectID, now.UnixNano(), cutoff).Scan(&head)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	return head, err == nil, err
+}
+
+// changedSinceUndo reports whether a live stateful decision committed
+// after the given undo row. Review-lane checks mirror the head
+// eligibility (non-undone, unlapsed, audit-live); labels check the
+// live label family; notes never count. Comparison is by storage
+// order, so equal timestamps cannot misorder the check.
+func changedSinceUndo(tx *sql.Tx, target Decision, undoCreated, undoRowID int64, now time.Time, cutoff int64) (bool, error) {
+	kinds := `'expected','not_expected','snooze'`
+	extra := `AND NOT EXISTS (SELECT 1 FROM operator_decisions u WHERE u.kind = 'undo' AND u.supersedes = operator_decisions.decision_id)
+		AND (kind != 'snooze' OR until > ?)
+		AND created_at >= ?`
+	args := []any{target.SubjectKind, target.SubjectID, now.UnixNano(), cutoff, undoCreated, undoRowID}
+	if target.Kind == DecisionLabel {
+		kinds = `'label'`
+		extra = `AND NOT EXISTS (SELECT 1 FROM operator_decisions u WHERE u.kind = 'undo' AND u.supersedes = operator_decisions.decision_id)`
+		args = []any{target.SubjectKind, target.SubjectID, undoCreated, undoRowID}
+	}
+	var one int
+	err := tx.QueryRow(`SELECT 1 FROM operator_decisions
+		WHERE subject_kind = ? AND subject_id = ? AND kind IN (`+kinds+`)
+		`+extra+`
+		AND (created_at, rowid) > (?, ?)
+		LIMIT 1`, args...).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // UndoDecision appends an explicit undo record for one decision.
 // Undo rows are terminal: undoing an undo is rejected, redo by
-// appending a fresh decision. A live undo already targeting the row
-// reports applied:false; a moved-on head — label by owner, review
-// lane by effective order — reports conflict; purged targets read as
-// unknown, leaving state untouched.
+// appending a fresh decision. Repeating an undo replays as
+// already_undone only while state is unchanged since that undo; a
+// moved-on head — review lane by effective order, label by owner —
+// reports conflict, as does a first-time undo of a superseded
+// record. Purged targets read as unknown, leaving state untouched.
 func (s *Store) UndoDecision(ctx context.Context, targetID, requestID string) (DecisionResult, error) {
 	now := s.now()
 	if err := checkRequestID(requestID); err != nil {
@@ -390,12 +440,31 @@ func (s *Store) UndoDecision(ctx context.Context, targetID, requestID string) (D
 		if target.Kind == DecisionUndo {
 			return fmt.Errorf("%w: %q", ErrInvalidUndo, targetID)
 		}
-		var live int
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM operator_decisions
-			WHERE kind = 'undo' AND supersedes = ?`, targetID).Scan(&live); err != nil {
+		var undoCreated, undoRowID int64
+		err = tx.QueryRow(`SELECT created_at, rowid FROM operator_decisions
+			WHERE kind = 'undo' AND supersedes = ?
+			ORDER BY created_at DESC, rowid DESC LIMIT 1`, targetID).Scan(&undoCreated, &undoRowID)
+		if err != nil && err != sql.ErrNoRows {
 			return err
 		}
-		if live > 0 {
+		if err == nil {
+			// The target is already neutralized. An exact request
+			// replay is idempotent, but a separate repeat operation
+			// must distinguish unchanged from subsequently changed
+			// state: when a live stateful decision committed after
+			// the undo, the operator acts on a stale view and the
+			// repeat conflicts instead of no-oping.
+			if target.Kind == DecisionNote {
+				res = DecisionResult{Decision: target, Applied: false, Reason: "already_undone"}
+				return nil
+			}
+			moved, err := changedSinceUndo(tx, target, undoCreated, undoRowID, now, s.decisionCutoff(now))
+			if err != nil {
+				return err
+			}
+			if moved {
+				return fmt.Errorf("%w: decision %q already undone and state moved on", ErrUndoConflict, targetID)
+			}
 			res = DecisionResult{Decision: target, Applied: false, Reason: "already_undone"}
 			return nil
 		}
@@ -404,21 +473,12 @@ func (s *Store) UndoDecision(ctx context.Context, targetID, requestID string) (D
 			// can be undone. Undoing a superseded record would rewrite
 			// history the head already moved past, so it conflicts
 			// instead of appending a no-op undo.
-			var head string
-			err := tx.QueryRow(`SELECT decision_id FROM (
-				SELECT decision_id, ROW_NUMBER() OVER (ORDER BY created_at DESC, decision_id DESC) AS rn
-				FROM operator_decisions
-				WHERE subject_kind = ? AND subject_id = ?
-					AND kind IN ('expected','not_expected','snooze')
-					AND NOT EXISTS (SELECT 1 FROM operator_decisions u WHERE u.kind = 'undo' AND u.supersedes = operator_decisions.decision_id)
-					AND (kind != 'snooze' OR until > ?)
-					AND created_at >= ?
-			) WHERE rn = 1`, target.SubjectKind, target.SubjectID, now.UnixNano(), s.decisionCutoff(now)).Scan(&head)
-			if err == sql.ErrNoRows || (err == nil && head != targetID) {
-				return fmt.Errorf("%w: review decision %q is no longer current", ErrUndoConflict, targetID)
-			}
+			head, ok, err := reviewHead(tx, target.SubjectKind, target.SubjectID, now, s.decisionCutoff(now))
 			if err != nil {
 				return err
+			}
+			if !ok || head != targetID {
+				return fmt.Errorf("%w: review decision %q is no longer current", ErrUndoConflict, targetID)
 			}
 		}
 		if target.Kind == DecisionLabel {
@@ -501,7 +561,7 @@ func (s *Store) EffectiveReview(ctx context.Context, subjectKind string, subject
 	args = append(args, now.UnixNano(), s.decisionCutoff(now))
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`SELECT subject_id, kind, until, decision_id FROM (
 			SELECT subject_id, kind, until, decision_id,
-				ROW_NUMBER() OVER (PARTITION BY subject_id ORDER BY created_at DESC, decision_id DESC) AS rn
+				ROW_NUMBER() OVER (PARTITION BY subject_id ORDER BY created_at DESC, rowid DESC) AS rn
 			FROM operator_decisions d
 			WHERE subject_kind = ? AND subject_id IN (%s)
 				AND kind IN ('expected','not_expected','snooze')

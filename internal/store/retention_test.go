@@ -1099,3 +1099,54 @@ func TestPurgeBriefingPinnedByRetainedDecision(t *testing.T) {
 		t.Fatalf("purge after audit expiry = %+v; want briefing and decision", rep)
 	}
 }
+
+// The pin lives inside the age selection before LIMIT: when a full
+// oldest-first batch consists of pinned briefings, the drain must
+// still reach and delete eligible work behind it instead of ending
+// with zero progress.
+func TestPurgeSkipsPinnedWindow(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	old := now.Add(-25 * time.Hour)
+	pinnedAt := nanos(old.Add(-time.Hour))
+	for i := 0; i < 210; i++ {
+		gid := fmt.Sprintf("grp-pin-%d", i)
+		bid := "brf-" + gid
+		if _, err := s.db.Exec(`INSERT INTO active_groups (group_id, host_anchor_key, opened_at, last_event_at, deadline_at, event_count, status)
+			VALUES (?, 'host:pin', ?, ?, ?, 1, 'done')`, gid, pinnedAt, pinnedAt, pinnedAt); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.Exec(`INSERT INTO briefings (briefing_id, group_id, host_anchor_key, baseline, priority, priority_reason, what_changed, context, recommended_check, created_at, seq)
+			VALUES (?, ?, 'host:pin', 'low', 'low', 'r', 'w', 'c', 'k', ?, ?)`, bid, gid, pinnedAt, i+1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.Exec(`INSERT INTO operator_decisions (decision_id, subject_kind, subject_id, kind, created_at)
+			VALUES (?, 'briefing', ?, 'expected', ?)`, fmt.Sprintf("dec-pin-%d", i), bid, nanos(now)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.Exec(`INSERT INTO active_groups (group_id, host_anchor_key, opened_at, last_event_at, deadline_at, event_count, status)
+		VALUES ('grp-open-1', 'host:open', ?, ?, ?, 1, 'done')`, nanos(old), nanos(old), nanos(old)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO briefings (briefing_id, group_id, host_anchor_key, baseline, priority, priority_reason, what_changed, context, recommended_check, created_at, seq)
+		VALUES ('brf-grp-open-1', 'grp-open-1', 'host:open', 'low', 'low', 'r', 'w', 'c', 'k', ?, 1000)`, nanos(old)); err != nil {
+		t.Fatal(err)
+	}
+	pin := PurgeSettings{BriefingRetention: 24 * time.Hour, SubjectRetention: 400 * 24 * time.Hour, DecisionRetention: 400 * 24 * time.Hour}
+	rep, err := s.PurgeOnce(ctx, pin, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Briefings != 1 {
+		t.Fatalf("purged briefings = %d, want the one eligible row", rep.Briefings)
+	}
+	var briefings, decisions int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM briefings`).Scan(&briefings); err != nil || briefings != 210 {
+		t.Fatalf("briefings = %d, %v; want all 210 pinned", briefings, err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM operator_decisions`).Scan(&decisions); err != nil || decisions != 210 {
+		t.Fatalf("decisions = %d, %v; want all 210 retained", decisions, err)
+	}
+}

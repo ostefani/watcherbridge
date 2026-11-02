@@ -278,18 +278,23 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 			return nil
 		}
 		if plan.stages&stageBriefings != 0 {
-			oldBriefings := `briefing_id IN (SELECT briefing_id FROM briefings WHERE created_at < ? ORDER BY created_at, rowid LIMIT ?)`
-			limit = deleteLimit()
-			if err := take("briefing_subjects", plan.briefingCut, `DELETE FROM briefing_subjects WHERE rowid IN (SELECT rowid FROM briefing_subjects WHERE `+oldBriefings+`
-				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefing_subjects.briefing_id AND d.created_at >= ?) ORDER BY rowid LIMIT ?)`, limit, plan.briefingCut, limit, plan.decisionCut, limit); err != nil {
-				return err
-			}
-			limit = deleteLimit()
 			// A briefing a retained decision still references cannot
 			// purge: its audit outlives it, and deleting the briefing
 			// would orphan the trail and unblock evidence the decision
 			// still justifies. The pin follows the audit cutoff, never
-			// the effective view, so no backup audit is needed.
+			// the effective view, so no backup audit is needed. The pin
+			// lives inside the age selection before LIMIT: selecting
+			// oldest-first and filtering after would stall the drain
+			// on a fully pinned batch while eligible work waits behind
+			// it. The outer takes repeat the pin as an invariant.
+			oldBriefings := `briefing_id IN (SELECT briefing_id FROM briefings WHERE created_at < ?
+				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?) ORDER BY created_at, rowid LIMIT ?)`
+			limit = deleteLimit()
+			if err := take("briefing_subjects", plan.briefingCut, `DELETE FROM briefing_subjects WHERE rowid IN (SELECT rowid FROM briefing_subjects WHERE `+oldBriefings+`
+				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefing_subjects.briefing_id AND d.created_at >= ?) ORDER BY rowid LIMIT ?)`, limit, plan.briefingCut, plan.decisionCut, limit, plan.decisionCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
 			if err := take("briefings", plan.briefingCut, `DELETE FROM briefings WHERE rowid IN (SELECT rowid FROM briefings WHERE created_at < ? AND NOT EXISTS (SELECT 1 FROM briefing_subjects WHERE briefing_subjects.briefing_id = briefings.briefing_id)
 				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?) ORDER BY created_at, rowid LIMIT ?)`, limit, plan.briefingCut, plan.decisionCut, limit); err != nil {
 				return err

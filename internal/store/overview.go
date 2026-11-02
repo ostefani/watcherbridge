@@ -166,7 +166,7 @@ type PurgeRunHealth struct {
 const effectiveReviewCTE = `eff AS (
 	SELECT subject_id, kind, until FROM (
 		SELECT d.subject_id, d.kind, d.until,
-			ROW_NUMBER() OVER (PARTITION BY d.subject_id ORDER BY d.created_at DESC, d.decision_id DESC) AS rn
+			ROW_NUMBER() OVER (PARTITION BY d.subject_id ORDER BY d.created_at DESC, d.rowid DESC) AS rn
 		FROM operator_decisions d
 		WHERE d.subject_kind = 'briefing'
 			AND d.kind IN ('expected','not_expected','snooze')

@@ -535,6 +535,39 @@ func TestUndoReviewStaleHead(t *testing.T) {
 	}
 }
 
+// Repeating an undo is idempotent only while state is unchanged
+// since that undo: A → B → undo B → C → undo B again conflicts,
+// because the head moved on. Redo the sequence without C and the
+// repeat replays as already_undone.
+func TestUndoRepeatAfterHeadMoved(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	at := time.Now().UTC().Truncate(time.Second)
+	gid := seedDecisionBriefing(t, s, "lab", "evt-dec-12", subjectMAC("aa:bb:cc:dd:ee:1c"), at)
+
+	if _, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid, Kind: DecisionExpected}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid, Kind: DecisionNotExpected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UndoDecision(ctx, b.Decision.DecisionID, "req-um-1"); err != nil {
+		t.Fatal(err)
+	}
+	// Unchanged repeat: same new request, nothing committed since.
+	steady, err := s.UndoDecision(ctx, b.Decision.DecisionID, "req-um-2")
+	if err != nil || steady.Applied || steady.Reason != "already_undone" {
+		t.Fatalf("unchanged repeat = %+v, %v; want already_undone", steady, err)
+	}
+	if _, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid, Kind: DecisionExpected}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UndoDecision(ctx, b.Decision.DecisionID, "req-um-3"); !errors.Is(err, ErrUndoConflict) {
+		t.Fatalf("repeat after head moved = %v, want conflict", err)
+	}
+}
+
 // A default snooze resolves its horizon on first commit only: the
 // idempotency hash covers specified content, so a retry replays
 // against the original row instead of hashing a new deadline. An

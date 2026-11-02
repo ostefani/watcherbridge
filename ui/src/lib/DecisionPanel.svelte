@@ -1,4 +1,5 @@
 <script>
+  import { onDestroy } from 'svelte';
   import { fetchDecisions, postDecision, postUndo } from '../api.js';
 
   // Operator decisions (Designv9 §5.1): explicit immutable verdicts
@@ -44,12 +45,28 @@
   // after a network failure replays against the original undo row
   // instead of minting a second one.
   let undoKeys = $state(/** @type {Record<string, string>} */ ({}));
-  // Older pages past the embedded trail, fetched on demand. A parent
-  // reload replaces the embedded head, so extra pages reset then.
+  // History navigation is a bounded window, never an unbounded
+  // append. headKey identifies the embedded head; an older page
+  // (extra) and the back stack apply only while their key matches
+  // it, so a late page response can never merge rows selected
+  // against a previous window, and destroying the panel drops
+  // in-flight work silently.
+  const PAGE_LIMIT = 50;
+  const BACK_PAGES = 4;
+  let alive = true;
+  onDestroy(() => {
+    alive = false;
+  });
+  const headKey = $derived(
+    decisions.length === 0 ? 'empty' : `${decisions[0].decision_id}:${decisions.length}`
+  );
   let extra = $state([]);
+  let extraKey = $state('');
+  let backStack = $state(/** @type {{rows: any[], key: string}[]} */ ([]));
   let paging = $state(false);
-  let exhausted = $state(false);
-  const trail = $derived([...decisions, ...extra]);
+  let atEnd = $state(false);
+  let windowNote = $state(/** @type {string|null} */ (null));
+  const trail = $derived(extraKey === headKey && extra.length > 0 ? [...decisions, ...extra] : decisions);
 
   const needsText = $derived(kind === 'note' || kind === 'label');
   const textCap = $derived(kind === 'label' ? 256 : 2000);
@@ -102,7 +119,10 @@
       untilText = '';
       text = '';
       extra = [];
-      exhausted = false;
+      extraKey = '';
+      backStack = [];
+      atEnd = false;
+      windowNote = null;
       if (out.applied === false) {
         formError = `Already recorded (${out.reason ?? 'duplicate'}).`;
       }
@@ -127,7 +147,10 @@
       delete rest[id];
       undoKeys = rest;
       extra = [];
-      exhausted = false;
+      extraKey = '';
+      backStack = [];
+      atEnd = false;
+      windowNote = null;
       await reload();
     } catch (err) {
       listError = err instanceof Error ? err.message : String(err);
@@ -137,24 +160,55 @@
   }
 
   async function older() {
-    if (paging || exhausted || trail.length === 0) {
+    if (paging || atEnd || trail.length === 0) {
       return;
     }
+    // Capture the window identity up front: only a response selected
+    // against this same window may commit, and only while mounted.
+    const key = headKey;
+    const before = trail[trail.length - 1].cursor;
     paging = true;
     listError = null;
     try {
-      const last = trail[trail.length - 1];
-      const page = await fetchDecisions(subjectKind, subjectId, { before: last.cursor });
-      if (page.length === 0) {
-        exhausted = true;
-      } else {
-        extra = [...extra, ...page];
+      const page = await fetchDecisions(subjectKind, subjectId, { limit: PAGE_LIMIT, before });
+      if (!alive || key !== headKey) {
+        return;
       }
+      if (extraKey === key && extra.length > 0) {
+        backStack.push({ rows: extra, key: extraKey });
+        if (backStack.length > BACK_PAGES) {
+          backStack.shift();
+          windowNote = 'Earlier pages dropped from this view; the full audit remains available through the API.';
+        }
+      }
+      extra = page;
+      extraKey = key;
+      atEnd = page.length < PAGE_LIMIT;
     } catch (err) {
+      if (!alive || key !== headKey) {
+        return;
+      }
       listError = err instanceof Error ? err.message : String(err);
     } finally {
-      paging = false;
+      if (alive) {
+        paging = false;
+      }
     }
+  }
+
+  function newer() {
+    while (backStack.length > 0 && backStack[backStack.length - 1].key !== headKey) {
+      backStack.pop();
+    }
+    const prev = backStack.pop();
+    if (prev === undefined) {
+      extra = [];
+      extraKey = '';
+    } else {
+      extra = prev.rows;
+      extraKey = prev.key;
+    }
+    atEnd = false;
   }
 
 </script>
@@ -217,10 +271,16 @@
         </li>
       {/each}
     </ol>
-    {#if !exhausted}
+    {#if !atEnd}
       <button type="button" onclick={older} disabled={paging}>
         {paging ? 'Loading…' : 'Show older decisions'}
       </button>
+    {/if}
+    {#if extraKey === headKey && extra.length > 0}
+      <button type="button" onclick={newer} disabled={paging}>Show newer decisions</button>
+    {/if}
+    {#if windowNote !== null}
+      <p role="note">{windowNote}</p>
     {/if}
   {/if}
   {#if listError !== null}
