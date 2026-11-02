@@ -1134,6 +1134,26 @@ func TestPurgeSkipsPinnedWindow(t *testing.T) {
 		VALUES ('brf-grp-open-1', 'grp-open-1', 'host:open', 'low', 'low', 'r', 'w', 'c', 'k', ?, 1000)`, nanos(old)); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.db.Exec(`INSERT INTO report_sources (source_scope) VALUES ('pin-scope')`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		pid := fmt.Sprintf("prof-pin-%d", i)
+		if _, err := s.db.Exec(`INSERT INTO reported_subjects (profile_id, source_scope, reference_class, upstream_reference, first_report_at, last_report_at)
+			VALUES (?, 'pin-scope', 'event', ?, ?, ?)`, pid, pid, nanos(old), nanos(now)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 210; i++ {
+		bid := fmt.Sprintf("brf-grp-pin-%d", i)
+		if _, err := s.db.Exec(`INSERT INTO briefing_subjects (briefing_id, profile_id, role) VALUES (?, ?, 'current')`,
+			bid, fmt.Sprintf("prof-pin-%d", i%5)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.Exec(`INSERT INTO briefing_subjects (briefing_id, profile_id, role) VALUES ('brf-grp-open-1', 'prof-pin-0', 'current')`); err != nil {
+		t.Fatal(err)
+	}
 	pin := PurgeSettings{BriefingRetention: 24 * time.Hour, SubjectRetention: 400 * 24 * time.Hour, DecisionRetention: 400 * 24 * time.Hour}
 	rep, err := s.PurgeOnce(ctx, pin, now)
 	if err != nil {
@@ -1142,11 +1162,14 @@ func TestPurgeSkipsPinnedWindow(t *testing.T) {
 	if rep.Briefings != 1 {
 		t.Fatalf("purged briefings = %d, want the one eligible row", rep.Briefings)
 	}
-	var briefings, decisions int
+	var briefings, decisions, links int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM briefings`).Scan(&briefings); err != nil || briefings != 210 {
 		t.Fatalf("briefings = %d, %v; want all 210 pinned", briefings, err)
 	}
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM operator_decisions`).Scan(&decisions); err != nil || decisions != 210 {
 		t.Fatalf("decisions = %d, %v; want all 210 retained", decisions, err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM briefing_subjects`).Scan(&links); err != nil || links != 210 {
+		t.Fatalf("links = %d, %v; want all 210 pinned links", links, err)
 	}
 }

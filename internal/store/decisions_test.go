@@ -568,6 +568,51 @@ func TestUndoRepeatAfterHeadMoved(t *testing.T) {
 	}
 }
 
+// An undo of a newer record moves the head without adding a live
+// row: A → B → undo B → undo A → repeat undo B conflicts, because
+// the head changed from A to none even though no later live review
+// row exists. The exact original request still replays idempotently.
+func TestUndoRepeatAfterUndoMovedHead(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	at := time.Now().UTC().Truncate(time.Second)
+	gid := seedDecisionBriefing(t, s, "lab", "evt-dec-13", subjectMAC("aa:bb:cc:dd:ee:1d"), at)
+
+	if _, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid, Kind: DecisionExpected}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid, Kind: DecisionNotExpected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UndoDecision(ctx, b.Decision.DecisionID, "req-uu-1"); err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.DecisionsForSubject(ctx, DecisionSubjectBriefing, "brf-"+gid, 50, 0, 0)
+	if err != nil || len(a) == 0 {
+		t.Fatalf("trail = %+v, %v", a, err)
+	}
+	var headID string
+	for _, d := range a {
+		if d.Kind == DecisionExpected && !d.Undone {
+			headID = d.DecisionID
+		}
+	}
+	if headID == "" {
+		t.Fatal("no live expected head to undo")
+	}
+	if _, err := s.UndoDecision(ctx, headID, "req-uu-2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UndoDecision(ctx, b.Decision.DecisionID, "req-uu-3"); !errors.Is(err, ErrUndoConflict) {
+		t.Fatalf("repeat after undo moved head = %v, want conflict", err)
+	}
+	replay, err := s.UndoDecision(ctx, b.Decision.DecisionID, "req-uu-1")
+	if err != nil || replay.Applied || replay.Reason != "duplicate_request" {
+		t.Fatalf("exact replay = %+v, %v; want duplicate", replay, err)
+	}
+}
+
 // A default snooze resolves its horizon on first commit only: the
 // idempotency hash covers specified content, so a retry replays
 // against the original row instead of hashing a new deadline. An

@@ -57,6 +57,11 @@
   onDestroy(() => {
     alive = false;
   });
+  // pageGen invalidates in-flight paging on every mutation and reset:
+  // a response selected against a previous window can commit
+  // neither rows nor exhaustion nor errors once the generation moved.
+  // Head identity additionally fences parent-history replacement.
+  let pageGen = 0;
   const headKey = $derived(
     decisions.length === 0 ? 'empty' : `${decisions[0].decision_id}:${decisions.length}`
   );
@@ -123,6 +128,7 @@
       backStack = [];
       atEnd = false;
       windowNote = null;
+      pageGen += 1;
       if (out.applied === false) {
         formError = `Already recorded (${out.reason ?? 'duplicate'}).`;
       }
@@ -151,6 +157,7 @@
       backStack = [];
       atEnd = false;
       windowNote = null;
+      pageGen += 1;
       await reload();
     } catch (err) {
       listError = err instanceof Error ? err.message : String(err);
@@ -163,15 +170,23 @@
     if (paging || atEnd || trail.length === 0) {
       return;
     }
-    // Capture the window identity up front: only a response selected
-    // against this same window may commit, and only while mounted.
+    // Capture the generation and window identity up front: only a
+    // response selected against this same mutation generation and
+    // head may commit rows, exhaustion, or errors, and only while
+    // mounted. An empty page marks exhaustion but preserves the
+    // current window, so the last reachable page stays navigable.
+    const gen = pageGen;
     const key = headKey;
     const before = trail[trail.length - 1].cursor;
     paging = true;
     listError = null;
     try {
       const page = await fetchDecisions(subjectKind, subjectId, { limit: PAGE_LIMIT, before });
-      if (!alive || key !== headKey) {
+      if (!alive || gen !== pageGen || key !== headKey) {
+        return;
+      }
+      if (page.length === 0) {
+        atEnd = true;
         return;
       }
       if (extraKey === key && extra.length > 0) {
@@ -185,7 +200,7 @@
       extraKey = key;
       atEnd = page.length < PAGE_LIMIT;
     } catch (err) {
-      if (!alive || key !== headKey) {
+      if (!alive || gen !== pageGen || key !== headKey) {
         return;
       }
       listError = err instanceof Error ? err.message : String(err);
