@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"strconv"
 	"strings"
@@ -129,18 +130,6 @@ func runAgent(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outco
 		// to the fallback rather than inventing a path.
 		return insertFallback(ctx, d, taken, outcome, "agent capability unavailable; briefing from deterministic baseline only")
 	}
-	raw, issued, display, failReason := buildScannedBundle(ctx, d, taken, outcome)
-	if failReason != "" {
-		return insertFallback(ctx, d, taken, outcome, failReason)
-	}
-	now := time.Now()
-	if d.Now != nil {
-		now = d.Now()
-	}
-	env := newAgentEnv(d.Store, taken, issued, now)
-	if failReason = env.seed(ctx, d.SourceScope); failReason != "" {
-		return insertFallback(ctx, d, taken, outcome, failReason)
-	}
 	budget := d.AgentTimeout
 	if budget <= 0 {
 		budget = 90 * time.Second
@@ -149,8 +138,24 @@ func runAgent(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outco
 	if providerTimeout <= 0 {
 		providerTimeout = 30 * time.Second
 	}
+	// The run budget starts before preparation: the bundle build and
+	// the registry seed run under it, so slow setup cannot hold the
+	// serial worker past AGENT_TIMEOUT. The parent context stays
+	// separate for fallback writes and cancellation handling.
 	runCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
+	raw, issued, display, failReason := buildScannedBundle(runCtx, d, taken, outcome)
+	if failReason != "" {
+		return insertFallback(ctx, d, taken, outcome, failReason)
+	}
+	now := time.Now()
+	if d.Now != nil {
+		now = d.Now()
+	}
+	env := newAgentEnv(d.Store, taken, issued, now)
+	if failReason = env.seed(runCtx, d.SourceScope); failReason != "" {
+		return insertFallback(ctx, d, taken, outcome, failReason)
+	}
 
 	l := &agentLoop{parent: ctx, ctx: runCtx, d: d, taken: taken, outcome: outcome, turner: turner,
 		env: env, issued: issued, display: display, steps: steps, provider: providerTimeout}
@@ -377,6 +382,16 @@ func (l *agentLoop) scanTranscript() string {
 	if err != nil || len(raw) > maxTranscriptBytes {
 		return "agent transcript exceeds size cap; briefing from deterministic baseline only"
 	}
+	// Duplicate JSON keys fail the send closed before anything else:
+	// the structural pass below normalizes message JSON through a map,
+	// where a shadowed first value escapes inspection while the
+	// provider receives the verbatim text.
+	for _, m := range l.env.transcript {
+		if messageHasDuplicateKeys(m.Text) {
+			log.Printf("briefing: group %s agent transcript blocked on duplicate JSON keys", l.taken.GroupID)
+			return "agent transcript blocked by redaction; briefing from deterministic baseline only"
+		}
+	}
 	cleared := make(map[string]bool, len(l.env.seenEvents))
 	var ids []string
 	for id := range l.env.seenEvents {
@@ -404,6 +419,100 @@ func (l *agentLoop) scanTranscript() string {
 		return "agent transcript blocked by redaction; briefing from deterministic baseline only"
 	}
 	return ""
+}
+
+// messageHasDuplicateKeys reports whether text parses as exactly one
+// JSON value holding a repeated object key at any depth. Only such
+// texts are normalized by neutralizeReferenceIDs below; anything else
+// (plain prose, malformed JSON, trailing data) is scanned verbatim, so
+// no shadowed value can escape inspection there.
+func messageHasDuplicateKeys(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if len(trimmed) < 2 || (trimmed[0] != '{' && trimmed[0] != '[') {
+		return false
+	}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	first, err := dec.Token()
+	if err != nil {
+		return false
+	}
+	type frame struct {
+		obj     bool
+		keys    map[string]bool
+		wantKey bool
+	}
+	var stack []frame
+	var found bool
+	if d, ok := first.(json.Delim); !ok || (d != '{' && d != '[') {
+		return false
+	} else {
+		var keys map[string]bool
+		if d == '{' {
+			keys = map[string]bool{}
+		}
+		stack = append(stack, frame{obj: d == '{', keys: keys, wantKey: d == '{'})
+	}
+	valueDone := func() {
+		if n := len(stack); n > 0 && stack[n-1].obj {
+			stack[n-1].wantKey = true
+		}
+	}
+	for len(stack) > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				top := &stack[len(stack)-1]
+				if top.obj {
+					if top.wantKey {
+						return false
+					}
+					top.wantKey = true
+				}
+				var keys map[string]bool
+				if d == '{' {
+					keys = map[string]bool{}
+				}
+				stack = append(stack, frame{obj: d == '{', keys: keys, wantKey: d == '{'})
+			case '}', ']':
+				top := stack[len(stack)-1]
+				if (d == '}') != top.obj {
+					return false
+				}
+				stack = stack[:len(stack)-1]
+				valueDone()
+			default:
+				return false
+			}
+			continue
+		}
+		top := &stack[len(stack)-1]
+		if top.obj && top.wantKey {
+			key, ok := tok.(string)
+			if !ok {
+				return false
+			}
+			// Record, don't return yet: trailing data below decides
+			// whether the structural pass normalizes this text at all.
+			if top.keys[key] {
+				found = true
+			}
+			top.keys[key] = true
+			top.wantKey = false
+			continue
+		}
+		valueDone()
+	}
+	// Trailing data means Unmarshal would refuse the text and the
+	// structural pass would leave it verbatim: no normalization loss.
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return false
+	}
+	return found
 }
 
 // neutralizeReferenceIDs re-marshals the transcript with cleared event
@@ -1495,10 +1604,10 @@ func (e *agentEnv) toolHistory(ctx context.Context, sub *subjectRef, limit int) 
 }
 
 // toolSimilar implements find_similar_reported_changes (Designv9 §6.2):
-// counts of retained observations of one scanner event class in the
-// run's scope and window, optionally mentioning a port, plus up to
-// five subject tokens granted for this run. No identity association:
-// the counts describe reports, never devices.
+// counts of retained reports (distinct events) of one scanner event
+// class in the run's scope and window, optionally mentioning a port,
+// plus up to five subject tokens granted for this run. No identity
+// association: the counts describe reports, never devices.
 func (e *agentEnv) toolSimilar(ctx context.Context, kind string, port, windowDays int) (map[string]any, []string, int, bool, bool) {
 	o := &toolOut{}
 	since := e.now.Add(-time.Duration(windowDays) * 24 * time.Hour)

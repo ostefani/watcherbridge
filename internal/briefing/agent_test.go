@@ -682,6 +682,30 @@ func TestNeutralizeReferenceIDsStructural(t *testing.T) {
 	}
 }
 
+func TestMessageHasDuplicateKeys(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{"flat duplicate", `{"why":"192.168.9.9","why":"safe"}`, true},
+		{"nested duplicate", `{"tool":"x","arguments":{"host":"IP_1","host":"IP_2"}}`, true},
+		{"duplicate in array element", `[{"a":1},{"a":2,"a":3}]`, true},
+		{"distinct keys", `{"tool":"x","arguments":{"host":"IP_1"},"why":"safe"}`, false},
+		{"same key in sibling objects", `{"a":{"x":1},"b":{"x":2}}`, false},
+		{"array of scalars", `[1,2,2]`, false},
+		{"plain prose", `saw 192.168.9.9 on the lan`, false},
+		{"malformed JSON passes through verbatim", `{"a":1,`, false},
+		{"trailing data is not normalized", `{"a":1,"a":2} trailing`, false},
+		{"empty", ``, false},
+	}
+	for _, c := range cases {
+		if got := messageHasDuplicateKeys(c.text); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}
+
 func TestAgentOverlappingIDStillBlocks(t *testing.T) {
 	s := openWorkerStore(t)
 	// Permitted short event ID overlapping a real address. The final is
@@ -739,5 +763,57 @@ func TestBlockedToolResultShape(t *testing.T) {
 	}
 	if strings.Contains(res, "reported_observations") || strings.Contains(res, "received_at") {
 		t.Fatalf("blocked result must name no values and no paths: %s", res)
+	}
+}
+
+func TestAgentDuplicateKeysBlockResend(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	// An otherwise valid tool call hides a raw address in the shadowed
+	// first "why": map decoding inspects only "safe", but the provider
+	// would receive the verbatim text with the address. The pre-send
+	// scan must fail the resend closed instead of transmitting it.
+	fake.TurnHandle = func(tr []provider.TurnMessage) (string, error) {
+		return `{"tool":"get_reported_profile","arguments":{"host":"IP_1"},"why":"192.168.9.9","why":"safe"}`, nil
+	}
+	d := agentTestDeps(t, s, fake)
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("blocked run must still progress the group")
+	}
+	if fake.TurnCalls != 1 {
+		t.Fatalf("duplicate-key transcript must never transmit again: %d calls", fake.TurnCalls)
+	}
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || !strings.Contains(b.Context, "transcript blocked") {
+		t.Fatalf("duplicate keys must fail closed to a blocked fallback: %+v", b)
+	}
+}
+
+func TestAgentSetupBoundedByRunBudget(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	fake.TurnHandle = func(tr []provider.TurnMessage) (string, error) {
+		return finalFromTranscript(t, tr, strptr("high")), nil
+	}
+	d := agentTestDeps(t, s, fake)
+	// An already-exhausted run budget must bound preparation too: the
+	// bundle build and registry seed run under it, so a starved run
+	// fails setup — never a turn-budget fallback after unbounded work —
+	// without ever billing a provider turn.
+	d.AgentTimeout = time.Nanosecond
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("starved run must still progress the group")
+	}
+	if fake.TurnCalls != 0 {
+		t.Fatalf("starved run must bill no provider turn: %d calls", fake.TurnCalls)
+	}
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || b.Source != "fallback" {
+		t.Fatalf("starved run must fall back: %+v", b)
+	}
+	if !(strings.Contains(b.Context, "bundle build failed") || strings.Contains(b.Context, "registry unavailable")) {
+		t.Fatalf("starved run must fail setup under the budget: %+v", b)
 	}
 }

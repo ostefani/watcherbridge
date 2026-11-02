@@ -171,6 +171,26 @@ func TestSimilarReportsCounts(t *testing.T) {
 	}
 }
 
+func TestSimilarReportsCountsDistinctEvents(t *testing.T) {
+	s := openTestStore(t)
+	gid, _ := agentSeed(t, s)
+	links, _, err := s.GroupSubjects(context.Background(), gid)
+	if err != nil || len(links) == 0 {
+		t.Fatal("round trip needs a linked subject")
+	}
+	// The seed persists one host.changed event with previous and current
+	// views: two observation rows, one report. The model-visible count
+	// must name reports, never observation views.
+	since := time.Now().Add(-24 * time.Hour)
+	count, _, err := s.SimilarReports(context.Background(), "test-scope", "changed", 0, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("one event with two views must count one report: %d", count)
+	}
+}
+
 func TestObservationPortsBounded(t *testing.T) {
 	s := openTestStore(t)
 	gid, _ := agentSeed(t, s)
@@ -208,7 +228,7 @@ func TestAgentReadsUseIndexes(t *testing.T) {
 	queries := []string{
 		`SELECT profile_id FROM group_subjects WHERE group_id = 'g' ORDER BY profile_id ASC, role ASC LIMIT 65`,
 		`SELECT b.briefing_id FROM briefings b JOIN briefing_subjects s ON s.briefing_id = b.briefing_id WHERE s.profile_id = 'p' ORDER BY b.created_at DESC, b.rowid DESC LIMIT 10`,
-		`SELECT COUNT(*) FROM reported_observations o JOIN reported_subjects s ON s.profile_id = o.profile_id JOIN raw_events e ON e.event_id = o.event_id WHERE s.source_scope = 's' AND e.event_type = 'host.changed' AND o.received_at >= 0`,
+		`SELECT COUNT(DISTINCT o.event_id) FROM reported_observations o JOIN reported_subjects s ON s.profile_id = o.profile_id JOIN raw_events e ON e.event_id = o.event_id WHERE s.source_scope = 's' AND e.event_type = 'host.changed' AND o.received_at >= 0`,
 		`SELECT o.profile_id FROM reported_observations o JOIN reported_subjects s ON s.profile_id = o.profile_id JOIN raw_events e ON e.event_id = o.event_id WHERE s.source_scope = 's' AND e.event_type = 'host.changed' AND o.received_at >= 0 GROUP BY o.profile_id ORDER BY MAX(o.received_at) DESC, MAX(o.observation_id) DESC LIMIT 5`,
 		`SELECT observation_id FROM reported_observations WHERE profile_id = 'p' ORDER BY reported_at DESC, observation_id DESC LIMIT 10`,
 		`SELECT proto FROM reported_ports WHERE observation_id = 1 ORDER BY port, proto LIMIT 65`,

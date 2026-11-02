@@ -314,12 +314,14 @@ var SimilarKinds = map[string]string{
 	"changed":     "host.changed",
 }
 
-// SimilarReports counts retained observations of one scanner event
-// class in a scope since a cutoff, optionally filtered to reports that
-// mention a port, and names up to five of their subjects, newest first.
-// The count walks one indexed received_at range; the profile list stops
-// after five groups. Port presence rides the reported_ports primary
-// key, so no new index is needed for the filter.
+// SimilarReports counts retained reports (distinct events) of one
+// scanner event class in a scope since a cutoff, optionally filtered
+// to reports that mention a port, and names up to five of their
+// subjects, newest first. One host.changed event stores a previous and
+// a current observation view, so counting observation rows would double
+// count it. The count walks one indexed received_at range; the profile
+// list stops after five groups. Port presence rides the reported_ports
+// primary key, so no new index is needed for the filter.
 func (s *Store) SimilarReports(ctx context.Context, scope, kind string, port int, since time.Time) (int, []string, error) {
 	eventType, ok := SimilarKinds[kind]
 	if !ok {
@@ -336,7 +338,7 @@ func (s *Store) SimilarReports(ctx context.Context, scope, kind string, port int
 		args = append(args, port)
 	}
 	var count int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reported_observations o
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT o.event_id) FROM reported_observations o
 		JOIN reported_subjects s ON s.profile_id = o.profile_id
 		JOIN raw_events e ON e.event_id = o.event_id
 		WHERE `+filters, args...).Scan(&count); err != nil {
