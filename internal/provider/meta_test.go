@@ -278,12 +278,15 @@ func TestMetaTurnSendsFullTranscript(t *testing.T) {
 	}}
 	a := testAdapter(t, stub, 64<<10)
 	tr := []TurnMessage{{Role: "system", Text: "s"}, {Role: "user", Text: "b"}}
-	text, err := a.Turn(t.Context(), tr)
+	res, err := a.Turn(t.Context(), tr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if text != answer {
-		t.Fatalf("turn must return the assistant text: %q", text)
+	if res.Text != answer {
+		t.Fatalf("turn must return the assistant text: %q", res.Text)
+	}
+	if res.Usage.HasUsage {
+		t.Fatalf("envelope without usage must read unknown: %+v", res.Usage)
 	}
 	if len(stub.requests) != 1 {
 		t.Fatalf("one turn is one POST: %d", len(stub.requests))
@@ -300,8 +303,8 @@ func TestMetaTurnSendsFullTranscript(t *testing.T) {
 func TestFakeTurnScripts(t *testing.T) {
 	f := NewFake()
 	f.Turns = []FakeStep{{JSON: []byte("one")}, {Err: errors.New("down")}}
-	if text, err := f.Turn(context.Background(), []TurnMessage{{Role: "user", Text: "a"}}); err != nil || text != "one" {
-		t.Fatalf("scripted turn must play: %q %v", text, err)
+	if res, err := f.Turn(context.Background(), []TurnMessage{{Role: "user", Text: "a"}}); err != nil || res.Text != "one" {
+		t.Fatalf("scripted turn must play: %q %v", res.Text, err)
 	}
 	if _, err := f.Turn(context.Background(), []TurnMessage{{Role: "user", Text: "b"}}); err == nil {
 		t.Fatal("scripted turn error must surface")
@@ -316,5 +319,57 @@ func TestFakeTurnScripts(t *testing.T) {
 	}
 	if len(f.Deadlines) != 3 {
 		t.Fatalf("deadlines must ride every turn: %d", len(f.Deadlines))
+	}
+}
+
+func TestTurnUsageRidesWhenSupplied(t *testing.T) {
+	const answer = `{"event_ids":["e1"],"host":"HOST_1"}`
+	stub := &stubTripper{respond: func(*http.Request) (*http.Response, error) {
+		return okResponse(`{"output":[{"type":"message","content":[{"type":"output_text","text":` +
+			strconv.Quote(answer) + `}]}],"usage":{"input_tokens":120,"output_tokens":45}}`), nil
+	}}
+	a := testAdapter(t, stub, 64<<10)
+	res, err := a.Turn(t.Context(), []TurnMessage{{Role: "user", Text: "b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Usage.HasUsage || res.Usage.InputTokens != 120 || res.Usage.OutputTokens != 45 {
+		t.Fatalf("envelope usage must ride the turn: %+v", res.Usage)
+	}
+	if res.Usage.HasCost {
+		t.Fatalf("the API reports no cost, so cost stays unknown: %+v", res.Usage)
+	}
+}
+
+func TestFakeStepUsageScripts(t *testing.T) {
+	f := NewFake(FakeStep{JSON: []byte("one"), Usage: Usage{InputTokens: 7, OutputTokens: 3, HasUsage: true}})
+	f.Turns = []FakeStep{{JSON: []byte("one"), Usage: Usage{InputTokens: 7, OutputTokens: 3, HasUsage: true}}}
+	res, err := f.Turn(context.Background(), []TurnMessage{{Role: "user", Text: "a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Usage.HasUsage || res.Usage.InputTokens != 7 || res.Usage.OutputTokens != 3 {
+		t.Fatalf("scripted usage must ride the turn: %+v", res.Usage)
+	}
+	raw, err := f.Brief(context.Background(), []byte("{}"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !raw.Usage.HasUsage || raw.Usage.InputTokens != 7 {
+		t.Fatalf("scripted usage must ride briefs too: %+v", raw.Usage)
+	}
+}
+
+func TestUsageAdd(t *testing.T) {
+	sum := Usage{InputTokens: 1, OutputTokens: 2, HasUsage: true}.Add(
+		Usage{InputTokens: 10, OutputTokens: 20, HasUsage: true, CostMicros: 5, HasCost: true})
+	if sum.InputTokens != 11 || sum.OutputTokens != 22 || !sum.HasUsage {
+		t.Fatalf("tokens must add: %+v", sum)
+	}
+	if !sum.HasCost || sum.CostMicros != 5 {
+		t.Fatalf("supplied cost must survive beside unsupplied: %+v", sum)
+	}
+	if (Usage{}.Add(Usage{})).HasUsage || (Usage{}.Add(Usage{})).HasCost {
+		t.Fatal("empty add must stay unknown")
 	}
 }

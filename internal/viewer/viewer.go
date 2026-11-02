@@ -711,6 +711,41 @@ type briefingView struct {
 	// trail with undone markers for the list and undo buttons.
 	EffectiveReview *reviewWire    `json:"effective_review,omitempty"`
 	Decisions       []decisionWire `json:"decisions"`
+	// LikelyExplanation and Confidence are the model's display-only
+	// hypothesis and self-assessment (Designv9 §6.3): absent for
+	// deterministic rows and pre-migration rows, which carry no model
+	// output. They never feed priority, identity or the resolver.
+	LikelyExplanation *string           `json:"likely_explanation,omitempty"`
+	Confidence        string            `json:"confidence,omitempty"`
+	EvidenceRefs      []evidenceRefWire `json:"evidence_refs,omitempty"`
+	// InputTokens and OutputTokens are the adapter-reported accounting
+	// for the producing calls; CostUSD is nil while no adapter has
+	// reported cost (unknown, never zero-filled).
+	InputTokens  *int64   `json:"input_tokens,omitempty"`
+	OutputTokens *int64   `json:"output_tokens,omitempty"`
+	CostUSD      *float64 `json:"cost_usd,omitempty"`
+	// Traces is the run's executed tool steps in 0-based order,
+	// served on the detail fetch only — never on the list or the
+	// stream, which stay lean.
+	Traces []traceWire `json:"traces,omitempty"`
+}
+
+// evidenceRefWire is one model citation: a real group event or a real
+// 0-based executed tool step of the producing run.
+type evidenceRefWire struct {
+	EventID  string `json:"event_id,omitempty"`
+	ToolStep *int   `json:"tool_step,omitempty"`
+}
+
+// traceWire is one executed investigator tool step: validated args and
+// the scanned result envelope, both tokenized, never raw identifiers.
+type traceWire struct {
+	Step       int    `json:"step"`
+	Tool       string `json:"tool"`
+	Args       string `json:"args"`
+	Result     string `json:"result"`
+	Status     string `json:"status"`
+	DurationMS int64  `json:"duration_ms"`
 }
 
 // briefingSubjectWire is one persisted profile link with its
@@ -727,7 +762,7 @@ type referencedEventWire struct {
 }
 
 func viewOf(b store.Briefing) briefingView {
-	return briefingView{
+	view := briefingView{
 		GroupingVersion: b.GroupingVersion,
 		BriefingID:      b.BriefingID, GroupID: b.GroupID, Host: b.HostAnchorKey,
 		Baseline: b.Baseline, ModelSuggestion: b.ModelSuggestion, Priority: b.Priority,
@@ -736,8 +771,26 @@ func viewOf(b store.Briefing) briefingView {
 		RecommendedCheck: b.RecommendedCheck, CreatedAt: b.CreatedAt.UTC().Format(time.RFC3339),
 		EventIDs: append([]string(nil), b.EventIDs...), Seq: b.Seq,
 		Profiles: []briefingSubjectWire{}, ReferencedEvents: []referencedEventWire{},
-		Observations: []observationWire{},
+		Observations:      []observationWire{},
+		LikelyExplanation: b.LikelyExplanation, Confidence: b.Confidence,
+		InputTokens: b.InputTokens, OutputTokens: b.OutputTokens,
 	}
+	if len(b.EvidenceRefs) > 0 {
+		view.EvidenceRefs = make([]evidenceRefWire, 0, len(b.EvidenceRefs))
+		for _, r := range b.EvidenceRefs {
+			if r.ToolStep >= 0 {
+				step := r.ToolStep
+				view.EvidenceRefs = append(view.EvidenceRefs, evidenceRefWire{ToolStep: &step})
+				continue
+			}
+			view.EvidenceRefs = append(view.EvidenceRefs, evidenceRefWire{EventID: r.EventID})
+		}
+	}
+	if b.CostMicros != nil {
+		cost := float64(*b.CostMicros) / 1e6
+		view.CostUSD = &cost
+	}
+	return view
 }
 
 // groupWire is the SSE/API snapshot shape: unix deadlines keep the JSON
@@ -905,6 +958,20 @@ func (v *Viewer) handleBriefing(w http.ResponseWriter, r *http.Request) {
 		view.Observations = append(view.Observations, wire)
 	}
 	view.ObservationsTruncated = obsTruncated
+	// The investigator trace rides the detail fetch only: the executed
+	// tool steps in 0-based order, tokenized like every provider-bound
+	// surface. An empty trace stays absent, never null.
+	traces, err := v.store.AgentTraces(ctx, b.BriefingID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	for _, tr := range traces {
+		view.Traces = append(view.Traces, traceWire{
+			Step: tr.Step, Tool: tr.Tool, Args: tr.ArgsJSON,
+			Result: tr.ResultJSON, Status: tr.Status, DurationMS: tr.DurationMS,
+		})
+	}
 	// Operator decisions ride the subject view so the dossier shows
 	// live review state and the audit trail without a second fetch;
 	// the raw list endpoint stays for API parity and the CLI.

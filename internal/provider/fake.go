@@ -7,11 +7,14 @@ import (
 )
 
 // FakeStep is one scripted answer. Hang blocks until ctx ends (timeout
-// path); otherwise JSON or Err is returned immediately.
+// path); otherwise JSON or Err is returned immediately. Usage scripts
+// the adapter-reported accounting for the step; zero means the adapter
+// supplied none.
 type FakeStep struct {
-	JSON []byte
-	Err  error
-	Hang bool
+	JSON  []byte
+	Err   error
+	Hang  bool
+	Usage Usage
 }
 
 // FakeAdapter is the test provider. It records every call (bytes received,
@@ -60,8 +63,10 @@ func (f *FakeAdapter) Repair(ctx context.Context, correction string, valid map[s
 }
 
 // Turn implements Turner for scripted agent tests: unknown/hostile
-// turns, truncation signals, hangs, and errors are all scriptable.
-func (f *FakeAdapter) Turn(ctx context.Context, transcript []TurnMessage) (string, error) {
+// turns, truncation signals, hangs, and errors are all scriptable. The
+// dynamic handle answers text only (no scripted usage); scripted steps
+// carry their own Usage.
+func (f *FakeAdapter) Turn(ctx context.Context, transcript []TurnMessage) (TurnResult, error) {
 	f.mu.Lock()
 	step := FakeStep{}
 	if len(f.Turns) > 0 {
@@ -82,16 +87,17 @@ func (f *FakeAdapter) Turn(ctx context.Context, transcript []TurnMessage) (strin
 	}
 	f.mu.Unlock()
 	if handle != nil {
-		return handle(cp)
+		text, err := handle(cp)
+		return TurnResult{Text: text}, err
 	}
 	if step.Hang {
 		<-ctx.Done()
-		return "", ctx.Err()
+		return TurnResult{}, ctx.Err()
 	}
 	if step.Err != nil {
-		return "", step.Err
+		return TurnResult{}, step.Err
 	}
-	return string(step.JSON), nil
+	return TurnResult{Text: string(step.JSON), Usage: step.Usage}, nil
 }
 
 func (f *FakeAdapter) next(ctx context.Context, repair bool, payload []byte, valid map[string]struct{}) (RawBriefing, error) {
@@ -126,5 +132,5 @@ func (f *FakeAdapter) next(ctx context.Context, repair bool, payload []byte, val
 	if step.Err != nil {
 		return RawBriefing{}, step.Err
 	}
-	return RawBriefing{JSON: append([]byte(nil), step.JSON...)}, nil
+	return RawBriefing{JSON: append([]byte(nil), step.JSON...), Usage: step.Usage}, nil
 }

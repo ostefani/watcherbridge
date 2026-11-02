@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ostefani/watcherbridge/internal/health"
 	"github.com/ostefani/watcherbridge/internal/provider"
 	"github.com/ostefani/watcherbridge/internal/redactor"
 	"github.com/ostefani/watcherbridge/internal/store"
@@ -68,7 +69,8 @@ func finalFromTranscript(t *testing.T, tr []provider.TurnMessage, suggestion *st
 		"event_ids": bundle.EventIDs, "host": host,
 		"what_changed": "changed " + host, "context": "context for " + host,
 		"model_suggestion": suggestion, "priority_reason": "because reasons",
-		"recommended_check": "look",
+		"recommended_check": "look", "likely_explanation": "likely " + host,
+		"confidence": "medium", "evidence_refs": eventRefs(bundle.EventIDs),
 	}
 	raw, err := json.Marshal(m)
 	if err != nil {
@@ -503,6 +505,9 @@ func TestParseTurn(t *testing.T) {
 	if _, final, _ := parseTurn(`{"event_ids":["e"],"host":"H","what_changed":"w","context":"c","priority_reason":"r","recommended_check":"k"}`); !final {
 		t.Fatal("final shape must classify as final")
 	}
+	if _, final, _ := parseTurn(`{"event_ids":["e"],"host":"H","what_changed":"w","context":"c","model_suggestion":null,"priority_reason":"r","recommended_check":"k","likely_explanation":"likely","confidence":"high","evidence_refs":[{"event_id":"e"},{"tool_step":0}]}`); !final {
+		t.Fatal("final shape with Step 27 fields must classify as final")
+	}
 	if _, _, corr := parseTurn(`{"event_ids":[],"bogus":1}`); corr == "" {
 		t.Fatal("unknown field in a final must reject")
 	}
@@ -815,5 +820,193 @@ func TestAgentSetupBoundedByRunBudget(t *testing.T) {
 	}
 	if !(strings.Contains(b.Context, "bundle build failed") || strings.Contains(b.Context, "registry unavailable")) {
 		t.Fatalf("starved run must fail setup under the budget: %+v", b)
+	}
+}
+
+// agentFinal builds a schema-complete final citing real group events,
+// for Step 27 end-to-end runs. refs mix event IDs and executed-step
+// indexes; suggestion may be nil to abstain.
+func agentFinal(eventIDs []string, host string, refs []any, suggestion *string) string {
+	m := map[string]any{
+		"event_ids": eventIDs, "host": host,
+		"what_changed": "changed " + host, "context": "context for " + host,
+		"model_suggestion": suggestion, "priority_reason": "because reasons",
+		"recommended_check": "look", "likely_explanation": "likely " + host,
+		"confidence": "high", "evidence_refs": refs,
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		panic(err)
+	}
+	return string(raw)
+}
+
+func TestAgentTraceStoredWithBriefing(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	calls := 0
+	fake.TurnHandle = func(tr []provider.TurnMessage) (string, error) {
+		calls++
+		if calls == 1 {
+			return `{"tool":"get_reported_profile","arguments":{"host":"IP_1"}}`, nil
+		}
+		return agentFinal([]string{"evt-w1"}, "IP_1",
+			[]any{map[string]any{"event_id": "evt-w1"}, map[string]any{"tool_step": 0}}, strptr("high")), nil
+	}
+	d := agentTestDeps(t, s, fake)
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("agent run must progress the group")
+	}
+	b := briefed(t, s, gid)
+	if b.FallbackUsed || b.Source != "agent" {
+		t.Fatalf("tool-then-final run must store an agent briefing: %+v", b)
+	}
+	// The explanation restores like every model text field: the token
+	// comes back as its display spelling, so only the shape asserts.
+	if b.LikelyExplanation == nil || !strings.HasPrefix(*b.LikelyExplanation, "likely ") ||
+		strings.Contains(*b.LikelyExplanation, "IP_1") || b.Confidence != "high" {
+		t.Fatalf("explanation fields must persist restored: %+v", b.LikelyExplanation)
+	}
+	if len(b.EvidenceRefs) != 2 || b.EvidenceRefs[0] != store.EventRef("evt-w1") || b.EvidenceRefs[1] != store.ToolRef(0) {
+		t.Fatalf("evidence refs must persist validated: %+v", b.EvidenceRefs)
+	}
+	traces, err := s.AgentTraces(context.Background(), b.BriefingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(traces) != 1 || traces[0].Step != 0 || traces[0].Tool != "get_reported_profile" || traces[0].Status != "ok" {
+		t.Fatalf("one executed step must audit exactly: %+v", traces)
+	}
+	if !strings.Contains(traces[0].ArgsJSON, "IP_1") || !strings.Contains(traces[0].ResultJSON, "get_reported_profile") {
+		t.Fatalf("trace must carry the tokenized call and envelope: %+v", traces[0])
+	}
+}
+
+func TestAgentInventedRefRepairsThenFallsBack(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	fake.TurnHandle = func(tr []provider.TurnMessage) (string, error) {
+		// e9 is no group event: invalid on the first turn and again
+		// after the single repair, so the run falls back.
+		return agentFinal([]string{"evt-w1"}, "IP_1",
+			[]any{map[string]any{"event_id": "e9"}}, strptr("high")), nil
+	}
+	d := agentTestDeps(t, s, fake)
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("failed run must still progress the group")
+	}
+	if fake.TurnCalls != 2 {
+		t.Fatalf("one repair per run, never more: %d calls", fake.TurnCalls)
+	}
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || b.Source != "fallback" {
+		t.Fatalf("invented refs must fall back: %+v", b)
+	}
+	traces, err := s.AgentTraces(context.Background(), b.BriefingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(traces) != 0 {
+		t.Fatalf("fallback with no executions stores no trace: %+v", traces)
+	}
+}
+
+func TestAgentOversizedLikelyRepairsThenFallsBack(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	fake.TurnHandle = func(tr []provider.TurnMessage) (string, error) {
+		m := map[string]any{
+			"event_ids": []string{"evt-w1"}, "host": "IP_1",
+			"what_changed": "w", "context": "c", "model_suggestion": nil,
+			"priority_reason": "r", "recommended_check": "k",
+			"likely_explanation": strings.Repeat("x", maxLikelyRunes+1),
+			"confidence":         "low", "evidence_refs": []any{},
+		}
+		raw, _ := json.Marshal(m)
+		return string(raw), nil
+	}
+	d := agentTestDeps(t, s, fake)
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("failed run must still progress the group")
+	}
+	if fake.TurnCalls != 2 {
+		t.Fatalf("one repair per run, never more: %d calls", fake.TurnCalls)
+	}
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || b.Source != "fallback" {
+		t.Fatalf("oversized explanation must fall back: %+v", b)
+	}
+}
+
+func TestAgentUsageAccounted(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	toolCall := `{"tool":"get_reported_profile","arguments":{"host":"IP_1"}}`
+	final := agentFinal([]string{"evt-w1"}, "IP_1",
+		[]any{map[string]any{"event_id": "evt-w1"}}, strptr("high"))
+	fake := provider.NewFake()
+	fake.Turns = []provider.FakeStep{
+		{JSON: []byte(toolCall), Usage: provider.Usage{InputTokens: 10, OutputTokens: 5, HasUsage: true}},
+		{JSON: []byte(final), Usage: provider.Usage{InputTokens: 7, OutputTokens: 3, HasUsage: true}},
+	}
+	d := agentTestDeps(t, s, fake)
+	d.Health = health.New()
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("agent run must progress the group")
+	}
+	b := briefed(t, s, gid)
+	if b.FallbackUsed {
+		t.Fatalf("scripted run must store the agent briefing: %+v", b)
+	}
+	if b.InputTokens == nil || *b.InputTokens != 17 || b.OutputTokens == nil || *b.OutputTokens != 8 {
+		t.Fatalf("run usage must sum both turns: %+v %+v", b.InputTokens, b.OutputTokens)
+	}
+	if b.CostMicros != nil {
+		t.Fatalf("unsupplied cost must stay unknown: %+v", b.CostMicros)
+	}
+	snap := d.Health.Snapshot()
+	if snap.ProviderCalls != 2 {
+		t.Fatalf("each turn counts a provider call: %+v", snap)
+	}
+	if snap.ProviderInputTokens != 17 || snap.ProviderOutputTokens != 8 {
+		t.Fatalf("health must accumulate supplied tokens: %+v", snap)
+	}
+	if snap.ProviderCostUSD != nil {
+		t.Fatalf("unsupplied cost must stay unknown in health: %+v", snap.ProviderCostUSD)
+	}
+}
+
+func TestAgentConfidenceNeverSetsPriority(t *testing.T) {
+	s := openWorkerStore(t)
+	// An undecodable payload decodes to no host view: baseline Low.
+	gid := seedGroup(t, s, "host:low", "evt-low-1", "host.changed", `{"event_id":"evt-low-1"}`)
+	fake := provider.NewFake()
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		// Abstain with high display-only confidence. Redaction is off
+		// below, so the raw hostname is operator data, not an invention.
+		return provider.RawBriefing{JSON: []byte(agentFinal(
+			[]string{"evt-low-1"}, "printer-2", []any{}, nil))}, nil
+	}
+	d := agentTestDeps(t, s, fake)
+	d.Redaction = redactor.Policy{Enabled: false, MaxFieldChars: 256}
+	// Low floor keeps the single call, not the loop: confidence "high"
+	// beside an abstaining suggestion must leave the low baseline alone.
+	d.ModelMinBaseline = Low
+	d.AgentMinBaseline = High
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("single-call path must progress the group")
+	}
+	b := briefed(t, s, gid)
+	if b.FallbackUsed || b.Source != "model" {
+		t.Fatalf("valid abstain must store a model briefing: %+v", b)
+	}
+	if b.Priority != "low" {
+		t.Fatalf("display-only confidence must not set priority: %+v", b)
+	}
+	if b.Confidence != "high" {
+		t.Fatalf("confidence must still persist as display: %+v", b)
 	}
 }

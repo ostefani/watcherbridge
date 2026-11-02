@@ -13,10 +13,52 @@ import (
 )
 
 // RawBriefing is one model answer: the briefing object as JSON, still
-// tokenized. Adapters extract it from their wire format; briefing-side
-// validation decides whether it is usable.
+// tokenized, plus the adapter-reported accounting for the call.
+// Adapters extract both from their wire format; briefing-side
+// validation decides whether the JSON is usable.
 type RawBriefing struct {
-	JSON []byte
+	JSON  []byte
+	Usage Usage
+}
+
+// Usage is the adapter-reported accounting for one provider call.
+// Token counts apply toward health totals only when HasUsage; cost
+// only when HasCost. Zero values with false flags read as unknown,
+// never as a free call — the adapter simply supplied nothing.
+type Usage struct {
+	InputTokens  int64
+	OutputTokens int64
+	HasUsage     bool
+	CostMicros   int64
+	HasCost      bool
+}
+
+// Add sums two calls' accounting: token counts add, and supplied costs
+// add. A call that supplied nothing contributes nothing — it neither
+// zeroes the other side nor marks the sum unknown. The flags report
+// whether anything was supplied at all.
+func (u Usage) Add(o Usage) Usage {
+	out := Usage{
+		InputTokens:  u.InputTokens + o.InputTokens,
+		OutputTokens: u.OutputTokens + o.OutputTokens,
+		HasUsage:     u.HasUsage || o.HasUsage,
+	}
+	if u.HasCost && o.HasCost {
+		out.CostMicros = u.CostMicros + o.CostMicros
+		out.HasCost = true
+	} else if u.HasCost {
+		out.CostMicros, out.HasCost = u.CostMicros, true
+	} else if o.HasCost {
+		out.CostMicros, out.HasCost = o.CostMicros, true
+	}
+	return out
+}
+
+// TurnResult is one Turner answer: the assistant text plus the
+// adapter-reported accounting for the send.
+type TurnResult struct {
+	Text  string
+	Usage Usage
 }
 
 // Provider synthesizes a briefing from a redacted bundle. Implementations
@@ -53,7 +95,7 @@ type TurnMessage struct {
 // "tool"-role messages; adapters forward them as model input, never
 // execute them.
 type Turner interface {
-	Turn(ctx context.Context, transcript []TurnMessage) (string, error)
+	Turn(ctx context.Context, transcript []TurnMessage) (TurnResult, error)
 }
 
 // responsesContent is one Responses API content part. The bundle (or the
@@ -82,7 +124,7 @@ type responsesRequest struct {
 // repair prompts. It mirrors modelBriefing (internal/briefing): exact
 // fields, token references only. It names no values, so a hostile bundle
 // cannot steer it; the briefing layer re-validates everything regardless.
-const briefingFieldContract = `Respond with exactly one JSON object and no other text, with exactly these fields: "event_ids" (array of all the group's event IDs), "host" (one token copied from the bundle), "what_changed", "context", "model_suggestion" (one of "low", "medium", "high", "critical", or null to abstain), "priority_reason", "recommended_check". Use only tokens that appear in the bundle; invent no new ones.`
+const briefingFieldContract = `Respond with exactly one JSON object and no other text, with exactly these fields: "event_ids" (array of all the group's event IDs), "host" (one token copied from the bundle), "what_changed", "context", "model_suggestion" (one of "low", "medium", "high", "critical", or null to abstain), "priority_reason", "recommended_check", "likely_explanation" (your display-only hypothesis, at most 256 chars), "confidence" (one of "low", "medium", "high"), "evidence_refs" (at most 8 citations, each {"event_id": "<a group event ID>"}). Use only tokens that appear in the bundle; invent no new ones.`
 
 const bundleSystemInstruction = `You summarize redacted network-monitoring bundles. Tokens like IP_1 or HOST_2 stand for real addresses; treat them as opaque identifiers. ` + briefingFieldContract + ` Redacted bundle follows: `
 

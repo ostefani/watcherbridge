@@ -9,13 +9,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ostefani/watcherbridge/internal/provider"
 	"github.com/ostefani/watcherbridge/internal/redactor"
 	"github.com/ostefani/watcherbridge/internal/store"
 )
 
-// modelBriefing is the strict model output schema (Designv5 §7.2). The
-// model answers with tokenized references only; every free-text field is
-// re-capped and restored after the invented-token check passes.
+// modelBriefing is the strict model output schema (Designv5 §7.2,
+// extended by Step 27 with the display-only explanation contract
+// (Designv9 §6.3). The model answers with tokenized references only;
+// every free-text field is re-capped and restored after the
+// invented-token check passes.
 type modelBriefing struct {
 	EventIDs   []string `json:"event_ids"`
 	Host       string   `json:"host"`
@@ -24,6 +27,51 @@ type modelBriefing struct {
 	Suggestion *string  `json:"model_suggestion"`
 	Reason     string   `json:"priority_reason"`
 	Check      string   `json:"recommended_check"`
+	// Likely is the display-only hypothesis; Confidence its display-only
+	// self-assessment. Neither feeds priority, identity or the resolver.
+	Likely     string            `json:"likely_explanation"`
+	Confidence string            `json:"confidence"`
+	Refs       []json.RawMessage `json:"evidence_refs"`
+}
+
+// maxEvidenceRefs caps the model's citations (Designv9 §6.3): at most
+// eight validated real event/tool refs. Fewer — including none — is
+// valid; more is a repair, then a fallback.
+const maxEvidenceRefs = 8
+
+// modelEvidenceRef is one cited target: exactly one of the two keys.
+// Step is a 0-based executed tool step of the producing run.
+type modelEvidenceRef struct {
+	Event *string `json:"event_id"`
+	Step  *int    `json:"tool_step"`
+}
+
+// decodeEvidenceRef parses one citation strictly: no unknown fields, no
+// trailing data, exactly one target. Errors name the broken rule, never
+// values.
+func decodeEvidenceRef(raw json.RawMessage) (modelEvidenceRef, error) {
+	var r modelEvidenceRef
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&r); err != nil {
+		if strings.Contains(err.Error(), "unknown field") {
+			return r, fmt.Errorf("unknown field in evidence ref")
+		}
+		return r, fmt.Errorf("malformed evidence ref")
+	}
+	if dec.More() {
+		return r, fmt.Errorf("trailing data after evidence ref")
+	}
+	if (r.Event == nil) == (r.Step == nil) {
+		return r, fmt.Errorf("evidence ref must name exactly one target")
+	}
+	if r.Event != nil && *r.Event == "" {
+		return r, fmt.Errorf("evidence event ref must be non-empty")
+	}
+	if r.Step != nil && *r.Step < 0 {
+		return r, fmt.Errorf("evidence tool ref must be non-negative")
+	}
+	return r, nil
 }
 
 // decodeModelBriefing parses one attempt strictly: no unknown fields, no
@@ -45,52 +93,92 @@ func decodeModelBriefing(raw []byte) (modelBriefing, error) {
 		return m, fmt.Errorf("trailing data after briefing object")
 	}
 	if len(m.EventIDs) == 0 || m.Host == "" || m.What == "" ||
-		m.Context == "" || m.Reason == "" || m.Check == "" {
+		m.Context == "" || m.Reason == "" || m.Check == "" ||
+		m.Likely == "" || m.Confidence == "" || m.Refs == nil {
 		return m, fmt.Errorf("missing or empty required field")
 	}
 	return m, nil
 }
 
+// maxLikelyRunes caps the display-only hypothesis (Designv9 §6.3:
+// likely_explanation<=256 chars). Restoration expansion rides the
+// separate 256 KiB preflight, never silent truncation.
+const maxLikelyRunes = 256
+
 // checkModelBriefing enforces the content rules: the event set is the
 // group's, the host is an issued token, the suggestion (when present) is a
-// known level, and no text field invents tokens. With redaction off no
-// tokens are issued, so the host and token rules cannot apply — raw values
-// are the operator's explicit choice, and only token-shaped inventions
-// (which restore would mishandle) are still rejected.
-func checkModelBriefing(m modelBriefing, taken store.TakenGroup, issued redactor.TokenMap, tokensEnforced bool) (Level, error) {
+// known level, the explanation is bounded display-only text, confidence is
+// a known self-assessment, every citation names a real group event or a
+// real executed tool step, and no text field invents tokens.
+// maxToolStep is the highest citable 0-based executed step of the
+// producing run (-1 on the single-call path, which executes nothing, so
+// no tool ref is real there). With redaction off no tokens are issued,
+// so the host and token rules cannot apply — raw values are the
+// operator's explicit choice, and only token-shaped inventions (which
+// restore would mishandle) are still rejected.
+func checkModelBriefing(m modelBriefing, taken store.TakenGroup, issued redactor.TokenMap, tokensEnforced bool, maxToolStep int) (Level, []store.EvidenceRef, error) {
 	want := map[string]bool{}
 	for _, ev := range taken.Events {
 		want[ev.EventID] = true
 	}
 	if len(m.EventIDs) != len(want) {
-		return Low, fmt.Errorf("event_ids do not match the group")
+		return Low, nil, fmt.Errorf("event_ids do not match the group")
 	}
 	for _, id := range m.EventIDs {
 		if !want[id] {
-			return Low, fmt.Errorf("event_ids do not match the group")
+			return Low, nil, fmt.Errorf("event_ids do not match the group")
 		}
 	}
 	if tokensEnforced {
 		if _, ok := issued[m.Host]; !ok {
-			return Low, fmt.Errorf("host is not an issued token")
+			return Low, nil, fmt.Errorf("host is not an issued token")
 		}
 	}
 	var suggestion *Level
 	if m.Suggestion != nil {
 		lvl, err := ParseLevel(*m.Suggestion)
 		if err != nil {
-			return Low, fmt.Errorf("model_suggestion is not a known level")
+			return Low, nil, fmt.Errorf("model_suggestion is not a known level")
 		}
 		suggestion = &lvl
 	}
-	joined := m.Host + "\n" + m.What + "\n" + m.Context + "\n" + m.Reason + "\n" + m.Check
+	if len([]rune(m.Likely)) > maxLikelyRunes {
+		return Low, nil, fmt.Errorf("likely_explanation exceeds 256 chars")
+	}
+	switch m.Confidence {
+	case "low", "medium", "high":
+	default:
+		return Low, nil, fmt.Errorf("confidence is not low, medium or high")
+	}
+	if len(m.Refs) > maxEvidenceRefs {
+		return Low, nil, fmt.Errorf("too many evidence refs")
+	}
+	refs := make([]store.EvidenceRef, 0, len(m.Refs))
+	for _, raw := range m.Refs {
+		r, err := decodeEvidenceRef(raw)
+		if err != nil {
+			return Low, nil, err
+		}
+		if r.Event != nil {
+			if !want[*r.Event] {
+				return Low, nil, fmt.Errorf("evidence ref is not a group event")
+			}
+			refs = append(refs, store.EventRef(*r.Event))
+			continue
+		}
+		if *r.Step > maxToolStep {
+			return Low, nil, fmt.Errorf("evidence ref is not a real tool step")
+		}
+		refs = append(refs, store.ToolRef(*r.Step))
+	}
+	joined := m.Host + "\n" + m.What + "\n" + m.Context + "\n" + m.Reason + "\n" + m.Check + "\n" + m.Likely
 	if err := redactor.ValidateTokens(joined, issued); err != nil {
-		return Low, fmt.Errorf("invented tokens present")
+		return Low, nil, fmt.Errorf("invented tokens present")
 	}
 	if suggestion == nil {
-		return Low, errAbstain
+		return Low, refs, errAbstain
 	}
-	return *suggestion, nil
+	return *suggestion, refs, nil
 }
 
 // errAbstain marks a schema-valid answer with suggestion null: not a
@@ -124,7 +212,7 @@ const maxRestoredBytes = 256 << 10
 // restoring with originals measures a different, shorter string.
 func projectedRestoredSize(m modelBriefing, restored redactor.TokenMap) int {
 	total := len(m.Reason)
-	for _, f := range []string{m.What, m.Context, m.Check} {
+	for _, f := range []string{m.What, m.Context, m.Check, m.Likely} {
 		total += redactor.ProjectedRestoreSize(f, restored)
 		if total > maxRestoredBytes {
 			return total
@@ -295,19 +383,24 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 		log.Printf("briefing: group %s provider: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
 		return insertFallback(ctx, d, taken, outcome, "model call failed; briefing from deterministic baseline only")
 	}
-	a := acceptAnswer(answer.JSON, taken, issued, d.Redaction.Enabled)
+	d.Health.AddUsage(answer.Usage)
+	usage := answer.Usage
+	// The single call executes no tools, so no tool_step ref is real.
+	a := acceptAnswer(answer.JSON, taken, issued, d.Redaction.Enabled, -1)
 	if !a.OK {
 		repair, err := d.Provider.Repair(modelCtx, repairPrompt(a.Correction), valid)
 		if err != nil {
 			log.Printf("briefing: group %s repair: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
 			return insertFallback(ctx, d, taken, outcome, "model repair failed; briefing from deterministic baseline only")
 		}
-		if a = acceptAnswer(repair.JSON, taken, issued, d.Redaction.Enabled); !a.OK {
+		d.Health.AddUsage(repair.Usage)
+		usage = usage.Add(repair.Usage)
+		if a = acceptAnswer(repair.JSON, taken, issued, d.Redaction.Enabled, -1); !a.OK {
 			log.Printf("briefing: group %s model invalid after repair (%s)", taken.GroupID, a.Correction)
 			return insertFallback(ctx, d, taken, outcome, "model output invalid; briefing from deterministic baseline only")
 		}
 	}
-	return insertModelBriefing(ctx, d, taken, outcome, a, issued, display, "model")
+	return insertModelBriefing(ctx, d, taken, outcome, a, issued, display, "model", nil, usage)
 }
 
 // insertModelBriefing stores one validated model answer: the suggestion
@@ -316,7 +409,7 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 // the path ("model" for the single call, "agent" for the loop, Designv9
 // §6.1) so the audit trail distinguishes them. Every error path releases
 // or parks the group — never silently drops it.
-func insertModelBriefing(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome, a answer, issued, display redactor.TokenMap, source string) bool {
+func insertModelBriefing(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome, a answer, issued, display redactor.TokenMap, source string, traces []store.AgentTrace, usage provider.Usage) bool {
 	m, suggestion, rawJSON := a.Model, a.Suggestion, a.Raw
 	final, clamped := Resolve(outcome.Level, suggestion)
 	now := time.Now()
@@ -342,25 +435,40 @@ func insertModelBriefing(ctx context.Context, d Deps, taken store.TakenGroup, ou
 	what := plainText(redactor.Restore(m.What, effective))
 	briefCtx := plainText(redactor.Restore(m.Context, effective))
 	check := plainText(redactor.Restore(m.Check, effective))
+	likely := plainText(redactor.Restore(m.Likely, effective))
 	reason := plainText(m.Reason)
 	b := store.Briefing{
-		BriefingID:       "brf-" + taken.GroupID,
-		GroupID:          taken.GroupID,
-		HostAnchorKey:    taken.Anchor,
-		Baseline:         outcome.Level.String(),
-		ModelSuggestion:  sug,
-		Priority:         final.String(),
-		PriorityReason:   reason,
-		BaselineRule:     outcome.RuleID,
-		Kind:             KindForTaken(taken, outcome.RuleID),
-		Source:           source,
-		Clamped:          clamped,
-		FallbackUsed:     false,
-		WhatChanged:      what,
-		Context:          briefCtx,
-		RecommendedCheck: check,
-		ModelRawJSON:     string(rawJSON),
-		CreatedAt:        now,
+		BriefingID:        "brf-" + taken.GroupID,
+		GroupID:           taken.GroupID,
+		HostAnchorKey:     taken.Anchor,
+		Baseline:          outcome.Level.String(),
+		ModelSuggestion:   sug,
+		Priority:          final.String(),
+		PriorityReason:    reason,
+		BaselineRule:      outcome.RuleID,
+		Kind:              KindForTaken(taken, outcome.RuleID),
+		Source:            source,
+		Clamped:           clamped,
+		FallbackUsed:      false,
+		WhatChanged:       what,
+		Context:           briefCtx,
+		RecommendedCheck:  check,
+		ModelRawJSON:      string(rawJSON),
+		CreatedAt:         now,
+		LikelyExplanation: &likely,
+		Confidence:        m.Confidence,
+		EvidenceRefs:      a.Refs,
+		Traces:            traces,
+	}
+	// Adapter-reported accounting rides only when supplied: nil reads
+	// as unknown, never as a free call.
+	if usage.HasUsage {
+		in, out := usage.InputTokens, usage.OutputTokens
+		b.InputTokens, b.OutputTokens = &in, &out
+	}
+	if usage.HasCost {
+		cost := usage.CostMicros
+		b.CostMicros = &cost
 	}
 	if err := d.Store.InsertBriefing(ctx, b); err != nil {
 		log.Printf("briefing: group %s insert: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
@@ -391,38 +499,43 @@ func restoreMap(issued, display redactor.TokenMap) redactor.TokenMap {
 }
 
 // answer is one model attempt: the decoded briefing and suggestion when
-// valid (a null suggestion abstains and the baseline stands), the raw
-// bytes for the audit trail, or the fixed-kind rejection when invalid.
+// valid (a null suggestion abstains and the baseline stands), the
+// validated citations, the raw bytes for the audit trail, or the
+// fixed-kind rejection when invalid.
 type answer struct {
 	Model      modelBriefing
 	Suggestion *Level
+	Refs       []store.EvidenceRef
 	Raw        []byte
 	OK         bool
 	Correction string // rejection kind when !OK; never bundle content
 }
 
 // acceptAnswer validates one model answer. A null suggestion is valid
-// (the baseline stands, model text still used). Correction prompts quote
-// the schema error kind only — never bundle content, so a hostile bundle
-// cannot steer the retry.
-func acceptAnswer(raw []byte, taken store.TakenGroup, issued redactor.TokenMap, tokensEnforced bool) answer {
+// (the baseline stands, model text still used). maxToolStep bounds the
+// citable executed steps (-1 where the producer executes nothing).
+// Correction prompts quote the schema error kind only — never bundle
+// content, so a hostile bundle cannot steer the retry.
+func acceptAnswer(raw []byte, taken store.TakenGroup, issued redactor.TokenMap, tokensEnforced bool, maxToolStep int) answer {
 	decoded, err := decodeModelBriefing(raw)
 	if err != nil {
 		return answer{Correction: err.Error()}
 	}
-	lvl, err := checkModelBriefing(decoded, taken, issued, tokensEnforced)
+	lvl, refs, err := checkModelBriefing(decoded, taken, issued, tokensEnforced, maxToolStep)
 	if err != nil {
 		if err == errAbstain {
-			return answer{Model: decoded, Raw: raw, OK: true}
+			return answer{Model: decoded, Refs: refs, Raw: raw, OK: true}
 		}
 		return answer{Correction: err.Error()}
 	}
 	lvlCopy := lvl
-	return answer{Model: decoded, Suggestion: &lvlCopy, Raw: raw, OK: true}
+	return answer{Model: decoded, Suggestion: &lvlCopy, Refs: refs, Raw: raw, OK: true}
 }
 
 // repairPrompt frames the single bounded retry: the schema error kind plus
 // an instruction to re-emit the full object. No bundle content travels.
 func repairPrompt(kind string) string {
-	return "Your briefing object was rejected (" + kind + "). Re-emit the complete briefing object as strict JSON with exactly the documented fields."
+	return "Your briefing object was rejected (" + kind + "). Re-emit the complete briefing object as strict JSON with exactly the documented fields, " +
+		"including likely_explanation (your display-only hypothesis, at most 256 chars), confidence (low, medium or high), and evidence_refs " +
+		"(at most 8 citations, each {\"event_id\": \"<a group event ID>\"}; there are no tool steps on this path)."
 }

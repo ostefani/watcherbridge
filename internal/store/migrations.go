@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 20
+const supportedSchemaVersion = 21
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -148,6 +148,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 19, migrateV19)
 		case 19:
 			err = applyMigration(db, 20, migrateV20)
+		case 20:
+			err = applyMigration(db, 21, migrateV21)
 		}
 		if err != nil {
 			return err
@@ -353,6 +355,42 @@ func migrateV19(tx *sql.Tx) error {
 func migrateV20(tx *sql.Tx) error {
 	if _, err := tx.Exec(`ALTER TABLE operator_decisions ADD COLUMN head_asof TEXT`); err != nil {
 		return err
+	}
+	return nil
+}
+
+// migrateV21 adds the Step 27 investigator audit surface (Designv9
+// §6.3): display-only explanation fields and usage accounting on
+// briefings, the tokenized agent_traces audit table, and its purge
+// ledger column. Every briefing column stays nullable: retained rows
+// predate the fields and deterministic briefings carry no model
+// output, so NULL reads as unknown rather than a fabricated value. A
+// plain ADD COLUMN plus one new table suffices — no rebuild.
+func migrateV21(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE briefings ADD COLUMN likely_explanation TEXT`,
+		`ALTER TABLE briefings ADD COLUMN confidence TEXT CHECK(confidence IN ('low','medium','high'))`,
+		`ALTER TABLE briefings ADD COLUMN evidence_refs_json TEXT`,
+		`ALTER TABLE briefings ADD COLUMN input_tokens INTEGER`,
+		`ALTER TABLE briefings ADD COLUMN output_tokens INTEGER`,
+		`ALTER TABLE briefings ADD COLUMN cost_micros INTEGER`,
+		`CREATE TABLE agent_traces (
+			briefing_id TEXT NOT NULL,
+			step INTEGER NOT NULL,
+			tool TEXT NOT NULL,
+			args_json TEXT NOT NULL DEFAULT '',
+			result_json TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL CHECK(status IN ('ok','blocked','error')),
+			duration_ms INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY(briefing_id, step)
+		)`,
+		`CREATE INDEX agent_traces_briefing ON agent_traces(briefing_id, step)`,
+		`ALTER TABLE purge_runs ADD COLUMN traces_deleted INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
 	}
 	return nil
 }

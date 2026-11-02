@@ -24,13 +24,69 @@ type Briefing struct {
 	CreatedAt                                    time.Time
 	EventIDs                                     []string // derived from group_events when empty
 	Seq                                          int64    // resumable-stream cursor (migration v8), 1-based, gaps after purge
+	// LikelyExplanation is the model's display-only hypothesis
+	// (Designv9 §6.3): nil for deterministic rows and pre-migration
+	// rows, which carry no model output. It never feeds priority,
+	// identity or the resolver.
+	LikelyExplanation *string
+	// Confidence is the model's display-only self-assessment: "" reads
+	// as unknown, otherwise low|medium|high. Display only, like the
+	// explanation it qualifies.
+	Confidence string
+	// EvidenceRefs are the model's validated citations: real group
+	// events and real 0-based executed tool steps of the producing run.
+	EvidenceRefs []EvidenceRef
+	// InputTokens, OutputTokens and CostMicros are the adapter-reported
+	// accounting for the producing provider calls; nil means the
+	// adapter supplied none (unknown, never zero-filled).
+	InputTokens  *int64
+	OutputTokens *int64
+	CostMicros   *int64
+	// Traces is write-only input for InsertBriefing: the run's executed
+	// tool steps, stored atomically with the briefing so a restart can
+	// never orphan or duplicate them. Never populated on reads; use
+	// AgentTraces for that.
+	Traces []AgentTrace
 }
+
+// EvidenceRef is one validated model citation (Designv9 §6.3): either a
+// real group event or a real 0-based executed tool step of the run.
+// ToolStep is -1 when the ref names an event.
+type EvidenceRef struct {
+	EventID  string
+	ToolStep int
+}
+
+// EventRef names a group event citation.
+func EventRef(eventID string) EvidenceRef { return EvidenceRef{EventID: eventID, ToolStep: -1} }
+
+// ToolRef names an executed tool-step citation (0-based).
+func ToolRef(step int) EvidenceRef { return EvidenceRef{ToolStep: step} }
+
+// AgentTrace is one executed investigator tool step (Designv9 §6.3):
+// validated args and the leak-scanned result envelope, both tokenized,
+// never raw identifiers or rejected free text. Steps are dense and
+// 0-based in execution order, so finals can cite them.
+type AgentTrace struct {
+	BriefingID string
+	Step       int
+	Tool       string
+	ArgsJSON   string
+	ResultJSON string
+	Status     string // ok|blocked|error: the result envelope kind
+	DurationMS int64
+}
+
+// maxAgentTraceRows caps the trace read: executions are bounded by the
+// run's step budget, so this is a backstop, not a limit the loop can hit.
+const maxAgentTraceRows = 32
 
 // briefingColumns is the single column list for every briefing read;
 // seq rides along so the API, the SSE id: field and replay share it.
 const briefingColumns = `briefing_id, group_id, host_anchor_key, baseline, model_suggestion,
 	priority, priority_reason, baseline_rule, kind, source, clamped, fallback_used, what_changed, context,
-	recommended_check, model_raw_json, created_at, event_ids_json, seq, grouping_version`
+	recommended_check, model_raw_json, created_at, event_ids_json, seq, grouping_version,
+	likely_explanation, confidence, evidence_refs_json, input_tokens, output_tokens, cost_micros`
 
 func scanBriefing(rows interface {
 	Scan(dest ...any) error
@@ -38,9 +94,12 @@ func scanBriefing(rows interface {
 	var suggestion, rule, rawJSON sql.NullString
 	var eventIDs string
 	var created int64
+	var explanation, confidence, refsJSON sql.NullString
+	var inputTokens, outputTokens, costMicros sql.NullInt64
 	if err := rows.Scan(&b.BriefingID, &b.GroupID, &b.HostAnchorKey, &b.Baseline, &suggestion,
 		&b.Priority, &b.PriorityReason, &rule, &b.Kind, &b.Source, &b.Clamped, &b.FallbackUsed, &b.WhatChanged, &b.Context,
-		&b.RecommendedCheck, &rawJSON, &created, &eventIDs, &b.Seq, &b.GroupingVersion); err != nil {
+		&b.RecommendedCheck, &rawJSON, &created, &eventIDs, &b.Seq, &b.GroupingVersion,
+		&explanation, &confidence, &refsJSON, &inputTokens, &outputTokens, &costMicros); err != nil {
 		return err
 	}
 	if suggestion.Valid {
@@ -58,7 +117,91 @@ func scanBriefing(rows interface {
 			return err
 		}
 	}
+	// The Step 27 fields stay nullable for the same reason: retained
+	// and deterministic rows predate model output, so NULL reads as
+	// unknown rather than failing the briefing read.
+	if explanation.Valid {
+		b.LikelyExplanation = &explanation.String
+	}
+	b.Confidence = confidence.String
+	if refsJSON.Valid && refsJSON.String != "" {
+		refs, err := parseEvidenceRefs(refsJSON.String)
+		if err != nil {
+			return err
+		}
+		b.EvidenceRefs = refs
+	}
+	if inputTokens.Valid {
+		b.InputTokens = &inputTokens.Int64
+	}
+	if outputTokens.Valid {
+		b.OutputTokens = &outputTokens.Int64
+	}
+	if costMicros.Valid {
+		b.CostMicros = &costMicros.Int64
+	}
 	return nil
+}
+
+// marshalEvidenceRefs encodes refs for storage: one object per ref with
+// exactly one key, so the read inverse stays unambiguous.
+func marshalEvidenceRefs(refs []EvidenceRef) (string, error) {
+	if len(refs) == 0 {
+		return "", nil
+	}
+	out := make([]map[string]any, 0, len(refs))
+	for _, r := range refs {
+		if r.ToolStep >= 0 {
+			if r.EventID != "" {
+				return "", fmt.Errorf("evidence ref names both an event and a tool step")
+			}
+			out = append(out, map[string]any{"tool_step": r.ToolStep})
+			continue
+		}
+		if r.EventID == "" {
+			return "", fmt.Errorf("evidence ref names neither an event nor a tool step")
+		}
+		out = append(out, map[string]any{"event_id": r.EventID})
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+// parseEvidenceRefs decodes the stored refs column: NULL/empty reads as
+// no refs; corrupt JSON fails the read loudly rather than inventing or
+// dropping citations.
+func parseEvidenceRefs(raw string) ([]EvidenceRef, error) {
+	var items []map[string]any
+	if err := json.Unmarshal([]byte(raw), &items); err != nil {
+		return nil, err
+	}
+	out := make([]EvidenceRef, 0, len(items))
+	for _, item := range items {
+		if len(item) != 1 {
+			return nil, fmt.Errorf("evidence ref must name exactly one target")
+		}
+		if id, ok := item["event_id"]; ok {
+			s, ok := id.(string)
+			if !ok || s == "" {
+				return nil, fmt.Errorf("evidence event ref must be a non-empty string")
+			}
+			out = append(out, EventRef(s))
+			continue
+		}
+		if step, ok := item["tool_step"]; ok {
+			f, ok := step.(float64)
+			if !ok || f < 0 || f != float64(int(f)) {
+				return nil, fmt.Errorf("evidence tool ref must be a non-negative integer")
+			}
+			out = append(out, ToolRef(int(f)))
+			continue
+		}
+		return nil, fmt.Errorf("evidence ref names an unknown target")
+	}
+	return out, nil
 }
 
 // BriefingForGroup reads the briefing row for a group, if any.
@@ -247,10 +390,42 @@ func (s *Store) InsertBriefing(ctx context.Context, b Briefing) error {
 		if err := tx.QueryRow(`UPDATE seq_state SET next_seq = next_seq + 1 WHERE id = 0 RETURNING next_seq - 1`).Scan(&seq); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`INSERT INTO briefings (briefing_id, group_id, host_anchor_key, baseline, model_suggestion, priority, priority_reason, baseline_rule, kind, source, clamped, fallback_used, what_changed, context, recommended_check, model_raw_json, created_at, event_ids_json, seq, grouping_version)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			b.BriefingID, b.GroupID, b.HostAnchorKey, b.Baseline, b.ModelSuggestion, b.Priority, b.PriorityReason, ruleArg, kind, source, b.Clamped, b.FallbackUsed, b.WhatChanged, b.Context, b.RecommendedCheck, b.ModelRawJSON, nanos(b.CreatedAt), string(eventIDsJSON), seq, groupingVersion); err != nil {
+		refsJSON, err := marshalEvidenceRefs(b.EvidenceRefs)
+		if err != nil {
 			return err
+		}
+		var refsArg any
+		if refsJSON != "" {
+			refsArg = refsJSON
+		}
+		var explanationArg any
+		if b.LikelyExplanation != nil {
+			explanationArg = *b.LikelyExplanation
+		}
+		var confidenceArg any
+		if b.Confidence != "" {
+			confidenceArg = b.Confidence
+		}
+		if _, err := tx.Exec(`INSERT INTO briefings (briefing_id, group_id, host_anchor_key, baseline, model_suggestion, priority, priority_reason, baseline_rule, kind, source, clamped, fallback_used, what_changed, context, recommended_check, model_raw_json, created_at, event_ids_json, seq, grouping_version,
+			likely_explanation, confidence, evidence_refs_json, input_tokens, output_tokens, cost_micros)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			b.BriefingID, b.GroupID, b.HostAnchorKey, b.Baseline, b.ModelSuggestion, b.Priority, b.PriorityReason, ruleArg, kind, source, b.Clamped, b.FallbackUsed, b.WhatChanged, b.Context, b.RecommendedCheck, b.ModelRawJSON, nanos(b.CreatedAt), string(eventIDsJSON), seq, groupingVersion,
+			explanationArg, confidenceArg, refsArg, b.InputTokens, b.OutputTokens, b.CostMicros); err != nil {
+			return err
+		}
+		// Trace steps ride the briefing transaction: a restart that
+		// loses the briefing race inserts nothing, so traces can never
+		// orphan or duplicate. Steps must be dense and 0-based —
+		// finals cite them by index.
+		for i, tr := range b.Traces {
+			if tr.Step != i {
+				return fmt.Errorf("agent trace steps must be dense 0-based, got step %d at index %d", tr.Step, i)
+			}
+			if _, err := tx.Exec(`INSERT INTO agent_traces (briefing_id, step, tool, args_json, result_json, status, duration_ms)
+				VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				b.BriefingID, tr.Step, tr.Tool, tr.ArgsJSON, tr.ResultJSON, tr.Status, tr.DurationMS); err != nil {
+				return err
+			}
 		}
 		res, err := tx.Exec(`UPDATE active_groups SET status = 'done' WHERE group_id = ? AND status = 'processing'`, b.GroupID)
 		if err != nil {
@@ -270,6 +445,33 @@ func (s *Store) InsertBriefing(ctx context.Context, b Briefing) error {
 		}
 		return nil
 	})
+}
+
+// AgentTraces reads one briefing's executed tool steps in 0-based
+// order. The read carries its own row cap: executions are bounded by
+// the run's step budget, so ordinary runs never approach it.
+func (s *Store) AgentTraces(ctx context.Context, briefingID string) ([]AgentTrace, error) {
+	if briefingID == "" {
+		return nil, fmt.Errorf("empty briefing id")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT briefing_id, step, tool, args_json, result_json, status, duration_ms
+		FROM agent_traces WHERE briefing_id = ? ORDER BY step ASC LIMIT ?`, briefingID, maxAgentTraceRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AgentTrace
+	for rows.Next() {
+		var tr AgentTrace
+		if err := rows.Scan(&tr.BriefingID, &tr.Step, &tr.Tool, &tr.ArgsJSON, &tr.ResultJSON, &tr.Status, &tr.DurationMS); err != nil {
+			return nil, err
+		}
+		out = append(out, tr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // SubjectBriefing is the tool-sized briefing projection for Step 26

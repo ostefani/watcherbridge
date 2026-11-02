@@ -89,12 +89,23 @@ func validAnswer(t tb, payload []byte, toks map[string]struct{}, suggestion *str
 		"event_ids": bundle.EventIDs, "host": host, "what_changed": what,
 		"context": "context for " + host, "model_suggestion": suggestion,
 		"priority_reason": "because reasons", "recommended_check": "look",
+		"likely_explanation": "likely " + host, "confidence": "medium",
+		"evidence_refs": eventRefs(bundle.EventIDs),
 	}
 	b, err := json.Marshal(m)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// eventRefs cites the first group event for schema-complete test
+// finals; empty input yields no refs, which the schema allows.
+func eventRefs(eventIDs []string) []any {
+	if len(eventIDs) == 0 {
+		return []any{}
+	}
+	return []any{map[string]any{"event_id": eventIDs[0]}}
 }
 
 func strptr(s string) *string { return &s }
@@ -281,6 +292,8 @@ func TestRestoredBudgetFallsBackWithDistinctReason(t *testing.T) {
 			"what_changed": strings.Repeat(ips[0]+" ", 1<<15),
 			"context":      "context for " + hosts[0], "model_suggestion": nil,
 			"priority_reason": "because reasons", "recommended_check": "look",
+			"likely_explanation": "likely", "confidence": "low",
+			"evidence_refs": eventRefs(bundle.EventIDs),
 		}
 		b, err := json.Marshal(m)
 		if err != nil {
@@ -335,6 +348,8 @@ func TestRestoredBudgetUsesDisplaySpelling(t *testing.T) {
 			"what_changed": strings.Repeat(ips[0]+" ", 8000),
 			"context":      "context", "model_suggestion": nil,
 			"priority_reason": "because reasons", "recommended_check": "look",
+			"likely_explanation": "likely", "confidence": "low",
+			"evidence_refs": eventRefs(parsed.EventIDs),
 		}
 		raw, err := json.Marshal(m)
 		if err != nil {
@@ -558,6 +573,8 @@ func TestRedactionOffPassesRawWithWarning(t *testing.T) {
 			"event_ids": bundle.EventIDs, "host": "p", "what_changed": "traffic from 192.168.0.5",
 			"context": "raw context", "model_suggestion": "high",
 			"priority_reason": "raw reason", "recommended_check": "raw check",
+			"likely_explanation": "likely raw", "confidence": "high",
+			"evidence_refs": eventRefs(bundle.EventIDs),
 		}
 		b, _ := json.Marshal(m)
 		return provider.RawBriefing{JSON: b}, nil
@@ -690,6 +707,8 @@ func TestProcessingVisibleWhileProviderBlocked(t *testing.T) {
 			"event_ids": bundle.EventIDs, "host": host,
 			"what_changed": "w", "context": "c", "model_suggestion": nil,
 			"priority_reason": "r", "recommended_check": "k",
+			"likely_explanation": "likely", "confidence": "low",
+			"evidence_refs": eventRefs(bundle.EventIDs),
 		})
 		if err != nil {
 			return provider.RawBriefing{}, err
@@ -827,12 +846,13 @@ func TestProjectionProgressesWhileProviderBlocked(t *testing.T) {
 }
 
 func TestDecodeModelBriefingRejects(t *testing.T) {
-	full := `{"event_ids":["e1"],"host":"HOST_1","what_changed":"w","context":"c","model_suggestion":"high","priority_reason":"r","recommended_check":"k"}`
+	full := `{"event_ids":["e1"],"host":"HOST_1","what_changed":"w","context":"c","model_suggestion":"high","priority_reason":"r","recommended_check":"k","likely_explanation":"likely","confidence":"high","evidence_refs":[{"event_id":"e1"}]}`
 	for name, raw := range map[string]string{
-		"unknown field": strings.Replace(full, `"recommended_check"`, `"bogus","recommended_check"`, 1),
-		"trailing data": full + " {}",
-		"empty field":   strings.Replace(full, `"what_changed":"w"`, `"what_changed":""`, 1),
-		"not json":      `{"event_ids":`,
+		"unknown field":  strings.Replace(full, `"recommended_check"`, `"bogus","recommended_check"`, 1),
+		"trailing data":  full + " {}",
+		"empty field":    strings.Replace(full, `"what_changed":"w"`, `"what_changed":""`, 1),
+		"missing likely": strings.Replace(full, `,"likely_explanation":"likely"`, ``, 1),
+		"not json":       `{"event_ids":`,
 	} {
 		if _, err := decodeModelBriefing([]byte(raw)); err == nil {
 			t.Fatalf("%s: expected rejection", name)
@@ -847,10 +867,11 @@ func TestCheckModelBriefingRules(t *testing.T) {
 	taken := store.TakenGroup{Events: []store.RawEvent{{EventID: "e1"}}}
 	issued := redactor.TokenMap{"HOST_1": "w", "IP_1": "10.0.0.1"}
 	base := modelBriefing{EventIDs: []string{"e1"}, Host: "HOST_1", What: "saw IP_1",
-		Context: "c", Reason: "r", Check: "k"}
+		Context: "c", Reason: "r", Check: "k", Likely: "likely IP_1", Confidence: "medium",
+		Refs: []json.RawMessage{json.RawMessage(`{"event_id":"e1"}`)}}
 	sug := "medium"
 	base.Suggestion = &sug
-	if _, err := checkModelBriefing(base, taken, issued, true); err != nil {
+	if _, _, err := checkModelBriefing(base, taken, issued, true, 0); err != nil {
 		t.Fatalf("valid rejected: %v", err)
 	}
 	cases := map[string]func(*modelBriefing){
@@ -858,24 +879,48 @@ func TestCheckModelBriefingRules(t *testing.T) {
 		"foreign host":   func(m *modelBriefing) { m.Host = "HOST_9" },
 		"bad level":      func(m *modelBriefing) { s := "urgent"; m.Suggestion = &s },
 		"invented token": func(m *modelBriefing) { m.What = "saw IP_9" },
+		"bad confidence": func(m *modelBriefing) { m.Confidence = "certain" },
+		"oversized likely": func(m *modelBriefing) {
+			m.Likely = strings.Repeat("x", maxLikelyRunes+1)
+		},
+		"invented event ref": func(m *modelBriefing) {
+			m.Refs = []json.RawMessage{json.RawMessage(`{"event_id":"e9"}`)}
+		},
+		"tool ref past the last step": func(m *modelBriefing) {
+			m.Refs = []json.RawMessage{json.RawMessage(`{"tool_step":5}`)}
+		},
+		"malformed ref": func(m *modelBriefing) {
+			m.Refs = []json.RawMessage{json.RawMessage(`{"event_id":"e1","tool_step":0}`)}
+		},
 	}
 	for name, mutate := range cases {
 		m := base
 		mutate(&m)
-		if _, err := checkModelBriefing(m, taken, issued, true); err == nil {
+		if _, _, err := checkModelBriefing(m, taken, issued, true, 0); err == nil {
 			t.Fatalf("%s: expected rejection", name)
 		}
+	}
+	// A real executed step is citable; anything past it is invented.
+	withStep := base
+	withStep.Refs = []json.RawMessage{json.RawMessage(`{"tool_step":0}`)}
+	if _, _, err := checkModelBriefing(withStep, taken, issued, true, 0); err != nil {
+		t.Fatalf("real tool step rejected: %v", err)
+	}
+	withStep.Refs = []json.RawMessage{json.RawMessage(`{"tool_step":1}`)}
+	if _, _, err := checkModelBriefing(withStep, taken, issued, true, 0); err == nil {
+		t.Fatal("unexecuted tool step must fail")
 	}
 	// Redaction off: unissued host is raw data, not an invention; a
 	// token-shaped string still fails.
 	off := base
 	off.Host = "printer-2"
+	off.Likely = "likely printer"
 	off.What = "saw 10.0.0.1"
-	if _, err := checkModelBriefing(off, taken, redactor.TokenMap{}, false); err != nil {
+	if _, _, err := checkModelBriefing(off, taken, redactor.TokenMap{}, false, 0); err != nil {
 		t.Fatalf("redaction-off raw host rejected: %v", err)
 	}
 	off.What = "saw IP_9"
-	if _, err := checkModelBriefing(off, taken, redactor.TokenMap{}, false); err == nil {
+	if _, _, err := checkModelBriefing(off, taken, redactor.TokenMap{}, false, 0); err == nil {
 		t.Fatal("token-shaped invention must fail even with redaction off")
 	}
 }

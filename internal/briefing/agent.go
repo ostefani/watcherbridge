@@ -83,7 +83,10 @@ func repairPromptForTurn(correction string) string {
 	return "That turn was rejected (" + correction + "). Reply with exactly one JSON object: either a tool call " +
 		`{"tool": "<name>", "arguments": {...}} or the final briefing ` +
 		`{"event_ids": [...], "host": "<token>", "what_changed": "...", "context": "...", ` +
-		`"model_suggestion": "low"|"medium"|"high"|"critical"|null, "priority_reason": "...", "recommended_check": "..."}. ` +
+		`"model_suggestion": "low"|"medium"|"high"|"critical"|null, "priority_reason": "...", "recommended_check": "...", ` +
+		`"likely_explanation": "...", "confidence": "low"|"medium"|"high", "evidence_refs": [...]}. ` +
+		`likely_explanation is your display-only hypothesis (at most 256 chars); evidence_refs holds at most 8 citations, ` +
+		`each {"event_id": "<a group event ID>"} or {"tool_step": <a 0-based executed tool step of this run>}. ` +
 		"Use only issued tokens: bundle tokens or subject tokens from earlier tool results."
 }
 
@@ -106,6 +109,7 @@ type agentLoop struct {
 	provider time.Duration
 	repair   bool // the one repair per run, shared by every failure
 	fallback string
+	usage    provider.Usage // adapter-reported accounting summed over the run's sends
 }
 
 // runAgent runs the bounded investigator loop for one taken group and
@@ -249,9 +253,9 @@ func (l *agentLoop) toolTurn(k int) (done bool) {
 		return false
 	}
 	if final {
-		a := acceptAnswer([]byte(text), l.taken, l.issued, l.d.Redaction.Enabled)
+		a := acceptAnswer([]byte(text), l.taken, l.issued, l.d.Redaction.Enabled, l.maxToolStep())
 		if a.OK {
-			insertModelBriefing(l.parent, l.d, l.taken, l.outcome, a, l.issued, l.display, "agent")
+			insertModelBriefing(l.parent, l.d, l.taken, l.outcome, a, l.issued, l.display, "agent", l.traces(), l.usage)
 			return true
 		}
 		return l.repairFlow(turnCtx, repairPrompt(a.Correction), true)
@@ -286,9 +290,9 @@ func (l *agentLoop) finalTurn() bool {
 		final = false
 	}
 	if final {
-		a := acceptAnswer([]byte(text), l.taken, l.issued, l.d.Redaction.Enabled)
+		a := acceptAnswer([]byte(text), l.taken, l.issued, l.d.Redaction.Enabled, l.maxToolStep())
 		if a.OK {
-			insertModelBriefing(l.parent, l.d, l.taken, l.outcome, a, l.issued, l.display, "agent")
+			insertModelBriefing(l.parent, l.d, l.taken, l.outcome, a, l.issued, l.display, "agent", l.traces(), l.usage)
 			return l.finish()
 		}
 		l.repairFlow(turnCtx, repairPrompt(a.Correction), false)
@@ -339,8 +343,8 @@ func (l *agentLoop) repairFlow(turnCtx context.Context, prompt string, allowTool
 		return false
 	}
 	if f2 {
-		if a := acceptAnswer([]byte(rep), l.taken, l.issued, l.d.Redaction.Enabled); a.OK {
-			insertModelBriefing(l.parent, l.d, l.taken, l.outcome, a, l.issued, l.display, "agent")
+		if a := acceptAnswer([]byte(rep), l.taken, l.issued, l.d.Redaction.Enabled, l.maxToolStep()); a.OK {
+			insertModelBriefing(l.parent, l.d, l.taken, l.outcome, a, l.issued, l.display, "agent", l.traces(), l.usage)
 			return true
 		}
 		log.Printf("briefing: group %s agent final invalid after repair", l.taken.GroupID)
@@ -369,9 +373,11 @@ func (l *agentLoop) turn(turnCtx context.Context) (string, error) {
 	if reason := l.scanTranscript(); reason != "" {
 		return "", &transcriptBlockedError{reason: reason}
 	}
-	text, err := l.turner.Turn(turnCtx, l.env.transcript)
+	res, err := l.turner.Turn(turnCtx, l.env.transcript)
 	l.d.Health.AddProviderCall()
-	return text, err
+	l.d.Health.AddUsage(res.Usage)
+	l.usage = l.usage.Add(res.Usage)
+	return res.Text, err
 }
 
 // scanTranscript enforces the run byte cap and the fail-closed leak
@@ -647,6 +653,19 @@ func (l *agentLoop) runCtx() context.Context {
 	return l.ctx
 }
 
+// maxToolStep bounds the citable executed steps: the highest 0-based
+// index so far, or -1 before the first execution, when no tool ref is
+// real yet.
+func (l *agentLoop) maxToolStep() int {
+	return len(l.env.execs) - 1
+}
+
+// traces converts the run's executed steps into store rows addressed
+// at this group's briefing for the atomic insert.
+func (l *agentLoop) traces() []store.AgentTrace {
+	return l.env.traces("brf-" + l.taken.GroupID)
+}
+
 // appendAssistant appends one assistant message, enforcing the run byte
 // cap before any send. It returns the fallback reason when over budget.
 func (l *agentLoop) appendAssistant(text string) string {
@@ -702,6 +721,7 @@ type agentEnv struct {
 	seenEvents map[string]bool   // every event ID already cleared to cross:
 	// the group's own plus scanned-clean tool result events
 	transcript []provider.TurnMessage
+	execs      []toolExec // executed tool calls in order; finals cite them by index
 }
 
 // newAgentEnv builds the environment with the inverted token map. The
@@ -850,7 +870,10 @@ func (e *agentEnv) systemPrompt(outcome Outcome) string {
 		"a tool call {\"tool\": \"<name>\", \"arguments\": {...}} or the final briefing " +
 		"{\"event_ids\": [...all group event IDs...], \"host\": \"<one bundle token>\", \"what_changed\": \"...\", " +
 		"\"context\": \"...\", \"model_suggestion\": \"low\"|\"medium\"|\"high\"|\"critical\"|null, " +
-		"\"priority_reason\": \"...\", \"recommended_check\": \"...\"}. " +
+		"\"priority_reason\": \"...\", \"recommended_check\": \"...\", " +
+		"\"likely_explanation\": \"...\", \"confidence\": \"low\"|\"medium\"|\"high\", \"evidence_refs\": [...]}. " +
+		"likely_explanation is your display-only hypothesis (at most 256 chars); evidence_refs holds at most 8 citations, " +
+		"each {\"event_id\": \"<a group event ID>\"} or {\"tool_step\": <a 0-based executed tool step of this run>}. " +
 		"Tools (integer arguments are JSON numbers): " +
 		"get_reported_profile{host} (scanner-reported attributes, provenance, report age, reference class, missing fields), " +
 		"get_reported_history{host, limit 1-10 default 4} (retained briefings and associated reported events, newest first), " +
@@ -923,7 +946,8 @@ func parseTurn(text string) (call *toolCall, final bool, correction string) {
 		for k := range shape {
 			switch k {
 			case "event_ids", "host", "what_changed", "context",
-				"model_suggestion", "priority_reason", "recommended_check":
+				"model_suggestion", "priority_reason", "recommended_check",
+				"likely_explanation", "confidence", "evidence_refs":
 			default:
 				return nil, false, "unknown field in final briefing"
 			}
@@ -1007,6 +1031,11 @@ func (e *agentEnv) runTool(turnCtx context.Context, call *toolCall) string {
 	if reject != "" {
 		return turnReject(reject)
 	}
+	// The call is authorized: whatever follows is an execution the
+	// trace records — including error and blocked envelopes, which are
+	// fixed safe shapes. Rejected turns (above) never execute and leave
+	// no row: their free text cannot be tokenized safely.
+	start := time.Now()
 	var result map[string]any
 	var events []string
 	var omitted int
@@ -1027,7 +1056,7 @@ func (e *agentEnv) runTool(turnCtx context.Context, call *toolCall) string {
 		return turnReject("unknown tool")
 	}
 	if storeFailed {
-		return toolError("store unavailable")
+		return e.record(call, toolError("store unavailable"), "error", start)
 	}
 	env := map[string]any{"tool": call.name, "result": result,
 		"truncated": truncated, "omitted": omitted}
@@ -1035,14 +1064,14 @@ func (e *agentEnv) runTool(turnCtx context.Context, call *toolCall) string {
 	if err != nil || len(raw) > maxToolResultBytes {
 		// Unreachable by construction (fields are budgeted below), but
 		// a tool must never emit over-budget or invalid JSON.
-		return toolError("result over budget")
+		return e.record(call, toolError("result over budget"), "error", start)
 	}
 	// Final gate before anything leaves the machine (Designv9 §6.3):
 	// the serialized result is scanned fail-closed. A hit never reaches
 	// the model — the generic result does, and the run stays alive.
 	if hits, err := redactor.ScanOutboundLeaks(raw, e.issuedMap(), e.scanEvents(events)); err != nil || len(hits) > 0 {
 		log.Printf("briefing: agent tool %s redaction blocked at %v", call.name, hits)
-		return toolBlocked(call.name)
+		return e.record(call, toolBlocked(call.name), "blocked", start)
 	}
 	// Clean results join the transcript skip set: their event IDs are
 	// cleared to cross in later turns. Blocked results contribute
@@ -1052,7 +1081,53 @@ func (e *agentEnv) runTool(turnCtx context.Context, call *toolCall) string {
 			e.seenEvents[id] = true
 		}
 	}
-	return string(raw)
+	return e.record(call, string(raw), "ok", start)
+}
+
+// toolExec is one executed tool call awaiting storage: the validated
+// arguments and the scanned result envelope, both tokenized, in
+// execution order. The step index is the slice index — dense and
+// 0-based by construction, so finals can cite it.
+type toolExec struct {
+	tool     string
+	args     string
+	result   string
+	status   string
+	duration time.Duration
+}
+
+// record appends one executed tool call to the run trace and returns
+// the envelope unchanged. Args are the validated call arguments only:
+// fixed enums, bounded integers and issued tokens — never model free
+// text — so the row is tokenized by construction.
+func (e *agentEnv) record(call *toolCall, result, status string, start time.Time) string {
+	args, err := json.Marshal(call.args)
+	if err != nil {
+		args = []byte(`{}`)
+	}
+	e.execs = append(e.execs, toolExec{
+		tool: call.name, args: string(args), result: result,
+		status: status, duration: time.Since(start),
+	})
+	return result
+}
+
+// traces converts the executed steps into store rows for the atomic
+// briefing insert. Duration rides in whole milliseconds; sub-ms runs
+// record zero, which reads as instant, not missing.
+func (e *agentEnv) traces(briefingID string) []store.AgentTrace {
+	if len(e.execs) == 0 {
+		return nil
+	}
+	out := make([]store.AgentTrace, 0, len(e.execs))
+	for i, ex := range e.execs {
+		out = append(out, store.AgentTrace{
+			BriefingID: briefingID, Step: i, Tool: ex.tool,
+			ArgsJSON: ex.args, ResultJSON: ex.result,
+			Status: ex.status, DurationMS: ex.duration.Milliseconds(),
+		})
+	}
+	return out
 }
 
 // toolError is the error-result envelope: a fixed shape, never

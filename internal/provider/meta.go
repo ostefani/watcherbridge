@@ -83,17 +83,19 @@ func (a *MetaAdapter) Brief(ctx context.Context, bundle []byte, _ map[string]str
 // Turn implements Turner: one stateless transcript send. The full
 // transcript is the request input, so the provider keeps no session and
 // a resumed run replays from the local log. Response cap, redirect
-// policy, and status mapping match Brief exactly.
-func (a *MetaAdapter) Turn(ctx context.Context, transcript []TurnMessage) (string, error) {
+// policy, and status mapping match Brief exactly. Envelope usage rides
+// along when the API supplies it; cost is never reported, so it stays
+// unknown.
+func (a *MetaAdapter) Turn(ctx context.Context, transcript []TurnMessage) (TurnResult, error) {
 	body, err := MarshalTurnRequest(a.modelID, transcript)
 	if err != nil {
-		return "", fmt.Errorf("encode turn request: %w", err)
+		return TurnResult{}, fmt.Errorf("encode turn request: %w", err)
 	}
 	raw, err := a.post(ctx, body)
 	if err != nil {
-		return "", err
+		return TurnResult{}, err
 	}
-	return string(raw.JSON), nil
+	return TurnResult{Text: string(raw.JSON), Usage: raw.Usage}, nil
 }
 
 // Repair implements Provider.
@@ -132,11 +134,11 @@ func (a *MetaAdapter) post(ctx context.Context, body []byte) (RawBriefing, error
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return RawBriefing{}, fmt.Errorf("provider returned an empty body")
 	}
-	text, err := extractResponseText(raw)
+	text, usage, err := extractResponse(raw)
 	if err != nil {
 		return RawBriefing{}, err
 	}
-	return RawBriefing{JSON: text}, nil
+	return RawBriefing{JSON: text, Usage: usage}, nil
 }
 
 // responsesOutputContent is one text part of a Responses API output item.
@@ -150,28 +152,48 @@ type responsesOutputItem struct {
 	Content []responsesOutputContent `json:"content"`
 }
 
+// responsesUsage is the Responses API token accounting. The API
+// reports no cost, so usage here is token counts only.
+type responsesUsage struct {
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+}
+
 // responsesEnvelope is the Responses API result body. Only the message
 // text is briefing content; everything else is transport.
 type responsesEnvelope struct {
 	Output []responsesOutputItem `json:"output"`
+	Usage  *responsesUsage       `json:"usage"`
 }
 
-// extractResponseText returns the model's message text: the first
-// non-empty content text in the output array. An envelope with no text
-// (an error shape, an empty finish) is a provider failure, never a
-// briefing — the worker falls back and the log names this cause.
-func extractResponseText(raw []byte) ([]byte, error) {
+// extractResponse returns the model's message text — the first
+// non-empty content text in the output array — plus the envelope usage
+// when the API supplies it. An envelope with no text (an error shape,
+// an empty finish) is a provider failure, never a briefing — the worker
+// falls back and the log names this cause.
+func extractResponse(raw []byte) ([]byte, Usage, error) {
 	var env responsesEnvelope
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	if err := dec.Decode(&env); err != nil {
-		return nil, fmt.Errorf("decode provider envelope: %v", strings.TrimSpace(err.Error()))
+		return nil, Usage{}, fmt.Errorf("decode provider envelope: %v", strings.TrimSpace(err.Error()))
+	}
+	var usage Usage
+	if env.Usage != nil {
+		usage = Usage{InputTokens: env.Usage.InputTokens, OutputTokens: env.Usage.OutputTokens, HasUsage: true}
 	}
 	for _, item := range env.Output {
 		for _, c := range item.Content {
 			if c.Text != "" {
-				return []byte(c.Text), nil
+				return []byte(c.Text), usage, nil
 			}
 		}
 	}
-	return nil, fmt.Errorf("provider returned no text output")
+	return nil, Usage{}, fmt.Errorf("provider returned no text output")
+}
+
+// extractResponseText keeps the text-only shape for callers that do not
+// account usage.
+func extractResponseText(raw []byte) ([]byte, error) {
+	text, _, err := extractResponse(raw)
+	return text, err
 }

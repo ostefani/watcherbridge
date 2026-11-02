@@ -282,13 +282,85 @@ func TestBriefingEndpointsShapeAndHeaders(t *testing.T) {
 	if rec := serve(v.handleBriefing, "/api/briefing"); rec.Code != http.StatusBadRequest {
 		t.Fatalf("missing id = %d", rec.Code)
 	}
-
 	rec = serve(v.handleGroups, "/api/groups")
 	var groups []map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &groups); err != nil {
 		t.Fatalf("groups: %v", err)
 	}
 	_ = groups
+}
+
+func TestBriefingDetailServesTrace(t *testing.T) {
+	_ = t
+	s := openViewerStore(t)
+	seedOpenGroup(t, s, "host:trace", "evt-trace")
+	groups, err := s.OpenGroupSnapshots(context.Background())
+	if err != nil || len(groups) == 0 {
+		t.Fatalf("seed group missing: %v", groups)
+	}
+	gid := groups[len(groups)-1].GroupID
+	if _, err := s.CloseDue(context.Background(), time.Now().UTC().Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := s.TakeGroup(context.Background(), gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	explanation := "likely a reappearing host"
+	in, out := int64(120), int64(45)
+	if err := s.InsertBriefing(context.Background(), store.Briefing{
+		BriefingID: "brf-" + taken.GroupID, GroupID: taken.GroupID, HostAnchorKey: "host:trace",
+		Baseline: "medium", Priority: "high", PriorityReason: "r",
+		WhatChanged: "w", Context: "c", RecommendedCheck: "k", CreatedAt: time.Now().UTC(),
+		Source:            "agent",
+		LikelyExplanation: &explanation,
+		Confidence:        "medium",
+		EvidenceRefs:      []store.EvidenceRef{store.EventRef("evt-trace"), store.ToolRef(0)},
+		InputTokens:       &in,
+		OutputTokens:      &out,
+		Traces: []store.AgentTrace{
+			{Step: 0, Tool: "get_reported_profile", ArgsJSON: `{"host":"IP_1"}`, ResultJSON: `{"tool":"get_reported_profile"}`, Status: "ok", DurationMS: 2},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	v := New(s, NewHub())
+	rec := httptest.NewRecorder()
+	v.handleBriefing(rec, httptest.NewRequest("GET", "/api/briefing?id="+gid, nil))
+	var one map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &one); err != nil {
+		t.Fatalf("single briefing: %v", err)
+	}
+	if one["likely_explanation"] != explanation || one["confidence"] != "medium" {
+		t.Fatalf("explanation missing from detail: %v", one)
+	}
+	refs, ok := one["evidence_refs"].([]any)
+	if !ok || len(refs) != 2 {
+		t.Fatalf("evidence_refs = %v, want event + tool refs", one["evidence_refs"])
+	}
+	if ref, ok := refs[0].(map[string]any); !ok || ref["event_id"] != "evt-trace" {
+		t.Fatalf("event ref = %v", refs[0])
+	}
+	if ref, ok := refs[1].(map[string]any); !ok || ref["tool_step"] != float64(0) {
+		t.Fatalf("tool ref = %v", refs[1])
+	}
+	traces, ok := one["traces"].([]any)
+	if !ok || len(traces) != 1 {
+		t.Fatalf("traces = %v, want the one executed step", one["traces"])
+	}
+	step, ok := traces[0].(map[string]any)
+	if !ok || step["step"] != float64(0) || step["tool"] != "get_reported_profile" || step["status"] != "ok" {
+		t.Fatalf("trace step = %v", traces[0])
+	}
+	if step["args"] != `{"host":"IP_1"}` {
+		t.Fatalf("trace args must stay tokenized: %v", step["args"])
+	}
+	if one["input_tokens"] != float64(120) || one["output_tokens"] != float64(45) {
+		t.Fatalf("usage missing from detail: %v", one)
+	}
+	if _, present := one["cost_usd"]; present {
+		t.Fatalf("unsupplied cost must stay absent: %v", one["cost_usd"])
+	}
 }
 
 func TestBriefingsCursorPaging(t *testing.T) {

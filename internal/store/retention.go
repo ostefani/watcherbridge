@@ -111,6 +111,7 @@ func decisionRetentionOf(settings PurgeSettings) time.Duration {
 type PurgeReport struct {
 	BriefingLinks int64
 	Briefings     int64
+	Traces        int64 // agent_traces rows; deleted with their briefing
 	Groups        int64
 	GroupLinks    int64 // group_subjects rows; group_events has its own counter below
 	GroupEvents   int64
@@ -128,6 +129,7 @@ type PurgeReport struct {
 func (r *PurgeReport) add(o PurgeReport) {
 	r.BriefingLinks += o.BriefingLinks
 	r.Briefings += o.Briefings
+	r.Traces += o.Traces
 	r.Groups += o.Groups
 	r.GroupLinks += o.GroupLinks
 	r.GroupEvents += o.GroupEvents
@@ -143,7 +145,7 @@ func (r *PurgeReport) add(o PurgeReport) {
 }
 
 func (r PurgeReport) total() int64 {
-	return r.BriefingLinks + r.Briefings + r.Groups + r.GroupLinks + r.GroupEvents + r.Ports +
+	return r.BriefingLinks + r.Briefings + r.Traces + r.Groups + r.GroupLinks + r.GroupEvents + r.Ports +
 		r.Observations + r.Progress + r.RawEvents + r.Subjects + r.Sources + r.Pseudonyms + r.Decisions
 }
 
@@ -250,6 +252,8 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 			switch table {
 			case "briefing_subjects":
 				report.BriefingLinks += n
+			case "agent_traces":
+				report.Traces += n
 			case "briefings":
 				report.Briefings += n
 			case "active_groups":
@@ -294,8 +298,18 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefing_subjects.briefing_id AND d.created_at >= ?) ORDER BY rowid LIMIT ?)`, limit, plan.briefingCut, plan.decisionCut, limit, plan.decisionCut, limit); err != nil {
 				return err
 			}
+			// Trace steps are audit children of their briefing: they drain
+			// under the same decision pin before the briefing row, so no
+			// retained audit outlives its briefing and no briefing deletes
+			// while steps remain.
+			limit = deleteLimit()
+			if err := take("agent_traces", plan.briefingCut, `DELETE FROM agent_traces WHERE rowid IN (SELECT rowid FROM agent_traces WHERE briefing_id IN (SELECT briefing_id FROM briefings WHERE created_at < ?
+				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?)) ORDER BY rowid LIMIT ?)`, limit, plan.briefingCut, plan.decisionCut, limit); err != nil {
+				return err
+			}
 			limit = deleteLimit()
 			if err := take("briefings", plan.briefingCut, `DELETE FROM briefings WHERE rowid IN (SELECT rowid FROM briefings WHERE created_at < ? AND NOT EXISTS (SELECT 1 FROM briefing_subjects WHERE briefing_subjects.briefing_id = briefings.briefing_id)
+				AND NOT EXISTS (SELECT 1 FROM agent_traces WHERE agent_traces.briefing_id = briefings.briefing_id)
 				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?) ORDER BY created_at, rowid LIMIT ?)`, limit, plan.briefingCut, plan.decisionCut, limit); err != nil {
 				return err
 			}
@@ -515,6 +529,7 @@ func (s *Store) refillProtectedTokensThrough(ctx context.Context, briefingCut, a
 		seen := map[string]struct{}{}
 		var tokens []string
 		scanned := int64(0)
+		pageStart := lastRowID
 		for rows.Next() {
 			var rowID int64
 			var rawJSON, reason string
@@ -532,6 +547,32 @@ func (s *Store) refillProtectedTokensThrough(ctx context.Context, briefingCut, a
 			return err
 		}
 		rows.Close()
+		// Trace envelopes are tokenized audit for the same window:
+		// validated args name issued tokens and results echo them, so
+		// their mappings need the same protection. Executions are
+		// loop-bounded far below the page multiple, so the cap is a
+		// backstop, not a silent occurrence drop.
+		trows, err := s.db.QueryContext(ctx, `SELECT args_json, result_json FROM agent_traces
+			WHERE briefing_id IN (SELECT briefing_id FROM briefings WHERE created_at >= ? AND rowid > ? AND rowid <= ?)
+			ORDER BY briefing_id, step LIMIT ?`,
+			briefingCut, pageStart, lastRowID, scanPage*8)
+		if err != nil {
+			return err
+		}
+		for trows.Next() {
+			var argsJSON, resultJSON string
+			if err := trows.Scan(&argsJSON, &resultJSON); err != nil {
+				trows.Close()
+				return err
+			}
+			tokens = appendProtectedTokens(seen, tokens, argsJSON)
+			tokens = appendProtectedTokens(seen, tokens, resultJSON)
+		}
+		if err := trows.Err(); err != nil {
+			trows.Close()
+			return err
+		}
+		trows.Close()
 		if len(tokens) > 0 {
 			if err := s.storeProtectedTokensPaged(ctx, tokens, writePage); err != nil {
 				return err
@@ -626,6 +667,7 @@ func addPurgeRunCounts(tx *sql.Tx, runID int64, report PurgeReport) error {
 	_, err := tx.Exec(`UPDATE purge_runs SET
 		briefing_links_deleted = briefing_links_deleted + ?,
 		briefings_deleted = briefings_deleted + ?,
+		traces_deleted = traces_deleted + ?,
 		groups_deleted = groups_deleted + ?,
 		group_links_deleted = group_links_deleted + ?,
 		group_events_deleted = group_events_deleted + ?,
@@ -639,7 +681,7 @@ func addPurgeRunCounts(tx *sql.Tx, runID int64, report PurgeReport) error {
 		decisions_deleted = decisions_deleted + ?,
 		bookkeeping_writes = bookkeeping_writes + ?
 		WHERE run_id = ?`,
-		report.BriefingLinks, report.Briefings, report.Groups, report.GroupLinks,
+		report.BriefingLinks, report.Briefings, report.Traces, report.Groups, report.GroupLinks,
 		report.GroupEvents,
 		report.Ports, report.Observations, report.Progress, report.RawEvents,
 		report.Subjects, report.Sources, report.Pseudonyms, report.Decisions, report.Bookkeeping,
@@ -819,13 +861,13 @@ type purgeRun struct {
 func (s *Store) LatestPurgeRun(ctx context.Context) (purgeRun, error) {
 	var run purgeRun
 	err := s.db.QueryRowContext(ctx, `SELECT run_id, started_at, finished_at, status, error,
-		briefing_links_deleted, briefings_deleted, groups_deleted, group_links_deleted,
+		briefing_links_deleted, briefings_deleted, traces_deleted, groups_deleted, group_links_deleted,
 		group_events_deleted,
 		ports_deleted, observations_deleted, progress_deleted, raw_events_deleted,
 		subjects_deleted, sources_deleted, pseudonyms_deleted, decisions_deleted, bookkeeping_writes
 		FROM purge_runs ORDER BY run_id DESC LIMIT 1`).Scan(
 		&run.runID, &run.startedAt, &run.finishedAt, &run.status, &run.errText,
-		&run.total.BriefingLinks, &run.total.Briefings, &run.total.Groups, &run.total.GroupLinks,
+		&run.total.BriefingLinks, &run.total.Briefings, &run.total.Traces, &run.total.Groups, &run.total.GroupLinks,
 		&run.total.GroupEvents,
 		&run.total.Ports, &run.total.Observations, &run.total.Progress, &run.total.RawEvents,
 		&run.total.Subjects, &run.total.Sources, &run.total.Pseudonyms, &run.total.Decisions, &run.total.Bookkeeping)

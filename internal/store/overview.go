@@ -54,6 +54,7 @@ var purgeRunColumns = []struct {
 }{
 	{"briefing_links_deleted", "briefing_subjects"},
 	{"briefings_deleted", "briefings"},
+	{"traces_deleted", "agent_traces"},
 	{"groups_deleted", "active_groups"},
 	{"group_links_deleted", "group_subjects"},
 	{"group_events_deleted", "group_events"},

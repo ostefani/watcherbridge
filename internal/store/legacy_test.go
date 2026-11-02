@@ -307,6 +307,7 @@ func TestGroupingProvenanceUpgrade(t *testing.T) {
 				dropGroupingProvenance(t, db)
 			}
 			dropDecisionSchema(t, db)
+			dropTraceSchema(t, db)
 			if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, from)); err != nil {
 				t.Fatal(err)
 			}
@@ -419,6 +420,7 @@ func TestMigrateSupportedFromV13(t *testing.T) {
 		`DROP INDEX IF EXISTS briefing_subjects_profile`,
 		`DROP INDEX IF EXISTS reported_observations_profile_received`,
 		`DROP INDEX IF EXISTS briefings_created_kind`,
+		`DROP TABLE IF EXISTS agent_traces`,
 		`PRAGMA user_version = 13`,
 	} {
 		if _, err := raw.Exec(stmt); err != nil {
@@ -428,6 +430,10 @@ func TestMigrateSupportedFromV13(t *testing.T) {
 	}
 	dropColumnIfExists(t, raw, "briefings", "kind")
 	dropColumnIfExists(t, raw, "briefings", "source")
+	for _, col := range []string{"likely_explanation", "confidence", "evidence_refs_json",
+		"input_tokens", "output_tokens", "cost_micros"} {
+		dropColumnIfExists(t, raw, "briefings", col)
+	}
 	dropColumnIfExists(t, raw, "reported_subjects", "label_owner")
 	if err := raw.Close(); err != nil {
 		t.Fatal(err)
