@@ -70,8 +70,15 @@
   let backStack = $state(/** @type {{rows: any[], key: string}[]} */ ([]));
   let paging = $state(false);
   let atEnd = $state(false);
+  let atEndKey = '';
   let windowNote = $state(/** @type {string|null} */ (null));
+  let windowNoteKey = '';
+  // Every paging flag is keyed to the head that produced it: a parent
+  // refresh with a new head automatically unhides continuation and
+  // drops stale navigation, with no reset timing to get right.
   const trail = $derived(extraKey === headKey && extra.length > 0 ? [...decisions, ...extra] : decisions);
+  const exhausted = $derived(atEnd && atEndKey === headKey);
+  const note = $derived(windowNoteKey === headKey ? windowNote : null);
 
   const needsText = $derived(kind === 'note' || kind === 'label');
   const textCap = $derived(kind === 'label' ? 256 : 2000);
@@ -167,7 +174,7 @@
   }
 
   async function older() {
-    if (paging || atEnd || trail.length === 0) {
+    if (paging || exhausted || trail.length === 0) {
       return;
     }
     // Capture the generation and window identity up front: only a
@@ -187,6 +194,7 @@
       }
       if (page.length === 0) {
         atEnd = true;
+        atEndKey = key;
         return;
       }
       if (extraKey === key && extra.length > 0) {
@@ -194,11 +202,13 @@
         if (backStack.length > BACK_PAGES) {
           backStack.shift();
           windowNote = 'Earlier pages dropped from this view; the full audit remains available through the API.';
+          windowNoteKey = key;
         }
       }
       extra = page;
       extraKey = key;
       atEnd = page.length < PAGE_LIMIT;
+      atEndKey = key;
     } catch (err) {
       if (!alive || gen !== pageGen || key !== headKey) {
         return;
@@ -224,6 +234,7 @@
       extraKey = prev.key;
     }
     atEnd = false;
+    atEndKey = headKey;
   }
 
 </script>
@@ -286,7 +297,7 @@
         </li>
       {/each}
     </ol>
-    {#if !atEnd}
+    {#if !exhausted}
       <button type="button" onclick={older} disabled={paging}>
         {paging ? 'Loading…' : 'Show older decisions'}
       </button>
@@ -294,8 +305,8 @@
     {#if extraKey === headKey && extra.length > 0}
       <button type="button" onclick={newer} disabled={paging}>Show newer decisions</button>
     {/if}
-    {#if windowNote !== null}
-      <p role="note">{windowNote}</p>
+    {#if note !== null}
+      <p role="note">{note}</p>
     {/if}
   {/if}
   {#if listError !== null}

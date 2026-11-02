@@ -613,6 +613,34 @@ func TestUndoRepeatAfterUndoMovedHead(t *testing.T) {
 	}
 }
 
+// The historical baseline runs on the undo-time clock: A is a live
+// snooze when undo B restores it, so a repeat of undo B after A
+// lapses compares head A against head none and conflicts instead of
+// replaying already_undone.
+func TestUndoRepeatAfterSnoozeLapseMovesHead(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	t0 := time.Now().UTC().Truncate(time.Second)
+	s.now = func() time.Time { return t0 }
+	gid := seedDecisionBriefing(t, s, "lab", "evt-dec-14", subjectMAC("aa:bb:cc:dd:ee:1e"), t0)
+
+	if _, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid,
+		Kind: DecisionSnooze, HasUntil: true, Until: t0.Add(2 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.AppendDecision(ctx, DecisionInput{SubjectKind: DecisionSubjectBriefing, SubjectID: gid, Kind: DecisionExpected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UndoDecision(ctx, b.Decision.DecisionID, "req-us-1"); err != nil {
+		t.Fatal(err)
+	}
+	s.now = func() time.Time { return t0.Add(3 * time.Hour) }
+	if _, err := s.UndoDecision(ctx, b.Decision.DecisionID, "req-us-2"); !errors.Is(err, ErrUndoConflict) {
+		t.Fatalf("repeat after snooze lapsed = %v, want conflict", err)
+	}
+}
+
 // A default snooze resolves its horizon on first commit only: the
 // idempotency hash covers specified content, so a retry replays
 // against the original row instead of hashing a new deadline. An

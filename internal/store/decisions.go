@@ -380,8 +380,11 @@ func reviewHead(tx *sql.Tx, subjectKind, subjectID string, now time.Time, cutoff
 // reviewHeadAsOf is reviewHead restricted to rows committed no later
 // than the given undo position: the head as the undo left it.
 // Storage order bounds the window, so equal timestamps cannot admit
-// a row the undo never saw.
-func reviewHeadAsOf(tx *sql.Tx, subjectKind, subjectID string, now time.Time, cutoff, undoCreated, undoRowID int64) (head string, ok bool, err error) {
+// a row the undo never saw. Snooze lapse and the audit cutoff are
+// evaluated at the undo time, not now: a snooze that lapsed after
+// the undo was live for the baseline but gone today, and the
+// comparison must see that change instead of erasing it.
+func reviewHeadAsOf(tx *sql.Tx, subjectKind, subjectID string, asofNanos, cutoffAsof, undoCreated, undoRowID int64) (head string, ok bool, err error) {
 	err = tx.QueryRow(`SELECT decision_id FROM (
 		SELECT decision_id, ROW_NUMBER() OVER (ORDER BY created_at DESC, rowid DESC) AS rn
 		FROM operator_decisions
@@ -392,7 +395,7 @@ func reviewHeadAsOf(tx *sql.Tx, subjectKind, subjectID string, now time.Time, cu
 			AND (kind != 'snooze' OR until > ?)
 			AND created_at >= ?
 			AND (created_at, rowid) <= (?, ?)
-	) WHERE rn = 1`, subjectKind, subjectID, undoCreated, undoRowID, now.UnixNano(), cutoff, undoCreated, undoRowID).Scan(&head)
+	) WHERE rn = 1`, subjectKind, subjectID, undoCreated, undoRowID, asofNanos, cutoffAsof, undoCreated, undoRowID).Scan(&head)
 	if err == sql.ErrNoRows {
 		return "", false, nil
 	}
@@ -406,7 +409,7 @@ func reviewHeadAsOf(tx *sql.Tx, subjectKind, subjectID string, now time.Time, cu
 // alone cannot prove this: an undo of a newer record changes the
 // head without adding any live row, so only the resulting state
 // comparison is sound. Notes carry no head and never count.
-func headChangedSinceUndo(tx *sql.Tx, target Decision, undoCreated, undoRowID int64, now time.Time, cutoff int64) (bool, error) {
+func headChangedSinceUndo(tx *sql.Tx, target Decision, undoCreated, undoRowID int64, now time.Time, cutoff, cutoffAsof int64) (bool, error) {
 	if target.Kind == DecisionLabel {
 		var owner sql.NullString
 		if err := tx.QueryRow(`SELECT label_owner FROM reported_subjects WHERE profile_id = ?`,
@@ -426,7 +429,7 @@ func headChangedSinceUndo(tx *sql.Tx, target Decision, undoCreated, undoRowID in
 	if err != nil {
 		return false, err
 	}
-	asof, asofOK, err := reviewHeadAsOf(tx, target.SubjectKind, target.SubjectID, now, cutoff, undoCreated, undoRowID)
+	asof, asofOK, err := reviewHeadAsOf(tx, target.SubjectKind, target.SubjectID, undoCreated, cutoffAsof, undoCreated, undoRowID)
 	if err != nil {
 		return false, err
 	}
@@ -486,7 +489,8 @@ func (s *Store) UndoDecision(ctx context.Context, targetID, requestID string) (D
 				res = DecisionResult{Decision: target, Applied: false, Reason: "already_undone"}
 				return nil
 			}
-			moved, err := headChangedSinceUndo(tx, target, undoCreated, undoRowID, now, s.decisionCutoff(now))
+			moved, err := headChangedSinceUndo(tx, target, undoCreated, undoRowID, now,
+				s.decisionCutoff(now), s.decisionCutoff(fromNanos(undoCreated)))
 			if err != nil {
 				return err
 			}
