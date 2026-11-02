@@ -9,6 +9,7 @@ package briefing
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"strconv"
 	"strings"
@@ -48,16 +49,17 @@ const (
 	modeAgent
 )
 
-// selectMode assigns the provider path. Below the single-call floor
-// the deterministic fallback answers; from the agent floor up the loop
-// investigates when enabled with a capable provider; between them the
-// single call answers. Equal floors give the level to the single call
-// — the agent starts strictly above it.
+// selectMode assigns the provider path (Designv9 §6.1 bands): below the
+// single-call floor the deterministic rules output answers; from the
+// agent floor up the loop investigates when enabled with a capable
+// provider; between the floors the single call answers. Equal floors
+// give the shared level to the loop — the agent floor includes its
+// level, and the single-call band between equal floors is empty.
 func selectMode(baseline, modelMin, agentMin Level, enabled, capable bool) briefMode {
 	if baseline < modelMin {
 		return modeDeterministic
 	}
-	if baseline >= agentMin && baseline > modelMin && enabled && capable {
+	if enabled && capable && baseline >= agentMin {
 		return modeAgent
 	}
 	return modeSingle
@@ -232,7 +234,7 @@ func (l *agentLoop) toolTurn(k int) (done bool) {
 	if call != nil {
 		res := l.env.runTool(turnCtx, call)
 		if corr, rej := isReject(res); rej {
-			return l.repairFlow(turnCtx, repairPromptForTurn(corr))
+			return l.repairFlow(turnCtx, repairPromptForTurn(corr), true)
 		}
 		if over := l.appendTool(res); over != "" {
 			log.Printf("briefing: group %s agent transcript over budget", l.taken.GroupID)
@@ -247,9 +249,9 @@ func (l *agentLoop) toolTurn(k int) (done bool) {
 			insertModelBriefing(l.parent, l.d, l.taken, l.outcome, a, l.issued, l.display, "agent")
 			return true
 		}
-		return l.repairFlow(turnCtx, repairPrompt(a.Correction))
+		return l.repairFlow(turnCtx, repairPrompt(a.Correction), true)
 	}
-	return l.repairFlow(turnCtx, repairPromptForTurn(correction))
+	return l.repairFlow(turnCtx, repairPromptForTurn(correction), true)
 }
 
 // finalTurn runs the reserved final turn on the whole remaining budget
@@ -284,21 +286,28 @@ func (l *agentLoop) finalTurn() bool {
 			insertModelBriefing(l.parent, l.d, l.taken, l.outcome, a, l.issued, l.display, "agent")
 			return l.finish()
 		}
-		l.repairFlow(turnCtx, repairPrompt(a.Correction))
+		l.repairFlow(turnCtx, repairPrompt(a.Correction), false)
 		return l.finish()
 	}
-	l.repairFlow(turnCtx, repairPromptForTurn(correction))
+	l.repairFlow(turnCtx, repairPromptForTurn(correction), false)
 	return l.finish()
 }
 
 // repairFlow spends the run's one repair on a correction re-ask and
-// dispatches the answer once: a tool call executes (a second rejection
-// falls back, the repair being spent), an accepted final stores the
-// briefing, anything else falls back. True means terminal.
-func (l *agentLoop) repairFlow(turnCtx context.Context, prompt string) (done bool) {
-	rep, ok := l.repairAsk(turnCtx, prompt)
+// dispatches the answer once. allowTool reports whether a tool turn
+// remains to use a tool result: tool turns pass true (a tool call
+// executes and the loop continues); the reserved final turn passes
+// false (a tool call there is terminally invalid — the tools are spent
+// and no turn remains to use the result). An accepted final stores the
+// briefing; anything else falls back. True means terminal, except a
+// tool turn's executed tool call, which continues the loop.
+func (l *agentLoop) repairFlow(turnCtx context.Context, prompt string, allowTool bool) (done bool) {
+	rep, failReason, ok := l.repairAsk(turnCtx, prompt)
 	if !ok {
-		l.fallback = "agent output invalid; briefing from deterministic baseline only"
+		if failReason == "" {
+			failReason = "agent output invalid; briefing from deterministic baseline only"
+		}
+		l.fallback = failReason
 		return true
 	}
 	if over := l.appendAssistant(rep); over != "" {
@@ -307,6 +316,11 @@ func (l *agentLoop) repairFlow(turnCtx context.Context, prompt string) (done boo
 	}
 	c2, f2, _ := parseTurn(rep)
 	if c2 != nil {
+		if !allowTool {
+			log.Printf("briefing: group %s agent tool call on the final turn", l.taken.GroupID)
+			l.fallback = "agent output invalid; briefing from deterministic baseline only"
+			return true
+		}
 		res := l.env.runTool(turnCtx, c2)
 		if corr, rej := isReject(res); rej {
 			log.Printf("briefing: group %s agent tool rejected after repair (%s)", l.taken.GroupID, corr)
@@ -332,13 +346,149 @@ func (l *agentLoop) repairFlow(turnCtx context.Context, prompt string) (done boo
 	return true
 }
 
+// transcriptBlockedError marks a pre-send scan hit: the transcript is
+// never transmitted, so no provider call is counted for it.
+type transcriptBlockedError struct{ reason string }
+
+func (e *transcriptBlockedError) Error() string { return e.reason }
+
 // turn sends one transcript and counts the provider call (Designv9
-// §6.3: health reports actual calls). The count covers every send,
-// including one the context then cancels — the call happened.
+// §6.3: health reports actual calls). Before anything leaves the
+// machine, the final serialized transcript is scanned fail-closed:
+// the bundle and each tool result were scanned at creation, but
+// assistant and repair texts join later turns verbatim, so only the
+// composed send is conclusive. A hit stores the deterministic fallback
+// without transmitting. The count covers every actual send, including
+// one the context then cancels — the call happened.
 func (l *agentLoop) turn(turnCtx context.Context) (string, error) {
+	if reason := l.scanTranscript(); reason != "" {
+		return "", &transcriptBlockedError{reason: reason}
+	}
 	text, err := l.turner.Turn(turnCtx, l.env.transcript)
 	l.d.Health.AddProviderCall()
 	return text, err
+}
+
+// scanTranscript enforces the run byte cap and the fail-closed leak
+// scan on the exact bytes about to cross. The skip set is the cleared
+// event IDs only — model-written IDs stay untrusted until validated.
+func (l *agentLoop) scanTranscript() string {
+	raw, err := json.Marshal(l.env.transcript)
+	if err != nil || len(raw) > maxTranscriptBytes {
+		return "agent transcript exceeds size cap; briefing from deterministic baseline only"
+	}
+	cleared := make(map[string]bool, len(l.env.seenEvents))
+	var ids []string
+	for id := range l.env.seenEvents {
+		if id == "" {
+			continue
+		}
+		cleared[id] = true
+		ids = append(ids, id)
+	}
+	// Cleared event IDs ride the transcript embedded in message text
+	// (bundle JSON, finals, tool results), where the scanner's exact
+	// whole-leaf skip cannot see them: a producer UUID's trailing
+	// 12-hex segment then matches the bare-12-hex MAC leg and blocks a
+	// clean run. Exempt them only in structurally identified reference
+	// fields — event_id scalars and event_ids array elements in decoded
+	// message JSON. Never scrubbed as arbitrary substrings: a short
+	// cleared ID such as "10" must not rewrite a raw 10.23.45.67
+	// elsewhere in the text into unscannable xxxx.23.45.67 while the
+	// original address transmits. Everything outside the reference
+	// fields — including uncleared values sitting in an event_id
+	// position — is scanned verbatim.
+	scrubbed := neutralizeReferenceIDs(raw, cleared)
+	if hits, err := redactor.ScanOutboundLeaks(scrubbed, l.issued, ids); err != nil || len(hits) > 0 {
+		log.Printf("briefing: group %s agent transcript blocked at %v", l.taken.GroupID, hits)
+		return "agent transcript blocked by redaction; briefing from deterministic baseline only"
+	}
+	return ""
+}
+
+// neutralizeReferenceIDs re-marshals the transcript with cleared event
+// IDs replaced by xxxx, but only inside event_id scalar fields and
+// event_ids arrays of decoded message texts. Messages that are not JSON
+// pass through untouched and are scanned verbatim. The xxxx run matches
+// no leak leg, so only the exempted references go quiet.
+func neutralizeReferenceIDs(raw []byte, cleared map[string]bool) []byte {
+	var msgs []provider.TurnMessage
+	if err := json.Unmarshal(raw, &msgs); err != nil {
+		return raw
+	}
+	changed := false
+	for i := range msgs {
+		var inner any
+		if err := json.Unmarshal([]byte(msgs[i].Text), &inner); err != nil {
+			continue
+		}
+		switch inner.(type) {
+		case map[string]any, []any:
+			msgs[i].Text = string(mustMarshal(neutralizeIDRefs(inner, cleared)))
+			changed = true
+		}
+	}
+	if !changed {
+		return raw
+	}
+	if out, err := json.Marshal(msgs); err == nil {
+		return out
+	}
+	return raw
+}
+
+// neutralizeIDRefs replaces cleared event IDs at reference positions:
+// an event_id scalar holding a cleared ID, or cleared elements of an
+// event_ids array, at any depth. Anything else — including values the
+// cleared set does not contain — is left for the scanner.
+func neutralizeIDRefs(v any, cleared map[string]bool) any {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, val := range t {
+			if k != "event_id" && k != "event_ids" {
+				t[k] = neutralizeIDRefs(val, cleared)
+				continue
+			}
+			t[k] = neutralizeIDValue(val, cleared)
+		}
+		return t
+	case []any:
+		for i, e := range t {
+			t[i] = neutralizeIDRefs(e, cleared)
+		}
+		return t
+	default:
+		return v
+	}
+}
+
+// neutralizeIDValue exempts one reference position: a cleared scalar,
+// or the cleared elements of an ID array. Uncleared values stay.
+func neutralizeIDValue(v any, cleared map[string]bool) any {
+	switch t := v.(type) {
+	case string:
+		if cleared[t] {
+			return "xxxx"
+		}
+		return t
+	case []any:
+		for i, e := range t {
+			if s, ok := e.(string); ok && cleared[s] {
+				t[i] = "xxxx"
+			}
+		}
+		return t
+	default:
+		return v
+	}
+}
+
+func mustMarshal(v any) []byte {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return []byte("null")
+	}
+	return raw
 }
 
 // turnFailed maps a turn error: a dead parent leaves fallback empty so
@@ -347,29 +497,38 @@ func (l *agentLoop) turn(turnCtx context.Context) (string, error) {
 // live-parent failure stores the deterministic fallback.
 func (l *agentLoop) turnFailed(err error) {
 	log.Printf("briefing: group %s agent turn: %s", l.taken.GroupID, store.SanitizeErrorText(err.Error()))
-	if l.parent.Err() == nil {
-		l.fallback = "agent turn failed; briefing from deterministic baseline only"
+	if l.parent.Err() != nil {
+		return
 	}
+	var blocked *transcriptBlockedError
+	if errors.As(err, &blocked) {
+		l.fallback = blocked.reason
+		return
+	}
+	l.fallback = "agent turn failed; briefing from deterministic baseline only"
 }
 
 // repairAsk spends the run's one repair on a correction re-ask sharing
 // the affected turn's context and deadline. False means the repair was
 // already spent (a second failure falls back) or the re-ask failed.
-func (l *agentLoop) repairAsk(turnCtx context.Context, prompt string) (string, bool) {
+func (l *agentLoop) repairAsk(turnCtx context.Context, prompt string) (rep, failReason string, ok bool) {
 	if l.repair {
-		return "", false
+		return "", "", false
 	}
 	l.repair = true
 	if over := l.appendUser(prompt); over != "" {
-		l.fallback = over
-		return "", false
+		return "", over, false
 	}
 	rep, err := l.turn(turnCtx)
 	if err != nil {
 		log.Printf("briefing: group %s agent repair: %s", l.taken.GroupID, store.SanitizeErrorText(err.Error()))
-		return "", false
+		var blocked *transcriptBlockedError
+		if errors.As(err, &blocked) {
+			return "", blocked.reason, false
+		}
+		return "", "", false
 	}
-	return rep, true
+	return rep, "", true
 }
 
 // runCtx returns the run context. Stored beside the parent because the
@@ -431,6 +590,8 @@ type agentEnv struct {
 	byAlias    map[string]string // SUBJ_n → profileID, minted by find_similar
 	byToken    map[string]string // bundle token → profileID, resolved at seed
 	issuedSet  map[string]bool   // every token valid this run: bundle + aliases
+	seenEvents map[string]bool   // every event ID already cleared to cross:
+	// the group's own plus scanned-clean tool result events
 	transcript []provider.TurnMessage
 }
 
@@ -458,9 +619,13 @@ func newAgentEnv(st *store.Store, taken store.TakenGroup, issued redactor.TokenM
 	for tok := range issued {
 		issuedSet[tok] = true
 	}
+	seenEvents := make(map[string]bool, len(taken.Events))
+	for _, ev := range taken.Events {
+		seenEvents[ev.EventID] = true
+	}
 	return &agentEnv{st: st, taken: taken, byValue: byValue, byLower: byLower, now: now,
 		reg: map[string]*subjectRef{}, byAlias: map[string]string{}, byToken: map[string]string{},
-		issuedSet: issuedSet}
+		issuedSet: issuedSet, seenEvents: seenEvents}
 }
 
 // seed loads the group-linked subjects as the tool registry. A subject
@@ -770,6 +935,14 @@ func (e *agentEnv) runTool(turnCtx context.Context, call *toolCall) string {
 		log.Printf("briefing: agent tool %s redaction blocked at %v", call.name, hits)
 		return toolBlocked(call.name)
 	}
+	// Clean results join the transcript skip set: their event IDs are
+	// cleared to cross in later turns. Blocked results contribute
+	// nothing — the generic envelope names no events.
+	for _, id := range events {
+		if id != "" {
+			e.seenEvents[id] = true
+		}
+	}
 	return string(raw)
 }
 
@@ -931,10 +1104,18 @@ func (e *agentEnv) scanEvents(toolEvents []string) []string {
 	return out
 }
 
-// toolFieldBudget bounds the rendered result fields; the envelope adds
-// a fixed ~120 bytes, so the serialized tool result stays well under
-// maxToolResultBytes by construction.
-const toolFieldBudget = 3072
+// toolFieldBudget bounds the rendered result fields. The envelope adds
+// roughly a hundred bytes, so the finished result stays well under the
+// 4 KiB result cap; the exact marshal-then-measure check on the finished
+// envelope stays the hard guarantee regardless.
+const toolFieldBudget = 3840
+
+// portListByteCap bounds one rendered port list: rows accumulate while
+// the list JSON stays within it, so long service names and five-digit
+// ports truncate rows instead of dropping the whole list at put time.
+// 3456 bytes admit 64 compact rows (~3.4 KiB) with room for sibling
+// fields and the envelope inside the 4 KiB cap.
+const portListByteCap = 3456
 
 // toolOut accumulates one tool result with an exact byte budget.
 // Fields are priority-ordered by insertion: the first fields win, the
@@ -950,16 +1131,17 @@ func (o *toolOut) put(key string, v any) {
 	if o.m == nil {
 		o.m = map[string]any{}
 	}
-	if o.truncated {
-		return
-	}
 	raw, err := json.Marshal(v)
 	if err != nil {
 		o.omitted++
 		return
 	}
+	// An over-budget field is skipped alone and marks truncation;
+	// later fields that fit are still kept. Dropping everything past
+	// the first overflow would discard usable bounded results.
 	if o.bytes+len(key)+len(raw)+8 > toolFieldBudget {
 		o.truncated = true
+		o.omitted++
 		return
 	}
 	o.m[key] = v
@@ -1033,9 +1215,12 @@ func (e *agentEnv) renderPorts(o *toolOut, ports []store.ReportedPort, cap int) 
 	}
 	rows := make([]portRow, 0, len(ports))
 	for _, p := range ports {
+		// The count cap bounds the retained list; reaching it keeps the
+		// collected rows and marks truncation — it must not discard
+		// them by returning before the put below.
 		if len(rows) >= cap {
 			o.truncated = true
-			return
+			break
 		}
 		proto := normEnum(p.Proto, "tcp", "udp")
 		state := normEnum(p.State, "open", "closed", "filtered")
@@ -1052,6 +1237,15 @@ func (e *agentEnv) renderPorts(o *toolOut, ports []store.ReportedPort, cap int) 
 			o.omitted++
 		}
 		rows = append(rows, portRow{Port: p.Port, Proto: proto, State: state, Service: svc})
+		// Incremental byte budget: keep the prefix that fits, so long
+		// rows truncate the list instead of the whole field being
+		// omitted at put time. Row counts stay small, so remarshaling
+		// the prefix per row is cheap and exact.
+		if listBytes, err := json.Marshal(rows); err != nil || len(listBytes) > portListByteCap {
+			rows = rows[:len(rows)-1]
+			o.truncated = true
+			break
+		}
 	}
 	o.put("ports", rows)
 }

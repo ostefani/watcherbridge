@@ -138,6 +138,15 @@ func projectedRestoredSize(m modelBriefing, restored redactor.TokenMap) int {
 // fallback string. Storing it moves processing→done, so the group never
 // strands — a fallback always completes the group.
 func fallbackBriefing(taken store.TakenGroup, outcome Outcome, now time.Time, contextNote string) store.Briefing {
+	return deterministicBriefing(taken, outcome, now, contextNote, "fallback", true)
+}
+
+// deterministicBriefing builds the model-less briefing. source names
+// the path (Designv9 §6.1): "fallback" for degraded provider paths,
+// "rules" for intentional below-floor output — fallback is distinct
+// from intentionally rules-only output, so the two never share the
+// source or the fallback flag.
+func deterministicBriefing(taken store.TakenGroup, outcome Outcome, now time.Time, contextNote, source string, fallbackUsed bool) store.Briefing {
 	return store.Briefing{
 		BriefingID:       "brf-" + taken.GroupID,
 		GroupID:          taken.GroupID,
@@ -148,8 +157,8 @@ func fallbackBriefing(taken store.TakenGroup, outcome Outcome, now time.Time, co
 		PriorityReason:   fallbackReason,
 		BaselineRule:     outcome.RuleID,
 		Kind:             KindForTaken(taken, outcome.RuleID),
-		Source:           "fallback",
-		FallbackUsed:     true,
+		Source:           source,
+		FallbackUsed:     fallbackUsed,
 		WhatChanged:      describeEvents(taken),
 		Context:          contextNote,
 		RecommendedCheck: "Review the recent changes on this host.",
@@ -163,6 +172,19 @@ func fallbackBriefing(taken store.TakenGroup, outcome Outcome, now time.Time, co
 // saw would be a permanent wrong record, so shutdown leaves the group
 // for the lease (or next startup) instead. Reports whether state changed.
 func insertFallback(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome, contextNote string) bool {
+	return insertDeterministic(ctx, d, taken, outcome, contextNote, "fallback", true)
+}
+
+// insertRules stores the intentional below-floor deterministic briefing
+// (Designv9 §6.1): same content shape as a fallback, but source "rules"
+// with no fallback flag and no fallback health count. Below the model
+// threshold the bridge answers from reported context — no provider is
+// billed, nothing degraded.
+func insertRules(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome, contextNote string) bool {
+	return insertDeterministic(ctx, d, taken, outcome, contextNote, "rules", false)
+}
+
+func insertDeterministic(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome, contextNote, source string, countFallback bool) bool {
 	if ctx.Err() != nil {
 		return false
 	}
@@ -170,15 +192,17 @@ func insertFallback(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 	if d.Now != nil {
 		now = d.Now()
 	}
-	b := fallbackBriefing(taken, outcome, now, contextNote)
+	b := deterministicBriefing(taken, outcome, now, contextNote, source, countFallback)
 	if err := d.Store.InsertBriefing(ctx, b); err != nil {
-		log.Printf("briefing: group %s fallback insert: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
+		log.Printf("briefing: group %s %s insert: %s", taken.GroupID, source, store.SanitizeErrorText(err.Error()))
 		if transientStoreErr(ctx, err) {
 			return releaseTransientErr(ctx, d, taken, err)
 		}
-		return releaseOrPark(ctx, d, taken, "fallback insert failed")
+		return releaseOrPark(ctx, d, taken, source+" insert failed")
 	}
-	d.Health.AddProviderFallback()
+	if countFallback {
+		d.Health.AddProviderFallback()
+	}
 	notifyBriefing(d, taken, b)
 	if len(outcome.Skipped) > 0 {
 		log.Printf("briefing: group %s baseline %s skipped %d unknown-input rules", taken.GroupID, outcome.RuleID, len(outcome.Skipped))

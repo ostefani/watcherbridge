@@ -308,9 +308,11 @@ func briefOne(ctx context.Context, d Deps, groupID string) (progressed bool) {
 		}
 		if outcome.Level < d.ModelMinBaseline {
 			// Below the single-call floor (Designv9 §6.1): the
-			// deterministic briefing answers without billing a
-			// provider call.
-			return insertFallback(ctx, d, taken, outcome, "baseline below the single-call floor; briefing from deterministic baseline only")
+			// intentional rules-only briefing answers without
+			// billing a provider call. Source "rules", not
+			// "fallback": fallback is distinct from intentionally
+			// rules-only output.
+			return insertRules(ctx, d, taken, outcome, "baseline below the single-call floor; briefing from deterministic rules only")
 		}
 		return briefWithModel(ctx, d, taken, outcome)
 	}

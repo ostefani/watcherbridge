@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ostefani/watcherbridge/internal/provider"
+	"github.com/ostefani/watcherbridge/internal/redactor"
 	"github.com/ostefani/watcherbridge/internal/store"
 )
 
@@ -90,7 +91,7 @@ func TestSelectMode(t *testing.T) {
 		{"disabled stays single", High, Low, Medium, false, true, modeSingle},
 		{"incapable stays single", High, Low, Medium, true, false, modeSingle},
 		{"below model floor is deterministic", Low, Medium, High, true, true, modeDeterministic},
-		{"equal floors give the level to single", High, High, High, true, true, modeSingle},
+		{"equal floors give the shared level to the loop", High, High, High, true, true, modeAgent},
 		{"above equal floors investigates", Critical, High, High, true, true, modeAgent},
 		{"zero deps never investigate", Medium, Low, Low, false, false, modeSingle},
 	}
@@ -263,6 +264,58 @@ func TestAgentRepairRecoversInvalidTurn(t *testing.T) {
 	}
 }
 
+func TestAgentFinalTurnToolFallsBack(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	// Every turn names a tool: the tool turn executes, the reserved
+	// final answers with another tool call, and the repair re-asks
+	// with a third. Tools are spent on the final turn, so the repair
+	// response cannot execute — it falls back instead of finishing
+	// with a dangling tool result and no briefing.
+	fake.TurnHandle = func(tr []provider.TurnMessage) (string, error) {
+		return `{"tool":"find_similar_reported_changes","arguments":{"kind":"changed"}}`, nil
+	}
+	d := agentTestDeps(t, s, fake)
+	d.AgentMaxSteps = 1
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("failed run must still progress the group")
+	}
+	// One tool turn, the reserved final, and the single repair: the
+	// repair response is never executed, so no fourth send exists.
+	if fake.TurnCalls != 3 {
+		t.Fatalf("tool turn plus final plus one repair: %d calls", fake.TurnCalls)
+	}
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || b.Source != "fallback" {
+		t.Fatalf("final-turn tool call must fall back: %+v", b)
+	}
+}
+
+func TestAgentTranscriptScanBlocksResend(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	// The hostile address rides inside an otherwise well-formed tool
+	// call: argument resolution rejects the unknown token, and the
+	// repair re-ask is never transmitted — the pre-send scan fails the
+	// composed transcript closed on the model's own hostile text.
+	fake.TurnHandle = func(tr []provider.TurnMessage) (string, error) {
+		return `{"tool":"get_reported_profile","arguments":{"host":"IP_1 // 192.168.9.9"}}`, nil
+	}
+	d := agentTestDeps(t, s, fake)
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("blocked run must still progress the group")
+	}
+	if fake.TurnCalls != 1 {
+		t.Fatalf("blocked transcript must never transmit again: %d calls", fake.TurnCalls)
+	}
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || !strings.Contains(b.Context, "transcript blocked") {
+		t.Fatalf("scan hit must fail closed to a fallback: %+v", b)
+	}
+}
+
 func TestAgentDoubleInvalidFallsBackOnce(t *testing.T) {
 	s := openWorkerStore(t)
 	gid := hostChangedGroup(t, s)
@@ -343,8 +396,8 @@ func TestAgentBelowFloorIsDeterministic(t *testing.T) {
 		t.Fatalf("below the floor bills no provider call: turns=%d briefs=%d", fake.TurnCalls, fake.Briefs)
 	}
 	b := briefed(t, s, gid)
-	if !b.FallbackUsed || !strings.Contains(b.Context, "single-call floor") {
-		t.Fatalf("below-floor briefing must say so: %+v", b)
+	if b.FallbackUsed || b.Source != "rules" || !strings.Contains(b.Context, "single-call floor") {
+		t.Fatalf("below-floor briefing must be intentional rules-only output: %+v", b)
 	}
 }
 
@@ -387,6 +440,38 @@ func TestAgentFinalTurnReserved(t *testing.T) {
 	}
 	if b := briefed(t, s, gid); b.Source != "agent" {
 		t.Fatalf("reserved final must store: %+v", b)
+	}
+}
+
+func TestAgentProducerUUIDsTransmit(t *testing.T) {
+	s := openWorkerStore(t)
+	// Producer UUIDs are legitimate event IDs (hex and '-'). Their
+	// trailing 12-hex segment matches the scanner's bare-12-hex MAC
+	// leg — but only when embedded in larger text. The bundle carries
+	// them as exact leaves (skipped); the transcript embeds them in
+	// message text, so the pre-send scan must neutralize the cleared
+	// IDs structurally instead of blocking the run.
+	uuid := "550e8400-e29b-41d4-a716-446655440000"
+	payload := strings.Replace(changedPayload("", `{"number":22,"protocol":"tcp","state":"open"}`), `"event_id":"e1"`, `"event_id":"`+uuid+`"`, 1)
+	gid := seedGroup(t, s, "host:u", uuid, "host.changed", payload)
+	fake := provider.NewFake()
+	calls := 0
+	fake.TurnHandle = func(tr []provider.TurnMessage) (string, error) {
+		calls++
+		if calls == 1 {
+			return `{"tool":"get_reported_profile","arguments":{"host":"IP_1"}}`, nil
+		}
+		return finalFromTranscript(t, tr, strptr("high")), nil
+	}
+	d := agentTestDeps(t, s, fake)
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("agent run must progress the group")
+	}
+	if fake.TurnCalls != 2 {
+		t.Fatalf("producer UUIDs must not block transmission: %d calls", fake.TurnCalls)
+	}
+	if b := briefed(t, s, gid); b.Source != "agent" {
+		t.Fatalf("UUID run must store a loop briefing: %+v", b)
 	}
 }
 
@@ -498,6 +583,127 @@ func TestToolResultStaysInBudget(t *testing.T) {
 	raw, err := json.Marshal(map[string]any{"result": o.m, "truncated": o.truncated, "omitted": o.omitted})
 	if err != nil || len(raw) > maxToolResultBytes {
 		t.Fatalf("truncated result must stay valid and in budget: %v %d", err, len(raw))
+	}
+}
+
+func TestRenderPortsKeepsCappedRows(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	taken := takeSeeded(t, s, gid)
+	env := newAgentEnv(s, taken, map[string]string{}, time.Now())
+	ports := make([]store.ReportedPort, 0, 65)
+	for i := 1; i <= 65; i++ {
+		ports = append(ports, store.ReportedPort{Proto: "tcp", Port: i, State: "open"})
+	}
+	o := &toolOut{}
+	env.renderPorts(o, ports, 64)
+	if _, ok := o.m["ports"]; !ok {
+		t.Fatal("capped list must still emit the ports key")
+	}
+	raw, err := json.Marshal(o.m["ports"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back []map[string]any
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatal(err)
+	}
+	// 65 valid ports with a cap of 64 keep the first 64 plus the
+	// truncation flag — never an empty list.
+	if len(back) != 64 {
+		t.Fatalf("capped list must keep 64 rows, kept %d", len(back))
+	}
+	if !o.truncated {
+		t.Fatal("capped list must mark truncation")
+	}
+}
+
+func TestRenderPortsKeepsFittingPrefix(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	taken := takeSeeded(t, s, gid)
+	env := newAgentEnv(s, taken, map[string]string{}, time.Now())
+	// Long but valid rows: five-digit ports, filtered states, 24-char
+	// service words. The whole list cannot fit, but the fitting prefix
+	// must be kept with the truncation flag — not omitted completely.
+	ports := make([]store.ReportedPort, 0, 65)
+	for i := 0; i < 65; i++ {
+		ports = append(ports, store.ReportedPort{Proto: "tcp", Port: 60000 + i, State: "filtered", Service: "abcdefghijklmnopqrstuvwx"})
+	}
+	o := &toolOut{}
+	env.renderPorts(o, ports, 64)
+	raw, err := json.Marshal(o.m["ports"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back []map[string]any
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatal(err)
+	}
+	if len(back) == 0 || len(back) >= 65 {
+		t.Fatalf("long rows must keep a non-empty fitting prefix: %d rows", len(back))
+	}
+	if !o.truncated {
+		t.Fatal("truncated list must mark truncation")
+	}
+	envRaw, err := json.Marshal(map[string]any{"tool": "get_reported_services", "result": o.m, "truncated": o.truncated, "omitted": o.omitted})
+	if err != nil || len(envRaw) > maxToolResultBytes {
+		t.Fatalf("bounded envelope must stay valid and within 4 KiB: %v %d", err, len(envRaw))
+	}
+}
+
+func TestNeutralizeReferenceIDsStructural(t *testing.T) {
+	// A cleared short ID overlapping an address: only the reference
+	// position is exempted, the address stays fully visible to the
+	// scanner. Global substring scrubbing would rewrite 10.23.45.67
+	// into unscannable xxxx.23.45.67 while the original transmits.
+	final := `{"event_ids":["10","bogus"],"host":"IP_1","what_changed":"saw 10.23.45.67","context":"c","model_suggestion":null,"priority_reason":"r","recommended_check":"k"}`
+	tr := []provider.TurnMessage{{Role: "assistant", Text: final}}
+	raw, _ := json.Marshal(tr)
+	out := neutralizeReferenceIDs(raw, map[string]bool{"10": true})
+	var back []provider.TurnMessage
+	if err := json.Unmarshal(out, &back); err != nil {
+		t.Fatal(err)
+	}
+	var shape map[string]any
+	if err := json.Unmarshal([]byte(back[0].Text), &shape); err != nil {
+		t.Fatal(err)
+	}
+	ids, _ := shape["event_ids"].([]any)
+	if len(ids) != 2 || ids[0] != "xxxx" || ids[1] != "bogus" {
+		t.Fatalf("only the cleared reference is exempted: %v", ids)
+	}
+	if !strings.Contains(back[0].Text, "10.23.45.67") {
+		t.Fatalf("the overlapping address must survive verbatim: %s", back[0].Text)
+	}
+	issued := redactor.TokenMap{"IP_1": "192.168.0.5"}
+	if hits, err := redactor.ScanOutboundLeaks(out, issued, []string{"10"}); err != nil || len(hits) == 0 {
+		t.Fatalf("the surviving address must still trip the scan: %v %v", hits, err)
+	}
+}
+
+func TestAgentOverlappingIDStillBlocks(t *testing.T) {
+	s := openWorkerStore(t)
+	// Permitted short event ID overlapping a real address. The final is
+	// invalid (bogus ID), so the loop attempts a repair: the repair
+	// send must be blocked on the raw address even though the "10"
+	// inside the reference array is cleared.
+	payload := strings.Replace(changedPayload("", `{"number":22,"protocol":"tcp","state":"open"}`), `"event_id":"e1"`, `"event_id":"10"`, 1)
+	gid := seedGroup(t, s, "host:neg", "10", "host.changed", payload)
+	fake := provider.NewFake()
+	fake.TurnHandle = func(tr []provider.TurnMessage) (string, error) {
+		return `{"event_ids":["10","bogus"],"host":"IP_1","what_changed":"saw 10.23.45.67","context":"c","model_suggestion":null,"priority_reason":"r","recommended_check":"k"}`, nil
+	}
+	d := agentTestDeps(t, s, fake)
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("blocked run must still progress the group")
+	}
+	if fake.TurnCalls != 1 {
+		t.Fatalf("overlapping address must block the repair send: %d calls", fake.TurnCalls)
+	}
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || !strings.Contains(b.Context, "transcript blocked") {
+		t.Fatalf("overlap must fail closed to a blocked fallback: %+v", b)
 	}
 }
 
