@@ -44,12 +44,12 @@ const maxInflightBytes = 64 << 20
 // (single-transaction read, decode, tokenize) and bundle size.
 const maxGroupEvents = 128
 
-// agentMaxSteps is the Step 26 per-turn agent cap, needed early for the
-// timeout inequality. Step 26 promotes it to AGENT_MAX_STEPS config;
-// until then the divisor stays fixed and the check stays startup-true.
-const agentMaxSteps = 4
+// levelRank orders baseline levels for the single-call/agent floor
+// pairing (Designv9 §6.1): the agent floor sits at or above the
+// single-call floor, so exactly one provider path owns every baseline.
+var levelRank = map[string]int{"low": 0, "medium": 1, "high": 2, "critical": 3}
 
-// leaseMargin is the Designv8 §6.8 hand-off margin for the processing
+// leaseMargin is the Designv9 §6.4 hand-off margin for the processing
 // lease: PROCESSING_LEASE must cover 2×AGENT_TIMEOUT plus this. It is
 // deliberately not Margin (1s of handler slack): a 182s lease with a 90s
 // agent budget must refuse startup, and the 210s default (2×90s+30s)
@@ -192,7 +192,11 @@ type Config struct {
 	OverviewMaxWindow    time.Duration // configured overview maximum; 168h initial
 	OverviewTick         time.Duration // overview recompute timer; 5s-5m
 	ProcessingLease      time.Duration // stale processing age; must exceed 2 x agent timeout + margin
-	AgentTimeout         time.Duration // per-turn agent budget; must cover the provider timeout
+	AgentTimeout         time.Duration // run budget for the bounded loop; must cover the provider timeout
+	AgentEnabled         bool          // bounded investigator loop; opt-in, default off
+	AgentMaxSteps        int           // read-only tool turns per run, 1-4, validated
+	ModelMinBaseline     string        // single-call provider available at/below this baseline level
+	AgentMinBaseline     string        // agent loop investigates at/above this baseline level; >= ModelMin
 	EstablishedAge       time.Duration // first-seen age for established; dormant until Pro ships the field
 	StrongHistoryAge     time.Duration // first-seen age for strong history; dormant until Pro ships the field
 	StableIdentityFields []string      // change-field names that break stability; validated at startup
@@ -268,6 +272,10 @@ func Default() Config {
 		OverviewTick:         30 * time.Second,
 		ProcessingLease:      210 * time.Second,
 		AgentTimeout:         90 * time.Second,
+		AgentEnabled:         false,
+		AgentMaxSteps:        4,
+		ModelMinBaseline:     "low",
+		AgentMinBaseline:     "medium",
 		EstablishedAge:       1 * time.Hour,
 		StrongHistoryAge:     24 * time.Hour,
 		StableIdentityFields: []string{"mac", "hostname", "host_id", "identity_confidence", "identity_source"},
@@ -636,7 +644,7 @@ func (c Config) Validate() error {
 	if c.AgentTimeout <= 0 {
 		return fmt.Errorf("agent timeout must be positive")
 	}
-	// Designv8 §6.8: the lease only governs a live worker that stalls,
+	// Designv9 §6.4: the lease only governs a live worker that stalls,
 	// so it must cover twice the agent budget plus the explicit 30s
 	// hand-off margin — not the 1s handler Margin above, which is a
 	// different pairing. At least, not strictly above: the 210s default
@@ -645,14 +653,32 @@ func (c Config) Validate() error {
 		return fmt.Errorf("processing lease %v must be at least 2 x agent timeout %v + %v lease margin, or a live worker is reaped mid-turn",
 			c.ProcessingLease, c.AgentTimeout, leaseMargin)
 	}
-	// Designv8 §6.2: the agent budget must cover the provider call it
+	// Designv9 §6.4: the agent budget must cover the provider call it
 	// wraps, including the repair attempt it may need.
 	if c.AgentTimeout < c.ProviderTimeout {
 		return fmt.Errorf("agent timeout %v must cover the provider timeout %v", c.AgentTimeout, c.ProviderTimeout)
 	}
-	if c.AgentTimeout < (agentMaxSteps+1)*(c.ProviderTimeout/2) {
+	if c.AgentMaxSteps < 1 || c.AgentMaxSteps > 4 {
+		return fmt.Errorf("agent max steps %d must be within 1-4: more turns exceed the per-run budget", c.AgentMaxSteps)
+	}
+	if c.AgentTimeout < time.Duration(c.AgentMaxSteps+1)*(c.ProviderTimeout/2) {
 		return fmt.Errorf("agent timeout %v must allow a full call plus repair within %d steps (provider timeout %v)",
-			c.AgentTimeout, agentMaxSteps+1, c.ProviderTimeout)
+			c.AgentTimeout, c.AgentMaxSteps+1, c.ProviderTimeout)
+	}
+	// Designv9 §6.1 floors: unknown strings refuse startup (never route
+	// on a typo), and the single-call ceiling must not overtake the
+	// agent floor, or a baseline would own two provider paths.
+	modelMin, ok := levelRank[strings.ToLower(strings.TrimSpace(c.ModelMinBaseline))]
+	if !ok {
+		return fmt.Errorf("model min baseline %q must be one of low, medium, high, critical", c.ModelMinBaseline)
+	}
+	agentMin, ok := levelRank[strings.ToLower(strings.TrimSpace(c.AgentMinBaseline))]
+	if !ok {
+		return fmt.Errorf("agent min baseline %q must be one of low, medium, high, critical", c.AgentMinBaseline)
+	}
+	if modelMin > agentMin {
+		return fmt.Errorf("model min baseline %q must not exceed agent min baseline %q, or both paths claim the gap",
+			c.ModelMinBaseline, c.AgentMinBaseline)
 	}
 	if c.GrouperTick >= c.ProcessingLease {
 		return fmt.Errorf("grouper tick %v must be below the processing lease %v, or a stale worker is never reaped in time", c.GrouperTick, c.ProcessingLease)

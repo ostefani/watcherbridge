@@ -41,6 +41,18 @@ type Deps struct {
 	Provider     provider.Provider
 	Redaction    redactor.Policy
 	ModelTimeout time.Duration
+	// Step 26 agent floors (Designv9 §6.1). AgentEnabled is opt-in
+	// (default off); AgentMaxSteps bounds read-only tool turns per run
+	// (1-4, validated); ModelMinBaseline is the lowest baseline the
+	// single call serves (lower answers deterministically);
+	// AgentMinBaseline is the lowest baseline the loop investigates.
+	// AgentTimeout bounds one loop run; zero means the loop default.
+	// Zero values disable the loop.
+	AgentEnabled     bool
+	AgentMaxSteps    int
+	ModelMinBaseline Level
+	AgentMinBaseline Level
+	AgentTimeout     time.Duration
 	// Health counts provider outcomes and writer-saturation refunds;
 	// nil-safe, unset in tests that do not exercise it.
 	Health *health.Counters
@@ -123,6 +135,9 @@ func Run(ctx context.Context, d Deps) error {
 	// Operator-chosen degradations are loud at startup, never silent.
 	if d.Provider == nil || d.Provider.Name() == "fake" {
 		log.Print("briefing: no model provider; all briefings will be deterministic fallbacks")
+	}
+	if d.AgentEnabled && !isTurner(d.Provider) {
+		log.Print("briefing: agent enabled but the provider has no turn capability; eligible groups use the single call")
 	}
 	if !d.Redaction.Enabled {
 		log.Print("briefing: WARNING: redaction is off; raw values go to the provider and the leak scan is bypassed")
@@ -288,6 +303,15 @@ func briefOne(ctx context.Context, d Deps, groupID string) (progressed bool) {
 		return releaseOrPark(ctx, d, taken, "no events")
 	}
 	if d.Provider != nil {
+		if selectMode(outcome.Level, d.ModelMinBaseline, d.AgentMinBaseline, d.AgentEnabled, isTurner(d.Provider)) == modeAgent {
+			return runAgent(ctx, d, taken, outcome)
+		}
+		if outcome.Level < d.ModelMinBaseline {
+			// Below the single-call floor (Designv9 §6.1): the
+			// deterministic briefing answers without billing a
+			// provider call.
+			return insertFallback(ctx, d, taken, outcome, "baseline below the single-call floor; briefing from deterministic baseline only")
+		}
 		return briefWithModel(ctx, d, taken, outcome)
 	}
 	// No provider in Step 9 scope: the deterministic minimal briefing.

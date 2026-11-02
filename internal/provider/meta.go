@@ -80,6 +80,22 @@ func (a *MetaAdapter) Brief(ctx context.Context, bundle []byte, _ map[string]str
 	return a.post(ctx, body)
 }
 
+// Turn implements Turner: one stateless transcript send. The full
+// transcript is the request input, so the provider keeps no session and
+// a resumed run replays from the local log. Response cap, redirect
+// policy, and status mapping match Brief exactly.
+func (a *MetaAdapter) Turn(ctx context.Context, transcript []TurnMessage) (string, error) {
+	body, err := MarshalTurnRequest(a.modelID, transcript)
+	if err != nil {
+		return "", fmt.Errorf("encode turn request: %w", err)
+	}
+	raw, err := a.post(ctx, body)
+	if err != nil {
+		return "", err
+	}
+	return string(raw.JSON), nil
+}
+
 // Repair implements Provider.
 func (a *MetaAdapter) Repair(ctx context.Context, correction string, _ map[string]struct{}) (RawBriefing, error) {
 	body, err := MarshalRepairRequest(a.modelID, correction)

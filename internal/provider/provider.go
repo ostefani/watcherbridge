@@ -36,6 +36,26 @@ type Provider interface {
 	Repair(ctx context.Context, correction string, validTokens map[string]struct{}) (RawBriefing, error)
 }
 
+// TurnMessage is one turn of the agent transcript: role names the
+// speaker, text carries that turn's literal content (Designv9 §6.2).
+// The loop re-sends the full transcript every turn, so the provider
+// holds no session state and a restart resumes from the local log.
+type TurnMessage struct {
+	Role string // "system", "user", "assistant", or "tool"
+	Text string
+}
+
+// Turner is the optional per-turn capability behind the bounded
+// investigator loop (Designv9 §6, default off). Turn sends one full
+// transcript and returns that turn's raw assistant text. Adapters must
+// honor ctx, cap the response at the configured bytes, follow no
+// redirects, and never log transcript content. Tool results arrive as
+// "tool"-role messages; adapters forward them as model input, never
+// execute them.
+type Turner interface {
+	Turn(ctx context.Context, transcript []TurnMessage) (string, error)
+}
+
 // responsesContent is one Responses API content part. The bundle (or the
 // correction) crosses as literal input text — string conversion of the
 // exact leak-scanned bytes, never re-serialization — framed by the system
@@ -85,4 +105,34 @@ func MarshalRepairRequest(model, correction string) ([]byte, error) {
 		Role:    "user",
 		Content: []responsesContent{{Type: "input_text", Text: repairSystemInstruction + correction}},
 	}}, Stream: false})
+}
+
+// turnRole maps transcript roles onto Responses API roles. Tool results
+// are model input, not a new speaker: they travel as user text with an
+// explicit marker, so the wire stays a plain message list.
+func turnRole(role string) string {
+	switch role {
+	case "system", "assistant":
+		return role
+	default:
+		return "user"
+	}
+}
+
+// MarshalTurnRequest renders one agent turn: the full transcript as the
+// input list, verbatim. No session ID crosses — the provider chains
+// nothing, so every turn is independently auditable from the local log.
+func MarshalTurnRequest(model string, transcript []TurnMessage) ([]byte, error) {
+	in := make([]responsesMessage, 0, len(transcript))
+	for _, m := range transcript {
+		text := m.Text
+		if m.Role == "tool" {
+			text = "Tool result: " + text
+		}
+		in = append(in, responsesMessage{
+			Role:    turnRole(m.Role),
+			Content: []responsesContent{{Type: "input_text", Text: text}},
+		})
+	}
+	return json.Marshal(responsesRequest{Model: model, Input: in, Stream: false})
 }

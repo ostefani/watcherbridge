@@ -38,6 +38,35 @@ type BriefingSubject struct {
 	Role      string
 }
 
+// GroupSubjects returns the profile links projected for one group in
+// deterministic profile, role order. The Step 26 tool registry admits
+// group-linked subjects (plus subjects granted by find_similar within
+// the same run): a valid issued token is never authorization, so tools
+// reject any subject outside the registry.
+func (s *Store) GroupSubjects(ctx context.Context, groupID string) ([]BriefingSubject, bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT profile_id, role FROM group_subjects
+		WHERE group_id = ? ORDER BY profile_id ASC, role ASC LIMIT ?`, groupID, maxBriefingSubjects+1)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	var out []BriefingSubject
+	for rows.Next() {
+		var link BriefingSubject
+		if err := rows.Scan(&link.ProfileID, &link.Role); err != nil {
+			return nil, false, err
+		}
+		out = append(out, link)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	if len(out) > maxBriefingSubjects {
+		return out[:maxBriefingSubjects], true, nil
+	}
+	return out, false, nil
+}
+
 // BriefingSubjects returns the persisted profile links for one
 // briefing in deterministic profile order. truncated reports that
 // links beyond maxBriefingSubjects exist.

@@ -163,6 +163,17 @@ func TestValidateRejects(t *testing.T) {
 		"source ID with space":    func(c *Config) { c.SourceID = "lab 1" },
 		"source ID with slash":    func(c *Config) { c.SourceID = "lab/1" },
 		"source ID too long":      func(c *Config) { c.SourceID = strings.Repeat("s", 129) },
+		// Designv9 §6.1/§6.4: the loop step count and baseline floors
+		// are startup refusals, never silent routing.
+		"agent steps zero":       func(c *Config) { c.AgentMaxSteps = 0 },
+		"agent steps above four": func(c *Config) { c.AgentMaxSteps = 5 },
+		"agent steps negative":   func(c *Config) { c.AgentMaxSteps = -1 },
+		"unknown model floor":    func(c *Config) { c.ModelMinBaseline = "urgent" },
+		"unknown agent floor":    func(c *Config) { c.AgentMinBaseline = "URGENT" },
+		"blank model floor":      func(c *Config) { c.ModelMinBaseline = "  " },
+		"floors inverted": func(c *Config) {
+			c.ModelMinBaseline, c.AgentMinBaseline = "high", "medium"
+		},
 	}
 	for name, mutate := range cases {
 		c := Default()
@@ -306,6 +317,13 @@ func TestValidateAllows(t *testing.T) {
 		"skew at edge boundary": func(c *Config) {
 			c.ClockSkewAllowance = c.ScanRelayTolerance - c.TimestampTolerance - c.HandlerDeadline
 		},
+		// Equal floors give the level to the single call; mixed case
+		// normalizes. One tool turn is a legal (if minimal) loop.
+		"equal floors": func(c *Config) { c.ModelMinBaseline, c.AgentMinBaseline = "high", "high" },
+		"mixed-case floors": func(c *Config) {
+			c.ModelMinBaseline, c.AgentMinBaseline = "Medium", "HIGH"
+		},
+		"agent steps at one": func(c *Config) { c.AgentMaxSteps = 1 },
 	}
 	for name, mutate := range cases {
 		c := Default()

@@ -271,3 +271,60 @@ func (s *Store) InsertBriefing(ctx context.Context, b Briefing) error {
 		return nil
 	})
 }
+
+// SubjectBriefing is the tool-sized briefing projection for Step 26
+// (Designv9 §6.2 get_reported_history): identity, verdict, and timing
+// only — never briefing text or raw JSON, so one tool result stays far
+// under its byte budget.
+type SubjectBriefing struct {
+	BriefingID      string
+	GroupID         string
+	Priority        string
+	ModelSuggestion *string
+	FallbackUsed    bool
+	Source          string
+	CreatedAt       time.Time
+}
+
+// maxSubjectBriefings caps the history tool's briefing section; ten
+// verdict rows fit the 4 KiB tool budget with room for the omission
+// flags and the associated event lists.
+const maxSubjectBriefings = 10
+
+// BriefingsForSubject returns the newest briefings explicitly
+// associated with one subject, newest first. The read carries its own
+// row and column bounds: no text columns, no cursor — the tool reports
+// what is retained, most recent first.
+func (s *Store) BriefingsForSubject(ctx context.Context, profileID string, limit int) ([]SubjectBriefing, error) {
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > maxSubjectBriefings {
+		limit = maxSubjectBriefings
+	}
+	// One briefing links a profile under several roles (host plus
+	// previous/current views); DISTINCT keeps one row per briefing.
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT b.briefing_id, b.group_id, b.priority, b.model_suggestion,
+		b.fallback_used, b.source, b.created_at FROM briefings b
+		JOIN briefing_subjects s ON s.briefing_id = b.briefing_id
+		WHERE s.profile_id = ? ORDER BY b.created_at DESC, b.rowid DESC LIMIT ?`, profileID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SubjectBriefing
+	for rows.Next() {
+		var b SubjectBriefing
+		var created int64
+		if err := rows.Scan(&b.BriefingID, &b.GroupID, &b.Priority, &b.ModelSuggestion,
+			&b.FallbackUsed, &b.Source, &created); err != nil {
+			return nil, err
+		}
+		b.CreatedAt = time.Unix(0, created).UTC()
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}

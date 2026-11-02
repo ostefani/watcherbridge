@@ -186,15 +186,12 @@ func insertFallback(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 	return true
 }
 
-// briefWithModel runs the Step 11 pipeline for a taken group: bundle →
-// leak scan → provider (+1 repair) → validate → resolve → restore →
-// insert. Every terminal path stores exactly one briefing.
-func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome) bool {
-	if taken.LastAttempt() {
-		// Final take: skip the provider and write the deterministic
-		// briefing inline, so a poison group converges to done.
-		return insertFallback(ctx, d, taken, outcome, "retry cap reached; briefing from deterministic baseline only")
-	}
+// buildScannedBundle builds the redacted bundle both provider paths
+// send (Designv9 §6.3: every bundle is leak-scanned fail-closed before
+// it leaves the machine): tokenize, serialize, enforce the bundle cap,
+// and scan. An empty fail reason means success; otherwise the caller
+// stores the deterministic fallback with that reason.
+func buildScannedBundle(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome) (raw []byte, issued, display redactor.TokenMap, failReason string) {
 	timeout := d.ModelTimeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -212,12 +209,13 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 	}, d.Redaction)
 	if err != nil {
 		log.Printf("briefing: group %s bundle build: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
-		return insertFallback(ctx, d, taken, outcome, "bundle build failed; briefing from deterministic baseline only")
+		return nil, nil, nil, "bundle build failed; briefing from deterministic baseline only"
 	}
-	raw, err := json.Marshal(bundle)
-	if err != nil {
-		log.Printf("briefing: group %s bundle encode: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
-		return insertFallback(ctx, d, taken, outcome, "bundle encode failed; briefing from deterministic baseline only")
+	var err2 error
+	raw, err2 = json.Marshal(bundle)
+	if err2 != nil {
+		log.Printf("briefing: group %s bundle encode: %s", taken.GroupID, store.SanitizeErrorText(err2.Error()))
+		return nil, nil, nil, "bundle encode failed; briefing from deterministic baseline only"
 	}
 	// The model-side limit is the serialized bundle, not the group
 	// payload: field capping makes the mapping nonlinear, so only the
@@ -226,7 +224,7 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 	// explicit, never a billed multi-megabyte call.
 	if len(raw) > redactor.MaxBundleBytes {
 		log.Printf("briefing: group %s bundle %d bytes exceeds the %d-byte cap", taken.GroupID, len(raw), redactor.MaxBundleBytes)
-		return insertFallback(ctx, d, taken, outcome, "bundle exceeds size cap; briefing from deterministic baseline only")
+		return nil, nil, nil, "bundle exceeds size cap; briefing from deterministic baseline only"
 	}
 	if d.Redaction.Enabled {
 		// Last step before anything leaves the machine: fail closed.
@@ -234,8 +232,25 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 		if hits, err := redactor.ScanOutboundLeaks(raw, issued, bundle.EventIDs); err != nil || len(hits) > 0 {
 			log.Printf("briefing: group %s redaction blocked at %v", taken.GroupID, hits)
 			d.Health.AddRedactionBlocked()
-			return insertFallback(ctx, d, taken, outcome, "redaction blocked the model call; briefing from deterministic baseline only")
+			return nil, nil, nil, "redaction blocked the model call; briefing from deterministic baseline only"
 		}
+	}
+
+	return raw, issued, display, ""
+}
+
+// briefWithModel runs the single-call pipeline for a taken group:
+// bundle → leak scan → provider (+1 repair) → validate → resolve →
+// restore → insert. Every terminal path stores exactly one briefing.
+func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome) bool {
+	if taken.LastAttempt() {
+		// Final take: skip the provider and write the deterministic
+		// briefing inline, so a poison group converges to done.
+		return insertFallback(ctx, d, taken, outcome, "retry cap reached; briefing from deterministic baseline only")
+	}
+	raw, issued, display, failReason := buildScannedBundle(ctx, d, taken, outcome)
+	if failReason != "" {
+		return insertFallback(ctx, d, taken, outcome, failReason)
 	}
 
 	// The adapter gets the token-name set for echo validation — never
@@ -243,6 +258,10 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 	valid := make(map[string]struct{}, len(issued))
 	for tok := range issued {
 		valid[tok] = struct{}{}
+	}
+	timeout := d.ModelTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
 	}
 	modelCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -264,6 +283,16 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 			return insertFallback(ctx, d, taken, outcome, "model output invalid; briefing from deterministic baseline only")
 		}
 	}
+	return insertModelBriefing(ctx, d, taken, outcome, a, issued, display, "model")
+}
+
+// insertModelBriefing stores one validated model answer: the suggestion
+// resolves against the baseline, tokens restore to display spellings
+// within the byte budget, and exactly one briefing inserts. source names
+// the path ("model" for the single call, "agent" for the loop, Designv9
+// §6.1) so the audit trail distinguishes them. Every error path releases
+// or parks the group — never silently drops it.
+func insertModelBriefing(ctx context.Context, d Deps, taken store.TakenGroup, outcome Outcome, a answer, issued, display redactor.TokenMap, source string) bool {
 	m, suggestion, rawJSON := a.Model, a.Suggestion, a.Raw
 	final, clamped := Resolve(outcome.Level, suggestion)
 	now := time.Now()
@@ -300,7 +329,7 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 		PriorityReason:   reason,
 		BaselineRule:     outcome.RuleID,
 		Kind:             KindForTaken(taken, outcome.RuleID),
-		Source:           "model",
+		Source:           source,
 		Clamped:          clamped,
 		FallbackUsed:     false,
 		WhatChanged:      what,

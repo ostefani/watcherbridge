@@ -29,6 +29,15 @@ type FakeAdapter struct {
 	Repairs   int
 	Received  [][]byte
 	Deadlines []time.Time // ctx deadline observed per call; zero means none
+	// Turns scripts the Turner path: one FakeStep per Turn call, JSON as
+	// the assistant text. Extra calls replay the last step, like Brief.
+	Turns        []FakeStep
+	TurnCalls    int
+	TurnReceived [][]TurnMessage
+	// TurnHandle, when non-nil, answers dynamically from the full
+	// transcript: tests parse the bundle out of transcript[1] and
+	// build token-echoing answers without hardcoding token numbers.
+	TurnHandle func(transcript []TurnMessage) (string, error)
 }
 
 // NewFake returns a FakeAdapter playing script in order; extra calls replay
@@ -48,6 +57,41 @@ func (f *FakeAdapter) Brief(ctx context.Context, bundle []byte, valid map[string
 // Repair implements Provider.
 func (f *FakeAdapter) Repair(ctx context.Context, correction string, valid map[string]struct{}) (RawBriefing, error) {
 	return f.next(ctx, true, []byte(correction), valid)
+}
+
+// Turn implements Turner for scripted agent tests: unknown/hostile
+// turns, truncation signals, hangs, and errors are all scriptable.
+func (f *FakeAdapter) Turn(ctx context.Context, transcript []TurnMessage) (string, error) {
+	f.mu.Lock()
+	step := FakeStep{}
+	if len(f.Turns) > 0 {
+		step = f.Turns[0]
+		if len(f.Turns) > 1 {
+			f.Turns = f.Turns[1:]
+		}
+	}
+	f.TurnCalls++
+	cp := make([]TurnMessage, len(transcript))
+	copy(cp, transcript)
+	f.TurnReceived = append(f.TurnReceived, cp)
+	handle := f.TurnHandle
+	if dl, ok := ctx.Deadline(); ok {
+		f.Deadlines = append(f.Deadlines, dl)
+	} else {
+		f.Deadlines = append(f.Deadlines, time.Time{})
+	}
+	f.mu.Unlock()
+	if handle != nil {
+		return handle(cp)
+	}
+	if step.Hang {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	if step.Err != nil {
+		return "", step.Err
+	}
+	return string(step.JSON), nil
 }
 
 func (f *FakeAdapter) next(ctx context.Context, repair bool, payload []byte, valid map[string]struct{}) (RawBriefing, error) {

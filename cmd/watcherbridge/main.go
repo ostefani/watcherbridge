@@ -55,7 +55,11 @@ func main() {
 	decisionRet := fs.Duration("decision-retention", def.DecisionRetention, "retained operator-decision audit (min 24h)")
 	tick := fs.Duration("grouper-tick", def.GrouperTick, "worker tick")
 	lease := fs.Duration("processing-lease", def.ProcessingLease, "stale processing lease")
-	agentTimeout := fs.Duration("agent-timeout", def.AgentTimeout, "per-turn agent budget (Step 26 uses it)")
+	agentTimeout := fs.Duration("agent-timeout", def.AgentTimeout, "bounded investigator loop run budget")
+	agentEnabled := fs.Bool("agent-enabled", def.AgentEnabled, "enable the bounded investigator loop (opt-in)")
+	agentMaxSteps := fs.Int("agent-max-steps", def.AgentMaxSteps, "read-only tool turns per run (1-4)")
+	modelMin := fs.String("model-min-baseline", def.ModelMinBaseline, "single-call provider available at/below this baseline")
+	agentMin := fs.String("agent-min-baseline", def.AgentMinBaseline, "agent loop investigates at/above this baseline")
 	modelProvider := fs.String("model-provider", def.ModelProvider, "meta or fake")
 	modelID := fs.String("model-id", def.ModelID, "model ID for the meta provider")
 	modelKey := fs.String("model-key", "", "model API key (or MODEL_API_KEY)")
@@ -89,6 +93,10 @@ func main() {
 	cfg.OverviewTick = *overviewTick
 	cfg.ProcessingLease = *lease
 	cfg.AgentTimeout = *agentTimeout
+	cfg.AgentEnabled = *agentEnabled
+	cfg.AgentMaxSteps = *agentMaxSteps
+	cfg.ModelMinBaseline = *modelMin
+	cfg.AgentMinBaseline = *agentMin
 	cfg.ModelProvider = *modelProvider
 	cfg.ModelID = *modelID
 	cfg.ModelAPIKey = config.Secret(firstNonEmpty(*modelKey, os.Getenv("MODEL_API_KEY")))
@@ -108,6 +116,10 @@ func main() {
 	// Effective-state queries share the configured audit horizon with
 	// purge, so a stalled purge never extends a verdict past retention.
 	st.SetDecisionRetention(cfg.DecisionRetention)
+	// Step 26 floors are validated in server.New before the worker
+	// starts; the parse here cannot fail on a validated config.
+	modelMinLevel, _ := briefing.ParseLevel(cfg.ModelMinBaseline)
+	agentMinLevel, _ := briefing.ParseLevel(cfg.AgentMinBaseline)
 	// Single-source binding: refuse to serve a database that already
 	// holds another deployment's scoped receipts instead of mixing
 	// their subjects. Pre-scope rows carry '' and stay adoptable.
@@ -216,12 +228,17 @@ func main() {
 			Now:   time.Now,
 			Policy: briefing.Policy{EstablishedAge: cfg.EstablishedAge,
 				StrongHistoryAge: cfg.StrongHistoryAge, StableFields: cfg.StableIdentityFields},
-			Provider:     prov,
-			Redaction:    redactor.Policy{Enabled: cfg.Redaction, MaxFieldChars: cfg.MaxFieldChars},
-			ModelTimeout: cfg.ProviderTimeout,
-			Health:       opHealth,
-			OnBriefing:   onBriefingChanged,
-			OnGroups:     onGroups,
+			Provider:         prov,
+			Redaction:        redactor.Policy{Enabled: cfg.Redaction, MaxFieldChars: cfg.MaxFieldChars},
+			ModelTimeout:     cfg.ProviderTimeout,
+			AgentTimeout:     cfg.AgentTimeout,
+			AgentEnabled:     cfg.AgentEnabled,
+			AgentMaxSteps:    cfg.AgentMaxSteps,
+			ModelMinBaseline: modelMinLevel,
+			AgentMinBaseline: agentMinLevel,
+			Health:           opHealth,
+			OnBriefing:       onBriefingChanged,
+			OnGroups:         onGroups,
 		})
 	}()
 
