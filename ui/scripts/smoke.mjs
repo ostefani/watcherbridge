@@ -157,7 +157,10 @@ const traceFixture = {
   source: 'agent',
   likely_explanation: `Likely explanation ${hostile}`,
   confidence: 'high',
-  evidence_refs: [{ event_id: 'evt-1' }, { tool_step: 0 }],
+  // Validation permits repeated citations, so the cited-evidence
+  // list must survive duplicates (client keyed-each keys are
+  // occurrence-unique).
+  evidence_refs: [{ event_id: 'evt-1' }, { event_id: 'evt-1' }, { tool_step: 0 }, { tool_step: 0 }],
   input_tokens: 1200,
   output_tokens: 300,
   cost_usd: 0.002,
@@ -292,7 +295,12 @@ const cases = [
       'Cited evidence',
       'Executed tool steps'
     ],
-    absent: ['<img', '<b>', 'No agent trace is available']
+    absent: ['<img', '<b>', 'No agent trace is available'],
+    // Both occurrences of each repeated citation must render.
+    expectCount: [
+      ['Event evt-1', 2],
+      ['Tool step 0', 2]
+    ]
   },
   {
     component: Devices,
@@ -453,6 +461,13 @@ for (const c of cases) {
   for (const s of c.absent ?? []) {
     if (stripped.includes(s)) {
       console.error(`[${c.name}] must not contain ${JSON.stringify(s)}`);
+      failed++;
+    }
+  }
+  for (const [s, n] of c.expectCount ?? []) {
+    const got = text.split(s).length - 1;
+    if (got !== n) {
+      console.error(`[${c.name}] expected ${n}x ${JSON.stringify(s)}, saw ${got}x`);
       failed++;
     }
   }

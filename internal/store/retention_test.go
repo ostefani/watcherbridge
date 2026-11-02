@@ -640,7 +640,7 @@ func TestProtectedTokenRefillPagesAcrossBriefings(t *testing.T) {
 	host := `{"ip":"192.168.7.21","host_id":"ip:192.168.7.21","identity_source":"ip","identity_confidence":"high"}`
 	seedRetainedBriefing(t, s, "lab", "evt-page-a", host, `{"host":`+fmt.Sprintf("%q", first)+`}`, "audit", now)
 	seedRetainedBriefing(t, s, "lab", "evt-page-b", host, `{"host":`+fmt.Sprintf("%q", second)+`}`, "audit", now)
-	fence, err := s.refillProtectedTokensPaged(ctx, nanos(now), nanos(now), 1, 1, 1, protectedRefillPasses)
+	fence, _, err := s.refillProtectedTokensPaged(ctx, nanos(now), nanos(now), 1, 1, 1, protectedRefillPasses)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -742,7 +742,7 @@ func TestPurgeTokenFenceBlocksNewBriefings(t *testing.T) {
 	}
 	host := `{"ip":"192.168.7.31","host_id":"ip:192.168.7.31","identity_source":"ip","identity_confidence":"high"}`
 	seedRetainedBriefing(t, s, "lab", "evt-fence-a", host, "{}", "audit", now)
-	fence, err := s.refillProtectedTokens(ctx, nanos(now), nanos(now))
+	fence, decFence, err := s.refillProtectedTokens(ctx, nanos(now), nanos(now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -751,11 +751,13 @@ func TestPurgeTokenFenceBlocksNewBriefings(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := purgePlan{
-		stages:     stageSubjects,
-		subjectCut: nanos(now.Add(time.Hour)),
-		sourceCut:  nanos(now.Add(time.Hour)),
-		tokenCut:   nanos(now.Add(-time.Hour)),
-		tokenFence: fence,
+		stages:        stageSubjects,
+		subjectCut:    nanos(now.Add(time.Hour)),
+		sourceCut:     nanos(now.Add(time.Hour)),
+		tokenCut:      nanos(now.Add(-time.Hour)),
+		tokenFence:    fence,
+		tokenDecFence: decFence,
+		decisionCut:   nanos(now.Add(-24 * time.Hour)),
 	}
 	report, _, err := s.purgeBatch(ctx, now, plan)
 	if err != nil {
@@ -767,12 +769,88 @@ func TestPurgeTokenFenceBlocksNewBriefings(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT COALESCE(MAX(rowid), 0) FROM briefings`).Scan(&plan.tokenFence); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(rowid), 0) FROM operator_decisions WHERE subject_kind = 'briefing'`).Scan(&plan.tokenDecFence); err != nil {
+		t.Fatal(err)
+	}
 	report, _, err = s.purgeBatch(ctx, now, plan)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if report.Pseudonyms != 1 {
 		t.Fatalf("current fence must release unrelated expiry: %+v", report)
+	}
+}
+
+// A pin committed after reference discovery must defer token expiry:
+// the aged briefing it retains was never scanned, so its mappings
+// cannot be judged unreferenced. The next discovery includes the pin
+// and protects them.
+func TestPurgeTokenFenceBlocksNewDecisions(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	doomed, err := s.GetOrAssignPseudonym(ctx, "ip", "192.168.7.71")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := `{"ip":"192.168.7.71","host_id":"ip:192.168.7.71","identity_source":"ip","identity_confidence":"high"}`
+	seedRetainedBriefing(t, s, "lab", "evt-pinfence-a", host, `{"host":`+fmt.Sprintf("%q", doomed)+`}`, "audit", now.Add(-48*time.Hour))
+	// A fresh retained briefing advances the briefing fence past the
+	// aged row, so only the decision fence can defer its token.
+	seedRetainedBriefing(t, s, "lab", "evt-pinfence-b", host, "{}", "audit", now)
+	briefingCut := nanos(now.Add(-time.Hour))
+	decisionCut := nanos(now.Add(-24 * time.Hour))
+	fence, decFence, err := s.refillProtectedTokens(ctx, briefingCut, decisionCut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var briefingID string
+	if err := s.db.QueryRow(`SELECT briefing_id FROM briefings ORDER BY created_at, rowid LIMIT 1`).Scan(&briefingID); err != nil {
+		t.Fatal(err)
+	}
+	// Pin the aged, never-scanned briefing after discovery.
+	if _, err := s.AppendDecision(ctx, DecisionInput{
+		SubjectKind: DecisionSubjectBriefing, SubjectID: briefingID,
+		Kind: DecisionExpected, RequestID: "pin-req-fence",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE pseudonym_map SET last_used_at = ? WHERE token = ?`, nanos(now.Add(-48*time.Hour)), doomed); err != nil {
+		t.Fatal(err)
+	}
+	plan := purgePlan{
+		stages:        stageSubjects,
+		subjectCut:    nanos(now.Add(time.Hour)),
+		sourceCut:     nanos(now.Add(time.Hour)),
+		tokenCut:      nanos(now.Add(-time.Hour)),
+		tokenFence:    fence,
+		tokenDecFence: decFence,
+		decisionCut:   decisionCut,
+	}
+	report, _, err := s.purgeBatch(ctx, now, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Pseudonyms != 0 {
+		t.Fatalf("post-discovery pin must defer token expiry: %+v", report)
+	}
+	// The next discovery runs with the pin standing, so the token
+	// enters the protected set and expiry stays deferred.
+	fence, decFence, err = s.refillProtectedTokens(ctx, briefingCut, decisionCut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var protected int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM purge_protected_tokens WHERE token = ?`, doomed).Scan(&protected); err != nil || protected != 1 {
+		t.Fatalf("rediscovery must protect the pinned token: %d %v", protected, err)
+	}
+	plan.tokenFence, plan.tokenDecFence = fence, decFence
+	report, _, err = s.purgeBatch(ctx, now, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Pseudonyms != 0 {
+		t.Fatalf("protected token must survive with its pin: %+v", report)
 	}
 }
 

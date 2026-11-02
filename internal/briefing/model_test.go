@@ -1041,3 +1041,30 @@ func TestSingleCallInvalidFallbackKeepsUsage(t *testing.T) {
 		t.Fatalf("fallback must sum both sends: %+v %+v", b.InputTokens, b.OutputTokens)
 	}
 }
+
+// A repair transport failure must not void the initial send's
+// accounting: the fallback keeps the usage already reported.
+func TestSingleCallRepairErrorKeepsInitialUsage(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	usage := provider.Usage{InputTokens: 10, OutputTokens: 5, HasUsage: true}
+	bad := []byte(`{"event_ids":["x"],"host":"IP_1"}`)
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		if repair {
+			return provider.RawBriefing{}, fmt.Errorf("repair transport down")
+		}
+		return provider.RawBriefing{JSON: bad, Usage: usage}, nil
+	}
+	d := modelDeps(t, s, fake)
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("failed run must still progress the group")
+	}
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || b.Source != "fallback" {
+		t.Fatalf("repair errors must fall back: %+v", b)
+	}
+	if b.InputTokens == nil || *b.InputTokens != 10 || b.OutputTokens == nil || *b.OutputTokens != 5 {
+		t.Fatalf("fallback must keep the initial usage: %+v %+v", b.InputTokens, b.OutputTokens)
+	}
+}

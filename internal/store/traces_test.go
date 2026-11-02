@@ -206,7 +206,7 @@ func TestProtectedTokensCoverTraces(t *testing.T) {
 	if err := s.InsertBriefing(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.refillProtectedTokens(context.Background(), now.Add(-time.Hour).UnixNano(), nanos(now.Add(-24*time.Hour))); err != nil {
+	if _, _, err := s.refillProtectedTokens(context.Background(), now.Add(-time.Hour).UnixNano(), nanos(now.Add(-24*time.Hour))); err != nil {
 		t.Fatal(err)
 	}
 	var n int
@@ -249,7 +249,7 @@ func TestProtectedTokensCoverPinnedTraces(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.refillProtectedTokens(context.Background(), now.Add(-time.Hour).UnixNano(), nanos(now.Add(-24*time.Hour))); err != nil {
+	if _, _, err := s.refillProtectedTokens(context.Background(), now.Add(-time.Hour).UnixNano(), nanos(now.Add(-24*time.Hour))); err != nil {
 		t.Fatal(err)
 	}
 	var n int

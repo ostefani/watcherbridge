@@ -235,7 +235,7 @@
         {#if shown.evidence_refs && shown.evidence_refs.length}
           <h4>Cited evidence</h4>
           <ul>
-            {#each shown.evidence_refs as ref (ref.event_id ?? `step:${ref.tool_step}`)}
+            {#each shown.evidence_refs as ref, i (`${ref.event_id ?? ref.tool_step}:${i}`)}
               <li>
                 {#if ref.event_id}
                   Event {ref.event_id}

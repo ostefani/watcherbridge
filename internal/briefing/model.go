@@ -408,7 +408,7 @@ func briefWithModel(ctx context.Context, d Deps, taken store.TakenGroup, outcome
 		repair, err := d.Provider.Repair(modelCtx, repairPrompt(a.Correction), valid)
 		if err != nil {
 			log.Printf("briefing: group %s repair: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
-			return insertFallback(ctx, d, taken, outcome, "model repair failed; briefing from deterministic baseline only", nil, provider.Usage{})
+			return insertFallback(ctx, d, taken, outcome, "model repair failed; briefing from deterministic baseline only", nil, usage)
 		}
 		d.Health.AddUsage(repair.Usage)
 		usage = usage.Add(repair.Usage)
