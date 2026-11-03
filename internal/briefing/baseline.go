@@ -39,19 +39,23 @@ type portView struct {
 }
 
 type hostView struct {
-	IP                 string     `json:"ip"`
-	Hostname           string     `json:"hostname"`
-	MAC                string     `json:"mac"`
-	RandomizedMAC      bool       `json:"randomized_mac"`
-	OS                 string     `json:"os"`
-	Device             string     `json:"device"`
-	Vendor             string     `json:"vendor"`
-	Weak               bool       `json:"weak"`
-	Alive              bool       `json:"alive"`
-	IdentityConfidence string     `json:"identity_confidence"`
-	LastStrongSeenAt   time.Time  `json:"last_strong_seen_at"`
-	FirstStrongSeenAt  time.Time  `json:"first_strong_seen_at"`
-	Ports              []portView `json:"ports"`
+	IP                 string `json:"ip"`
+	Hostname           string `json:"hostname"`
+	MAC                string `json:"mac"`
+	RandomizedMAC      bool   `json:"randomized_mac"`
+	OS                 string `json:"os"`
+	Device             string `json:"device"`
+	Vendor             string `json:"vendor"`
+	Weak               bool   `json:"weak"`
+	Alive              bool   `json:"alive"`
+	IdentityConfidence string `json:"identity_confidence"`
+	// IdentityRevision preserves the reported stable-identity
+	// revision for epoch-pinned rule scopes. Stored payloads are
+	// already bounded at ingest; no second cap here.
+	IdentityRevision  string     `json:"identity_revision"`
+	LastStrongSeenAt  time.Time  `json:"last_strong_seen_at"`
+	FirstStrongSeenAt time.Time  `json:"first_strong_seen_at"`
+	Ports             []portView `json:"ports"`
 }
 
 // GroupEvent is one taken event with its payload decoded. Type comes from

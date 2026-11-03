@@ -23,6 +23,47 @@ func dropSubjectRevision(t *testing.T, db *sql.DB) {
 	dropColumnIfExists(t, db, "reported_subjects", "identity_revision")
 }
 
+func TestSubjectRevisionHighWater(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	view := func(rev string) []byte {
+		return []byte(`{"event_id":"e","host":{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","identity_namespace":"ns-1","identity_revision":"` + rev + `","identity_confidence":"high"}}`)
+	}
+	t0 := time.Now().UTC().Truncate(time.Second)
+	ingest := func(eventID, rev string, at time.Time) string {
+		gid := persistReported(t, s, "test-scope", eventID, "k", "host.appeared", view(rev), at)
+		if _, err := s.ProjectReported(ctx, "test-scope", 64); err != nil {
+			t.Fatal(err)
+		}
+		links, _, err := s.GroupSubjects(ctx, gid)
+		if err != nil || len(links) == 0 {
+			t.Fatalf("group subjects must link: %+v %v", links, err)
+		}
+		sub, err := s.ReportedProfile(ctx, links[0].ProfileID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sub.IdentityRevision
+	}
+	if rev := ingest("evt-w1", "rev-1", t0); rev != "rev-1" {
+		t.Fatalf("reported revision must persist: %q", rev)
+	}
+	if rev := ingest("evt-w2", "rev-2", t0.Add(time.Hour)); rev != "rev-2" {
+		t.Fatalf("newer revision must win: %q", rev)
+	}
+	// An older replay of a previous epoch must not roll the reference
+	// back: the high-water mark keeps the newest report.
+	if rev := ingest("evt-w3", "rev-1", t0.Add(-time.Hour)); rev != "rev-2" {
+		t.Fatalf("older replay must not roll back the revision: %q", rev)
+	}
+	// Over-bound revisions are dropped, never truncated into a
+	// colliding key.
+	wide := toSubjectView("host", &hostViewJSON{IdentityRevision: strings.Repeat("r", maxRevisionRunes+1)})
+	if wide.identityRevision != "" {
+		t.Fatalf("over-bound revision must drop: %q", wide.identityRevision)
+	}
+}
+
 // dropProjectionSchema rewinds the Step-18 schema additions (v10 tables,
 // v11 pending queue/receipt scope and v12 grouping provenance) so migration-chain tests
 // that rewind to older versions replay cleanly through the current

@@ -206,6 +206,52 @@ func TestDeriveProposalsTruncatesOldEvidence(t *testing.T) {
 		t.Fatalf("truncation must keep the newest evidence: %+v", ps[0])
 	}
 }
+
+// Judgments stay pinned to the epoch they were made in. Three rev-1
+// judgments, an approval, then one unjudged rev-2 report: the old
+// judgments must not be reassigned to rev-2 (no rev-2 proposal), the
+// rev-1 grant must not fire on the live rev-2 scope, and three fresh
+// rev-2 judgments must propose the new epoch.
+func TestDeriveProposalsRejectsStaleRevision(t *testing.T) {
+	s := openWorkerStore(t)
+	bindRuleSource(t, s, "test-scope")
+	rev2Payload := strings.Replace(rulePayload(), ruleRevision, "rev-2", -1)
+	judge := func(id, payload, req string) {
+		gid := seedGroup(t, s, "host:w", id, "host.changed", payload)
+		briefRuleGroup(t, s, gid)
+		expectBriefing(t, s, gid, req)
+	}
+	for i, id := range []string{"evt-e1", "evt-e2", "evt-e3"} {
+		judge(id, rulePayload(), "epoch-req-"+string(rune('a'+i)))
+	}
+	now := time.Now()
+	ps, err := DeriveProposals(context.Background(), s, 3, now)
+	if err != nil || len(ps) != 1 || ps[0].IdentityRevision != ruleRevision {
+		t.Fatalf("rev-1 evidence must propose its own epoch: %+v %v", ps, err)
+	}
+	grant, applied, err := ApproveProposal(context.Background(), s, ps[0].ProposalID, 3, -1, 90*24*time.Hour, now)
+	if err != nil || !applied {
+		t.Fatalf("rev-1 grant must apply: %+v %v", grant, err)
+	}
+	// The epoch turns: one rev-2 report, judged by nobody.
+	epochGID := seedGroup(t, s, "host:w", "evt-e4", "host.changed", rev2Payload)
+	epochBrief := briefRuleGroup(t, s, epochGID)
+	if epochBrief.BaselineRule == grant.RuleID {
+		t.Fatalf("rev-1 grant must not fire on the rev-2 scope: %+v", epochBrief)
+	}
+	if ps, err := DeriveProposals(context.Background(), s, 3, now); err != nil || len(ps) != 0 {
+		t.Fatalf("old judgments must not propose the new epoch: %+v %v", ps, err)
+	}
+	// Three rev-2 judgments propose the new epoch on its own evidence.
+	for i, id := range []string{"evt-e5", "evt-e6", "evt-e7"} {
+		judge(id, rev2Payload, "epoch2-req-"+string(rune('a'+i)))
+	}
+	ps, err = DeriveProposals(context.Background(), s, 3, now)
+	if err != nil || len(ps) != 1 || ps[0].IdentityRevision != "rev-2" {
+		t.Fatalf("rev-2 evidence must propose its own epoch: %+v %v", ps, err)
+	}
+}
+
 func TestDeriveProposalsSkipsUnknownRevision(t *testing.T) {
 	s := openWorkerStore(t)
 	bindRuleSource(t, s, "test-scope")

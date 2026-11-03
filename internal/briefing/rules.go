@@ -296,10 +296,46 @@ func scopeForBriefing(ctx context.Context, st *store.Store, b store.Briefing) (R
 		}
 		events = append(events, ev)
 	}
+	rev, ok := briefingRevision(events)
+	if !ok || rev != scope.IdentityRevision {
+		// Judgments stay pinned to the epoch they were made in. The
+		// subject row always carries the latest reported revision, so
+		// without this check old judgments would be reassigned to the
+		// newest epoch and counted as evidence for it. Stale (past
+		// epoch), unknown (no reported revision) and mixed (straddled
+		// epochs) evidence never proposes.
+		return zero, false, nil
+	}
 	scope.Kind = b.Kind
 	scope.PortsCSV = canonicalPorts(events)
 	scope.ChangedFieldsCSV = canonicalChangeFields(events)
 	return scope, true, nil
+}
+
+// briefingRevision reduces a briefing's decoded events to the single
+// identity revision they unanimously report. Every readable view
+// votes; an empty vote (a view from before revisions were reported)
+// poisons unanimity exactly like a disagreement. Events without any
+// usable view never reach here — scope derivation already voids those
+// scopes as incomplete provenance.
+func briefingRevision(events []GroupEvent) (string, bool) {
+	seen := map[string]bool{}
+	var out []string
+	for _, e := range events {
+		for _, v := range []*hostView{e.Host, e.Current, e.Previous} {
+			if v == nil {
+				continue
+			}
+			if !seen[v.IdentityRevision] {
+				seen[v.IdentityRevision] = true
+				out = append(out, v.IdentityRevision)
+			}
+		}
+	}
+	if len(out) != 1 || out[0] == "" {
+		return "", false
+	}
+	return out[0], true
 }
 
 // DeriveProposals collects the actionable scopes: distinct briefings
