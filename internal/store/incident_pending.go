@@ -1,6 +1,7 @@
 package store
 
 import (
+	"container/list"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -153,42 +154,52 @@ func pendingSourceQualified(tx *sql.Tx, c classifiedBriefing) (bool, error) {
 	return true, nil
 }
 
-// formationCandidates searches descending candidate windows with bounded work.
-// On a failed window, no qualifying burst can end later than oldest+Window:
-// even the MinRefs newest references did not fit. Seek to that endpoint and
-// retain progress on the oldest pending candidate if this pass exhausts its
-// search budget. A newer isolated report cannot hide an older burst forever.
+// pendingWindowRef identifies an occurrence in a backward report scan.
+// At most MinRefs-1 distinct references are carried across bounded pages.
+type pendingWindowRef struct {
+	Reference  string
+	BriefingID string
+	At         int64
+}
+
+const maxIncidentFormationReports = 32
+
+// formationCandidates uses latest representatives as a fast path. When they
+// cannot qualify, scan immutable pending reports backward in bounded pages.
+// The most recently scanned occurrence replaces an earlier occurrence of the
+// same reference, so a later repeat cannot hide an older qualifying burst.
 func formationCandidates(tx *sql.Tx, key string, settings IncidentSettings, now time.Time, limit int) ([]classifiedBriefing, bool, error) {
 	if limit < settings.MinRefs {
 		return nil, false, nil
 	}
-	var anchor string
+	var anchor, beforeID, raw, savedSettings string
 	var before int64
-	if err := tx.QueryRow(`SELECT briefing_id,formation_before FROM incident_pending WHERE correlation_key=? ORDER BY created_at,briefing_id LIMIT 1`, key).Scan(&anchor, &before); err != nil {
+	if err := tx.QueryRow(`SELECT briefing_id,formation_before,formation_briefing,formation_refs_json,formation_settings FROM incident_pending WHERE correlation_key=? ORDER BY created_at,briefing_id LIMIT 1`, key).Scan(&anchor, &before, &beforeID, &raw, &savedSettings); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, false, nil
 		}
 		return nil, false, err
 	}
-	through := now
-	if before > 0 && before < nanos(through) {
-		through = fromNanos(before)
+	// A wider window or a different threshold can make an occurrence
+	// discarded by the previous scan relevant again. Restart on settings changes.
+	searchSettings := fmt.Sprintf("%d:%d:%d", settings.Window, settings.Quiet, settings.MinRefs)
+	if savedSettings != searchSettings {
+		beforeID = ""
+		raw = "[]"
 	}
-	reset := func(value int64) error {
-		_, err := tx.Exec(`UPDATE incident_pending SET formation_before=? WHERE briefing_id=?`, value, anchor)
+	reset := func() error {
+		_, err := tx.Exec(`UPDATE incident_pending SET formation_before=0,formation_briefing='',formation_refs_json='[]',formation_settings='' WHERE briefing_id=?`, anchor)
 		return err
 	}
-	var ids map[string]bool
-	var newest time.Time
-	found := false
-	for attempt := 0; attempt < 8; attempt++ {
-		rows, err := tx.Query(`SELECT briefing_id,created_at FROM incident_pending_refs
-   WHERE correlation_key=? AND created_at>=? AND created_at<=? ORDER BY created_at DESC LIMIT ?`, key, nanos(now.Add(-settings.Window-settings.Quiet)), nanos(through), settings.MinRefs)
+	{
+		// Each index entry is a different reference, so this common path is
+		// bounded independently of repeated reports on any one reference.
+		rows, err := tx.Query(`SELECT briefing_id,created_at FROM incident_pending_refs WHERE correlation_key=? AND created_at>=? AND created_at<=? ORDER BY created_at DESC LIMIT ?`, key, nanos(now.Add(-settings.Window-settings.Quiet)), nanos(now), settings.MinRefs)
 		if err != nil {
 			return nil, false, err
 		}
-		ids = map[string]bool{}
-		var oldest time.Time
+		ids := map[string]bool{}
+		var newest, oldest time.Time
 		count := 0
 		for rows.Next() {
 			var id string
@@ -197,11 +208,10 @@ func formationCandidates(tx *sql.Tx, key string, settings IncidentSettings, now 
 				rows.Close()
 				return nil, false, err
 			}
-			t := fromNanos(at)
 			if count == 0 {
-				newest = t
+				newest = fromNanos(at)
 			}
-			oldest = t
+			oldest = fromNanos(at)
 			ids[id] = true
 			count++
 		}
@@ -210,21 +220,117 @@ func formationCandidates(tx *sql.Tx, key string, settings IncidentSettings, now 
 		if err != nil {
 			return nil, false, err
 		}
-		if count < settings.MinRefs {
-			return nil, false, reset(0)
+		if count == settings.MinRefs && newest.Sub(oldest) <= settings.Window {
+			if err := reset(); err != nil {
+				return nil, false, err
+			}
+			members, err := formationMembers(tx, key, ids, newest, settings.Window, limit)
+			return members, false, err
 		}
-		if newest.Sub(oldest) <= settings.Window {
-			found = true
-			break
+	}
+	var saved []pendingWindowRef
+	if beforeID != "" {
+		if err := json.Unmarshal([]byte(raw), &saved); err != nil {
+			return nil, false, err
 		}
-		through = oldest.Add(settings.Window)
+		if len(saved) >= settings.MinRefs {
+			return nil, false, fmt.Errorf("incident search state exceeds reference bound")
+		}
 	}
-	if !found {
-		return nil, true, reset(nanos(through))
+	recent := list.New()
+	byRef := map[string]*list.Element{}
+	cut := nanos(now.Add(-settings.Window - settings.Quiet))
+	for _, r := range saved {
+		if r.At >= cut {
+			byRef[r.Reference] = recent.PushBack(r)
+		}
 	}
-	if err := reset(0); err != nil {
+	query := `SELECT briefing_id,created_at,data_json FROM incident_pending WHERE correlation_key=? AND created_at>=? AND created_at<=?`
+	args := []any{key, cut, nanos(now)}
+	if beforeID != "" {
+		query += ` AND (created_at,briefing_id)<(?,?)`
+		args = append(args, before, beforeID)
+	}
+	query += ` ORDER BY created_at DESC,briefing_id DESC LIMIT ?`
+	args = append(args, maxIncidentFormationReports)
+	rows, err := tx.Query(query, args...)
+	if err != nil {
 		return nil, false, err
 	}
+	type report struct {
+		id   string
+		at   int64
+		refs []MemberRef
+	}
+	var reports []report
+	for rows.Next() {
+		var r report
+		var raw string
+		if err := rows.Scan(&r.id, &r.at, &raw); err != nil {
+			rows.Close()
+			return nil, false, err
+		}
+		var p pendingEvidence
+		if err := json.Unmarshal([]byte(raw), &p); err != nil {
+			rows.Close()
+			return nil, false, err
+		}
+		if len(p.Refs) > 512 {
+			rows.Close()
+			return nil, false, fmt.Errorf("incident reference snapshot exceeds bound")
+		}
+		r.refs = p.Refs
+		reports = append(reports, r)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, false, err
+	}
+	for _, report := range reports {
+		for _, r := range report.refs {
+			if previous := byRef[r.Reference]; previous != nil {
+				recent.Remove(previous)
+			}
+			byRef[r.Reference] = recent.PushBack(pendingWindowRef{r.Reference, report.id, report.at})
+			if recent.Len() < settings.MinRefs {
+				continue
+			}
+			newest := recent.Front().Value.(pendingWindowRef)
+			if newest.At-report.at <= int64(settings.Window) {
+				ids := map[string]bool{}
+				for e := recent.Front(); e != nil; e = e.Next() {
+					ids[e.Value.(pendingWindowRef).BriefingID] = true
+				}
+				if err := reset(); err != nil {
+					return nil, false, err
+				}
+				members, err := formationMembers(tx, key, ids, fromNanos(newest.At), settings.Window, limit)
+				return members, false, err
+			}
+			// No window containing this newest occurrence can qualify. Retain
+			// the older occurrences and continue, including future repeats.
+			delete(byRef, newest.Reference)
+			recent.Remove(recent.Front())
+		}
+	}
+	if len(reports) < maxIncidentFormationReports {
+		return nil, false, reset()
+	}
+	saved = nil
+	for e := recent.Front(); e != nil; e = e.Next() {
+		saved = append(saved, e.Value.(pendingWindowRef))
+	}
+	data, err := json.Marshal(saved)
+	if err != nil {
+		return nil, false, err
+	}
+	last := reports[len(reports)-1]
+	_, err = tx.Exec(`UPDATE incident_pending SET formation_before=?,formation_briefing=?,formation_refs_json=?,formation_settings=? WHERE briefing_id=?`, last.at, last.id, string(data), searchSettings, anchor)
+	return nil, true, err
+}
+
+func formationMembers(tx *sql.Tx, key string, ids map[string]bool, newest time.Time, window time.Duration, limit int) ([]classifiedBriefing, error) {
 	// Representatives may be later than the first 500 repeated reports.
 	// Include them explicitly before filling remaining formation capacity.
 	var out []classifiedBriefing
@@ -233,11 +339,11 @@ func formationCandidates(tx *sql.Tx, key string, settings IncidentSettings, now 
 		var c classifiedBriefing
 		var at int64
 		if err := tx.QueryRow(`SELECT p.briefing_id,b.group_id,b.priority,p.created_at,p.data_json FROM incident_pending p JOIN briefings b ON b.briefing_id=p.briefing_id WHERE p.briefing_id=?`, id).Scan(&c.briefingID, &c.groupID, &c.priority, &at, &raw); err != nil {
-			return nil, false, err
+			return nil, err
 		}
 		var p pendingEvidence
 		if err := json.Unmarshal([]byte(raw), &p); err != nil {
-			return nil, false, err
+			return nil, err
 		}
 		c.createdAt = fromNanos(at)
 		c.kind, c.source, c.target, c.revision = p.Kind, p.Source, p.Target, p.Revision
@@ -247,9 +353,9 @@ func formationCandidates(tx *sql.Tx, key string, settings IncidentSettings, now 
 		}
 		out = append(out, c)
 	}
-	fill, err := readPending(tx, key, newest.Add(-settings.Window), newest, limit-len(out))
+	fill, err := readPending(tx, key, newest.Add(-window), newest, limit-len(out))
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	for _, c := range fill {
 		if !ids[c.briefingID] {
@@ -262,7 +368,7 @@ func formationCandidates(tx *sql.Tx, key string, settings IncidentSettings, now 
 		}
 		return out[i].createdAt.Before(out[j].createdAt)
 	})
-	return out, false, nil
+	return out, nil
 }
 
 func insertMemberReferences(tx *sql.Tx, id string, refs []MemberRef) (int, error) {

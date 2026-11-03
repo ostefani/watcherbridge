@@ -40,7 +40,7 @@ export function fetchBriefing(id) {
  * Incident subjects require includeMembers: true fans the decision
  * out to the membership snapshot, false leaves members untouched.
  * @param {{subjectKind: string, subjectId: string, kind: string, until?: string, text?: string, requestId: string, includeMembers?: boolean}} d
- * @returns {Promise<{decision: import('./wire.js').Decision, applied: boolean, reason?: string, members?: import('./wire.js').Decision[], generated_decision_ids?: string[]}>}
+ * @returns {Promise<{decision: import('./wire.js').Decision, applied: boolean, reason?: string, members?: import('./wire.js').Decision[], generated_decision_ids?: string[], generated_next?: number}>}
  */
 export async function postDecision(d) {
   const body = {
@@ -96,7 +96,7 @@ export function fetchDecisions(subjectKind, subjectId, page = {}) {
  * them in generated_decision_ids for individual revisit.
  * @param {string} id decision ID
  * @param {string} requestId retry key, rotated after success
- * @returns {Promise<{decision: import('./wire.js').Decision, applied: boolean, reason?: string, generated_decision_ids?: string[]}>}
+ * @returns {Promise<{decision: import('./wire.js').Decision, applied: boolean, reason?: string, generated_decision_ids?: string[], generated_next?: number}>}
  */
 export async function postUndo(id, requestId) {
   const res = await fetch(`/api/decisions/${encodeURIComponent(id)}/undo`, {
@@ -108,6 +108,17 @@ export async function postUndo(id, requestId) {
     throw new Error(`undo ${res.status}: ${await res.text()}`);
   }
   return res.json();
+}
+
+/**
+ * Continue a committed incident fan-out, independently of current membership.
+ * @param {string} id parent decision ID
+ * @param {number} after exclusive generated-decision cursor
+ * @returns {Promise<{members: import('./wire.js').Decision[], next?: number}>}
+ */
+export function fetchDecisionMembers(id, after) {
+  const q = new URLSearchParams({ after: String(after), limit: '200' });
+  return fetchJSON(`/api/decisions/${encodeURIComponent(id)}/members?${q}`, 'member decisions');
 }
 
 /**

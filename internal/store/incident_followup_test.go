@@ -153,7 +153,7 @@ func TestIncidentAlternativeWindowProgressSurvivesUpgradeAndRestart(t *testing.T
 	defer func() { s.Close() }()
 	bindIncidentSource(t, s, "lab")
 	base := time.Now().UTC().Truncate(time.Second)
-	for i := 0; i < 23; i++ {
+	for i := 0; i < 83; i++ {
 		sec := i
 		if i >= 3 {
 			sec = 30 + (i-3)*10
@@ -162,8 +162,13 @@ func TestIncidentAlternativeWindowProgressSurvivesUpgradeAndRestart(t *testing.T
 	}
 	// Queue the candidates without forming an incident, then preserve them
 	// across the metadata-only v27 upgrade.
-	if _, err = s.CorrelateIncidents(ctx, IncidentSettings{Window: 5 * time.Second, Quiet: 1000 * time.Second, MinRefs: 500}, base.Add(240*time.Second)); err != nil {
+	if _, err = s.CorrelateIncidents(ctx, IncidentSettings{Window: 5 * time.Second, Quiet: 2000 * time.Second, MinRefs: 500}, base.Add(900*time.Second)); err != nil {
 		t.Fatal(err)
+	}
+	for _, column := range []string{"formation_briefing", "formation_refs_json", "formation_settings"} {
+		if _, err = s.db.Exec(`ALTER TABLE incident_pending DROP COLUMN ` + column); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err = s.db.Exec(`ALTER TABLE incident_pending DROP COLUMN formation_before`); err != nil {
 		t.Fatal(err)
@@ -178,9 +183,9 @@ func TestIncidentAlternativeWindowProgressSurvivesUpgradeAndRestart(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	settings := IncidentSettings{Window: 5 * time.Second, Quiet: 1000 * time.Second, MinRefs: 3}
+	settings := IncidentSettings{Window: 5 * time.Second, Quiet: 2000 * time.Second, MinRefs: 3}
 	var report IncidentReport
-	more, err := s.correlatePass(ctx, settings, base.Add(240*time.Second), &report)
+	more, err := s.correlatePass(ctx, settings, base.Add(900*time.Second), &report)
 	if err != nil || !more || report.Created != 0 {
 		t.Fatalf("first bounded search: %+v more=%v %v", report, more, err)
 	}
@@ -195,12 +200,101 @@ func TestIncidentAlternativeWindowProgressSurvivesUpgradeAndRestart(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err = s.CorrelateIncidents(ctx, settings, base.Add(240*time.Second))
+	report, err = s.CorrelateIncidents(ctx, settings, base.Add(900*time.Second))
 	if err != nil || report.Created != 1 {
 		t.Fatalf("restarted search lost older window: %+v %v", report, err)
 	}
 	list, err := s.ListIncidents(ctx, 50, 0, 0)
 	if err != nil || len(list) != 1 || list[0].MemberCount != 3 {
 		t.Fatalf("wrong recovered burst: %+v %v", list, err)
+	}
+}
+
+func TestIncidentEarlierBurstSurvivesRepeatedReference(t *testing.T) {
+	s := openTestStore(t)
+	bindIncidentSource(t, s, "lab")
+	base := time.Now().UTC().Truncate(time.Second)
+	for _, e := range []struct {
+		ref    string
+		second int
+	}{{"A", 0}, {"B", 1}, {"C", 2}, {"D", 303}, {"A", 304}} {
+		seedIncidentBriefing(t, s, "lab", "lan-a", "host.appeared", "mac:repeat:"+e.ref, base.Add(time.Duration(e.second)*time.Second), "medium")
+	}
+	correlateOnce(t, s, base.Add(305*time.Second))
+	list, err := s.ListIncidents(context.Background(), 50, 0, 0)
+	if err != nil || len(list) != 1 || list[0].MemberCount != 3 || list[0].QualifiedRefs != 3 {
+		t.Fatalf("repeated later reference hid original burst: %+v %v", list, err)
+	}
+}
+
+func TestIncidentRepeatedReferenceSearchResumesAcrossTiedTimes(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/repeated.db"
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { s.Close() }()
+	bindIncidentSource(t, s, "lab")
+	base := time.Now().UTC().Truncate(time.Second)
+	for _, e := range []struct {
+		ref    string
+		second int
+	}{{"A", 0}, {"B", 1}, {"C", 2}, {"D", 303}} {
+		seedIncidentBriefing(t, s, "lab", "lan-a", "host.appeared", "mac:restart:"+e.ref, base.Add(time.Duration(e.second)*time.Second), "medium")
+	}
+	for i := 0; i < 100; i++ {
+		bid := seedIncidentBriefingMaxEvents(t, s, "lab", "lan-a", "host.appeared", "mac:restart:A", base.Add(304*time.Second+time.Duration(i)*time.Nanosecond), "medium", 1)
+		// Equal completion times exercise the briefing-ID tie-breaker.
+		if _, err = s.db.Exec(`UPDATE briefings SET created_at=? WHERE briefing_id=?`, nanos(base.Add(304*time.Second)), bid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var report IncidentReport
+	more, err := s.correlatePass(ctx, incidentSettings(), base.Add(305*time.Second), &report)
+	if err != nil || !more || report.Created != 0 {
+		t.Fatalf("expected bounded partial search: %+v %v %v", report, more, err)
+	}
+	var cursor string
+	if err = s.db.QueryRow(`SELECT formation_briefing FROM incident_pending ORDER BY created_at,briefing_id LIMIT 1`).Scan(&cursor); err != nil || cursor == "" {
+		t.Fatalf("search did not checkpoint: %q %v", cursor, err)
+	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.CorrelateIncidents(ctx, incidentSettings(), base.Add(305*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.ListIncidents(ctx, 50, 0, 0)
+	if err != nil || len(list) != 1 || list[0].MemberCount != 3 || list[0].QualifiedRefs != 3 {
+		t.Fatalf("tied-time search lost earlier occurrences after restart: %+v %v", list, err)
+	}
+}
+
+func TestIncidentHistoricalSearchRestartsForNewThreshold(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	bindIncidentSource(t, s, "lab")
+	base := time.Now().UTC().Truncate(time.Second)
+	for i := 0; i < 73; i++ {
+		sec := i
+		if i >= 3 {
+			sec = 30 + (i-3)*10
+		}
+		seedIncidentBriefing(t, s, "lab", "lan-a", "host.appeared", fmt.Sprintf("mac:settings:%d", i), base.Add(time.Duration(sec)*time.Second), "medium")
+	}
+	settings := IncidentSettings{Window: 5 * time.Second, Quiet: 1000 * time.Second, MinRefs: 3}
+	var report IncidentReport
+	if more, err := s.correlatePass(ctx, settings, base.Add(730*time.Second), &report); err != nil || !more || report.Created != 0 {
+		t.Fatalf("partial search: %+v %v %v", report, more, err)
+	}
+	settings.MinRefs = 2
+	report, err := s.CorrelateIncidents(ctx, settings, base.Add(730*time.Second))
+	if err != nil || report.Created != 1 {
+		t.Fatalf("new threshold must reconsider historical occurrences: %+v %v", report, err)
 	}
 }

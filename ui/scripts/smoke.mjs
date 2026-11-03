@@ -35,7 +35,8 @@ for (const [from, to] of [
   [join(lib, 'format.js'), join(out, 'format.js')],
   [join(lib, 'roving.js'), join(out, 'roving.js')],
   [join(lib, 'paging.js'), join(out, 'paging.js')],
-  [join(lib, 'purge.js'), join(out, 'purge.js')]
+  [join(lib, 'purge.js'), join(out, 'purge.js')],
+  [join(lib, 'memberUndo.js'), join(out, 'memberUndo.js')]
 ]) {
   writeFileSync(to, readFileSync(from, 'utf8'));
 }
@@ -690,4 +691,31 @@ console.log('smoke: freshness guard holds');
   if (invalidations !== 4 || refreshes !== 4) {
     throw new Error('closed incident connection retained its listeners');
   }
+}
+
+// Exercise the same bounded continuation state the undo panel uses.
+{
+  const { memberUndoReview, memberUndoNote, continueMemberUndo } = await import('../src/lib/memberUndo.js');
+  const initial = memberUndoReview('dec-1-2', {
+    generated_decision_ids: Array.from({ length: 500 }, (_, i) => `dec-${i}`),
+    generated_next: 600
+  });
+  if (!memberUndoNote(initial).includes('At least 500')) {
+    throw new Error('partial undo count must be labelled');
+  }
+  let failed = false;
+  try {
+    await continueMemberUndo(initial, async () => { throw new Error('offline'); });
+  } catch { failed = true; }
+  if (!failed || initial.count !== 500 || initial.next !== 600) {
+    throw new Error('failed continuation must preserve retry state');
+  }
+  const final = await continueMemberUndo(initial, async (id, after) => {
+    if (id !== 'dec-1-2' || after !== 600) { throw new Error('wrong snapshot cursor'); }
+    return { members: [{ decision_id: 'dec-501', subject_id: 'brf-501', kind: 'expected' }] };
+  });
+  if (final.count !== 501 || final.next !== 0 || final.members.length !== 1 || memberUndoNote(final).includes('At least')) {
+    throw new Error('completed undo count must include remaining members');
+  }
+  console.log('smoke: undo member continuation holds');
 }

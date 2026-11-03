@@ -1,6 +1,7 @@
 <script>
   import { onDestroy } from 'svelte';
-  import { fetchDecisions, postDecision, postUndo } from '../api.js';
+  import { fetchDecisions, fetchDecisionMembers, postDecision, postUndo } from '../api.js';
+  import { memberUndoReview, memberUndoNote, continueMemberUndo } from './memberUndo.js';
 
   // Operator decisions (Designv9 §5.1): explicit immutable verdicts
   // with superseding undo. The server owns the subject matrix, text
@@ -49,6 +50,9 @@
   // outcomes without touching the audit trail rendering.
   let includeMembers = $state(false);
   let outcomeNote = $state(/** @type {string|null} */ (null));
+  let memberReview = $state(null);
+  let memberPaging = $state(false);
+  let memberError = $state(null);
   let submitButton = $state(null);
   // Undo keys are stable per row until that undo succeeds: a retry
   // after a network failure replays against the original undo row
@@ -148,6 +152,8 @@
       text = '';
       includeMembers = false;
       outcomeNote = null;
+      memberReview = null;
+      memberError = null;
       extra = [];
       extraKey = '';
       backStack = [];
@@ -174,12 +180,13 @@
     undoPending = id;
     listError = null;
     outcomeNote = null;
+    memberReview = null;
+    memberError = null;
     try {
       undoKeys[id] ??= crypto.randomUUID();
       const out = await postUndo(id, undoKeys[id]);
-      const generated = Array.isArray(out.generated_decision_ids) ? out.generated_decision_ids : [];
-      if (generated.length > 0) {
-        outcomeNote = `Undone. ${generated.length} member decision${generated.length === 1 ? '' : 's'} still stand; undo them on their briefing pages.`;
+      if ((out.generated_decision_ids?.length ?? 0) > 0 || out.generated_next) {
+        memberReview = memberUndoReview(id, out);
       }
       const rest = { ...undoKeys };
       delete rest[id];
@@ -195,6 +202,29 @@
       listError = err instanceof Error ? err.message : String(err);
     } finally {
       undoPending = null;
+    }
+  }
+
+  async function moreMembers() {
+    if (memberPaging || !memberReview?.next) {
+      return;
+    }
+    const selected = memberReview;
+    memberPaging = true;
+    memberError = null;
+    try {
+      const next = await continueMemberUndo(selected, fetchDecisionMembers);
+      if (alive && memberReview === selected) {
+        memberReview = next;
+      }
+    } catch (err) {
+      if (alive && memberReview === selected) {
+        memberError = err instanceof Error ? err.message : String(err);
+      }
+    } finally {
+      if (alive) {
+        memberPaging = false;
+      }
     }
   }
 
@@ -307,6 +337,23 @@
       {pending ? 'Recording…' : 'Record decision'}
     </button>
   </form>
+
+  {#if memberReview !== null}
+    <p role="status">{memberUndoNote(memberReview)}</p>
+    {#if memberReview.members.length > 0}
+      <ul>
+        {#each memberReview.members as m (m.decision_id)}
+          <li><a href={`#/briefing/${encodeURIComponent(m.subject_id)}`}>{m.subject_id}</a> — {m.kind.replace('_', ' ')}</li>
+        {/each}
+      </ul>
+    {/if}
+    {#if memberReview.next}
+      <button type="button" onclick={moreMembers} disabled={memberPaging}>
+        {memberPaging ? 'Loading…' : memberError ? 'Retry remaining member decisions' : 'Show remaining member decisions'}
+      </button>
+    {/if}
+    {#if memberError !== null}<p role="alert">{memberError}</p>{/if}
+  {/if}
 
   {#if trail.length === 0}
     <p>No decisions recorded.</p>

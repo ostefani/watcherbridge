@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 28
+const supportedSchemaVersion = 29
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -164,6 +164,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 27, migrateV27)
 		case 27:
 			err = applyMigration(db, 28, migrateV28)
+		case 28:
+			err = applyMigration(db, 29, migrateV29)
 		}
 		if err != nil {
 			return err
@@ -638,6 +640,21 @@ func migrateV27(tx *sql.Tx) error {
 func migrateV28(tx *sql.Tx) error {
 	_, err := tx.Exec(`ALTER TABLE incident_pending ADD COLUMN formation_before INTEGER NOT NULL DEFAULT 0`)
 	return err
+}
+
+// v29 resumes historical searches through immutable pending reports. The
+// briefing cursor distinguishes new scan state from v28's window endpoints.
+func migrateV29(tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`ALTER TABLE incident_pending ADD COLUMN formation_briefing TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE incident_pending ADD COLUMN formation_refs_json TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE incident_pending ADD COLUMN formation_settings TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func applyMigration(db *sql.DB, to int, fn func(*sql.Tx) error) error {
