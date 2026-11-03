@@ -30,8 +30,9 @@ func TestSubjectRevisionHighWater(t *testing.T) {
 		return []byte(`{"event_id":"e","host":{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","identity_namespace":"ns-1","identity_revision":"` + rev + `","identity_confidence":"high"}}`)
 	}
 	t0 := time.Now().UTC().Truncate(time.Second)
-	ingest := func(eventID, rev string, at time.Time) string {
-		gid := persistReported(t, s, "test-scope", eventID, "k", "host.appeared", view(rev), at)
+	ingestPayload := func(t *testing.T, eventID string, payload []byte, at time.Time) string {
+		t.Helper()
+		gid := persistReported(t, s, "test-scope", eventID, "k", "host.appeared", payload, at)
 		if _, err := s.ProjectReported(ctx, "test-scope", 64); err != nil {
 			t.Fatal(err)
 		}
@@ -45,36 +46,48 @@ func TestSubjectRevisionHighWater(t *testing.T) {
 		}
 		return sub.IdentityRevision
 	}
-	if rev := ingest("evt-w1", "rev-1", t0); rev != "rev-1" {
+	ingest := func(t *testing.T, eventID, rev string, at time.Time) string {
+		t.Helper()
+		return ingestPayload(t, eventID, view(rev), at)
+	}
+	if rev := ingest(t, "evt-w1", "rev-1", t0); rev != "rev-1" {
 		t.Fatalf("reported revision must persist: %q", rev)
 	}
-	if rev := ingest("evt-w2", "rev-2", t0.Add(time.Hour)); rev != "rev-2" {
+	if rev := ingest(t, "evt-w2", "rev-2", t0.Add(time.Hour)); rev != "rev-2" {
 		t.Fatalf("newer revision must win: %q", rev)
 	}
 	// An older replay of a previous epoch must not roll the reference
 	// back: the high-water mark keeps the newest report.
-	if rev := ingest("evt-w3", "rev-1", t0.Add(-time.Hour)); rev != "rev-2" {
+	if rev := ingest(t, "evt-w3", "rev-1", t0.Add(-time.Hour)); rev != "rev-2" {
 		t.Fatalf("older replay must not roll back the revision: %q", rev)
 	}
-	// A newer report without a revision reports nothing: it must not
-	// clear the verified epoch either.
-	viewNoRev := func() []byte {
-		return []byte(`{"event_id":"e","host":{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","identity_namespace":"ns-1","identity_confidence":"high"}}`)
+	if rev := ingest(t, "evt-old-unknown", "", t0.Add(-2*time.Hour)); rev != "rev-2" {
+		t.Fatalf("older unknown revision must not clear newer provenance: %q", rev)
 	}
-	gid := persistReported(t, s, "test-scope", "evt-w4", "k", "host.appeared", viewNoRev(), t0.Add(2*time.Hour))
-	if _, err := s.ProjectReported(ctx, "test-scope", 64); err != nil {
-		t.Fatal(err)
-	}
-	links, _, err := s.GroupSubjects(ctx, gid)
-	if err != nil || len(links) == 0 {
-		t.Fatalf("group subjects must link: %+v %v", links, err)
-	}
-	sub, err := s.ReportedProfile(ctx, links[0].ProfileID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sub.IdentityRevision != "rev-2" {
-		t.Fatalf("empty revision must preserve the verified epoch: %q", sub.IdentityRevision)
+	// Newer incomplete provenance invalidates the current revision.
+	// An older known report cannot restore eligibility; a newer known
+	// revision can. Originals remain in the retained payloads.
+	for i, tc := range []struct {
+		name    string
+		payload []byte
+	}{
+		{"missing", []byte(strings.ReplaceAll(string(view("rev-2")), `"identity_revision":"rev-2",`, ""))},
+		{"empty", view("")},
+		{"whitespace", view(" ")},
+		{"oversized", view(strings.Repeat("r", maxRevisionRunes+1))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			at := t0.Add(time.Duration(2+3*i) * time.Hour)
+			if rev := ingestPayload(t, "evt-invalid-"+tc.name, tc.payload, at); rev != "" {
+				t.Fatalf("newer invalid revision must clear eligibility: %q", rev)
+			}
+			if rev := ingest(t, "evt-stale-"+tc.name, "rev-2", at.Add(-time.Minute)); rev != "" {
+				t.Fatalf("older known revision must not restore eligibility: %q", rev)
+			}
+			if rev := ingest(t, "evt-recover-"+tc.name, "rev-2", at.Add(time.Hour)); rev != "rev-2" {
+				t.Fatalf("newer known revision must restore provenance: %q", rev)
+			}
+		})
 	}
 	// Over-bound revisions are dropped, never truncated into a
 	// colliding key.

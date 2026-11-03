@@ -343,6 +343,53 @@ func TestRuleApplyRejectsMixedRevision(t *testing.T) {
 	}
 }
 
+// Incomplete current provenance suspends an approved rule even when
+// the queued group's own payloads still report the approved revision.
+func TestRuleApplyRejectsUnknownLiveRevision(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload string
+	}{
+		{"missing", strings.ReplaceAll(rulePayload(), `"identity_revision":"`+ruleRevision+`",`, "")},
+		{"empty", strings.ReplaceAll(rulePayload(), ruleRevision, "")},
+		{"whitespace", strings.ReplaceAll(rulePayload(), ruleRevision, " ")},
+		{"oversized", strings.ReplaceAll(rulePayload(), ruleRevision, strings.Repeat("r", 256))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openWorkerStore(t)
+			seedThreeExpected(t, s)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			ps, err := DeriveProposals(ctx, s, 3, now)
+			if err != nil || len(ps) != 1 {
+				t.Fatalf("known revision must propose: %+v %v", ps, err)
+			}
+			grant, applied, err := ApproveProposal(ctx, s, ps[0].ProposalID, 3, -1, 90*24*time.Hour, now)
+			if err != nil || !applied {
+				t.Fatalf("known revision must approve: %+v %v", grant, err)
+			}
+			queued := seedRuleGroup(t, s, "evt-known-queued")
+			// Give the incomplete report a strictly later receipt so
+			// the test does not depend on clock precision or tied rows.
+			at := now.Add(time.Hour)
+			if _, err := s.PersistEventAndGroup(ctx, store.RawEvent{
+				EventID: "evt-latest-invalid", EventKey: "k", EventType: "host.changed",
+				OccurredAt: at, ReceivedAt: at, SignatureTimestamp: at,
+				SourceScope: "test-scope", Payload: []byte(tc.payload),
+			}, "host:w", store.GroupPolicy{QuietWindow: time.Millisecond, MaxWindow: time.Hour}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.ProjectReported(ctx, "test-scope", 64); err != nil {
+				t.Fatal(err)
+			}
+			b := briefRuleGroup(t, s, queued)
+			if b.Baseline != "high" || b.Priority != "high" || b.BaselineRule != RuleHighNewService {
+				t.Fatalf("unknown live revision must preserve the deterministic baseline, not apply %s: %+v", grant.RuleID, b)
+			}
+		})
+	}
+}
+
 func TestDeriveProposalsSkipsUnknownRevision(t *testing.T) {
 	s := openWorkerStore(t)
 	bindRuleSource(t, s, "test-scope")

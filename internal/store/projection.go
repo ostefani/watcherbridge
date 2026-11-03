@@ -759,20 +759,18 @@ func ensureSubject(tx *sql.Tx, sourceScope, class, namespace, upstreamRef string
 	}
 	// CASE branches read the pre-update mark (assigned last): ties go
 	// to the current view, which is processed after previous views. The
-	// revision rides the same high-water mark: a replayed older report
-	// can never roll a reference back to a previous epoch. An empty
-	// revision reports nothing, so it never clears a verified one: a
-	// legacy report arriving after qualified ones must not erase the
-	// epoch the row already stands in.
+	// revision rides the same high-water mark: older reports cannot
+	// overwrite current provenance. A newer missing or invalid revision
+	// clears it so rule eligibility fails closed on incomplete evidence.
 	if _, err := tx.Exec(`UPDATE reported_subjects
 		SET reported_identity_source = CASE WHEN ? >= last_report_at THEN ? ELSE reported_identity_source END,
 		    reported_confidence = CASE WHEN ? >= last_report_at THEN ? ELSE reported_confidence END,
-		    identity_revision = CASE WHEN ? >= last_report_at AND ? <> '' THEN ? ELSE identity_revision END,
+		    identity_revision = CASE WHEN ? >= last_report_at THEN ? ELSE identity_revision END,
 		    last_report_at = MAX(last_report_at, ?)
 		WHERE profile_id = ?`,
 		receivedAt, capRunes(view.identitySource, maxDisplayRunes),
 		receivedAt, capRunes(view.identityConfidence, maxDisplayRunes),
-		receivedAt, view.identityRevision, view.identityRevision,
+		receivedAt, view.identityRevision,
 		receivedAt, profileID); err != nil {
 		return "", err
 	}
