@@ -131,12 +131,24 @@ func leakEager(s string) bool {
 // Dotted ports and versions ("192.168.1.5.443", "1.2.3.4.5") tokenize
 // with the glue left literal, so no exemption is needed here either.
 // Leading-zero forms with real octets ("192.168.001.001") still hit.
+// An all-zero quad that continues into ".digits" ("000.00.0.0.1") still
+// hits: the tokenizer keeps the zero quad literal with its glue, and the
+// longer run parses as an address substring downstream. Fail the run
+// closed rather than letting a glued tail ride to the provider.
 func leakEagerQuad(s string) bool {
-	for _, m := range eagerQuadRe.FindAllString(s, -1) {
-		for _, part := range strings.Split(m, ".") {
+	for _, loc := range eagerQuadRe.FindAllStringIndex(s, -1) {
+		nonzero := false
+		for _, part := range strings.Split(s[loc[0]:loc[1]], ".") {
 			if strings.TrimLeft(part, "0") != "" {
-				return true
+				nonzero = true
+				break
 			}
+		}
+		if nonzero {
+			return true
+		}
+		if tail := s[loc[1]:]; len(tail) >= 2 && tail[0] == '.' && tail[1] >= '0' && tail[1] <= '9' {
+			return true
 		}
 	}
 	return false
@@ -150,12 +162,34 @@ func leakEagerQuad(s string) bool {
 // zone-flagged), so a surviving literal with a trailing colon is a
 // glued run the tokenizer refused — fail it closed instead of letting a
 // glued MAC ride to the provider.
+// A dot-separated group of exactly 12 nonzero hex digits also hits:
+// the shared walk skips a dotted-MAC prefix glued to more hex (emitting
+// would glue a token to the tail past restore), and non-overlapping
+// consumption blinds the bare-12 alternative to the straddling window —
+// but "0000.0000.000000000001" still carries a contiguous 12-hex run a
+// reader parses as a MAC. Longer groups stay fragments and all-zero
+// groups carry no identity, matching the oracle both ways.
 func leakEagerMAC(s string) bool {
 	for _, loc := range eagerMACRe.FindAllStringIndex(s, -1) {
 		if loc[1] < len(s) && isHexByte(s[loc[1]]) {
 			continue
 		}
 		return true
+	}
+	for _, group := range strings.Split(s, ".") {
+		if len(group) != 12 || strings.TrimLeft(group, "0") == "" {
+			continue
+		}
+		hex := true
+		for i := 0; i < len(group); i++ {
+			if !isHexByte(group[i]) {
+				hex = false
+				break
+			}
+		}
+		if hex {
+			return true
+		}
 	}
 	return false
 }

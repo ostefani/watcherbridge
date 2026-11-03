@@ -269,6 +269,19 @@ func (v *Viewer) Attach(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/rules/approve", v.approveRuleGuarded)
 	mux.HandleFunc("POST /api/rules/dismiss", v.dismissProposalGuarded)
 	mux.HandleFunc("POST /api/rules/revoke", v.revokeRuleGuarded)
+	// Unknown GET /api/* paths are 404 JSON, never the index catch-all:
+	// Go prefers the registered routes above, so this only fires when
+	// nothing else matches. (A methodless "/api/" pattern conflicts
+	// with the "GET /" catch-all, so other methods on unknown API
+	// paths keep the mux 405.) Without it a typo'd API path serves the
+	// HTML shell with 200, which JSON clients cannot distinguish from
+	// an empty success.
+	mux.HandleFunc("GET /api/", v.handleUnknownAPI)
+}
+
+// handleUnknownAPI answers unregistered API paths with a headed 404.
+func (v *Viewer) handleUnknownAPI(w http.ResponseWriter, _ *http.Request) {
+	writeViewerError(w, "not found", http.StatusNotFound)
 }
 
 // Handler returns the viewer subtree with Host validation applied ahead
