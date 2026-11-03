@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 23
+const supportedSchemaVersion = 24
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -154,6 +154,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 22, migrateV22)
 		case 22:
 			err = applyMigration(db, 23, migrateV23)
+		case 23:
+			err = applyMigration(db, 24, migrateV24)
 		}
 		if err != nil {
 			return err
@@ -444,6 +446,24 @@ func migrateV23(tx *sql.Tx) error {
 	stmts := []string{
 		`ALTER TABLE review_rules ADD COLUMN identity_revision TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE review_rules ADD COLUMN changed_fields_csv TEXT NOT NULL DEFAULT ''`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV24 records the reported stable-identity revision on
+// subjects (Designv9 §§1.4, 5.2): the revision rides the projection
+// high-water mark like every other current-state provenance column,
+// so replays never roll a reference back to a previous epoch. The
+// subject identity key is unchanged — a revision change voids rules,
+// it never forks or merges the subject.
+func migrateV24(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE reported_subjects ADD COLUMN identity_revision TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt); err != nil {

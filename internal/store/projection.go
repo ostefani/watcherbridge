@@ -36,6 +36,11 @@ const (
 	// colliding key; the subject keeps its reference with no usable
 	// namespace, which rule eligibility reads as unqualified.
 	maxNamespaceRunes = 128
+	// maxRevisionRunes bounds a reported stable-identity revision.
+	// Over-bound revisions are dropped for the same reason: an
+	// unverifiable revision keeps the subject usable but the rules
+	// ineligible.
+	maxRevisionRunes = 64
 	// maxDisplayRunes caps stored reported strings. Lists carry explicit
 	// truncation flags; missing values are preserved as null, never as
 	// false or empty defaults.
@@ -66,6 +71,7 @@ type subjectView struct {
 	identitySource     string
 	identityConfidence string
 	identityNamespace  string
+	identityRevision   string
 	ip                 string
 	hostname           string
 	mac                string
@@ -198,7 +204,11 @@ type hostViewJSON struct {
 	// namespace verbatim (Designv9 §1.4 I1, when a producer emits
 	// one). Preservation is not qualification: rule eligibility
 	// still requires the receiver-bound registration contract.
-	IdentityNamespace  string           `json:"identity_namespace"`
+	IdentityNamespace string `json:"identity_namespace"`
+	// IdentityRevision preserves a reported stable-identity revision
+	// verbatim (Designv9 §1.4 I1, when a producer emits one). Like
+	// the namespace, preservation is not qualification.
+	IdentityRevision   string           `json:"identity_revision"`
 	IdentityAliases    cappedStringList `json:"identity_aliases"`
 	IdentityAnchorKeys cappedStringList `json:"identity_anchor_keys"`
 	Fingerprint        string           `json:"evidence_fingerprint"`
@@ -229,6 +239,10 @@ func toSubjectView(role string, h *hostViewJSON) subjectView {
 	v.identityNamespace = strings.TrimSpace(h.IdentityNamespace)
 	if utf8.RuneCountInString(v.identityNamespace) > maxNamespaceRunes {
 		v.identityNamespace = ""
+	}
+	v.identityRevision = strings.TrimSpace(h.IdentityRevision)
+	if utf8.RuneCountInString(v.identityRevision) > maxRevisionRunes {
+		v.identityRevision = ""
 	}
 	v.ip = strings.TrimSpace(h.IP)
 	v.hostname = h.Hostname
@@ -728,10 +742,10 @@ func ensureSubject(tx *sql.Tx, sourceScope, class, namespace, upstreamRef string
 	// Profile columns are bounded like the snapshot: unbounded
 	// upstream strings never widen a stored current-state column.
 	if _, err := tx.Exec(`INSERT OR IGNORE INTO reported_subjects
-		(profile_id, source_scope, reference_class, identity_namespace, upstream_reference,
+		(profile_id, source_scope, reference_class, identity_namespace, identity_revision, upstream_reference,
 		 reported_identity_source, reported_confidence, first_report_at, last_report_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, sourceScope, class, namespace, upstreamRef,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, sourceScope, class, namespace, view.identityRevision, upstreamRef,
 		capRunes(view.identitySource, maxDisplayRunes),
 		capRunes(view.identityConfidence, maxDisplayRunes),
 		receivedAt, receivedAt); err != nil {
@@ -744,14 +758,18 @@ func ensureSubject(tx *sql.Tx, sourceScope, class, namespace, upstreamRef string
 		return "", err
 	}
 	// CASE branches read the pre-update mark (assigned last): ties go
-	// to the current view, which is processed after previous views.
+	// to the current view, which is processed after previous views. The
+	// revision rides the same high-water mark: a replayed older report
+	// can never roll a reference back to a previous epoch.
 	if _, err := tx.Exec(`UPDATE reported_subjects
 		SET reported_identity_source = CASE WHEN ? >= last_report_at THEN ? ELSE reported_identity_source END,
 		    reported_confidence = CASE WHEN ? >= last_report_at THEN ? ELSE reported_confidence END,
+		    identity_revision = CASE WHEN ? >= last_report_at THEN ? ELSE identity_revision END,
 		    last_report_at = MAX(last_report_at, ?)
 		WHERE profile_id = ?`,
 		receivedAt, capRunes(view.identitySource, maxDisplayRunes),
 		receivedAt, capRunes(view.identityConfidence, maxDisplayRunes),
+		receivedAt, view.identityRevision,
 		receivedAt, profileID); err != nil {
 		return "", err
 	}

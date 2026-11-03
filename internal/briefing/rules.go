@@ -161,9 +161,14 @@ func canonicalChangeFields(events []GroupEvent) string {
 		if prev.Hostname != cur.Hostname && (prev.Hostname != "" || cur.Hostname != "") {
 			add("hostname")
 		}
-		if (prev.OS != cur.OS && (prev.OS != "" || cur.OS != "")) ||
-			(prev.Device != cur.Device && (prev.Device != "" || cur.Device != "")) {
+		// OS and device compare independently: an OS-only change must
+		// not share a scope with a device-only or combined change.
+		// The kind derivation still merges the OS refinement family
+		// for precedence; the field set records what actually moved.
+		if prev.OS != cur.OS && (prev.OS != "" || cur.OS != "") {
 			add("os")
+		}
+		if prev.Device != cur.Device && (prev.Device != "" || cur.Device != "") {
 			add("device")
 		}
 		if prev.IP != cur.IP && (prev.IP != "" || cur.IP != "") {
@@ -193,24 +198,27 @@ func canonicalChangeFields(events []GroupEvent) string {
 // qualifyRuleSubject is the stable-identity gate (Designv9 §§1.3–1.4,
 // §5.2; Plan Step 28): a subject automates only under a qualified
 // stable contract — reported_device class, high upstream confidence,
-// a non-empty namespace bound to the source registration, and the
-// negotiated stable-identity capability. Anything else, including
-// today's bare MAC references with no namespace, reads as no scope:
-// the feature stays unavailable rather than matching local
-// attributes. Pure so every combination is unit-coverable.
+// a non-empty namespace bound to the source registration, a verified
+// (non-empty) identity revision, and the negotiated stable-identity
+// capability. Anything else, including namespace-bound references
+// with unknown revisions, reads as no scope: unknown or changed
+// revisions void application, so eligibility stays closed until a
+// verified revision is available. Pure so every combination is
+// unit-coverable.
 func qualifyRuleSubject(sub store.ReportedSubject, configuredNS, capabilities string) (RuleScope, bool) {
 	var zero RuleScope
 	if sub.ReferenceClass != store.SubjectReportedDevice || sub.SourceScope == "" ||
 		sub.ReportedIdentitySource == "" || sub.ReportedConfidence != "high" {
 		return zero, false
 	}
-	if sub.IdentityNamespace == "" || sub.IdentityNamespace != configuredNS ||
+	if sub.IdentityNamespace == "" || sub.IdentityNamespace != configuredNS || sub.IdentityRevision == "" ||
 		!store.HasCapability(capabilities, store.StableIdentityCapability) {
 		return zero, false
 	}
 	return RuleScope{
 		SourceScope: sub.SourceScope, ReferenceClass: sub.ReferenceClass,
-		IdentityNamespace: sub.IdentityNamespace, UpstreamReference: sub.UpstreamReference,
+		IdentityNamespace: sub.IdentityNamespace, IdentityRevision: sub.IdentityRevision,
+		UpstreamReference:      sub.UpstreamReference,
 		ReportedIdentitySource: sub.ReportedIdentitySource, ReportedConfidence: sub.ReportedConfidence,
 	}, true
 }
@@ -238,7 +246,8 @@ func liveSubjectScope(ctx context.Context, st *store.Store, groupID string) (Rul
 			continue
 		}
 		if one.SourceScope != sub.SourceScope || one.ReferenceClass != sub.ReferenceClass ||
-			one.IdentityNamespace != sub.IdentityNamespace || one.UpstreamReference != sub.UpstreamReference ||
+			one.IdentityNamespace != sub.IdentityNamespace || one.IdentityRevision != sub.IdentityRevision ||
+			one.UpstreamReference != sub.UpstreamReference ||
 			one.ReportedIdentitySource != sub.ReportedIdentitySource || one.ReportedConfidence != sub.ReportedConfidence {
 			return zero, false, nil
 		}
@@ -300,12 +309,19 @@ func scopeForBriefing(ctx context.Context, st *store.Store, b store.Briefing) (R
 // grant or an explicit decline are not proposals; revoked scopes
 // re-propose (the evidence still stands, the automation stopped).
 // maxProposalEvidenceIDs bounds the distinct briefing IDs one
-// derivation collects (Designv9 §4.6: explicit cardinality bounds,
-// never reliance on retention age). The scan runs newest-first, so a
-// busy history keeps recent judgments — the evidence automation acts
-// on — and drops the oldest first. Small histories never notice the
-// bound; operator routes stay bounded regardless of fleet size.
+// derivation collects, and maxProposalDecisionRows bounds the decision
+// rows it examines to collect them (Designv9 §4.6: explicit
+// cardinality bounds on work as well as memory, never reliance on
+// retention age). The scan runs newest-first, so a busy history keeps
+// recent judgments — the evidence automation acts on — and drops the
+// oldest first. A truncated scan yields a proposal subset, never a
+// wrong proposal: counts only grow toward the threshold, so missing
+// old evidence can only withhold proposals, and the truncation is
+// logged. Small histories never notice either bound; operator routes
+// stay bounded regardless of fleet size.
 const maxProposalEvidenceIDs = 2000
+
+const maxProposalDecisionRows = 10000
 
 func DeriveProposals(ctx context.Context, st *store.Store, proposeAfter int, now time.Time) ([]Proposal, error) {
 	if proposeAfter < 1 {
@@ -314,8 +330,10 @@ func DeriveProposals(ctx context.Context, st *store.Store, proposeAfter int, now
 	var ids []string
 	seenBriefing := map[string]bool{}
 	var beforeRowID int64
-	capped := false
-	for !capped {
+	var examined int64
+	incomplete := false
+loop:
+	for {
 		page, err := st.ExpectedBriefingDecisionsDesc(ctx, beforeRowID, 500)
 		if err != nil {
 			return nil, err
@@ -323,20 +341,28 @@ func DeriveProposals(ctx context.Context, st *store.Store, proposeAfter int, now
 		if len(page) == 0 {
 			break
 		}
-		for _, d := range page {
+		for i, d := range page {
 			beforeRowID = d.RowID
 			if !seenBriefing[d.BriefingID] {
 				seenBriefing[d.BriefingID] = true
 				ids = append(ids, d.BriefingID)
-				if len(ids) >= maxProposalEvidenceIDs {
-					capped = true
-					break
-				}
+			}
+			examined++
+			if examined >= maxProposalDecisionRows || len(ids) >= maxProposalEvidenceIDs {
+				// Rows after this one in the page, or any later
+				// page, go unexamined: the scan yields a proposal
+				// subset. A bound met exactly at the last row of a
+				// short page leaves nothing behind.
+				incomplete = i < len(page)-1 || len(page) == 500
+				break loop
 			}
 		}
 		if len(page) < 500 {
 			break
 		}
+	}
+	if incomplete {
+		log.Printf("briefing: proposal derivation truncated at %d rows (%d briefings); counts are lower bounds", examined, len(ids))
 	}
 	counts := map[RuleScope]map[string]bool{}
 	for start := 0; start < len(ids); start += 500 {

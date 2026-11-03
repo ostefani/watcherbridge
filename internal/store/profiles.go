@@ -37,6 +37,7 @@ type ReportedSubject struct {
 	SourceScope            string
 	ReferenceClass         string
 	IdentityNamespace      string
+	IdentityRevision       string
 	UpstreamReference      string
 	ReportedIdentitySource string
 	ReportedConfidence     string
@@ -86,7 +87,7 @@ type SubjectProfile struct {
 	HistoryNext string
 }
 
-const subjectColumns = `profile_id, source_scope, reference_class, identity_namespace, upstream_reference,
+const subjectColumns = `profile_id, source_scope, reference_class, identity_namespace, identity_revision, upstream_reference,
 	reported_identity_source, reported_confidence, association_status, operator_label, label_owner,
 	first_report_at, last_report_at,
 	(SELECT COUNT(*) FROM group_subjects WHERE group_subjects.profile_id = reported_subjects.profile_id),
@@ -97,7 +98,7 @@ func scanSubject(row interface {
 }, s *ReportedSubject) error {
 	var label, owner sql.NullString
 	var first, last int64
-	if err := row.Scan(&s.ProfileID, &s.SourceScope, &s.ReferenceClass, &s.IdentityNamespace,
+	if err := row.Scan(&s.ProfileID, &s.SourceScope, &s.ReferenceClass, &s.IdentityNamespace, &s.IdentityRevision,
 		&s.UpstreamReference, &s.ReportedIdentitySource, &s.ReportedConfidence, &s.AssociationStatus,
 		&label, &owner, &first, &last, &s.Groups, &s.Briefings); err != nil {
 		return err

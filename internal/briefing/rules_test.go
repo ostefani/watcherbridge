@@ -2,6 +2,7 @@ package briefing
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,11 @@ import (
 // unavailable, exactly like today's bare-producer reports.
 const ruleNamespace = "ns-1"
 
+// ruleRevision is the verified identity revision every rule fixture
+// carries: unknown revisions void application, so the revision must
+// be reported, not merely bound.
+const ruleRevision = "rev-1"
+
 // rulePayload reports one open port on the shared MAC: every group
 // seeded with it shares one reported_device scope, one kind and one
 // canonical port set. The host_id/identity_source pair is what makes
@@ -24,7 +30,7 @@ const ruleNamespace = "ns-1"
 // The namespace alone qualifies nothing: only the bound registration
 // (bindRuleSource) completes the stable contract.
 func rulePayload() string {
-	view := `{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","identity_namespace":"` + ruleNamespace + `","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[%s]}`
+	view := `{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","identity_namespace":"` + ruleNamespace + `","identity_revision":"` + ruleRevision + `","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[%s]}`
 	open := `{"number":22,"protocol":"tcp","state":"open"}`
 	return `{"event_id":"e1","previous":` + strings.Replace(view, "%s", "", 1) +
 		`,"current":` + strings.Replace(view, "%s", open, 1) + `}`
@@ -156,6 +162,65 @@ func TestDeriveProposalsNeedsBoundContract(t *testing.T) {
 	}
 }
 
+// A bounded scan withholds stale proposals without breaking recent
+// ones: ten thousand filler judgments push an older scope's three
+// expecteds past the examined-rows bound, so the old scope stays
+// silent while a newer scope's three judgments still propose. The
+// truncated counts are lower bounds: missing evidence withholds
+// proposals, it never invents them.
+func TestDeriveProposalsTruncatesOldEvidence(t *testing.T) {
+	s := openWorkerStore(t)
+	bindRuleSource(t, s, "test-scope")
+	oldPayload := strings.Replace(rulePayload(), "aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02", -1)
+	judge := func(id, payload, req string) {
+		gid := seedGroup(t, s, "host:w", id, "host.changed", payload)
+		briefRuleGroup(t, s, gid)
+		expectBriefing(t, s, gid, req)
+	}
+	for i, id := range []string{"evt-old1", "evt-old2", "evt-old3"} {
+		judge(id, oldPayload, "old-req-"+string(rune('a'+i)))
+	}
+	fill := seedRuleGroup(t, s, "evt-fill")
+	briefRuleGroup(t, s, fill)
+	fillBriefing := briefed(t, s, fill)
+	for i := 0; i < maxProposalDecisionRows; i++ {
+		if _, err := s.AppendDecision(context.Background(), store.DecisionInput{
+			SubjectKind: store.DecisionSubjectBriefing, SubjectID: fillBriefing.BriefingID,
+			Kind: store.DecisionExpected, RequestID: fmt.Sprintf("fill-%d", i),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, id := range []string{"evt-new1", "evt-new2", "evt-new3"} {
+		judge(id, rulePayload(), "new-req-"+string(rune('a'+i)))
+	}
+	now := time.Now()
+	ps, err := DeriveProposals(context.Background(), s, 3, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ps) != 1 {
+		t.Fatalf("only the recent scope must propose: %+v", ps)
+	}
+	if !strings.Contains(ps[0].UpstreamReference, "aa:bb:cc:dd:ee:01") {
+		t.Fatalf("truncation must keep the newest evidence: %+v", ps[0])
+	}
+}
+func TestDeriveProposalsSkipsUnknownRevision(t *testing.T) {
+	s := openWorkerStore(t)
+	bindRuleSource(t, s, "test-scope")
+	payload := strings.Replace(rulePayload(), `"identity_revision":"`+ruleRevision+`"`, `"identity_revision":""`, -1)
+	for i, id := range []string{"evt-v1", "evt-v2", "evt-v3"} {
+		gid := seedGroup(t, s, "host:w", id, "host.changed", payload)
+		briefRuleGroup(t, s, gid)
+		expectBriefing(t, s, gid, "rev-req-"+string(rune('a'+i)))
+	}
+	now := time.Now()
+	if ps, err := DeriveProposals(context.Background(), s, 3, now); err != nil || len(ps) != 0 {
+		t.Fatalf("unknown revision must not propose: %+v %v", ps, err)
+	}
+}
+
 // Low upstream confidence never qualifies for automatic rules, even
 // under a bound contract.
 func TestDeriveProposalsSkipsLowConfidence(t *testing.T) {
@@ -176,7 +241,8 @@ func TestDeriveProposalsSkipsLowConfidence(t *testing.T) {
 func TestQualifyRuleSubjectMatrix(t *testing.T) {
 	base := store.ReportedSubject{
 		SourceScope: "test-scope", ReferenceClass: store.SubjectReportedDevice,
-		IdentityNamespace: ruleNamespace, UpstreamReference: "mac:aa:bb:cc:dd:ee:01",
+		IdentityNamespace: ruleNamespace, IdentityRevision: ruleRevision,
+		UpstreamReference:      "mac:aa:bb:cc:dd:ee:01",
 		ReportedIdentitySource: "mac", ReportedConfidence: "high",
 	}
 	caps := string(store.StableIdentityCapability)
@@ -200,6 +266,10 @@ func TestQualifyRuleSubjectMatrix(t *testing.T) {
 		}, false},
 		{"namespace mismatch", func(s *store.ReportedSubject) (string, string) {
 			return "other-ns", caps
+		}, false},
+		{"unknown revision", func(s *store.ReportedSubject) (string, string) {
+			s.IdentityRevision = ""
+			return ruleNamespace, caps
 		}, false},
 		{"capability missing", func(s *store.ReportedSubject) (string, string) {
 			return ruleNamespace, ""
@@ -227,7 +297,8 @@ func TestQualifyRuleSubjectMatrix(t *testing.T) {
 		if ok != tc.ok {
 			t.Fatalf("%s: qualify = %v, want %v", tc.name, ok, tc.ok)
 		}
-		if ok && (scope.UpstreamReference != sub.UpstreamReference || scope.IdentityNamespace != ruleNamespace) {
+		if ok && (scope.UpstreamReference != sub.UpstreamReference || scope.IdentityNamespace != ruleNamespace ||
+			scope.IdentityRevision != ruleRevision) {
 			t.Fatalf("%s: qualified scope must carry the subject: %+v", tc.name, scope)
 		}
 	}
@@ -401,7 +472,7 @@ func TestRuleStaysInScope(t *testing.T) {
 		t.Fatalf("cross-source MAC must not borrow a rule: %+v", b)
 	}
 	// A different port set is out of scope even for the same subject.
-	view := `{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","identity_namespace":"` + ruleNamespace + `","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[%s]}`
+	view := `{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","identity_namespace":"` + ruleNamespace + `","identity_revision":"` + ruleRevision + `","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[%s]}`
 	otherPorts := `{"event_id":"e1","previous":` + strings.Replace(view, "%s", "", 1) +
 		`,"current":` + strings.Replace(view, "%s", `{"number":80,"protocol":"tcp","state":"open"}`, 1) + `}`
 	portsGID := seedGroup(t, s, "host:w", "evt-r9", "host.changed", otherPorts)
@@ -492,36 +563,41 @@ func TestRuleExpiryFailsClosed(t *testing.T) {
 }
 
 func TestCanonicalChangeFields(t *testing.T) {
-	view := func(hostname, os string) *hostView {
-		return &hostView{Hostname: hostname, OS: os, Ports: []portView{{Protocol: "tcp", Number: 22, State: "open"}}}
+	view := func(hostname, os, device string) *hostView {
+		return &hostView{Hostname: hostname, OS: os, Device: device, Ports: []portView{{Protocol: "tcp", Number: 22, State: "open"}}}
+	}
+	changed := func(prev, cur *hostView, changes ...string) []GroupEvent {
+		return []GroupEvent{{
+			EventType: "host.changed",
+			Previous:  prev, Current: cur,
+			Changes: changes,
+		}}
 	}
 	// Producer-reported changes name fields directly.
-	reported := []GroupEvent{{
-		EventType: "host.changed",
-		Previous:  view("p1", "o1"), Current: view("p2", "o2"),
-		Changes: []string{"hostname", "os"},
-	}}
-	if got := canonicalChangeFields(reported); got != "hostname,os" {
+	if got := canonicalChangeFields(changed(view("p1", "o1", ""), view("p2", "o2", ""), "hostname", "os")); got != "hostname,os" {
 		t.Fatalf("reported changes must canonicalize: %q", got)
 	}
-	// Without changes[] the salient raw differences stand in: the OS
-	// refinement family stays merged exactly like the kind derivation.
-	raw := []GroupEvent{{
-		EventType: "host.changed",
-		Previous:  view("p1", "o1"), Current: view("p2", "o2"),
-	}}
-	if got := canonicalChangeFields(raw); got != "device,hostname,os" {
-		t.Fatalf("raw differences must canonicalize: %q", got)
+	// Without changes[] each raw difference stands on its own: OS-only
+	// and combined changes produce different field sets, so neither
+	// borrows the other's scope.
+	if got := canonicalChangeFields(changed(view("p1", "o1", ""), view("p2", "o2", ""))); got != "hostname,os" {
+		t.Fatalf("os-only raw differences must canonicalize: %q", got)
+	}
+	if got := canonicalChangeFields(changed(view("p", "", "d1"), view("p", "", "d2"))); got != "device" {
+		t.Fatalf("device-only raw differences must canonicalize: %q", got)
+	}
+	if got := canonicalChangeFields(changed(view("p1", "o1", "d1"), view("p2", "o2", "d2"))); got != "device,hostname,os" {
+		t.Fatalf("combined raw differences must canonicalize: %q", got)
 	}
 	// Identical views carry no change; non-change events contribute
 	// nothing on their own.
-	if got := canonicalChangeFields([]GroupEvent{{EventType: "host.appeared", Host: view("p1", "o1")}}); got != "" {
+	if got := canonicalChangeFields([]GroupEvent{{EventType: "host.appeared", Host: view("p1", "o1", "")}}); got != "" {
 		t.Fatalf("changeless events must canonicalize empty: %q", got)
 	}
 	// Hostile field names cannot bloat rule rows.
 	long := []GroupEvent{{
 		EventType: "host.changed",
-		Previous:  view("p1", "o1"), Current: view("p2", "o1"),
+		Previous:  view("p1", "o1", ""), Current: view("p2", "o1", ""),
 		Changes: []string{strings.Repeat("f", 200)},
 	}}
 	if got := canonicalChangeFields(long); len([]rune(got)) != maxChangeFieldRunes {
@@ -542,7 +618,7 @@ func ruleChangePayload(hostnameChanged, osChanged bool) string {
 		prevOS, curOS = "o1", "o2"
 	}
 	mkView := func(hostname, os string) string {
-		return `{"ip":"192.168.0.5","hostname":"` + hostname + `","mac":"aa:bb:cc:dd:ee:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","identity_namespace":"` + ruleNamespace + `","os":"` + os + `","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[{"number":22,"protocol":"tcp","state":"open"}]}`
+		return `{"ip":"192.168.0.5","hostname":"` + hostname + `","mac":"aa:bb:cc:dd:ee:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","identity_namespace":"` + ruleNamespace + `","identity_revision":"` + ruleRevision + `","os":"` + os + `","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[{"number":22,"protocol":"tcp","state":"open"}]}`
 	}
 	return `{"event_id":"e1","previous":` + mkView(prevHost, prevOS) + `,"current":` + mkView(curHost, curOS) + `}`
 }

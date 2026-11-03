@@ -402,6 +402,12 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 		}
 		if plan.stages&stageSubjects != 0 {
 			limit = deleteLimit()
+			// A retained rule record keeps its subject like a retained
+			// briefing keeps its rule: terminal rows (dismissed,
+			// revoked, lapsed) still name the scope an operator
+			// judged, so the subject survives until the rule itself
+			// drains. Status and expiry do not filter here; the rule
+			// purge bounds how long any row can hold a subject.
 			if err := take("reported_subjects", plan.subjectCut, `DELETE FROM reported_subjects WHERE rowid IN (SELECT rowid FROM reported_subjects WHERE last_report_at < ?
 				AND NOT EXISTS (SELECT 1 FROM reported_observations WHERE reported_observations.profile_id = reported_subjects.profile_id)
 				AND NOT EXISTS (SELECT 1 FROM group_subjects WHERE group_subjects.profile_id = reported_subjects.profile_id)
@@ -410,8 +416,7 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				AND NOT EXISTS (SELECT 1 FROM review_rules WHERE review_rules.source_scope = reported_subjects.source_scope
 					AND review_rules.reference_class = reported_subjects.reference_class
 					AND review_rules.identity_namespace = reported_subjects.identity_namespace
-					AND review_rules.upstream_reference = reported_subjects.upstream_reference
-					AND review_rules.status = 'approved' AND (review_rules.expires_at IS NULL OR review_rules.expires_at > ?)) ORDER BY last_report_at, rowid LIMIT ?)`, limit, plan.subjectCut, plan.decisionCut, plan.now, limit); err != nil {
+					AND review_rules.upstream_reference = reported_subjects.upstream_reference) ORDER BY last_report_at, rowid LIMIT ?)`, limit, plan.subjectCut, plan.decisionCut, limit); err != nil {
 				return err
 			}
 			// Decision audit expires purely by row age: the effective

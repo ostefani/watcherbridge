@@ -17,7 +17,7 @@ import (
 // The namespace alone qualifies nothing: tests bind the
 // registration contract explicitly, like an I1-qualified deployment.
 func ruleMACPayload(mac string) string {
-	view := `{"ip":"192.168.0.5","hostname":"p","mac":"` + mac + `","host_id":"mac:` + mac + `","identity_source":"mac","identity_namespace":"ns-1","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[%s]}`
+	view := `{"ip":"192.168.0.5","hostname":"p","mac":"` + mac + `","host_id":"mac:` + mac + `","identity_source":"mac","identity_namespace":"ns-1","identity_revision":"rev-1","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[%s]}`
 	open := `{"number":22,"protocol":"tcp","state":"open"}`
 	return `{"event_id":"e1","previous":` + strings.Replace(view, "%s", "", 1) +
 		`,"current":` + strings.Replace(view, "%s", open, 1) + `}`

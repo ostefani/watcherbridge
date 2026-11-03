@@ -250,9 +250,11 @@ func TestRulePurgeExpiryAnchored(t *testing.T) {
 	}
 }
 
-// A subject referenced only by a live rule grant survives the
-// subject purge; once the grant lapses past the horizon, both the
-// expired rule and its orphaned subject drain.
+// A subject referenced by a retained rule record survives the
+// subject purge — live grants and retained terminal rows alike,
+// because the row still names the scope an operator judged. Once the
+// rule itself drains past its horizon, its orphaned subject drains
+// with it.
 func TestPurgeKeepsRuleReferencedSubjects(t *testing.T) {
 	s := openTestStore(t)
 	now := time.Now().UTC().Truncate(time.Second)
@@ -272,33 +274,41 @@ func TestPurgeKeepsRuleReferencedSubjects(t *testing.T) {
 	if err := s.PutRule(context.Background(), live); err != nil {
 		t.Fatal(err)
 	}
-	rep, err := s.PurgeOnce(context.Background(), PurgeSettings{
+	retention := PurgeSettings{
 		BriefingRetention: 24 * time.Hour, SubjectRetention: time.Hour,
-		DecisionRetention: 24 * time.Hour, RuleRetention: 24 * time.Hour,
-	}, now)
+		DecisionRetention: 24 * time.Hour, RuleRetention: time.Hour,
+	}
+	rep, err := s.PurgeOnce(context.Background(), retention, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if rep.Subjects != 0 {
 		t.Fatalf("rule-referenced subject must survive: %+v", rep)
 	}
-	// Lapse the grant past both horizons: the expired rule and its
-	// orphaned subject drain together.
+	// Lapse the grant but keep the row retained: the terminal record
+	// still references the subject, so it must survive too.
 	lapsed := live
-	lapsed.ApprovedAt, lapsed.HasApprovedAt = old, true
-	lapsed.ExpiresAt, lapsed.HasExpiresAt = old.Add(time.Hour), true
+	lapsed.ApprovedAt, lapsed.HasApprovedAt = now.Add(-time.Hour), true
+	lapsed.ExpiresAt, lapsed.HasExpiresAt = now.Add(-10*time.Minute), true
 	if err := s.PutRule(context.Background(), lapsed); err != nil {
 		t.Fatal(err)
 	}
-	rep, err = s.PurgeOnce(context.Background(), PurgeSettings{
-		BriefingRetention: 24 * time.Hour, SubjectRetention: time.Hour,
-		DecisionRetention: 24 * time.Hour, RuleRetention: 30 * time.Minute,
-	}, now)
+	rep, err = s.PurgeOnce(context.Background(), retention, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Subjects != 0 || rep.Rules != 0 {
+		t.Fatalf("retained terminal rule must keep its subject: %+v", rep)
+	}
+	// Past the rule horizon both drain in one run: the rule row goes
+	// first, and a later batch in the same run releases the subject.
+	later := now.Add(2 * time.Hour)
+	rep, err = s.PurgeOnce(context.Background(), retention, later)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if rep.Subjects != 1 || rep.Rules != 1 {
-		t.Fatalf("orphaned subject and lapsed rule must drain: %+v", rep)
+		t.Fatalf("orphaned subject and drained rule must purge: %+v", rep)
 	}
 }
 

@@ -13,6 +13,16 @@ import (
 	"unicode/utf8"
 )
 
+// dropSubjectRevision rewinds the v24 reported_subjects identity
+// column for migration-chain tests that rewind past it but keep the
+// subjects table: without the drop, replaying v24 hits a duplicate
+// column. Callers that drop the whole projection schema do not need
+// it.
+func dropSubjectRevision(t *testing.T, db *sql.DB) {
+	t.Helper()
+	dropColumnIfExists(t, db, "reported_subjects", "identity_revision")
+}
+
 // dropProjectionSchema rewinds the Step-18 schema additions (v10 tables,
 // v11 pending queue/receipt scope and v12 grouping provenance) so migration-chain tests
 // that rewind to older versions replay cleanly through the current
