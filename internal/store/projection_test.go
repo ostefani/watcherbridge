@@ -56,6 +56,26 @@ func TestSubjectRevisionHighWater(t *testing.T) {
 	if rev := ingest("evt-w3", "rev-1", t0.Add(-time.Hour)); rev != "rev-2" {
 		t.Fatalf("older replay must not roll back the revision: %q", rev)
 	}
+	// A newer report without a revision reports nothing: it must not
+	// clear the verified epoch either.
+	viewNoRev := func() []byte {
+		return []byte(`{"event_id":"e","host":{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","identity_namespace":"ns-1","identity_confidence":"high"}}`)
+	}
+	gid := persistReported(t, s, "test-scope", "evt-w4", "k", "host.appeared", viewNoRev(), t0.Add(2*time.Hour))
+	if _, err := s.ProjectReported(ctx, "test-scope", 64); err != nil {
+		t.Fatal(err)
+	}
+	links, _, err := s.GroupSubjects(ctx, gid)
+	if err != nil || len(links) == 0 {
+		t.Fatalf("group subjects must link: %+v %v", links, err)
+	}
+	sub, err := s.ReportedProfile(ctx, links[0].ProfileID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sub.IdentityRevision != "rev-2" {
+		t.Fatalf("empty revision must preserve the verified epoch: %q", sub.IdentityRevision)
+	}
 	// Over-bound revisions are dropped, never truncated into a
 	// colliding key.
 	wide := toSubjectView("host", &hostViewJSON{IdentityRevision: strings.Repeat("r", maxRevisionRunes+1)})

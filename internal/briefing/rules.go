@@ -631,6 +631,14 @@ func ApplyOperatorRules(ctx context.Context, st *store.Store, taken store.TakenG
 			return outcome
 		}
 	}
+	// The taken group's own payloads must unanimously report the live
+	// revision: a group queued before an epoch change keeps its old
+	// payloads, and matching it against the new epoch's rule would
+	// automate stale evidence. Stale, unknown and mixed revisions
+	// preserve the original baseline.
+	if rev, ok := briefingRevision(events); !ok || rev != scope.IdentityRevision {
+		return outcome
+	}
 	scope.Kind = KindForTaken(taken, outcome.RuleID)
 	scope.PortsCSV = canonicalPorts(events)
 	scope.ChangedFieldsCSV = canonicalChangeFields(events)

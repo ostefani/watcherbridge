@@ -252,6 +252,97 @@ func TestDeriveProposalsRejectsStaleRevision(t *testing.T) {
 	}
 }
 
+// A group queued before an epoch change keeps its old payloads: when
+// it is finally briefed under the new epoch, the rev-2 grant must
+// not fire on rev-1 evidence. The taken payloads are checked against
+// the live scope exactly like derived evidence.
+func TestRuleApplyRejectsStaleRevision(t *testing.T) {
+	s := openWorkerStore(t)
+	bindRuleSource(t, s, "test-scope")
+	queued := seedGroup(t, s, "host:w", "evt-q1", "host.changed", rulePayload())
+	rev2Payload := strings.Replace(rulePayload(), ruleRevision, "rev-2", -1)
+	for i, id := range []string{"evt-a1", "evt-a2", "evt-a3"} {
+		gid := seedGroup(t, s, "host:w", id, "host.changed", rev2Payload)
+		briefRuleGroup(t, s, gid)
+		expectBriefing(t, s, gid, "apply-req-"+string(rune('a'+i)))
+	}
+	now := time.Now()
+	ps, err := DeriveProposals(context.Background(), s, 3, now)
+	if err != nil || len(ps) != 1 || ps[0].IdentityRevision != "rev-2" {
+		t.Fatalf("rev-2 evidence must propose: %+v %v", ps, err)
+	}
+	grant, applied, err := ApproveProposal(context.Background(), s, ps[0].ProposalID, 3, -1, 90*24*time.Hour, now)
+	if err != nil || !applied {
+		t.Fatalf("rev-2 grant must apply: %+v %v", grant, err)
+	}
+	b := briefRuleGroup(t, s, queued)
+	if b.BaselineRule == grant.RuleID {
+		t.Fatalf("queued rev-1 group must not receive the rev-2 rule: %+v", b)
+	}
+}
+
+// A taken group whose payloads never reported a revision must not
+// borrow a verified grant: unknown revisions preserve the original
+// baseline on application as they do on derivation.
+func TestRuleApplyRejectsUnknownRevision(t *testing.T) {
+	s := openWorkerStore(t)
+	bindRuleSource(t, s, "test-scope")
+	barePayload := strings.Replace(rulePayload(), `"identity_revision":"`+ruleRevision+`",`, "", -1)
+	queued := seedGroup(t, s, "host:w", "evt-q2", "host.changed", barePayload)
+	rev2Payload := strings.Replace(rulePayload(), ruleRevision, "rev-2", -1)
+	for i, id := range []string{"evt-b1", "evt-b2", "evt-b3"} {
+		gid := seedGroup(t, s, "host:w", id, "host.changed", rev2Payload)
+		briefRuleGroup(t, s, gid)
+		expectBriefing(t, s, gid, "apply2-req-"+string(rune('a'+i)))
+	}
+	now := time.Now()
+	ps, err := DeriveProposals(context.Background(), s, 3, now)
+	if err != nil || len(ps) != 1 {
+		t.Fatalf("rev-2 evidence must propose: %+v %v", ps, err)
+	}
+	grant, applied, err := ApproveProposal(context.Background(), s, ps[0].ProposalID, 3, -1, 90*24*time.Hour, now)
+	if err != nil || !applied {
+		t.Fatalf("rev-2 grant must apply: %+v %v", grant, err)
+	}
+	b := briefRuleGroup(t, s, queued)
+	if b.BaselineRule == grant.RuleID {
+		t.Fatalf("revision-less group must not receive the rev-2 rule: %+v", b)
+	}
+}
+
+// A taken group straddling an epoch change (previous rev-1, current
+// rev-2) matches neither epoch: mixed revisions preserve the
+// original baseline.
+func TestRuleApplyRejectsMixedRevision(t *testing.T) {
+	s := openWorkerStore(t)
+	bindRuleSource(t, s, "test-scope")
+	rev2Payload := strings.Replace(rulePayload(), ruleRevision, "rev-2", -1)
+	for i, id := range []string{"evt-c1", "evt-c2", "evt-c3"} {
+		gid := seedGroup(t, s, "host:w", id, "host.changed", rev2Payload)
+		briefRuleGroup(t, s, gid)
+		expectBriefing(t, s, gid, "apply3-req-"+string(rune('a'+i)))
+	}
+	now := time.Now()
+	ps, err := DeriveProposals(context.Background(), s, 3, now)
+	if err != nil || len(ps) != 1 {
+		t.Fatalf("rev-2 evidence must propose: %+v %v", ps, err)
+	}
+	grant, applied, err := ApproveProposal(context.Background(), s, ps[0].ProposalID, 3, -1, 90*24*time.Hour, now)
+	if err != nil || !applied {
+		t.Fatalf("rev-2 grant must apply: %+v %v", grant, err)
+	}
+	// Straddle the epochs inside one group: the previous view stays
+	// rev-1 while the current view moves to rev-2.
+	raw := rulePayload()
+	idx := strings.LastIndex(raw, ruleRevision)
+	mixed := raw[:idx] + "rev-2" + raw[idx+len(ruleRevision):]
+	straddler := seedGroup(t, s, "host:w", "evt-c4", "host.changed", mixed)
+	b := briefRuleGroup(t, s, straddler)
+	if b.BaselineRule == grant.RuleID {
+		t.Fatalf("epoch-straddling group must not receive the rev-2 rule: %+v", b)
+	}
+}
+
 func TestDeriveProposalsSkipsUnknownRevision(t *testing.T) {
 	s := openWorkerStore(t)
 	bindRuleSource(t, s, "test-scope")
