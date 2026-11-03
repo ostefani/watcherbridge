@@ -353,11 +353,26 @@ const cases = [
       'disk I/O',
       'Latest fully successful purge',
       'Configured retention: 30 days for reports, 90 days for subjects',
-      'unknown — Step 21 has not reported one',
+      'unknown — stable identity contract unavailable',
       'Heartbeat',
       'disabled',
       'Ingest accepted'
     ]
+  },
+  {
+    component: Health,
+    name: 'health with partial heartbeat',
+    props: { stream: 'live', initial: {
+      ...healthFixture,
+      sources: [{
+        scope: 'lab', status: 'degraded', liveness: 'reporting', heartbeat_enabled: true,
+        heartbeat: { completed_at: '2026-11-03T12:00:00Z', status: 'partial', issue_count: 2,
+          duration_ms: 1200, hosts_seen: 4, clock_skew_seconds: -2 },
+        reasons: ['scanner reported partial scan']
+      }]
+    } },
+    expect: ['Last completed scan', 'partial, 2 issues, 1200 ms', 'Reported host records',
+      'not a current inventory or device count', 'Signing clock offset', 'heartbeat is not identity proof']
   },
   {
     name: 'quiet empty',

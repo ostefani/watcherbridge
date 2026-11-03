@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 24
+const supportedSchemaVersion = 25
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -156,6 +156,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 23, migrateV23)
 		case 23:
 			err = applyMigration(db, 24, migrateV24)
+		case 24:
+			err = applyMigration(db, 25, migrateV25)
 		}
 		if err != nil {
 			return err
@@ -466,6 +468,30 @@ func migrateV24(tx *sql.Tx) error {
 		`ALTER TABLE reported_subjects ADD COLUMN identity_revision TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV25 adds isolated H1 history and compact source progress. H1 rows
+// never enter raw_events, projection queues, or the forwarding sweep.
+func migrateV25(tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`CREATE TABLE heartbeats (
+            source_scope TEXT NOT NULL REFERENCES report_sources(source_scope),
+            event_id TEXT NOT NULL,
+            completed_at INTEGER NOT NULL,
+            received_at INTEGER NOT NULL,
+            payload BLOB NOT NULL CHECK(length(payload) <= 8192),
+            PRIMARY KEY(source_scope, event_id)
+        )`,
+		`CREATE INDEX heartbeats_received ON heartbeats(received_at)`,
+		`ALTER TABLE report_sources ADD COLUMN heartbeat_completed_at INTEGER`,
+		`ALTER TABLE report_sources ADD COLUMN heartbeat_summary TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE purge_runs ADD COLUMN heartbeats_deleted INTEGER NOT NULL DEFAULT 0`,
+	} {
 		if _, err := tx.Exec(stmt); err != nil {
 			return err
 		}

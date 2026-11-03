@@ -192,6 +192,9 @@ type Config struct {
 	RuleProposeAfter int
 	RuleDefaultTTL   time.Duration
 	RulePurgeAfter   time.Duration
+	// H1 source progress, independent of SSE connection comment pings.
+	HeartbeatStaleAfter time.Duration
+	HeartbeatRetention  time.Duration
 
 	GrouperTick          time.Duration
 	OverviewWindow       time.Duration // default overview window; window <= max <= briefing retention
@@ -266,14 +269,16 @@ func Default() Config {
 		GroupMaxWindow:   120 * time.Second,
 		GroupMaxEvents:   10,
 
-		BriefingRetention: 30 * 24 * time.Hour,
-		SubjectRetention:  90 * 24 * time.Hour,
-		PurgeInterval:     6 * time.Hour,
-		SnoozeDefault:     24 * time.Hour,
-		DecisionRetention: 180 * 24 * time.Hour,
-		RuleProposeAfter:  3,
-		RuleDefaultTTL:    90 * 24 * time.Hour,
-		RulePurgeAfter:    180 * 24 * time.Hour,
+		BriefingRetention:   30 * 24 * time.Hour,
+		SubjectRetention:    90 * 24 * time.Hour,
+		PurgeInterval:       6 * time.Hour,
+		SnoozeDefault:       24 * time.Hour,
+		DecisionRetention:   180 * 24 * time.Hour,
+		RuleProposeAfter:    3,
+		RuleDefaultTTL:      90 * 24 * time.Hour,
+		RulePurgeAfter:      180 * 24 * time.Hour,
+		HeartbeatStaleAfter: 10 * time.Minute,
+		HeartbeatRetention:  7 * 24 * time.Hour,
 
 		GrouperTick:          1 * time.Second,
 		OverviewWindow:       24 * time.Hour,
@@ -633,6 +638,9 @@ func (c Config) Validate() error {
 	}
 	if c.SnoozeDefault <= 0 || c.SnoozeDefault > c.DecisionRetention {
 		return fmt.Errorf("snooze default %v must be positive and within decision retention %v", c.SnoozeDefault, c.DecisionRetention)
+	}
+	if c.HeartbeatStaleAfter <= 0 || c.HeartbeatRetention <= 0 {
+		return fmt.Errorf("heartbeat stale-after and retention must be positive")
 	}
 	if c.RuleProposeAfter < 1 {
 		return fmt.Errorf("rule propose-after %d must be at least 1", c.RuleProposeAfter)

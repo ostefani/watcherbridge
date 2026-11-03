@@ -851,11 +851,12 @@ func seededDone(t *testing.T, h *harness, ids []string) bool {
 func briefingDeps(t *testing.T, h *harness) briefing.Deps {
 	t.Helper()
 	return briefing.Deps{
-		Store:  h.srv.events,
-		Groups: store.GroupPolicy{QuietWindow: time.Second, MaxWindow: time.Hour},
-		Tick:   10 * time.Millisecond,
-		Lease:  h.srv.cfg.ProcessingLease,
-		Now:    time.Now,
+		SourceScope: h.srv.cfg.SourceID,
+		Store:       h.srv.events,
+		Groups:      store.GroupPolicy{QuietWindow: time.Second, MaxWindow: time.Hour},
+		Tick:        10 * time.Millisecond,
+		Lease:       h.srv.cfg.ProcessingLease,
+		Now:         time.Now,
 		Policy: briefing.Policy{
 			EstablishedAge:   h.srv.cfg.EstablishedAge,
 			StrongHistoryAge: h.srv.cfg.StrongHistoryAge,
@@ -958,10 +959,12 @@ func FuzzParseAndValidate(f *testing.F) {
 
 // RegisterOnShutdown hooks run when Shutdown starts, so open SSE tabs stop
 // blocking the drain. The server is built directly (no fake relay), so the
-// test needs no socket: Start either blocks in ListenAndServe or fails
-// fast on bind, and Shutdown must run the hooks and return either way.
+// listener uses an ephemeral loopback port: Start either blocks in
+// ListenAndServe or fails fast, and Shutdown must run the hooks either way.
 func TestRegisterOnShutdownRunsHooks(t *testing.T) {
 	cfg := config.Default()
+	// Isolate the test from operator UI reconnects on the default port.
+	cfg.Bind = "127.0.0.1:0"
 	cfg.Mode = config.ModeTap
 	cfg.Secret = "test-secret-long-enough-01234567"
 	st, err := store.Open(filepath.Join(t.TempDir(), "bridge.db"))

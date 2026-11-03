@@ -27,8 +27,8 @@ const maxPurgeRowsPerTxn = 200
 // outcome without waiting indefinitely behind writer pressure.
 const purgeLedgerTimeout = 5 * time.Second
 
-// heartbeatRetention compacts stale scanner heartbeat rows. A scope
-// that still owns subjects is never compacted, however old.
+// heartbeatRetention is the default H1 history horizon and the existing
+// retired-source cleanup horizon. Configured or referenced sources survive.
 const heartbeatRetention = 7 * 24 * time.Hour
 
 // Checkpoint runs a TRUNCATE checkpoint on the single writer goroutine (but
@@ -88,6 +88,9 @@ type PurgeSettings struct {
 	// older than this drain, and only while no retained briefing still
 	// records their rule ID as its baseline.
 	RuleRetention time.Duration
+	// HeartbeatRetention bounds isolated H1 history; zero selects 7d.
+	// Compact source progress survives this history horizon.
+	HeartbeatRetention time.Duration
 	// ActiveSource names the configured SOURCE_ID. A quiet-but-live
 	// registration is never retired by inactivity alone (Designv9 §4.6);
 	// when empty, source cleanup keeps its legacy behavior for tests.
@@ -139,6 +142,7 @@ type PurgeReport struct {
 	Sources       int64
 	Pseudonyms    int64
 	Decisions     int64 // expired operator-decision audit rows; labels survive in reported_subjects
+	Heartbeats    int64 // isolated H1 history; compact source state survives
 	Rules         int64 // terminal review-policy rule rows unreferenced by retained briefings
 	Bookkeeping   int64 // purge_state upserts sharing the row budget
 }
@@ -158,13 +162,14 @@ func (r *PurgeReport) add(o PurgeReport) {
 	r.Sources += o.Sources
 	r.Pseudonyms += o.Pseudonyms
 	r.Decisions += o.Decisions
+	r.Heartbeats += o.Heartbeats
 	r.Rules += o.Rules
 	r.Bookkeeping += o.Bookkeeping
 }
 
 func (r PurgeReport) total() int64 {
 	return r.BriefingLinks + r.Briefings + r.Traces + r.Groups + r.GroupLinks + r.GroupEvents + r.Ports +
-		r.Observations + r.Progress + r.RawEvents + r.Subjects + r.Sources + r.Pseudonyms + r.Decisions + r.Rules
+		r.Observations + r.Progress + r.RawEvents + r.Subjects + r.Sources + r.Pseudonyms + r.Decisions + r.Rules + r.Heartbeats
 }
 
 // purgeStages selects which table families one batch transaction covers.
@@ -182,15 +187,16 @@ const (
 // purgePlan carries one batch's horizons. Cutoffs are absolute nanos so
 // every statement in the transaction agrees on eligibility.
 type purgePlan struct {
-	stages      purgeStages
-	briefingCut int64
-	rawCut      int64
-	failedCut   int64
-	subjectCut  int64
-	sourceCut   int64
-	tokenCut    int64
-	decisionCut int64
-	ruleCut     int64
+	stages       purgeStages
+	briefingCut  int64
+	rawCut       int64
+	failedCut    int64
+	subjectCut   int64
+	sourceCut    int64
+	tokenCut     int64
+	decisionCut  int64
+	ruleCut      int64
+	heartbeatCut int64
 	// now is the run's wall clock for liveness checks (expiry is
 	// relative to now; the horizon cuts are relative to retention).
 	now int64
@@ -306,6 +312,8 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				report.Pseudonyms += n
 			case "operator_decisions":
 				report.Decisions += n
+			case "heartbeats":
+				report.Heartbeats += n
 			case "review_rules":
 				report.Rules += n
 			}
@@ -402,6 +410,12 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 		}
 		if plan.stages&stageSubjects != 0 {
 			limit = deleteLimit()
+			if err := take("heartbeats", plan.heartbeatCut, `DELETE FROM heartbeats WHERE rowid IN
+                (SELECT rowid FROM heartbeats WHERE received_at < ? ORDER BY received_at, rowid LIMIT ?)`,
+				limit, plan.heartbeatCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
 			// A retained rule record keeps its subject like a retained
 			// briefing keeps its rule: terminal rows (dismissed,
 			// revoked, lapsed) still name the scope an operator
@@ -446,7 +460,7 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.baseline_rule = review_rules.rule_id) ORDER BY decided_at, rowid LIMIT ?)`, limit, plan.ruleCut, plan.now, limit); err != nil {
 				return err
 			}
-			sourceScope := "last_report_at IS NOT NULL AND last_report_at < ?\n\t\t\t\tAND NOT EXISTS (SELECT 1 FROM reported_subjects WHERE reported_subjects.source_scope = report_sources.source_scope)"
+			sourceScope := "last_report_at IS NOT NULL AND last_report_at < ?\n\t\t\t\tAND NOT EXISTS (SELECT 1 FROM reported_subjects WHERE reported_subjects.source_scope = report_sources.source_scope) AND NOT EXISTS (SELECT 1 FROM heartbeats WHERE heartbeats.source_scope = report_sources.source_scope)"
 			sourceArgs := []any{plan.sourceCut}
 			if plan.activeSource != "" {
 				sourceScope += " AND source_scope <> ?"
@@ -783,12 +797,13 @@ func addPurgeRunCounts(tx *sql.Tx, runID int64, report PurgeReport) error {
 		pseudonyms_deleted = pseudonyms_deleted + ?,
 		decisions_deleted = decisions_deleted + ?,
 		rules_deleted = rules_deleted + ?,
+		heartbeats_deleted = heartbeats_deleted + ?,
 		bookkeeping_writes = bookkeeping_writes + ?
 		WHERE run_id = ?`,
 		report.BriefingLinks, report.Briefings, report.Traces, report.Groups, report.GroupLinks,
 		report.GroupEvents,
 		report.Ports, report.Observations, report.Progress, report.RawEvents,
-		report.Subjects, report.Sources, report.Pseudonyms, report.Decisions, report.Rules, report.Bookkeeping,
+		report.Subjects, report.Sources, report.Pseudonyms, report.Decisions, report.Rules, report.Heartbeats, report.Bookkeeping,
 		runID)
 	return err
 }
@@ -808,6 +823,10 @@ func addPurgeRunCounts(tx *sql.Tx, runID int64, report PurgeReport) error {
 // independently safe stage still drains; the skip is noted in the run
 // and surfaced to the caller, and a later run retries expiry.
 func (s *Store) PurgeOnce(ctx context.Context, settings PurgeSettings, now time.Time) (PurgeReport, error) {
+	heartbeatAge := settings.HeartbeatRetention
+	if heartbeatAge <= 0 {
+		heartbeatAge = heartbeatRetention
+	}
 	rawCut := nanos(now.Add(-settings.BriefingRetention))
 	plan := purgePlan{
 		stages:       stageAll,
@@ -819,6 +838,7 @@ func (s *Store) PurgeOnce(ctx context.Context, settings PurgeSettings, now time.
 		tokenCut:     rawCut,
 		decisionCut:  nanos(now.Add(-decisionRetentionOf(settings))),
 		ruleCut:      nanos(now.Add(-ruleRetentionOf(settings))),
+		heartbeatCut: nanos(now.Add(-heartbeatAge)),
 		now:          nanos(now),
 		activeSource: settings.ActiveSource,
 	}
@@ -970,13 +990,13 @@ func (s *Store) LatestPurgeRun(ctx context.Context) (purgeRun, error) {
 		briefing_links_deleted, briefings_deleted, traces_deleted, groups_deleted, group_links_deleted,
 		group_events_deleted,
 		ports_deleted, observations_deleted, progress_deleted, raw_events_deleted,
-		subjects_deleted, sources_deleted, pseudonyms_deleted, decisions_deleted, rules_deleted, bookkeeping_writes
+		subjects_deleted, sources_deleted, pseudonyms_deleted, decisions_deleted, rules_deleted, heartbeats_deleted, bookkeeping_writes
 		FROM purge_runs ORDER BY run_id DESC LIMIT 1`).Scan(
 		&run.runID, &run.startedAt, &run.finishedAt, &run.status, &run.errText,
 		&run.total.BriefingLinks, &run.total.Briefings, &run.total.Traces, &run.total.Groups, &run.total.GroupLinks,
 		&run.total.GroupEvents,
 		&run.total.Ports, &run.total.Observations, &run.total.Progress, &run.total.RawEvents,
-		&run.total.Subjects, &run.total.Sources, &run.total.Pseudonyms, &run.total.Decisions, &run.total.Rules, &run.total.Bookkeeping)
+		&run.total.Subjects, &run.total.Sources, &run.total.Pseudonyms, &run.total.Decisions, &run.total.Rules, &run.total.Heartbeats, &run.total.Bookkeeping)
 	if err != nil {
 		return purgeRun{}, err
 	}

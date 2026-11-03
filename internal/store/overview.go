@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -67,6 +69,7 @@ var purgeRunColumns = []struct {
 	{"pseudonyms_deleted", "pseudonym_map"},
 	{"decisions_deleted", "operator_decisions"},
 	{"rules_deleted", "review_rules"},
+	{"heartbeats_deleted", "heartbeats"},
 }
 
 // scanPurgeRun reads one purge_runs row; ok is false on no match.
@@ -139,6 +142,7 @@ type SourceHealth struct {
 	Capabilities     string
 	LastReportAt     time.Time
 	HasLastReport    bool
+	Heartbeat        *HeartbeatSummary
 	HeartbeatEnabled bool
 	LastHeartbeatAt  time.Time
 	HasLastHeartbeat bool
@@ -381,7 +385,7 @@ func (s *Store) RecentForwardErrors(ctx context.Context, since time.Time) (int, 
 // are NULL until H1; they read as absent, never as zero time.
 func (s *Store) SourceHealthRows(ctx context.Context) ([]SourceHealth, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT source_scope, configured_identity_namespace,
-		capabilities, last_report_at, heartbeat_enabled, last_heartbeat_at, delivery_status
+		capabilities, last_report_at, heartbeat_enabled, last_heartbeat_at, delivery_status, heartbeat_summary
 		FROM report_sources ORDER BY source_scope ASC`)
 	if err != nil {
 		return nil, err
@@ -391,13 +395,20 @@ func (s *Store) SourceHealthRows(ctx context.Context) ([]SourceHealth, error) {
 	for rows.Next() {
 		var h SourceHealth
 		var lr, lh sql.NullInt64
+		var summary string
 		var hb sql.NullBool
 		if err := rows.Scan(&h.Scope, &h.ConfiguredNS, &h.Capabilities,
-			&lr, &hb, &lh, &h.DeliveryStatus); err != nil {
+			&lr, &hb, &lh, &h.DeliveryStatus, &summary); err != nil {
 			return nil, err
 		}
 		if lr.Valid {
 			h.LastReportAt, h.HasLastReport = fromNanos(lr.Int64), true
+		}
+		if summary != "" {
+			h.Heartbeat = new(HeartbeatSummary)
+			if err := json.Unmarshal([]byte(summary), h.Heartbeat); err != nil {
+				return nil, fmt.Errorf("invalid stored heartbeat summary")
+			}
 		}
 		h.HeartbeatEnabled = hb.Valid && hb.Bool
 		if lh.Valid {

@@ -40,11 +40,12 @@
  * @property {string} scope
  * @property {string} status ok|degraded|blind
  * @property {string} liveness
- * @property {string} [identity_namespace] absent until Step 21 reports it
- * @property {string} [capabilities] absent until Step 21 reports it
+ * @property {string} [identity_namespace] absent without the separate stable identity contract
+ * @property {string} [capabilities] identity capability, never inferred from heartbeat
  * @property {string} [last_report_at] RFC 3339
  * @property {boolean} heartbeat_enabled heartbeat opt-in, not identity proof
  * @property {string} [last_heartbeat_at] RFC 3339
+ * @property {{scan_id: string, target: string, completed_at: string, received_at: string, fresh_at: string, hosts_seen: number, duration_ms: number, status: string, issue_count: number, clock_skew_seconds: number}} [heartbeat] compact latest scan summary, survives history purge
  * @property {string} [delivery_status]
  * @property {string[]} reasons
  */

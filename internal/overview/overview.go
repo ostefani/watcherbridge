@@ -141,6 +141,7 @@ type SourceInput struct {
 	// HeartbeatCapable is false until H1 (Step 21).
 	HeartbeatCapable bool
 	HeartbeatStale   bool
+	ScanStatus       string
 	// LastReportAge is informational: silence alone is not a gap.
 	LastReportAge time.Duration
 	DeliveryGap   bool
@@ -148,10 +149,12 @@ type SourceInput struct {
 
 // Coverage statuses.
 const (
-	CoverageOK       = "ok"
-	CoverageDegraded = "degraded"
-	CoverageBlind    = "blind"
-	LivenessUnknown  = "unknown"
+	CoverageOK        = "ok"
+	CoverageDegraded  = "degraded"
+	CoverageBlind     = "blind"
+	LivenessUnknown   = "unknown"
+	LivenessReporting = "reporting"
+	LivenessStale     = "stale"
 )
 
 // AssessCoverage derives coverage from health evidence. Blind requires
@@ -166,7 +169,15 @@ func AssessCoverage(in CoverageInput) Coverage {
 	cov := Coverage{Status: CoverageOK, Reasons: []string{}}
 	for _, s := range in.Sources {
 		sc := SourceCoverage{Scope: s.Scope, Status: CoverageOK, Liveness: LivenessUnknown, Reasons: []string{}}
+		if s.HeartbeatCapable {
+			sc.Liveness = LivenessReporting
+			if s.ScanStatus == "partial" || s.ScanStatus == "error" {
+				sc.Status = CoverageDegraded
+				sc.Reasons = append(sc.Reasons, "scanner reported "+s.ScanStatus+" scan")
+			}
+		}
 		if s.HeartbeatCapable && s.HeartbeatStale {
+			sc.Liveness = LivenessStale
 			sc.Status = CoverageBlind
 			sc.Reasons = append(sc.Reasons, "heartbeat stale")
 		}

@@ -5,8 +5,9 @@
 // 202 accepted (persisted; forwarded in proxy mode), 401 bad signature or
 // timestamp, 400 malformed, 413 oversize, 405 non-POST, 503 saturated or
 // store unavailable with Retry-After, 502 ScanRelay delivery failed.
-// A duplicate of a known event is idempotent (202 when forwarded, 502 when
-// not) — never a 401/409.
+// A duplicate host event is idempotent (202 when forwarded, 502 when not).
+// H1 is persisted separately and never forwarded; identical retries are 202,
+// while conflicting reuse of a heartbeat ID is 409.
 package server
 
 import (
@@ -46,6 +47,7 @@ var eventTypes = map[string]bool{
 	"host.appeared":    true,
 	"host.disappeared": true,
 	"host.changed":     true,
+	"scan.heartbeat":   true,
 }
 
 // Server serves the ingest endpoint and runs the startup sweep. The
@@ -131,6 +133,7 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 	s.viewer.Overview = viewer.NewRefresher(events, nil, nil,
 		cfg.OverviewWindow, cfg.OverviewMaxWindow, cfg.BriefingRetention)
 	s.viewer.Overview.SetSubjectRetention(cfg.SubjectRetention)
+	s.viewer.Overview.SetHeartbeatStaleAfter(cfg.HeartbeatStaleAfter)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook", s.handleWebhook)
 	// GET needs an explicit route: without it the viewer mount below
@@ -240,7 +243,11 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.HandlerDeadline)
 	defer cancel()
 
-	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
+	bodyLimit := s.cfg.MaxBodyBytes
+	if r.Header.Get("X-SubnetLens-Event-Type") == "scan.heartbeat" && bodyLimit > store.MaxHeartbeatBytes {
+		bodyLimit = store.MaxHeartbeatBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, bodyLimit)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		s.Health.AddRejected()
@@ -272,6 +279,11 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if !validSignature(s.secret, timestamp, eventID, eventKey, eventType, body, signature) {
 		s.Health.AddRejected()
 		writeError(w, http.StatusUnauthorized, "invalid signature")
+		return
+	}
+
+	if eventType == "scan.heartbeat" {
+		s.acceptHeartbeat(ctx, w, body, eventID, eventKey, sigTime)
 		return
 	}
 

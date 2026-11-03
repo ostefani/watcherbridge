@@ -120,14 +120,25 @@
               <dt>Liveness</dt>
               <dd>{src.liveness}{src.liveness === 'unknown' ? ' (no heartbeat capability; silence is not absence)' : ''}</dd>
               <dt>Identity namespace</dt>
-              <dd>{src.identity_namespace || 'unknown — Step 21 has not reported one'}</dd>
+              <dd>{src.identity_namespace || 'unknown — stable identity contract unavailable'}</dd>
               <dt>Identity capability</dt>
-              <dd>{src.capabilities || 'not reported — Step 21 has not reported any'}</dd>
+              <dd>{src.capabilities || 'not reported — heartbeat is not identity proof'}</dd>
               <dt>Heartbeat</dt>
               <dd>
                 {src.heartbeat_enabled ? 'enabled (delivery opt-in, not identity proof)' : 'disabled'}
                 {#if src.last_heartbeat_at}— last at {displayTime(src.last_heartbeat_at).local}{/if}
               </dd>
+              {#if src.heartbeat}
+                {@const scan = displayTime(src.heartbeat.completed_at)}
+                <dt>Last completed scan</dt>
+                <dd><time datetime={src.heartbeat.completed_at} title={scan.utc}>{scan.local}</time></dd>
+                <dt>Scan result</dt>
+                <dd>{src.heartbeat.status}, {src.heartbeat.issue_count} {src.heartbeat.issue_count === 1 ? 'issue' : 'issues'}, {src.heartbeat.duration_ms} ms</dd>
+                <dt>Reported host records</dt>
+                <dd>{src.heartbeat.hosts_seen} — scan records, not a current inventory or device count</dd>
+                <dt>Signing clock offset</dt>
+                <dd>{src.heartbeat.clock_skew_seconds} seconds (includes delivery delay)</dd>
+              {/if}
               {#if src.last_report_at}
                 {@const at = displayTime(src.last_report_at)}
                 <dt>Last report</dt>

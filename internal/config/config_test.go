@@ -24,6 +24,9 @@ func TestDefaultPairs(t *testing.T) {
 	if c.MaxFieldChars != 256 {
 		t.Fatalf("default field cap must be 256, got %d", c.MaxFieldChars)
 	}
+	if c.HeartbeatStaleAfter != 10*time.Minute || c.HeartbeatRetention != 7*24*time.Hour {
+		t.Fatal("H1 defaults must match Designv9")
+	}
 	// The approved chain: handler = proxy + persist + margin, below Pro's 10s.
 	if want := c.ProxyForwardTimeout + c.PersistBudget + c.Margin; c.HandlerDeadline != want {
 		t.Fatalf("handler deadline %v != proxy+persist+margin %v", c.HandlerDeadline, want)
@@ -61,6 +64,8 @@ func TestOverviewWindowChain(t *testing.T) {
 
 func TestValidateRejects(t *testing.T) {
 	cases := map[string]func(*Config){
+		"zero heartbeat stale horizon":     func(c *Config) { c.HeartbeatStaleAfter = 0 },
+		"zero heartbeat retention":         func(c *Config) { c.HeartbeatRetention = 0 },
 		"rule propose-after below one":     func(c *Config) { c.RuleProposeAfter = 0 },
 		"rule default ttl non-positive":    func(c *Config) { c.RuleDefaultTTL = 0 },
 		"rule retention below a day":       func(c *Config) { c.RulePurgeAfter = 23 * time.Hour },

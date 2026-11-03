@@ -29,6 +29,7 @@ func dropTraceSchema(t *testing.T, db *sql.DB) {
 // table and ledger column) for the same migration-chain replay.
 func dropRuleSchema(t *testing.T, db *sql.DB) {
 	t.Helper()
+	dropHeartbeatSchema(t, db)
 	if _, err := db.Exec(`DROP TABLE IF EXISTS review_rules`); err != nil {
 		t.Fatalf("drop rules: %v", err)
 	}

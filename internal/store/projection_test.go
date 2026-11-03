@@ -103,6 +103,7 @@ func TestSubjectRevisionHighWater(t *testing.T) {
 // version on reopen. Children drop before parents.
 func dropProjectionSchema(t *testing.T, db *sql.DB) {
 	t.Helper()
+	dropHeartbeatSchema(t, db)
 	dropGroupingProvenance(t, db)
 	dropColumnIfExists(t, db, "pseudonym_map", "last_used_at")
 	// SQLite refuses DROP COLUMN while a dependent index exists, so

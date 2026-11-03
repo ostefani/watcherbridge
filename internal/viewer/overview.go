@@ -32,20 +32,21 @@ type attentionWire struct {
 
 // sourceWire is one source's coverage and liveness with reasons.
 // IdentityNamespace and Capabilities mirror the stored registration;
-// both stay empty until the upstream identity work (Step 21) reports
+// both stay empty until the separate upstream identity contract reports
 // them, and empty reads as unknown, never as a granted capability.
 // Heartbeat enablement and identity capability are different claims.
 type sourceWire struct {
-	Scope             string   `json:"scope"`
-	Status            string   `json:"status"`
-	Liveness          string   `json:"liveness"`
-	IdentityNamespace string   `json:"identity_namespace,omitempty"`
-	Capabilities      string   `json:"capabilities,omitempty"`
-	LastReportAt      string   `json:"last_report_at,omitempty"`
-	HeartbeatEnabled  bool     `json:"heartbeat_enabled"`
-	LastHeartbeatAt   string   `json:"last_heartbeat_at,omitempty"`
-	DeliveryStatus    string   `json:"delivery_status,omitempty"`
-	Reasons           []string `json:"reasons"`
+	Scope             string                  `json:"scope"`
+	Status            string                  `json:"status"`
+	Liveness          string                  `json:"liveness"`
+	IdentityNamespace string                  `json:"identity_namespace,omitempty"`
+	Capabilities      string                  `json:"capabilities,omitempty"`
+	LastReportAt      string                  `json:"last_report_at,omitempty"`
+	Heartbeat         *store.HeartbeatSummary `json:"heartbeat,omitempty"`
+	HeartbeatEnabled  bool                    `json:"heartbeat_enabled"`
+	LastHeartbeatAt   string                  `json:"last_heartbeat_at,omitempty"`
+	DeliveryStatus    string                  `json:"delivery_status,omitempty"`
+	Reasons           []string                `json:"reasons"`
 }
 
 // overviewWire is the GET /api/overview body and the `overview` SSE
@@ -280,8 +281,9 @@ type Refresher struct {
 	// subjectRetention is the reported-subject horizon from config;
 	// zero means unconfigured and the health retention section omits
 	// subject ages rather than claiming a policy.
-	subjectRetention time.Duration
-	now              func() time.Time
+	subjectRetention    time.Duration
+	heartbeatStaleAfter time.Duration
+	now                 func() time.Time
 
 	trigger chan struct{}
 
@@ -326,6 +328,10 @@ func (r *Refresher) SetPublisher(p *Publisher) {
 func (r *Refresher) SetSubjectRetention(d time.Duration) {
 	r.subjectRetention = d
 }
+
+// SetHeartbeatStaleAfter configures H1 freshness. Zero selects Designv9's 10m.
+// Set once before serving, like the other refresher horizons.
+func (r *Refresher) SetHeartbeatStaleAfter(d time.Duration) { r.heartbeatStaleAfter = d }
 
 // Trigger requests a refresh, coalesced: a full trigger channel means a
 // refresh is already pending, so extra triggers drop.
@@ -560,12 +566,21 @@ func (r *Refresher) coverage(ctx context.Context) (overview.Coverage, []sourceWi
 			IdentityNamespace: s.ConfiguredNS,
 			Capabilities:      s.Capabilities,
 			HeartbeatEnabled:  s.HeartbeatEnabled,
+			Heartbeat:         s.Heartbeat,
 			DeliveryStatus:    s.DeliveryStatus,
 			Reasons:           []string{},
 		}
 		si := overview.SourceInput{Scope: s.Scope}
 		if s.HeartbeatEnabled {
 			si.HeartbeatCapable = true
+			staleAfter := r.heartbeatStaleAfter
+			if staleAfter <= 0 {
+				staleAfter = 10 * time.Minute
+			}
+			si.HeartbeatStale = s.Heartbeat == nil || now.Sub(s.Heartbeat.FreshAt) >= staleAfter
+			if s.Heartbeat != nil {
+				si.ScanStatus = s.Heartbeat.Status
+			}
 		}
 		if s.HasLastReport {
 			w.LastReportAt = s.LastReportAt.UTC().Format(time.RFC3339)
@@ -582,6 +597,7 @@ func (r *Refresher) coverage(ctx context.Context) (overview.Coverage, []sourceWi
 	}
 	assessed := overview.AssessCoverage(in)
 	for i, sc := range assessed.Sources {
+		wires[i].Liveness = sc.Liveness
 		wires[i].Status = sc.Status
 		wires[i].Reasons = sc.Reasons
 	}

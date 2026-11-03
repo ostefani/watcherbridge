@@ -414,6 +414,7 @@ func TestMigrateSupportedFromV13(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	dropHeartbeatSchema(t, raw)
 	for _, stmt := range []string{
 		`DROP TABLE IF EXISTS purge_runs`,
 		`DROP TABLE IF EXISTS purge_protected_tokens`,

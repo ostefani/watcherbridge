@@ -53,6 +53,8 @@ func main() {
 	purgeEvery := fs.Duration("purge-interval", def.PurgeInterval, "purge loop interval (min 1m)")
 	snoozeDefault := fs.Duration("snooze-default", def.SnoozeDefault, "default briefing snooze horizon")
 	decisionRet := fs.Duration("decision-retention", def.DecisionRetention, "retained operator-decision audit (min 24h)")
+	heartbeatStale := fs.Duration("heartbeat-stale-after", def.HeartbeatStaleAfter, "source heartbeat freshness limit")
+	heartbeatRetention := fs.Duration("heartbeat-retention", def.HeartbeatRetention, "retained heartbeat history")
 	ruleProposeAfter := fs.Int("rule-propose-after", def.RuleProposeAfter, "matching expected decisions that derive a rule proposal (min 1)")
 	ruleDefaultTTL := fs.Duration("rule-default-ttl", def.RuleDefaultTTL, "default rule approval grant")
 	ruleRet := fs.Duration("rule-retention", def.RulePurgeAfter, "retained terminal review-policy rules (min 24h)")
@@ -90,6 +92,8 @@ func main() {
 	cfg.PurgeInterval = *purgeEvery
 	cfg.SnoozeDefault = *snoozeDefault
 	cfg.DecisionRetention = *decisionRet
+	cfg.HeartbeatStaleAfter = *heartbeatStale
+	cfg.HeartbeatRetention = *heartbeatRetention
 	cfg.RuleProposeAfter = *ruleProposeAfter
 	cfg.RuleDefaultTTL = *ruleDefaultTTL
 	cfg.RulePurgeAfter = *ruleRet
@@ -159,7 +163,7 @@ func main() {
 	srv.Health = opHealth
 	srv.Viewer().Overview.SetHealth(opHealth)
 	srv.SweepOnce(ctx)
-	purgeSettings := store.PurgeSettings{BriefingRetention: cfg.BriefingRetention, SubjectRetention: cfg.SubjectRetention, DecisionRetention: cfg.DecisionRetention, RuleRetention: cfg.RulePurgeAfter, ActiveSource: cfg.SourceID}
+	purgeSettings := store.PurgeSettings{BriefingRetention: cfg.BriefingRetention, SubjectRetention: cfg.SubjectRetention, DecisionRetention: cfg.DecisionRetention, RuleRetention: cfg.RulePurgeAfter, HeartbeatRetention: cfg.HeartbeatRetention, ActiveSource: cfg.SourceID}
 	if rep, err := st.PurgeOnce(ctx, purgeSettings, time.Now()); err != nil {
 		log.Fatalf("startup purge: %v", err)
 	} else {
