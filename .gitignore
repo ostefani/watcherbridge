@@ -40,6 +40,10 @@ pseudonyms.*
 ui/node_modules/
 ui/.smoke-tmp/
 
+# --- E2E harness output (rebuilt/preserved per run, never committed) ---
+.e2e-bin/
+.e2e-last-failure/
+
 # --- Editors and IDEs ---
 .idea/
 .vscode/
