@@ -61,6 +61,7 @@ type Store struct {
 	closeErr    error
 	groupSeq    atomic.Int64
 	decisionSeq atomic.Int64
+	incidentSeq atomic.Int64
 	now         func() time.Time
 	// decisionRetention bounds how long operator-decision audit stays
 	// effective; zero means the 180d default. Purge deletes audit rows

@@ -195,6 +195,14 @@ type Config struct {
 	// H1 source progress, independent of SSE connection comment pings.
 	HeartbeatStaleAfter time.Duration
 	HeartbeatRetention  time.Duration
+	// Presentation incidents (Designv9 §7): formation window, quiet
+	// close, distinct-reference threshold and closed retention. The
+	// 30s tick is applied by the loop owner, like the overview tick.
+	IncidentTick      time.Duration
+	IncidentWindow    time.Duration
+	IncidentQuiet     time.Duration
+	IncidentMinRefs   int
+	IncidentRetention time.Duration
 
 	GrouperTick          time.Duration
 	OverviewWindow       time.Duration // default overview window; window <= max <= briefing retention
@@ -279,6 +287,11 @@ func Default() Config {
 		RulePurgeAfter:      180 * 24 * time.Hour,
 		HeartbeatStaleAfter: 10 * time.Minute,
 		HeartbeatRetention:  7 * 24 * time.Hour,
+		IncidentTick:        30 * time.Second,
+		IncidentWindow:      5 * time.Minute,
+		IncidentQuiet:       120 * time.Second,
+		IncidentMinRefs:     3,
+		IncidentRetention:   90 * 24 * time.Hour,
 
 		GrouperTick:          1 * time.Second,
 		OverviewWindow:       24 * time.Hour,
@@ -641,6 +654,31 @@ func (c Config) Validate() error {
 	}
 	if c.HeartbeatStaleAfter <= 0 || c.HeartbeatRetention <= 0 {
 		return fmt.Errorf("heartbeat stale-after and retention must be positive")
+	}
+	// Designv9 §7: the correlator tick shares the overview timer
+	// range (5s-5m); the window must fit briefing retention or
+	// formation would read purged evidence; quiet must cover at
+	// least one tick or every incident closes before the next pass
+	// can extend it; single- and double-report bursts stay
+	// individual, never incidents; incident retention shares the
+	// subject horizon so pins never outlive their subjects.
+	if c.IncidentTick < 5*time.Second || c.IncidentTick > 5*time.Minute {
+		return fmt.Errorf("incident tick %v must be between 5s and 5m", c.IncidentTick)
+	}
+	if c.IncidentWindow <= 0 || c.IncidentWindow > c.BriefingRetention {
+		return fmt.Errorf("incident window %v must be positive and within briefing retention %v", c.IncidentWindow, c.BriefingRetention)
+	}
+	if c.IncidentQuiet < c.IncidentTick {
+		return fmt.Errorf("incident quiet %v must cover at least one tick %v", c.IncidentQuiet, c.IncidentTick)
+	}
+	if c.IncidentMinRefs < 2 {
+		return fmt.Errorf("incident min refs %d must be at least 2", c.IncidentMinRefs)
+	}
+	if c.IncidentRetention < 24*time.Hour {
+		return fmt.Errorf("incident retention %v must be at least 24h", c.IncidentRetention)
+	}
+	if c.IncidentRetention > c.SubjectRetention {
+		return fmt.Errorf("incident retention %v must not exceed subject retention %v", c.IncidentRetention, c.SubjectRetention)
 	}
 	if c.RuleProposeAfter < 1 {
 		return fmt.Errorf("rule propose-after %d must be at least 1", c.RuleProposeAfter)

@@ -19,6 +19,12 @@ import (
 // errors (Designv9 §3.2: ratio over >=3 briefings in 1h).
 const healthWindow = time.Hour
 
+// incidentCandidateCap bounds the incident display-cut read per
+// refresh. Open and recently closed incidents are few; the verdict
+// counts cover the full window separately, so the cap only trims the
+// visible list, like the briefing candidate cap.
+const incidentCandidateCap = 100
+
 // attentionWire is one attention item on the wire. Raw identifiers stay
 // server-side; only stable IDs, kinds, and priorities cross.
 type attentionWire struct {
@@ -483,11 +489,68 @@ func (r *Refresher) compute(ctx context.Context, window time.Duration) ([]byte, 
 			last = c.CreatedAt
 		}
 	}
-	// Incidents stay typed but empty until Step 29; their behavior is
-	// exercised through synthetic pure inputs. Compute orders the
-	// display cut; Summarize derives the verdict from the full-window
-	// effective counts so rows past the cap still vote.
-	computed := overview.Compute(items, nil, digest, receipts, window, last, cov, now)
+	// Incidents join the same display cut: open incidents plus ones
+	// closed inside the window, decision-aware like briefings. The
+	// candidate cap only bounds the display cut; the verdict counts
+	// below cover the full window.
+	incidentCands, err := r.store.IncidentCandidates(ctx, since, incidentCandidateCap)
+	if err != nil {
+		return nil, 0, err
+	}
+	incidentItems := make([]overview.Item, 0, len(incidentCands))
+	for _, c := range incidentCands {
+		incidentItems = append(incidentItems, overview.Item{
+			ID: c.IncidentID, Priority: c.Floor,
+			CreatedAt: c.UpdatedAt, ChangeKind: c.Kind,
+			Flagged: c.Flagged,
+		})
+		if c.UpdatedAt.After(last) {
+			last = c.UpdatedAt
+		}
+	}
+	if len(incidentItems) > 0 {
+		// Presentation collapse: member briefings of an
+		// attention-state incident leave the display cut — the
+		// incident row represents them. Flagged members stay
+		// visible, and incident-only acknowledgement never hides
+		// members: collapse applies only while the incident itself
+		// is in attention. Verdict counts below are untouched:
+		// collapse hides duplicate presentation, not priority.
+		ids := make([]string, 0, len(incidentItems))
+		for _, it := range incidentItems {
+			ids = append(ids, it.ID)
+		}
+		memberMap, err := r.store.IncidentMemberBriefings(ctx, ids)
+		if err != nil {
+			return nil, 0, err
+		}
+		collapsed := map[string]bool{}
+		for _, bids := range memberMap {
+			for _, bid := range bids {
+				collapsed[bid] = true
+			}
+		}
+		kept := items[:0]
+		for _, it := range items {
+			if !it.Flagged && collapsed[it.ID] {
+				continue
+			}
+			kept = append(kept, it)
+		}
+		items = kept
+	}
+	incidentCounts, incidentFlagged, err := r.store.IncidentEffectiveCounts(ctx, since, now)
+	if err != nil {
+		return nil, 0, err
+	}
+	for pri, n := range incidentCounts {
+		rankCounts[pri] += n
+	}
+	flagged += incidentFlagged
+	// Compute orders the display cut; Summarize derives the verdict
+	// from the full-window effective counts so rows past the cap
+	// still vote.
+	computed := overview.Compute(items, incidentItems, digest, receipts, window, last, cov, now)
 	verdict, headline, _ := overview.Summarize(rankCounts, flagged)
 	wire := overviewWire{
 		Verdict:   verdict,

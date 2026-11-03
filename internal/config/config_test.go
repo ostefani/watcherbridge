@@ -27,6 +27,12 @@ func TestDefaultPairs(t *testing.T) {
 	if c.HeartbeatStaleAfter != 10*time.Minute || c.HeartbeatRetention != 7*24*time.Hour {
 		t.Fatal("H1 defaults must match Designv9")
 	}
+	if c.IncidentTick != 30*time.Second || c.IncidentWindow != 5*time.Minute || c.IncidentQuiet != 120*time.Second {
+		t.Fatal("incident tick/window/quiet defaults must match Designv9 §7")
+	}
+	if c.IncidentMinRefs != 3 || c.IncidentRetention != 90*24*time.Hour {
+		t.Fatal("incident threshold/retention defaults must match Designv9 §7")
+	}
 	// The approved chain: handler = proxy + persist + margin, below Pro's 10s.
 	if want := c.ProxyForwardTimeout + c.PersistBudget + c.Margin; c.HandlerDeadline != want {
 		t.Fatalf("handler deadline %v != proxy+persist+margin %v", c.HandlerDeadline, want)
@@ -66,6 +72,13 @@ func TestValidateRejects(t *testing.T) {
 	cases := map[string]func(*Config){
 		"zero heartbeat stale horizon":     func(c *Config) { c.HeartbeatStaleAfter = 0 },
 		"zero heartbeat retention":         func(c *Config) { c.HeartbeatRetention = 0 },
+		"incident tick below range":        func(c *Config) { c.IncidentTick = 4 * time.Second },
+		"incident tick above range":        func(c *Config) { c.IncidentTick = 6 * time.Minute },
+		"incident window above retention":  func(c *Config) { c.IncidentWindow = c.BriefingRetention + time.Hour },
+		"incident quiet below one tick":    func(c *Config) { c.IncidentQuiet = c.IncidentTick - time.Second },
+		"incident min refs below two":      func(c *Config) { c.IncidentMinRefs = 1 },
+		"incident retention below a day":   func(c *Config) { c.IncidentRetention = 23 * time.Hour },
+		"incident retention above subject": func(c *Config) { c.IncidentRetention = c.SubjectRetention + time.Hour },
 		"rule propose-after below one":     func(c *Config) { c.RuleProposeAfter = 0 },
 		"rule default ttl non-positive":    func(c *Config) { c.RuleDefaultTTL = 0 },
 		"rule retention below a day":       func(c *Config) { c.RulePurgeAfter = 23 * time.Hour },

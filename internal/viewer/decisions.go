@@ -59,11 +59,16 @@ func reviewWireOf(state store.ReviewState) reviewWire {
 // mutationWire reports a POST outcome. Applied=false with a reason
 // means the valid request changed nothing (identical replay, already
 // neutralized target) — never a masked validation failure, which
-// stays a 4xx, and never a lost race, which is a 409.
+// stays a 4xx, and never a lost race, which is a 409. Members carries
+// the generated member rows of an incident fan-out; Generated carries
+// the member decision IDs an undone incident decision generated, for
+// individual revisit — undo itself never cascades.
 type mutationWire struct {
-	Decision decisionWire `json:"decision"`
-	Applied  bool         `json:"applied"`
-	Reason   string       `json:"reason,omitempty"`
+	Decision  decisionWire   `json:"decision"`
+	Applied   bool           `json:"applied"`
+	Reason    string         `json:"reason,omitempty"`
+	Members   []decisionWire `json:"members,omitempty"`
+	Generated []string       `json:"generated_decision_ids,omitempty"`
 }
 
 func decisionWireOf(d store.Decision) decisionWire {
@@ -142,12 +147,13 @@ func (v *Viewer) listDecisions(w http.ResponseWriter, r *http.Request) {
 // content is a 409, never a silent overwrite.
 func (v *Viewer) appendDecision(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		SubjectKind string `json:"subject_kind"`
-		SubjectID   string `json:"subject_id"`
-		Kind        string `json:"kind"`
-		Until       string `json:"until"`
-		Text        string `json:"text"`
-		RequestID   string `json:"request_id"`
+		SubjectKind    string `json:"subject_kind"`
+		SubjectID      string `json:"subject_id"`
+		Kind           string `json:"kind"`
+		Until          string `json:"until"`
+		Text           string `json:"text"`
+		RequestID      string `json:"request_id"`
+		IncludeMembers *bool  `json:"include_members"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeViewerError(w, "invalid decision body", http.StatusBadRequest)
@@ -180,6 +186,35 @@ func (v *Viewer) appendDecision(w http.ResponseWriter, r *http.Request) {
 		if in.SnoozeDefault <= 0 {
 			in.SnoozeDefault = 24 * time.Hour
 		}
+	}
+	if body.SubjectKind == store.DecisionSubjectIncident {
+		// Acknowledging an incident must state whether members are
+		// included: incident-only acknowledgement never implicitly
+		// suppresses member attention.
+		if body.IncludeMembers == nil {
+			writeViewerError(w, "include_members is required for incident decisions", http.StatusBadRequest)
+			return
+		}
+		res, err := v.store.AppendIncidentDecision(r.Context(), in, *body.IncludeMembers)
+		if err != nil {
+			writeDecisionError(w, err)
+			return
+		}
+		v.Overview.Trigger()
+		v.Hub().Broadcast("incident", incidentEvent{Changed: []string{in.SubjectID}})
+		out := mutationWire{Decision: decisionWireOf(res.Parent), Applied: res.Applied, Reason: res.Reason}
+		for _, m := range res.Members {
+			out.Members = append(out.Members, decisionWireOf(m))
+		}
+		if res.Applied {
+			w.WriteHeader(http.StatusCreated)
+		}
+		writeJSON(w, out)
+		return
+	}
+	if body.IncludeMembers != nil {
+		writeViewerError(w, "include_members applies to incident subjects only", http.StatusBadRequest)
+		return
 	}
 	res, err := v.store.AppendDecision(r.Context(), in)
 	if err != nil {
@@ -219,23 +254,33 @@ func (v *Viewer) handleDecisionUndo(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		v.Overview.Trigger()
-		writeJSON(w, mutationWire{Decision: decisionWireOf(res.Decision), Applied: res.Applied, Reason: res.Reason})
+		out := mutationWire{Decision: decisionWireOf(res.Decision), Applied: res.Applied, Reason: res.Reason}
+		// Undo never cascades, but when the target generated member
+		// rows the response names them so the operator can revisit
+		// each member judgment individually.
+		if gen, err := v.store.GeneratedDecisions(r.Context(), id); err == nil && len(gen) > 0 {
+			out.Generated = gen
+		}
+		writeJSON(w, out)
 	})(w, r)
 }
 
 // validDecisionSubject allowlists subject reference shapes before any
-// store lookup: briefing IDs in either spelling and locally generated
-// profile IDs. Anything else is malformed (400), never a store probe.
-// Well-formed but unsupported combinations (incident subjects, labels
-// on briefings) travel to the store, which rejects them as 422 with
-// an explicit reason instead of silently storing them.
+// store lookup: briefing IDs in either spelling, locally generated
+// profile IDs, and correlator-assigned incident IDs. Anything else is
+// malformed (400), never a store probe. Well-formed but unsupported
+// combinations (labels on briefings) travel to the store, which
+// rejects them as 422 with an explicit reason instead of silently
+// storing them.
 func validDecisionSubject(kind, id string) bool {
 	switch kind {
 	case store.DecisionSubjectBriefing:
 		return strings.HasPrefix(id, "brf-") || strings.HasPrefix(id, "grp-")
 	case store.DecisionSubjectProfile:
 		return validProfileID(id)
-	case "incident", "legacy":
+	case store.DecisionSubjectIncident:
+		return validIncidentID(id)
+	case "legacy":
 		return strings.HasPrefix(id, "brf-") || strings.HasPrefix(id, "grp-") || validProfileID(id)
 	}
 	return false

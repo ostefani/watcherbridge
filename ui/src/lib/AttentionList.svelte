@@ -1,8 +1,49 @@
 <script>
+  import { onDestroy } from 'svelte';
+  import { fetchIncident } from '../api.js';
+
   // Attention list: server-ordered (flagged, priority, incident, newest,
-  // stable ID). Briefing rows link to their detail screen; other kinds
-  // stay text until their screens exist.
+  // stable ID). Briefing and incident rows link to their detail
+  // screens; other kinds stay text until their screens exist.
+  // Incident rows expand inline to their member briefings; the member
+  // list is cached per incident so a toggle never refetches, and a
+  // fetch failure surfaces on the row, never as navigation.
   let { items = [] } = $props();
+
+  let expanded = $state(/** @type {Record<string, boolean>} */ ({}));
+  let memberCache = $state(/** @type {Record<string, import('../wire.js').IncidentMember[]>} */ ({}));
+  let expandError = $state(/** @type {Record<string, string>} */ ({}));
+  let expanding = $state(/** @type {Record<string, boolean>} */ ({}));
+  let alive = true;
+  onDestroy(() => {
+    alive = false;
+  });
+
+  async function toggleMembers(/** @type {string} */ id) {
+    if (expanded[id]) {
+      expanded[id] = false;
+      return;
+    }
+    expanded[id] = true;
+    if (memberCache[id] !== undefined || expanding[id]) {
+      return;
+    }
+    expanding[id] = true;
+    try {
+      const detail = await fetchIncident(id);
+      if (alive) {
+        memberCache[id] = detail.members;
+      }
+    } catch (err) {
+      if (alive) {
+        expandError[id] = err instanceof Error ? err.message : String(err);
+      }
+    } finally {
+      if (alive) {
+        expanding[id] = false;
+      }
+    }
+  }
 </script>
 
 <section aria-label="Attention">
@@ -23,6 +64,37 @@
                 >{new Date(item.created_at).toLocaleString()}</time
               >
             </a>
+          {:else if item.kind === 'incident'}
+            <a data-row href={`#/incidents/${item.id}`}>
+              <span class="pill">Priority: {item.priority}</span>
+              <span class="pill">Status: {item.status}</span>
+              <span class="kind">{item.change_kind}</span>
+              <code>{item.id}</code>
+              <time datetime={item.created_at} title={item.created_at}
+                >{new Date(item.created_at).toLocaleString()}</time
+              >
+            </a>
+            <button
+              type="button"
+              aria-expanded={expanded[item.id] ?? false}
+              disabled={expanding[item.id] ?? false}
+              onclick={() => toggleMembers(item.id)}
+            >
+              {expanded[item.id] ? 'Hide members' : expanding[item.id] ? 'Loading members…' : 'Show members'}
+            </button>
+            {#if expandError[item.id] !== undefined}
+              <p role="alert">{expandError[item.id]}</p>
+            {/if}
+            {#if (expanded[item.id] ?? false) && memberCache[item.id] !== undefined}
+              <ol>
+                {#each memberCache[item.id] as m (m.briefing_id)}
+                  <li>
+                    <a href={`#/briefing/${m.briefing_id}`}>{m.briefing_id}</a>
+                    <span class="pill">{m.priority}</span>
+                  </li>
+                {/each}
+              </ol>
+            {/if}
           {:else}
             <span class="pill">Priority: {item.priority}</span>
             <span class="pill">Status: {item.status}</span>

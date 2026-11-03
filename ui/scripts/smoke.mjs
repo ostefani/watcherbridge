@@ -52,6 +52,8 @@ const { default: Devices } = await import(pathToFileURL(join(out, 'Devices.js'))
 const { default: Device } = await import(pathToFileURL(join(out, 'Device.js')).href);
 // eslint-disable-next-line no-unsanitized/method
 const { default: Health } = await import(pathToFileURL(join(out, 'Health.js')).href);
+// eslint-disable-next-line no-unsanitized/method
+const { default: Incident } = await import(pathToFileURL(join(out, 'Incident.js')).href);
 
 const zeroDigest = {
   weak_appearance: 0,
@@ -214,6 +216,57 @@ const legacyDevice = {
     }
   ],
   history_next_after: ''
+};
+
+const incidentFixture = {
+  incident: {
+    incident_id: 'inc-11-22',
+    kind: 'burst_disappearance',
+    source_scope: 'lab',
+    target: 'lan-a',
+    status: 'open',
+    floor: 'medium',
+    qualified_refs: 2,
+    member_count: 3,
+    window_start: '2026-11-01T00:00:00Z',
+    last_member_at: '2026-11-01T00:02:00Z',
+    opened_at: '2026-11-01T00:03:00Z',
+    updated_at: '2026-11-01T00:03:00Z',
+    cursor: '1:2'
+  },
+  members: [
+    {
+      briefing_id: 'brf-grp-1',
+      created_at: '2026-11-01T00:00:00Z',
+      priority: 'low',
+      refs: [{ reference: 'mac:aa', namespace: 'ns-1', revision: `r1 ${hostile}`, confidence: 'high' }]
+    },
+    {
+      briefing_id: 'brf-grp-2',
+      created_at: '2026-11-01T00:01:00Z',
+      priority: 'low',
+      refs: [{ reference: 'mac:bb', namespace: 'ns-1', revision: 'r1', confidence: 'medium' }]
+    },
+    {
+      briefing_id: 'brf-grp-3',
+      created_at: '2026-11-01T00:02:00Z',
+      priority: 'low',
+      refs: [{ reference: 'mac:aa', namespace: 'ns-1', revision: 'r1', confidence: 'high' }]
+    }
+  ],
+  truncated: false,
+  decisions: [
+    {
+      decision_id: 'dec-31',
+      subject_kind: 'incident',
+      subject_id: 'inc-11-22',
+      kind: 'note',
+      text: `burst reviewed ${hostile}`,
+      created_at: '2026-11-01T00:04:00Z',
+      undone: false
+    }
+  ],
+  effective_review: { kind: 'expected', decision_id: 'dec-32' }
 };
 
 const healthFixture = {
@@ -444,6 +497,64 @@ const cases = [
     name: 'load error',
     props: { overview: null, loadError: 'overview 500' },
     expect: ['Overview unavailable', 'overview 500']
+  },
+  {
+    component: Incident,
+    name: 'incident detail with shared evidence',
+    props: { id: 'inc-11-22', initial: incidentFixture },
+    expect: [
+      'Burst disappearance',
+      'open',
+      'Floor: medium',
+      'Source:',
+      'Target: lan-a',
+      '3 member reports · 2 qualified upstream references',
+      'Some members share identity evidence',
+      'brf-grp-1',
+      'brf-grp-2',
+      'brf-grp-3',
+      '1 qualified reference',
+      'Operator decisions',
+      'Status: Reviewed: expected',
+      'Also apply to the 3 member briefings',
+      'Record decision',
+      'burst reviewed'
+    ],
+    absent: ['<img', 'More members exist than shown']
+  },
+  {
+    component: Incident,
+    name: 'incident closed and truncated',
+    props: {
+      id: 'inc-11-22',
+      initial: {
+        ...incidentFixture,
+        incident: { ...incidentFixture.incident, status: 'closed', closed_at: '2026-11-01T01:00:00Z' },
+        truncated: true
+      }
+    },
+    expect: ['closed', 'Closed', 'More members exist than shown'],
+    absent: ['Open since']
+  },
+  {
+    name: 'review with incident row',
+    props: {
+      overview: base({
+        verdict: 'review',
+        headline: '1 things to review',
+        receipts: 1,
+        attention: [{
+          id: 'inc-11-22',
+          kind: 'incident',
+          priority: 'medium',
+          change_kind: 'burst_disappearance',
+          created_at: '2026-11-01T00:03:00Z',
+          status: 'attention'
+        }]
+      }),
+      loadError: null
+    },
+    expect: ['1 things to review', 'inc-11-22', '#/incidents/inc-11-22', 'Show members']
   },
   {
     name: 'stale error keeps overview',

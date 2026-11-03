@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import Home from './lib/Home.svelte';
   import Detail from './lib/Detail.svelte';
+  import Incident from './lib/Incident.svelte';
   import Devices from './lib/Devices.svelte';
   import Device from './lib/Device.svelte';
   import Health from './lib/Health.svelte';
@@ -33,6 +34,10 @@
     let m = h.match(/^#\/briefing\/(.+)$/);
     if (m) {
       return { name: 'briefing', id: decodeURIComponent(m[1]) };
+    }
+    m = h.match(/^#\/incidents\/(.+)$/);
+    if (m) {
+      return { name: 'incident', id: decodeURIComponent(m[1]) };
     }
     m = h.match(/^#\/devices\/(.+)$/);
     if (m) {
@@ -81,6 +86,13 @@
       } catch {
         // A malformed frame degrades to the next refresh, never a crash.
       }
+    });
+    // Incident updates carry no SSE id and never replay: forward them
+    // as window events for mounted detail screens, and refetch the
+    // overview so attention stays current even when a frame was lost.
+    source.addEventListener('incident', () => {
+      window.dispatchEvent(new CustomEvent('watcherbridge:incident'));
+      load();
     });
     source.onerror = () => {
       stream = 'retrying';
@@ -174,6 +186,8 @@
       <Home {overview} {loadError} />
     {:else if route.name === 'briefing'}
       <Detail id={route.id} />
+    {:else if route.name === 'incident'}
+      <Incident id={route.id} />
     {:else if route.name === 'devices'}
       <Devices {stream} />
     {:else if route.name === 'device'}

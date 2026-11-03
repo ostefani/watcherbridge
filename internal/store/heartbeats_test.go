@@ -14,6 +14,10 @@ import (
 
 func dropHeartbeatSchema(t *testing.T, db *sql.DB) {
 	t.Helper()
+	// Incident schema is newer than heartbeats: every rewind that
+	// replays through v26 must drop it first, so the incident drops
+	// ride this shared helper rather than each rewind site.
+	dropIncidentSchema(t, db)
 	if _, err := db.Exec(`DROP TABLE IF EXISTS heartbeats`); err != nil {
 		t.Fatal(err)
 	}

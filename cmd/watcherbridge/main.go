@@ -58,6 +58,11 @@ func main() {
 	ruleProposeAfter := fs.Int("rule-propose-after", def.RuleProposeAfter, "matching expected decisions that derive a rule proposal (min 1)")
 	ruleDefaultTTL := fs.Duration("rule-default-ttl", def.RuleDefaultTTL, "default rule approval grant")
 	ruleRet := fs.Duration("rule-retention", def.RulePurgeAfter, "retained terminal review-policy rules (min 24h)")
+	incidentTick := fs.Duration("incident-tick", def.IncidentTick, "presentation incident correlator tick (5s-5m)")
+	incidentWindow := fs.Duration("incident-window", def.IncidentWindow, "incident formation window (within briefing retention)")
+	incidentQuiet := fs.Duration("incident-quiet", def.IncidentQuiet, "incident quiet close (min one tick)")
+	incidentMinRefs := fs.Int("incident-min-refs", def.IncidentMinRefs, "distinct qualified references per incident (min 2)")
+	incidentRet := fs.Duration("incident-retention", def.IncidentRetention, "retained closed incidents (min 24h, max subject retention)")
 	tick := fs.Duration("grouper-tick", def.GrouperTick, "worker tick")
 	lease := fs.Duration("processing-lease", def.ProcessingLease, "stale processing lease")
 	agentTimeout := fs.Duration("agent-timeout", def.AgentTimeout, "bounded investigator loop run budget")
@@ -97,6 +102,11 @@ func main() {
 	cfg.RuleProposeAfter = *ruleProposeAfter
 	cfg.RuleDefaultTTL = *ruleDefaultTTL
 	cfg.RulePurgeAfter = *ruleRet
+	cfg.IncidentTick = *incidentTick
+	cfg.IncidentWindow = *incidentWindow
+	cfg.IncidentQuiet = *incidentQuiet
+	cfg.IncidentMinRefs = *incidentMinRefs
+	cfg.IncidentRetention = *incidentRet
 	cfg.GrouperTick = *tick
 	cfg.OverviewWindow = *overviewWindow
 	cfg.OverviewMaxWindow = *overviewMax
@@ -163,7 +173,7 @@ func main() {
 	srv.Health = opHealth
 	srv.Viewer().Overview.SetHealth(opHealth)
 	srv.SweepOnce(ctx)
-	purgeSettings := store.PurgeSettings{BriefingRetention: cfg.BriefingRetention, SubjectRetention: cfg.SubjectRetention, DecisionRetention: cfg.DecisionRetention, RuleRetention: cfg.RulePurgeAfter, HeartbeatRetention: cfg.HeartbeatRetention, ActiveSource: cfg.SourceID}
+	purgeSettings := store.PurgeSettings{BriefingRetention: cfg.BriefingRetention, SubjectRetention: cfg.SubjectRetention, DecisionRetention: cfg.DecisionRetention, RuleRetention: cfg.RulePurgeAfter, HeartbeatRetention: cfg.HeartbeatRetention, IncidentRetention: cfg.IncidentRetention, ActiveSource: cfg.SourceID}
 	if rep, err := st.PurgeOnce(ctx, purgeSettings, time.Now()); err != nil {
 		log.Fatalf("startup purge: %v", err)
 	} else {
@@ -226,6 +236,19 @@ func main() {
 	purgeDone := make(chan error, 1)
 	go func() { purgeDone <- runPurgeLoop(ctx, st, cfg, purgeSettings) }()
 
+	// The incident correlator sits beside them on the same terms: one
+	// bounded pass per tick through the serialized writer, joined
+	// before the store. A pass that changes incidents broadcasts one
+	// `incident` event (no SSE id: clients refetch the list) and
+	// triggers an overview refresh for the attention cut.
+	incidentSettings := store.IncidentSettings{
+		Window: cfg.IncidentWindow, Quiet: cfg.IncidentQuiet, MinRefs: cfg.IncidentMinRefs,
+	}
+	incidentDone := make(chan error, 1)
+	go func() {
+		incidentDone <- runIncidentLoop(ctx, st, hub, ov, cfg.IncidentTick, incidentSettings)
+	}()
+
 	workerDone := make(chan error, 1)
 	go func() {
 		workerDone <- briefing.Run(ctx, briefing.Deps{
@@ -274,8 +297,38 @@ func main() {
 	if err := <-purgeDone; err != nil {
 		log.Printf("purge loop: %v", err)
 	}
+	if err := <-incidentDone; err != nil {
+		log.Printf("incident loop: %v", err)
+	}
 	<-overviewDone
 	log.Print("watcherbridge: stopped")
+}
+
+// runIncidentLoop ticks CorrelateIncidents until ctx ends. A pass
+// that creates, extends or closes incidents broadcasts one `incident`
+// event and triggers an overview refresh; quiet passes stay silent.
+// Errors are logged and retried next tick: the durable cursor makes
+// every pass safely repeatable.
+func runIncidentLoop(ctx context.Context, st *store.Store, hub *viewer.Hub, ov *viewer.Refresher, tick time.Duration, settings store.IncidentSettings) error {
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+		rep, err := st.CorrelateIncidents(ctx, settings, time.Now())
+		if err != nil {
+			log.Printf("incidents: %v", err)
+			continue
+		}
+		if rep.Created+rep.Appended+rep.Closed == 0 {
+			continue
+		}
+		hub.Broadcast("incident", viewer.IncidentEventOf(rep))
+		ov.Trigger()
+	}
 }
 
 // runPurgeLoop ticks PurgeOnce until ctx ends. Errors are logged and

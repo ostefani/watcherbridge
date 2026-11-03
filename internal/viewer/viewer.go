@@ -261,6 +261,8 @@ func (v *Viewer) Attach(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/health", v.handleHealth)
 	mux.HandleFunc("GET /api/decisions", v.listDecisions)
 	mux.HandleFunc("POST /api/decisions", v.appendDecisionGuarded)
+	mux.HandleFunc("GET /api/incidents", v.handleIncidents)
+	mux.HandleFunc("GET /api/incidents/{id}", v.handleIncident)
 	mux.HandleFunc("POST /api/decisions/{id}/undo", v.handleDecisionUndo)
 	mux.HandleFunc("GET /api/rules/proposals", v.listProposals)
 	mux.HandleFunc("POST /api/rules/approve", v.approveRuleGuarded)

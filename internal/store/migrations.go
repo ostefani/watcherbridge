@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 25
+const supportedSchemaVersion = 26
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -158,6 +158,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 24, migrateV24)
 		case 24:
 			err = applyMigration(db, 25, migrateV25)
+		case 25:
+			err = applyMigration(db, 26, migrateV26)
 		}
 		if err != nil {
 			return err
@@ -491,6 +493,94 @@ func migrateV25(tx *sql.Tx) error {
 		`ALTER TABLE report_sources ADD COLUMN heartbeat_completed_at INTEGER`,
 		`ALTER TABLE report_sources ADD COLUMN heartbeat_summary TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE purge_runs ADD COLUMN heartbeats_deleted INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV26 adds the Step 29 presentation-incident registry (Designv9
+// §7): incidents with durable membership and catch-up progress, plus
+// incident decision subjects. Incident rows name their correlation key
+// (kind, source, target), floor, counts, window start and quiet state;
+// members carry an immutable qualification snapshot taken at accept
+// time so later subject drift cannot rewrite burst evidence. A briefing
+// belongs to at most one incident (UNIQUE), and purge drains members
+// before parents under explicit childless gates. The incident_progress
+// cursor survives restarts next to the rows it protects.
+//
+// operator_decisions needs a rebuild, not an ALTER: SQLite cannot widen
+// a CHECK constraint. The rebuild copies every column explicitly and
+// adds the 'incident' subject kind plus the generated_by linkage that
+// records which incident decision generated a member row (” for
+// operator-authored rows). Existing rows satisfy the wider CHECK, and
+// the request_id uniqueness and subject/created indexes are recreated.
+func migrateV26(tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`CREATE TABLE incidents (
+			incident_id TEXT PRIMARY KEY,
+			kind TEXT NOT NULL CHECK(kind IN ('burst_appearance','burst_disappearance')),
+			source_scope TEXT NOT NULL,
+			target TEXT NOT NULL,
+			status TEXT NOT NULL CHECK(status IN ('open','closed')),
+			floor TEXT NOT NULL CHECK(floor IN ('low','medium','high','critical')),
+			identity_revision TEXT NOT NULL DEFAULT '',
+			qualified_refs INTEGER NOT NULL DEFAULT 0,
+			member_count INTEGER NOT NULL DEFAULT 0,
+			window_start INTEGER NOT NULL,
+			last_member_at INTEGER NOT NULL,
+			opened_at INTEGER NOT NULL,
+			closed_at INTEGER,
+			updated_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE incident_members (
+			incident_id TEXT NOT NULL REFERENCES incidents(incident_id),
+			briefing_id TEXT NOT NULL REFERENCES briefings(briefing_id),
+			member_created_at INTEGER NOT NULL,
+			refs_json TEXT NOT NULL DEFAULT '[]',
+			PRIMARY KEY(incident_id, briefing_id),
+			UNIQUE(briefing_id)
+		)`,
+		`CREATE TABLE incident_progress (
+			id INTEGER PRIMARY KEY CHECK(id = 0),
+			last_briefing_rowid INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX incidents_open_key ON incidents(kind, source_scope, target, status)`,
+		`CREATE INDEX incidents_opened ON incidents(opened_at)`,
+		`CREATE INDEX incidents_status_closed ON incidents(status, closed_at)`,
+		`CREATE INDEX incident_members_incident ON incident_members(incident_id)`,
+		`ALTER TABLE purge_runs ADD COLUMN incidents_deleted INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE purge_runs ADD COLUMN incident_members_deleted INTEGER NOT NULL DEFAULT 0`,
+		`CREATE TABLE operator_decisions_new (
+			decision_id TEXT PRIMARY KEY,
+			subject_kind TEXT NOT NULL CHECK(subject_kind IN ('briefing','reported_subject','incident')),
+			subject_id TEXT NOT NULL,
+			kind TEXT NOT NULL CHECK(kind IN ('expected','not_expected','snooze','note','label','undo')),
+			until INTEGER,
+			text TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			supersedes TEXT NOT NULL DEFAULT '',
+			request_id TEXT UNIQUE,
+			content_hash TEXT NOT NULL DEFAULT '',
+			prior_label TEXT,
+			prior_owner TEXT,
+			head_asof TEXT,
+			generated_by TEXT NOT NULL DEFAULT ''
+		)`,
+		`INSERT INTO operator_decisions_new (decision_id, subject_kind, subject_id, kind, until, text,
+			created_at, supersedes, request_id, content_hash, prior_label, prior_owner, head_asof)
+			SELECT decision_id, subject_kind, subject_id, kind, until, text,
+			created_at, supersedes, request_id, content_hash, prior_label, prior_owner, head_asof
+			FROM operator_decisions`,
+		`DROP TABLE operator_decisions`,
+		`ALTER TABLE operator_decisions_new RENAME TO operator_decisions`,
+		`CREATE INDEX decisions_subject ON operator_decisions(subject_kind, subject_id, created_at)`,
+		`CREATE INDEX decisions_created ON operator_decisions(created_at)`,
+		// After the rebuild: generated_by exists only here, so its
+		// index must follow, not precede, the new table.
+		`CREATE INDEX decisions_generated ON operator_decisions(generated_by)`,
 	} {
 		if _, err := tx.Exec(stmt); err != nil {
 			return err

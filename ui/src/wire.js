@@ -71,7 +71,7 @@
 /**
  * @typedef {object} Decision
  * @property {string} decision_id
- * @property {string} subject_kind briefing|reported_subject
+ * @property {string} subject_kind briefing|reported_subject|incident
  * @property {string} subject_id
  * @property {string} kind expected|not_expected|snooze|note|label|undo
  * @property {string} [until] RFC 3339, snooze only
@@ -167,6 +167,44 @@
  * @typedef {object} DevicesPage
  * @property {DeviceProfile[]} devices
  * @property {string} next_after "" when exhausted
+ */
+
+// wire: incidentWire (internal/viewer/incidents.go)
+/**
+ * @typedef {object} Incident
+ * @property {string} incident_id
+ * @property {string} kind burst_appearance|burst_disappearance
+ * @property {string} source_scope
+ * @property {string} target
+ * @property {string} status open|closed
+ * @property {string} floor low|medium|high|critical
+ * @property {number} qualified_refs distinct qualified upstream references
+ * @property {number} member_count member briefings
+ * @property {string} window_start RFC 3339
+ * @property {string} last_member_at RFC 3339
+ * @property {string} opened_at RFC 3339
+ * @property {string} [closed_at] RFC 3339, closed only
+ * @property {string} updated_at RFC 3339
+ * @property {string} cursor "<opened nanos>:<rowid>" paging state, never identity
+ */
+
+// wire: incidentMemberWire (internal/viewer/incidents.go)
+/**
+ * @typedef {object} IncidentMember
+ * @property {string} briefing_id
+ * @property {string} created_at RFC 3339
+ * @property {string} priority member final, never rewritten by the incident
+ * @property {Array<{reference: string, namespace: string, revision: string, confidence: string}>} refs accept-time qualification snapshot
+ */
+
+// wire: incidentDetailWire (internal/viewer/incidents.go)
+/**
+ * @typedef {object} IncidentDetail
+ * @property {Incident} incident
+ * @property {IncidentMember[]} members oldest first
+ * @property {boolean} truncated member section cut at the serving bound
+ * @property {Decision[]} decisions newest-first audit trail
+ * @property {EffectiveReview} [effective_review] absent without live review
  */
 
 export {};

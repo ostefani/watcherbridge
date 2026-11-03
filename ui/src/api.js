@@ -37,8 +37,10 @@ export function fetchBriefing(id) {
  * unknown kinds, text where none belongs, and past snooze horizons
  * come back as 4xx the caller surfaces. requestId makes a retry after
  * a network failure replay-safe; rotate it after a success.
- * @param {{subjectKind: string, subjectId: string, kind: string, until?: string, text?: string, requestId: string}} d
- * @returns {Promise<{decision: import('./wire.js').Decision, applied: boolean, reason?: string}>}
+ * Incident subjects require includeMembers: true fans the decision
+ * out to the membership snapshot, false leaves members untouched.
+ * @param {{subjectKind: string, subjectId: string, kind: string, until?: string, text?: string, requestId: string, includeMembers?: boolean}} d
+ * @returns {Promise<{decision: import('./wire.js').Decision, applied: boolean, reason?: string, members?: import('./wire.js').Decision[], generated_decision_ids?: string[]}>}
  */
 export async function postDecision(d) {
   const body = {
@@ -52,6 +54,9 @@ export async function postDecision(d) {
   }
   if (d.text !== undefined) {
     body.text = d.text;
+  }
+  if (d.includeMembers !== undefined) {
+    body.include_members = d.includeMembers;
   }
   const res = await fetch('/api/decisions', {
     method: 'POST',
@@ -86,9 +91,12 @@ export function fetchDecisions(subjectKind, subjectId, page = {}) {
 
 /**
  * Undo one decision by ID. Undoing a stale label head is a 409, never
- * a silent overwrite; the caller surfaces the status.
+ * a silent overwrite; the caller surfaces the status. Undo never
+ * cascades; when the target generated member rows the response names
+ * them in generated_decision_ids for individual revisit.
  * @param {string} id decision ID
  * @param {string} requestId retry key, rotated after success
+ * @returns {Promise<{decision: import('./wire.js').Decision, applied: boolean, reason?: string, generated_decision_ids?: string[]}>}
  */
 export async function postUndo(id, requestId) {
   const res = await fetch(`/api/decisions/${encodeURIComponent(id)}/undo`, {
@@ -126,4 +134,31 @@ export function fetchDevice(id, historyAfter = '') {
  */
 export function fetchHealth() {
   return fetchJSON('/api/health', 'health');
+}
+
+/**
+ * List presentation incidents, newest first. before continues an
+ * earlier page as "<opened nanos>:<rowid>"; a full page may have
+ * more. Malformed cursors are 400.
+ * @param {{limit?: number, before?: string}} [page]
+ * @returns {Promise<import('./wire.js').Incident[]>}
+ */
+export function fetchIncidents(page = {}) {
+  const q = new URLSearchParams();
+  if (page.limit !== undefined) {
+    q.set('limit', String(page.limit));
+  }
+  if (page.before !== undefined) {
+    q.set('before', String(page.before));
+  }
+  const suffix = q.toString();
+  return fetchJSON(`/api/incidents${suffix === '' ? '' : `?${suffix}`}`, 'incidents');
+}
+
+/**
+ * @param {string} id incident ID; the server validates it
+ * @returns {Promise<import('./wire.js').IncidentDetail>}
+ */
+export function fetchIncident(id) {
+  return fetchJSON(`/api/incidents/${encodeURIComponent(id)}`, 'incident');
 }

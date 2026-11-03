@@ -91,6 +91,11 @@ type PurgeSettings struct {
 	// HeartbeatRetention bounds isolated H1 history; zero selects 7d.
 	// Compact source progress survives this history horizon.
 	HeartbeatRetention time.Duration
+	// IncidentRetention bounds closed presentation incidents measured
+	// from close; zero selects the 90d default. Open incidents and
+	// member briefings (plus their subject links and traces) of any
+	// retained incident are pinned until the incident itself drains.
+	IncidentRetention time.Duration
 	// ActiveSource names the configured SOURCE_ID. A quiet-but-live
 	// registration is never retired by inactivity alone (Designv9 §4.6);
 	// when empty, source cleanup keeps its legacy behavior for tests.
@@ -112,6 +117,18 @@ func decisionRetentionOf(settings PurgeSettings) time.Duration {
 // PurgeSettings leaves RuleRetention unset.
 const defaultRuleRetention = 180 * 24 * time.Hour
 
+// defaultIncidentRetention is the closed-incident horizon when
+// PurgeSettings leaves IncidentRetention unset (Designv9 §4.6: 90d
+// since close).
+const defaultIncidentRetention = 90 * 24 * time.Hour
+
+func incidentRetentionOf(settings PurgeSettings) time.Duration {
+	if settings.IncidentRetention > 0 {
+		return settings.IncidentRetention
+	}
+	return defaultIncidentRetention
+}
+
 func ruleRetentionOf(settings PurgeSettings) time.Duration {
 	if settings.RuleRetention > 0 {
 		return settings.RuleRetention
@@ -128,23 +145,25 @@ func ruleRetentionOf(settings PurgeSettings) time.Duration {
 // progress check) counts deletions only, so an idle pass with no
 // deletions terminates even though no bookkeeping row is written.
 type PurgeReport struct {
-	BriefingLinks int64
-	Briefings     int64
-	Traces        int64 // agent_traces rows; deleted with their briefing
-	Groups        int64
-	GroupLinks    int64 // group_subjects rows; group_events has its own counter below
-	GroupEvents   int64
-	Ports         int64
-	Observations  int64
-	Progress      int64 // projection_progress + projection_pending rows
-	RawEvents     int64
-	Subjects      int64
-	Sources       int64
-	Pseudonyms    int64
-	Decisions     int64 // expired operator-decision audit rows; labels survive in reported_subjects
-	Heartbeats    int64 // isolated H1 history; compact source state survives
-	Rules         int64 // terminal review-policy rule rows unreferenced by retained briefings
-	Bookkeeping   int64 // purge_state upserts sharing the row budget
+	BriefingLinks   int64
+	Briefings       int64
+	Traces          int64 // agent_traces rows; deleted with their briefing
+	Groups          int64
+	GroupLinks      int64 // group_subjects rows; group_events has its own counter below
+	GroupEvents     int64
+	Ports           int64
+	Observations    int64
+	Progress        int64 // projection_progress + projection_pending rows
+	RawEvents       int64
+	Subjects        int64
+	Sources         int64
+	Pseudonyms      int64
+	Decisions       int64 // expired operator-decision audit rows; labels survive in reported_subjects
+	Heartbeats      int64 // isolated H1 history; compact source state survives
+	Rules           int64 // terminal review-policy rule rows unreferenced by retained briefings
+	Incidents       int64 // closed incidents past retention with no members left
+	IncidentMembers int64 // membership rows of closed incidents past retention
+	Bookkeeping     int64 // purge_state upserts sharing the row budget
 }
 
 func (r *PurgeReport) add(o PurgeReport) {
@@ -164,12 +183,15 @@ func (r *PurgeReport) add(o PurgeReport) {
 	r.Decisions += o.Decisions
 	r.Heartbeats += o.Heartbeats
 	r.Rules += o.Rules
+	r.Incidents += o.Incidents
+	r.IncidentMembers += o.IncidentMembers
 	r.Bookkeeping += o.Bookkeeping
 }
 
 func (r PurgeReport) total() int64 {
 	return r.BriefingLinks + r.Briefings + r.Traces + r.Groups + r.GroupLinks + r.GroupEvents + r.Ports +
-		r.Observations + r.Progress + r.RawEvents + r.Subjects + r.Sources + r.Pseudonyms + r.Decisions + r.Rules + r.Heartbeats
+		r.Observations + r.Progress + r.RawEvents + r.Subjects + r.Sources + r.Pseudonyms + r.Decisions + r.Rules + r.Heartbeats +
+		r.Incidents + r.IncidentMembers
 }
 
 // purgeStages selects which table families one batch transaction covers.
@@ -197,6 +219,11 @@ type purgePlan struct {
 	decisionCut  int64
 	ruleCut      int64
 	heartbeatCut int64
+	// incidentCut is the closed_at horizon for incident drains. Open
+	// incidents never drain; member briefings of any retained
+	// incident (open, or closed within this horizon) are pinned in
+	// the briefing stage below.
+	incidentCut int64
 	// now is the run's wall clock for liveness checks (expiry is
 	// relative to now; the horizon cuts are relative to retention).
 	now int64
@@ -240,6 +267,21 @@ const eligibleEvents = `event_id IN (SELECT DISTINCT re.event_id FROM raw_events
 	AND NOT EXISTS (SELECT 1 FROM group_events ge JOIN briefings b ON b.group_id = ge.group_id WHERE ge.event_id = re.event_id)
 	AND COALESCE(ag0.status, 'done') NOT IN ('open', 'closed', 'processing')
 	ORDER BY re.received_at, re.rowid LIMIT 64)`
+
+// incidentMemberPin keeps member briefings of retained incidents:
+// open incidents pin unconditionally, closed ones while their close
+// stays within the incident horizon. It references the inner briefings
+// selection, like the decision pin beside it.
+// incidentDecisionPin keeps member briefings an incident decision
+// still justifies, mirroring the briefing-decision pin: the audit
+// outlives the rows it justifies.
+const incidentMemberPin = `AND NOT EXISTS (SELECT 1 FROM incident_members m JOIN incidents i
+	ON i.incident_id = m.incident_id WHERE m.briefing_id = briefings.briefing_id
+	AND (i.status = 'open' OR i.closed_at >= ?))`
+const incidentDecisionPin = `AND NOT EXISTS (SELECT 1 FROM operator_decisions d
+	JOIN incident_members m ON m.incident_id = d.subject_id
+	WHERE d.subject_kind = 'incident' AND m.briefing_id = briefings.briefing_id
+	AND d.created_at >= ?)`
 
 // purgeBatch deletes at most maxPurgeRowsPerTxn rows in one transaction,
 // oldest first, in dependency order. Eligibility is checked inside the
@@ -316,10 +358,36 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				report.Heartbeats += n
 			case "review_rules":
 				report.Rules += n
+			case "incident_members":
+				report.IncidentMembers += n
+			case "incidents":
+				report.Incidents += n
 			}
 			return nil
 		}
 		if plan.stages&stageBriefings != 0 {
+			// Closed incidents drain past the incident horizon
+			// measured from close, before any briefing take: members
+			// drain first under an explicit childless gate, so no
+			// retained member ID dangles and SQLite RowsAffected stays
+			// exact (cascades kept empty). Draining here matters
+			// because member briefings age out on the same horizon —
+			// deleting them first would violate the membership
+			// foreign key. Open incidents never drain. Eligibility is
+			// rechecked in the deletion transaction; a close is
+			// terminal and the next burst forms a new incident.
+			// (Legacy briefing-only wrappers run this stage with a
+			// zero incident cutoff, which drains nothing.)
+			limit = deleteLimit()
+			if err := take("incident_members", plan.incidentCut, `DELETE FROM incident_members WHERE rowid IN (SELECT rowid FROM incident_members WHERE incident_id IN
+				(SELECT incident_id FROM incidents WHERE status = 'closed' AND closed_at < ?) ORDER BY rowid LIMIT ?)`, limit, plan.incidentCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
+			if err := take("incidents", plan.incidentCut, `DELETE FROM incidents WHERE rowid IN (SELECT rowid FROM incidents WHERE status = 'closed' AND closed_at < ?
+				AND NOT EXISTS (SELECT 1 FROM incident_members WHERE incident_members.incident_id = incidents.incident_id) ORDER BY closed_at, rowid LIMIT ?)`, limit, plan.incidentCut, limit); err != nil {
+				return err
+			}
 			// A briefing a retained decision still references cannot
 			// purge: its audit outlives it, and deleting the briefing
 			// would orphan the trail and unblock evidence the decision
@@ -329,11 +397,15 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 			// oldest-first and filtering after would stall the drain
 			// on a fully pinned batch while eligible work waits behind
 			// it. The outer takes repeat the pin as an invariant.
+			// The incident pins ride the same selection: a member
+			// briefing of a retained incident (or one an incident
+			// decision still justifies) is never age-eligible, so its
+			// subject links and trace steps survive with it.
 			oldBriefings := `briefing_id IN (SELECT briefing_id FROM briefings WHERE created_at < ?
-				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?) ORDER BY created_at, rowid LIMIT ?)`
+				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?)` + incidentMemberPin + incidentDecisionPin + ` ORDER BY created_at, rowid LIMIT ?)`
 			limit = deleteLimit()
 			if err := take("briefing_subjects", plan.briefingCut, `DELETE FROM briefing_subjects WHERE rowid IN (SELECT rowid FROM briefing_subjects WHERE `+oldBriefings+`
-				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefing_subjects.briefing_id AND d.created_at >= ?) ORDER BY rowid LIMIT ?)`, limit, plan.briefingCut, plan.decisionCut, limit, plan.decisionCut, limit); err != nil {
+				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefing_subjects.briefing_id AND d.created_at >= ?) ORDER BY rowid LIMIT ?)`, limit, plan.briefingCut, plan.decisionCut, plan.incidentCut, plan.decisionCut, limit, plan.decisionCut, limit); err != nil {
 				return err
 			}
 			// Trace steps are audit children of their briefing: they drain
@@ -342,13 +414,13 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 			// while steps remain.
 			limit = deleteLimit()
 			if err := take("agent_traces", plan.briefingCut, `DELETE FROM agent_traces WHERE rowid IN (SELECT rowid FROM agent_traces WHERE briefing_id IN (SELECT briefing_id FROM briefings WHERE created_at < ?
-				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?)) ORDER BY rowid LIMIT ?)`, limit, plan.briefingCut, plan.decisionCut, limit); err != nil {
+				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?)`+incidentMemberPin+incidentDecisionPin+`) ORDER BY rowid LIMIT ?)`, limit, plan.briefingCut, plan.decisionCut, plan.incidentCut, plan.decisionCut, limit); err != nil {
 				return err
 			}
 			limit = deleteLimit()
 			if err := take("briefings", plan.briefingCut, `DELETE FROM briefings WHERE rowid IN (SELECT rowid FROM briefings WHERE created_at < ? AND NOT EXISTS (SELECT 1 FROM briefing_subjects WHERE briefing_subjects.briefing_id = briefings.briefing_id)
 				AND NOT EXISTS (SELECT 1 FROM agent_traces WHERE agent_traces.briefing_id = briefings.briefing_id)
-				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?) ORDER BY created_at, rowid LIMIT ?)`, limit, plan.briefingCut, plan.decisionCut, limit); err != nil {
+				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?)`+incidentMemberPin+incidentDecisionPin+` ORDER BY created_at, rowid LIMIT ?)`, limit, plan.briefingCut, plan.decisionCut, plan.incidentCut, plan.decisionCut, limit); err != nil {
 				return err
 			}
 			deletableDone := `status = 'done'
@@ -798,12 +870,15 @@ func addPurgeRunCounts(tx *sql.Tx, runID int64, report PurgeReport) error {
 		decisions_deleted = decisions_deleted + ?,
 		rules_deleted = rules_deleted + ?,
 		heartbeats_deleted = heartbeats_deleted + ?,
+		incidents_deleted = incidents_deleted + ?,
+		incident_members_deleted = incident_members_deleted + ?,
 		bookkeeping_writes = bookkeeping_writes + ?
 		WHERE run_id = ?`,
 		report.BriefingLinks, report.Briefings, report.Traces, report.Groups, report.GroupLinks,
 		report.GroupEvents,
 		report.Ports, report.Observations, report.Progress, report.RawEvents,
-		report.Subjects, report.Sources, report.Pseudonyms, report.Decisions, report.Rules, report.Heartbeats, report.Bookkeeping,
+		report.Subjects, report.Sources, report.Pseudonyms, report.Decisions, report.Rules, report.Heartbeats,
+		report.Incidents, report.IncidentMembers, report.Bookkeeping,
 		runID)
 	return err
 }
@@ -839,6 +914,7 @@ func (s *Store) PurgeOnce(ctx context.Context, settings PurgeSettings, now time.
 		decisionCut:  nanos(now.Add(-decisionRetentionOf(settings))),
 		ruleCut:      nanos(now.Add(-ruleRetentionOf(settings))),
 		heartbeatCut: nanos(now.Add(-heartbeatAge)),
+		incidentCut:  nanos(now.Add(-incidentRetentionOf(settings))),
 		now:          nanos(now),
 		activeSource: settings.ActiveSource,
 	}

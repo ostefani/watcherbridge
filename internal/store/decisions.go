@@ -159,6 +159,9 @@ func decisionHash(subjectKind, subjectID, kind string, until int64, hasUntil boo
 // checkDecisionMatrix enforces the Step 25 action-by-subject matrix:
 // snooze and review verdicts are briefing-only (never profile-wide
 // suppression or propagation), labels belong to exact profiles.
+// Incident subjects (Step 29) take the briefing review/note set —
+// labels stay profile-only — and member fan-out travels through
+// AppendIncidentDecision, never this matrix alone.
 // Undo never travels through the append path.
 func checkDecisionMatrix(kind, subjectKind string) error {
 	switch subjectKind {
@@ -170,6 +173,11 @@ func checkDecisionMatrix(kind, subjectKind string) error {
 	case DecisionSubjectProfile:
 		switch kind {
 		case DecisionNote, DecisionLabel:
+			return nil
+		}
+	case DecisionSubjectIncident:
+		switch kind {
+		case DecisionExpected, DecisionNotExpected, DecisionSnooze, DecisionNote:
 			return nil
 		}
 	}
@@ -196,6 +204,30 @@ func checkDecisionText(kind, text string) error {
 		}
 	}
 	return nil
+}
+
+// resolveDecisionUntil maps the input's snooze horizon to storage
+// nanos: an explicit until must lie in the future, a defaulted snooze
+// resolves once from now so every retry of the same operation replays
+// against identical content, and non-snooze kinds take no until.
+func resolveDecisionUntil(in DecisionInput, now time.Time) (int64, error) {
+	var untilNanos int64
+	if in.Kind == DecisionSnooze {
+		if !in.HasUntil {
+			if in.SnoozeDefault <= 0 {
+				return 0, fmt.Errorf("%w: snooze requires an until or a default horizon", ErrInvalidDecision)
+			}
+			untilNanos = now.Add(in.SnoozeDefault).UnixNano()
+		} else {
+			if !in.Until.After(now) {
+				return 0, fmt.Errorf("%w: snooze requires a future until", ErrInvalidDecision)
+			}
+			untilNanos = in.Until.UnixNano()
+		}
+	} else if in.HasUntil {
+		return 0, fmt.Errorf("%w: kind %q takes no until", ErrInvalidDecision, in.Kind)
+	}
+	return untilNanos, nil
 }
 
 func checkRequestID(requestID string) error {
@@ -278,23 +310,9 @@ func (s *Store) AppendDecision(ctx context.Context, in DecisionInput) (DecisionR
 		if err := checkDecisionText(in.Kind, in.Text); err != nil {
 			return err
 		}
-		var untilNanos int64
-		hasUntil := in.HasUntil
-		if in.Kind == DecisionSnooze {
-			if !hasUntil {
-				if in.SnoozeDefault <= 0 {
-					return fmt.Errorf("%w: snooze requires an until or a default horizon", ErrInvalidDecision)
-				}
-				untilNanos = now.Add(in.SnoozeDefault).UnixNano()
-				hasUntil = true
-			} else {
-				if !in.Until.After(now) {
-					return fmt.Errorf("%w: snooze requires a future until", ErrInvalidDecision)
-				}
-				untilNanos = in.Until.UnixNano()
-			}
-		} else if hasUntil {
-			return fmt.Errorf("%w: kind %q takes no until", ErrInvalidDecision, in.Kind)
+		untilNanos, err := resolveDecisionUntil(in, now)
+		if err != nil {
+			return err
 		}
 		subjectID := in.SubjectID
 		if in.SubjectKind == DecisionSubjectBriefing {
@@ -303,6 +321,15 @@ func (s *Store) AppendDecision(ctx context.Context, in DecisionInput) (DecisionR
 				return err
 			}
 			subjectID = bid
+		} else if in.SubjectKind == DecisionSubjectIncident {
+			var one int
+			if err := tx.QueryRow(`SELECT 1 FROM incidents WHERE incident_id = ?`,
+				in.SubjectID).Scan(&one); err != nil {
+				if err == sql.ErrNoRows {
+					return fmt.Errorf("%w: %q", ErrUnknownSubject, in.SubjectID)
+				}
+				return err
+			}
 		} else {
 			var label, owner sql.NullString
 			if err := tx.QueryRow(`SELECT operator_label, label_owner FROM reported_subjects WHERE profile_id = ?`,

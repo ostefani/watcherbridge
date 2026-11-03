@@ -18,7 +18,10 @@
     decisions = [],
     effective = null,
     preset = null,
-    reload = async () => {}
+    reload = async () => {},
+    memberScope = false,
+    memberCount = 0,
+    kindHelp = {}
   } = $props();
 
   const KIND_HELP = {
@@ -40,6 +43,12 @@
   let formError = $state(null);
   let listError = $state(null);
   let requestId = $state(crypto.randomUUID());
+  // Member-inclusion choice incident subjects require: unchecked
+  // (incident-only) is the default, so acknowledgement never silently
+  // takes members. outcomeNote reports fan-out and undo-generated
+  // outcomes without touching the audit trail rendering.
+  let includeMembers = $state(false);
+  let outcomeNote = $state(/** @type {string|null} */ (null));
   let submitButton = $state(null);
   // Undo keys are stable per row until that undo succeeds: a retry
   // after a network failure replays against the original undo row
@@ -129,11 +138,16 @@
       if (needsText) {
         d.text = text;
       }
+      if (memberScope) {
+        d.includeMembers = includeMembers;
+      }
       const out = await postDecision(d);
       requestId = crypto.randomUUID();
       chosen = null;
       untilText = '';
       text = '';
+      includeMembers = false;
+      outcomeNote = null;
       extra = [];
       extraKey = '';
       backStack = [];
@@ -142,6 +156,8 @@
       pageGen += 1;
       if (out.applied === false) {
         formError = `Already recorded (${out.reason ?? 'duplicate'}).`;
+      } else if (Array.isArray(out.members) && out.members.length > 0) {
+        outcomeNote = `Recorded on the incident and ${out.members.length} member briefing${out.members.length === 1 ? '' : 's'}.`;
       }
       await reload();
     } catch (err) {
@@ -157,9 +173,14 @@
     }
     undoPending = id;
     listError = null;
+    outcomeNote = null;
     try {
       undoKeys[id] ??= crypto.randomUUID();
-      await postUndo(id, undoKeys[id]);
+      const out = await postUndo(id, undoKeys[id]);
+      const generated = Array.isArray(out.generated_decision_ids) ? out.generated_decision_ids : [];
+      if (generated.length > 0) {
+        outcomeNote = `Undone. ${generated.length} member decision${generated.length === 1 ? '' : 's'} still stand; undo them on their briefing pages.`;
+      }
       const rest = { ...undoKeys };
       delete rest[id];
       undoKeys = rest;
@@ -257,7 +278,16 @@
         </label>
       {/each}
     </fieldset>
-    <p class="help">{KIND_HELP[kind] ?? ''}</p>
+    <p class="help">{kindHelp[kind] ?? KIND_HELP[kind] ?? ''}</p>
+    {#if memberScope}
+      <label>
+        <input type="checkbox" bind:checked={includeMembers} />
+        Also apply to the {memberCount} member briefing{memberCount === 1 ? '' : 's'} (snapshot now; later joiners stay untouched)
+      </label>
+    {/if}
+    {#if outcomeNote !== null}
+      <p role="status">{outcomeNote}</p>
+    {/if}
     {#if kind === 'snooze'}
       <label>
         Until (empty keeps the server default)
