@@ -671,8 +671,8 @@ func (c Config) Validate() error {
 	if c.IncidentQuiet < c.IncidentTick {
 		return fmt.Errorf("incident quiet %v must cover at least one tick %v", c.IncidentQuiet, c.IncidentTick)
 	}
-	if c.IncidentMinRefs < 2 {
-		return fmt.Errorf("incident min refs %d must be at least 2", c.IncidentMinRefs)
+	if c.IncidentMinRefs < 2 || c.IncidentMinRefs > 500 {
+		return fmt.Errorf("incident min refs %d must be between 2 and 500", c.IncidentMinRefs)
 	}
 	if c.IncidentRetention < 24*time.Hour {
 		return fmt.Errorf("incident retention %v must be at least 24h", c.IncidentRetention)

@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 26
+const supportedSchemaVersion = 27
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -160,6 +160,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 25, migrateV25)
 		case 25:
 			err = applyMigration(db, 26, migrateV26)
+		case 26:
+			err = applyMigration(db, 27, migrateV27)
 		}
 		if err != nil {
 			return err
@@ -581,6 +583,46 @@ func migrateV26(tx *sql.Tx) error {
 		// After the rebuild: generated_by exists only here, so its
 		// index must follow, not precede, the new table.
 		`CREATE INDEX decisions_generated ON operator_decisions(generated_by)`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// v27 stores bounded incident work durably. Existing reference snapshots
+// are indexed incrementally by the correlator, not rewritten at upgrade.
+func migrateV27(tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`ALTER TABLE incidents ADD COLUMN identity_namespace TEXT NOT NULL DEFAULT ''`,
+		`CREATE TABLE incident_pending (
+			briefing_id TEXT PRIMARY KEY REFERENCES briefings(briefing_id),
+			correlation_key TEXT NOT NULL, created_at INTEGER NOT NULL, data_json TEXT NOT NULL)`,
+		`CREATE INDEX incident_pending_key ON incident_pending(correlation_key, created_at, briefing_id)`,
+		`CREATE INDEX incident_pending_created ON incident_pending(created_at)`,
+		`CREATE TABLE incident_pending_refs (
+			correlation_key TEXT NOT NULL, reference TEXT NOT NULL,
+			briefing_id TEXT NOT NULL REFERENCES incident_pending(briefing_id), created_at INTEGER NOT NULL,
+			PRIMARY KEY(correlation_key, reference))`,
+		`CREATE INDEX incident_pending_refs_time ON incident_pending_refs(correlation_key, created_at DESC)`,
+		`CREATE INDEX incident_pending_refs_briefing ON incident_pending_refs(briefing_id)`,
+		`CREATE TABLE incident_references (
+			incident_id TEXT NOT NULL REFERENCES incidents(incident_id), reference TEXT NOT NULL,
+			PRIMARY KEY(incident_id, reference))`,
+		`ALTER TABLE incident_progress RENAME COLUMN last_briefing_rowid TO last_briefing_seq`,
+		`ALTER TABLE incident_progress ADD COLUMN pending_after TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE incident_progress ADD COLUMN pin_version INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE incident_progress ADD COLUMN refs_cursor INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE incident_progress ADD COLUMN refs_through INTEGER NOT NULL DEFAULT 0`,
+		`INSERT OR IGNORE INTO incident_progress(id,last_briefing_seq) VALUES (0,0)`,
+		// The legacy cursor used recyclable SQLite rowids. Revisit retained
+		// briefings once using their durable sequence; membership is unique.
+		`UPDATE incident_progress SET last_briefing_seq=0,
+			refs_through=(SELECT COALESCE(MAX(rowid),0) FROM incident_members) WHERE id=0`,
+		`ALTER TABLE purge_runs ADD COLUMN incident_pending_deleted INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE purge_runs ADD COLUMN incident_pending_refs_deleted INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE purge_runs ADD COLUMN incident_refs_deleted INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := tx.Exec(stmt); err != nil {
 			return err

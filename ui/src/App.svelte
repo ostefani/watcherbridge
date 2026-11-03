@@ -3,6 +3,7 @@
   import Home from './lib/Home.svelte';
   import Detail from './lib/Detail.svelte';
   import Incident from './lib/Incident.svelte';
+  import { forwardIncidentEvents } from './lib/incidentEvents.js';
   import Devices from './lib/Devices.svelte';
   import Device from './lib/Device.svelte';
   import Health from './lib/Health.svelte';
@@ -71,12 +72,14 @@
     }
   }
 
+  let releaseIncidentEvents = () => {};
+
   function connect() {
     stream = 'connecting';
     source = new EventSource('/events');
+    releaseIncidentEvents = forwardIncidentEvents(source, window, load);
     source.onopen = () => {
       stream = 'live';
-      load();
     };
     source.addEventListener('overview', (/** @type {MessageEvent} */ ev) => {
       try {
@@ -87,14 +90,8 @@
         // A malformed frame degrades to the next refresh, never a crash.
       }
     });
-    // Incident updates carry no SSE id and never replay: forward them
-    // as window events for mounted detail screens, and refetch the
-    // overview so attention stays current even when a frame was lost.
-    source.addEventListener('incident', () => {
-      window.dispatchEvent(new CustomEvent('watcherbridge:incident'));
-      load();
-    });
     source.onerror = () => {
+      releaseIncidentEvents();
       stream = 'retrying';
       source?.close();
       source = null;
@@ -153,6 +150,7 @@
       window.removeEventListener('keydown', onKey);
       window.clearTimeout(retryTimer);
       window.clearTimeout(pendingTimer);
+      releaseIncidentEvents();
       source?.close();
       source = null;
     };

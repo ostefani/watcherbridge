@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -36,17 +37,16 @@ import (
 //   - A completed briefing whose completion is older than
 //     window+quiet at processing time is consumed without formation:
 //     a stale burst presents as its individual reports, never as a
-//     freshly opened incident. Fresh unmembered briefings are
-//     reconsidered every pass, so bursts spanning pages, ticks and
-//     restarts — and briefings completed before projection linked
-//     their subjects — still form while fresh.
+//     freshly opened incident. Qualified pending briefings are
+//     indexed by scope and reference, so thin bursts spanning pages,
+//     ticks and restarts do not compete with unrelated reports.
 //   - A briefing whose retained events mix appear and disappear types,
 //     mix sources, or mix/omit targets is not a candidate for either
 //     direction. Missing or ambiguous scope never forms an incident.
 //   - Qualification reads immutable member evidence first (explicit
 //     event types from retained group events; reference class,
-//     namespace, revision and confidence from the briefing's subject
-//     links, snapshotted into the member row at accept time), then
+//     namespace, revision and confidence decoded from retained event
+//     payloads, snapshotted into the member row at accept time), then
 //     checks current source qualification (bound namespace plus the
 //     advertised stable-identity capability). Low, unknown or mixed
 //     confidence, unknown or mixed revisions, and unsupported
@@ -73,25 +73,26 @@ const (
 // member briefings. WindowStart pins the formation window;
 // LastMemberAt drives quiet closure; ClosedAt is set on close.
 type Incident struct {
-	IncidentID       string
-	Kind             string
-	SourceScope      string
-	Target           string
-	Status           string
-	Floor            string
-	IdentityRevision string
-	QualifiedRefs    int
-	MemberCount      int
-	WindowStart      time.Time
-	LastMemberAt     time.Time
-	OpenedAt         time.Time
-	ClosedAt         time.Time
-	HasClosedAt      bool
-	UpdatedAt        time.Time
+	IncidentID        string
+	Kind              string
+	SourceScope       string
+	Target            string
+	Status            string
+	Floor             string
+	IdentityRevision  string
+	IdentityNamespace string
+	QualifiedRefs     int
+	MemberCount       int
+	WindowStart       time.Time
+	LastMemberAt      time.Time
+	OpenedAt          time.Time
+	ClosedAt          time.Time
+	HasClosedAt       bool
+	UpdatedAt         time.Time
 }
 
 const incidentColumns = `incident_id, kind, source_scope, target, status, floor,
-	identity_revision, qualified_refs, member_count, window_start, last_member_at,
+	identity_revision, identity_namespace, qualified_refs, member_count, window_start, last_member_at,
 	opened_at, closed_at, updated_at`
 
 func scanIncident(row interface {
@@ -100,7 +101,7 @@ func scanIncident(row interface {
 	var windowStart, lastMember, opened, updated int64
 	var closed sql.NullInt64
 	if err := row.Scan(&in.IncidentID, &in.Kind, &in.SourceScope, &in.Target, &in.Status, &in.Floor,
-		&in.IdentityRevision, &in.QualifiedRefs, &in.MemberCount, &windowStart, &lastMember,
+		&in.IdentityRevision, &in.IdentityNamespace, &in.QualifiedRefs, &in.MemberCount, &windowStart, &lastMember,
 		&opened, &closed, &updated); err != nil {
 		return err
 	}
@@ -257,11 +258,6 @@ const maxIncidentPage = 200
 // from the durable cursor.
 const maxIncidentPasses = 10
 
-// maxIncidentConsider bounds the fresh-unmembered reconsideration set:
-// bursts spanning pages, ticks and restarts stay visible without an
-// unbounded scan.
-const maxIncidentConsider = 500
-
 // maxIncidentOpen bounds the open-incident scan per pass. Open
 // incidents quiet-close within minutes, so hundreds of open rows
 // already indicate a stuck correlator; the cap keeps the pass bounded
@@ -280,7 +276,7 @@ const maxIncidentMembersPerPass = 500
 // already belong to an incident: consumed for cursor purposes, never
 // reclassified.
 type candidateBriefing struct {
-	rowID      int64
+	seq        int64
 	briefingID string
 	groupID    string
 	priority   string
@@ -301,8 +297,8 @@ type classifiedBriefing struct {
 }
 
 // CorrelateIncidents runs one bounded correlator pass: it pages
-// completed briefings through the durable cursor, reconsiders fresh
-// unmembered briefings, forms and extends incidents, quiet-closes idle
+// completed briefings through the durable cursor, persists qualified
+// pending briefings, forms and extends incidents, quiet-closes idle
 // ones, and advances the cursor — progress and incident changes commit
 // in the same writer transactions, so retries, cancellation and
 // restart neither duplicate membership nor lose the cursor.
@@ -313,8 +309,8 @@ func (s *Store) CorrelateIncidents(ctx context.Context, settings IncidentSetting
 	if settings.Quiet <= 0 {
 		return IncidentReport{}, fmt.Errorf("incident quiet window must be positive")
 	}
-	if settings.MinRefs < 1 {
-		return IncidentReport{}, fmt.Errorf("incident reference threshold must be positive")
+	if settings.MinRefs < 1 || settings.MinRefs > maxIncidentMembersPerPass {
+		return IncidentReport{}, fmt.Errorf("incident reference threshold must be between 1 and 500")
 	}
 	var report IncidentReport
 	for pass := 0; pass < maxIncidentPasses; pass++ {
@@ -333,8 +329,8 @@ func (s *Store) CorrelateIncidents(ctx context.Context, settings IncidentSetting
 	return report, nil
 }
 
-// correlatePass processes one page past the cursor plus the fresh
-// reconsideration set. It reports whether the cursor advanced, i.e.
+// correlatePass processes one page past the cursor plus durable pending
+// candidates. It reports whether the cursor advanced, i.e.
 // whether another page may remain.
 func (s *Store) correlatePass(ctx context.Context, settings IncidentSettings, now time.Time, report *IncidentReport) (bool, error) {
 	cursor, err := s.incidentCursor(ctx)
@@ -345,126 +341,169 @@ func (s *Store) correlatePass(ctx context.Context, settings IncidentSettings, no
 	if err != nil {
 		return false, err
 	}
-	staleCut := nanos(now.Add(-(settings.Window + settings.Quiet)))
-	fresh, err := s.incidentFreshUnmembered(ctx, staleCut)
-	if err != nil {
-		return false, err
-	}
-	// The page and the fresh set overlap by construction (fresh rows
-	// are cursor-independent); dedupe keeps classification single.
-	// Page rows older than the stale cutoff are consumed without
-	// classification: a burst that old presents as its individual
-	// reports, never as a freshly opened incident. The cursor still
-	// advances past them below.
-	seen := map[string]bool{}
+	staleCut := now.Add(-settings.Window - settings.Quiet)
 	var consider []candidateBriefing
-	for _, c := range fresh {
-		if seen[c.briefingID] {
-			continue
-		}
-		seen[c.briefingID] = true
-		consider = append(consider, c)
-	}
+	next := cursor
 	for _, c := range page {
-		if seen[c.briefingID] {
-			continue
+		if c.seq > next {
+			next = c.seq
 		}
-		seen[c.briefingID] = true
-		if c.membered {
-			// Consumed for cursor purposes below, never
-			// reclassified: membership is terminal.
-			continue
+		if !c.membered && !c.createdAt.Before(staleCut) {
+			consider = append(consider, c)
 		}
-		if nanos(c.createdAt) < staleCut {
-			continue
-		}
-		consider = append(consider, c)
 	}
 	classified, err := s.classifyCandidates(ctx, consider)
 	if err != nil {
 		return false, err
 	}
-	next := cursor
-	for _, c := range page {
-		if c.rowID > next {
-			next = c.rowID
-		}
-	}
+	more := next > cursor
 	err = s.write(ctx, func(tx *sql.Tx) error {
+		ready, err := backfillIncidentReferences(tx)
+		if err != nil {
+			return err
+		}
+		if !ready {
+			more = true
+			return nil
+		}
+		for _, c := range classified {
+			if err := enqueueIncidentCandidate(tx, c); err != nil {
+				return err
+			}
+		}
+		// Expired work is removed in bounded pages, with child rows first.
+		if _, err := tx.Exec(`DELETE FROM incident_pending_refs WHERE rowid IN (SELECT r.rowid FROM incident_pending_refs r JOIN incident_pending p ON p.briefing_id=r.briefing_id WHERE p.created_at<? ORDER BY p.created_at,r.rowid LIMIT 200)`, nanos(staleCut)); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM incident_pending WHERE briefing_id IN (SELECT p.briefing_id FROM incident_pending p WHERE p.created_at<? AND NOT EXISTS(SELECT 1 FROM incident_pending_refs r WHERE r.briefing_id=p.briefing_id) ORDER BY p.created_at LIMIT 200)`, nanos(staleCut)); err != nil {
+			return err
+		}
 		open, err := loadOpenIncidents(tx)
 		if err != nil {
 			return err
 		}
-		// Quiet closure first, in the same transaction: a candidate
-		// for a key whose incident just closed seeds the next burst
-		// instead of joining a stale one.
+		keys, err := pendingKeys(tx)
+		if err != nil {
+			return err
+		}
+		budget := maxIncidentMembersPerPass
+		changed := false
+		for _, key := range keys {
+			if budget <= 0 {
+				more = true
+				break
+			}
+			sample, err := readPending(tx, key, staleCut, now, 1)
+			if err != nil {
+				return err
+			}
+			if len(sample) == 0 {
+				continue
+			}
+			qualified, err := pendingSourceQualified(tx, sample[0])
+			if err != nil {
+				return err
+			}
+			if !qualified {
+				continue
+			}
+			k := incidentKey(sample[0].kind, sample[0].source, sample[0].target)
+			in := open[k]
+			if in != nil && in.IdentityRevision == sample[0].revision && in.IdentityNamespace == sample[0].refs[0].Namespace {
+				members, err := readPending(tx, key, in.WindowStart, in.WindowStart.Add(settings.Window), budget)
+				if err != nil {
+					return err
+				}
+				n, err := appendIncidentMembers(tx, in, members, settings.Window, settings.Quiet, now)
+				if err != nil {
+					return err
+				}
+				if n > 0 {
+					changed = true
+					report.Appended += n
+					report.markChanged(in.IncidentID)
+					budget -= n
+					more = more || n == len(members)
+				}
+			}
+			if in != nil && len(page) < maxIncidentPage && now.Sub(in.LastMemberAt) >= settings.Quiet {
+				// A bounded pass may leave members whose completion precedes the
+				// quiet deadline. Defer closure until that pending work is applied.
+				oldKey := classifiedBriefing{kind: in.Kind, source: in.SourceScope, target: in.Target, revision: in.IdentityRevision, refs: []MemberRef{{Namespace: in.IdentityNamespace}}}
+				waiting, err := readPending(tx, pendingKey(oldKey), in.WindowStart, minTime(in.WindowStart.Add(settings.Window), in.LastMemberAt.Add(settings.Quiet)), 1)
+				if err != nil {
+					return err
+				}
+				if len(waiting) == 0 {
+					if err := closeIncident(tx, in.IncidentID, now); err != nil {
+						return err
+					}
+					report.Closed++
+					report.markChanged(in.IncidentID)
+					delete(open, k)
+					in = nil
+				}
+			}
+			if in == nil {
+				members, err := formationCandidates(tx, key, settings, now, budget)
+				if err != nil {
+					return err
+				}
+				id, err := formIncident(tx, s, members, settings, now)
+				if err != nil {
+					return err
+				}
+				if id != "" {
+					changed = true
+					report.Created++
+					report.markChanged(id)
+					budget -= len(members)
+				}
+			}
+		}
+		// Keys with no pending work must also quiet-close.
 		for _, in := range open {
-			if now.Sub(in.LastMemberAt) >= settings.Quiet {
+			if len(page) == maxIncidentPage || now.Sub(in.LastMemberAt) < settings.Quiet {
+				continue
+			}
+			c := classifiedBriefing{kind: in.Kind, source: in.SourceScope, target: in.Target, revision: in.IdentityRevision, refs: []MemberRef{{Namespace: in.IdentityNamespace}}}
+			waiting, err := readPending(tx, pendingKey(c), in.WindowStart, minTime(in.WindowStart.Add(settings.Window), in.LastMemberAt.Add(settings.Quiet)), 1)
+			if err != nil {
+				return err
+			}
+			qualified := false
+			if len(waiting) > 0 {
+				qualified, err = pendingSourceQualified(tx, waiting[0])
+				if err != nil {
+					return err
+				}
+			}
+			if !qualified {
 				if err := closeIncident(tx, in.IncidentID, now); err != nil {
 					return err
 				}
 				report.Closed++
 				report.markChanged(in.IncidentID)
-				delete(open, incidentKey(in.Kind, in.SourceScope, in.Target))
 			}
 		}
-		byKey := map[string][]classifiedBriefing{}
-		var keys []string
-		for _, c := range classified {
-			k := incidentKey(c.kind, c.source, c.target)
-			if _, ok := byKey[k]; !ok {
-				keys = append(keys, k)
-			}
-			byKey[k] = append(byKey[k], c)
-		}
-		sort.Strings(keys)
-		budget := maxIncidentMembersPerPass
-		for _, k := range keys {
-			if budget <= 0 {
-				break
-			}
-			members := byKey[k]
-			sort.Slice(members, func(i, j int) bool {
-				if !members[i].createdAt.Equal(members[j].createdAt) {
-					return members[i].createdAt.Before(members[j].createdAt)
-				}
-				return members[i].briefingID < members[j].briefingID
-			})
-			if len(members) > budget {
-				members = members[:budget]
-			}
-			budget -= len(members)
-			if in, ok := open[k]; ok {
-				appended, err := appendIncidentMembers(tx, in, members, settings.Window, now)
-				if err != nil {
-					return err
-				}
-				if appended > 0 {
-					report.Appended += appended
-					report.markChanged(in.IncidentID)
-				}
-				continue
-			}
-			created, err := formIncident(tx, s, members, settings, now)
-			if err != nil {
+		if changed {
+			if _, err := tx.Exec(`UPDATE incident_progress SET pin_version=pin_version+1 WHERE id=0`); err != nil {
 				return err
-			}
-			if created != "" {
-				report.Created++
-				report.markChanged(created)
 			}
 		}
 		if next > cursor {
-			if err := saveIncidentCursor(tx, next); err != nil {
-				return err
-			}
+			return saveIncidentCursor(tx, next)
 		}
 		return nil
 	})
-	if err != nil {
-		return false, err
+	return more, err
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
 	}
-	return next > cursor, nil
+	return b
 }
 
 func incidentKey(kind, source, target string) string {
@@ -472,12 +511,11 @@ func incidentKey(kind, source, target string) string {
 }
 
 // incidentCursor reads the durable catch-up position: briefings at or
-// below it were considered in an earlier pass. Zero on a fresh
-// database; purge deletions never move it backwards because rowids are
-// never reused for comparison here — only greater-than.
+// below it have durable pending state or were ineligible. The sequence
+// never recycles across purge, unlike SQLite rowids.
 func (s *Store) incidentCursor(ctx context.Context) (int64, error) {
 	var cursor sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `SELECT last_briefing_rowid FROM incident_progress WHERE id = 0`).Scan(&cursor); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT last_briefing_seq FROM incident_progress WHERE id = 0`).Scan(&cursor); err != nil {
 		if err == sql.ErrNoRows {
 			return 0, nil
 		}
@@ -487,34 +525,23 @@ func (s *Store) incidentCursor(ctx context.Context) (int64, error) {
 }
 
 func saveIncidentCursor(tx *sql.Tx, rowID int64) error {
-	_, err := tx.Exec(`INSERT INTO incident_progress (id, last_briefing_rowid) VALUES (0, ?)
-		ON CONFLICT(id) DO UPDATE SET last_briefing_rowid = MAX(last_briefing_rowid, excluded.last_briefing_rowid)`, rowID)
+	_, err := tx.Exec(`INSERT INTO incident_progress (id, last_briefing_seq) VALUES (0, ?)
+		ON CONFLICT(id) DO UPDATE SET last_briefing_seq = MAX(last_briefing_seq, excluded.last_briefing_seq)`, rowID)
 	return err
 }
 
-// incidentPage reads one catch-up page past the cursor in rowid order:
-// completion order, stable across restarts and purges. Membership is
+// incidentPage reads one catch-up page past the cursor in durable sequence order:
+// stable across restarts and purges. Membership is
 // terminal, so each row carries whether it already belongs to an
 // incident: the cursor advances past every row, but classification
 // only considers unmembered ones. Without the flag, a pass that
 // quiet-closes an incident would re-form its still-paged members
 // into a phantom second incident.
 func (s *Store) incidentPage(ctx context.Context, cursor int64) ([]candidateBriefing, error) {
-	return queryCandidates(ctx, s.db, `SELECT b.rowid, b.briefing_id, b.group_id, b.priority, b.created_at,
+	return queryCandidates(ctx, s.db, `SELECT b.seq, b.briefing_id, b.group_id, b.priority, b.created_at,
 		m.briefing_id IS NOT NULL
 		FROM briefings b LEFT JOIN incident_members m ON m.briefing_id = b.briefing_id
-		WHERE b.rowid > ? ORDER BY b.rowid ASC LIMIT ?`, cursor, maxIncidentPage)
-}
-
-// incidentFreshUnmembered reconsiders completed briefings young enough
-// to still join or seed a burst, whether or not an earlier pass saw
-// them. The stale cutoff (window+quiet) bounds the read; older
-// completions stay individual reports.
-func (s *Store) incidentFreshUnmembered(ctx context.Context, staleCut int64) ([]candidateBriefing, error) {
-	return queryCandidates(ctx, s.db, `SELECT b.rowid, b.briefing_id, b.group_id, b.priority, b.created_at, 0
-		FROM briefings b LEFT JOIN incident_members m ON m.briefing_id = b.briefing_id
-		WHERE b.created_at >= ? AND m.briefing_id IS NULL
-		ORDER BY b.created_at ASC, b.rowid ASC LIMIT ?`, staleCut, maxIncidentConsider)
+		WHERE b.seq > ? ORDER BY b.seq ASC LIMIT ?`, cursor, maxIncidentPage)
 }
 
 func queryCandidates(ctx context.Context, db *sql.DB, query string, args ...any) ([]candidateBriefing, error) {
@@ -527,7 +554,7 @@ func queryCandidates(ctx context.Context, db *sql.DB, query string, args ...any)
 	for rows.Next() {
 		var c candidateBriefing
 		var created int64
-		if err := rows.Scan(&c.rowID, &c.briefingID, &c.groupID, &c.priority, &created, &c.membered); err != nil {
+		if err := rows.Scan(&c.seq, &c.briefingID, &c.groupID, &c.priority, &created, &c.membered); err != nil {
 			return nil, err
 		}
 		c.createdAt = fromNanos(created)
@@ -544,6 +571,8 @@ type groupScope struct {
 	types   map[string]bool
 	targets map[string]bool
 	sources map[string]bool
+	refs    []refEvidence
+	invalid bool
 }
 
 // classifyCandidates attaches retained evidence to each considered
@@ -555,22 +584,14 @@ func (s *Store) classifyCandidates(ctx context.Context, consider []candidateBrie
 		return nil, nil
 	}
 	groupIDs := make([]string, 0, len(consider))
-	briefingIDs := make([]string, 0, len(consider))
-	byGroup := map[string][]int{}
-	byBriefing := map[string]int{}
-	for i, c := range consider {
-		byBriefing[c.briefingID] = i
-		briefingIDs = append(briefingIDs, c.briefingID)
-		if _, ok := byGroup[c.groupID]; !ok {
+	byGroup := map[string]bool{}
+	for _, c := range consider {
+		if !byGroup[c.groupID] {
 			groupIDs = append(groupIDs, c.groupID)
 		}
-		byGroup[c.groupID] = append(byGroup[c.groupID], i)
+		byGroup[c.groupID] = true
 	}
 	scopes, err := groupScopes(ctx, s.db, groupIDs)
-	if err != nil {
-		return nil, err
-	}
-	refs, err := briefingRefEvidence(ctx, s.db, briefingIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -622,7 +643,7 @@ func (s *Store) classifyCandidates(ctx context.Context, consider []candidateBrie
 	var out []classifiedBriefing
 	for _, c := range consider {
 		sc, ok := scopes[c.groupID]
-		if !ok || len(sc.types) == 0 {
+		if !ok || sc.invalid || len(sc.types) == 0 {
 			continue
 		}
 		kind := ""
@@ -650,14 +671,13 @@ func (s *Store) classifyCandidates(ctx context.Context, consider []candidateBrie
 		if target == "" || source == "" {
 			continue
 		}
-		// Distinct qualified references from the briefing's subject
-		// links: reported-device class under the source's bound
+		// Distinct qualified references from immutable event views: reported-device class under the source's bound
 		// namespace, medium or better confidence, known revision.
 		// Low, unknown or mixed confidence and unknown or mixed
 		// revisions fail closed to individual reports.
 		seen := map[string]MemberRef{}
 		revisions := map[string]bool{}
-		for _, r := range refs[c.briefingID] {
+		for _, r := range sc.refs {
 			if r.Class != SubjectReportedDevice {
 				continue
 			}
@@ -725,7 +745,7 @@ func groupScopes(ctx context.Context, db *sql.DB, groupIDs []string) (map[string
 			args = append(args, id)
 		}
 		rows, err := db.QueryContext(ctx, `SELECT ge.group_id, e.event_type,
-			COALESCE(e.target,''), COALESCE(e.source_scope,'')
+			COALESCE(e.target,''), COALESCE(e.source_scope,''), e.payload
 			FROM group_events ge JOIN raw_events e ON e.event_id = ge.event_id
 			WHERE ge.group_id IN (`+placeholders+`)`, args...)
 		if err != nil {
@@ -733,7 +753,8 @@ func groupScopes(ctx context.Context, db *sql.DB, groupIDs []string) (map[string
 		}
 		for rows.Next() {
 			var gid, typ, target, source string
-			if err := rows.Scan(&gid, &typ, &target, &source); err != nil {
+			var payload []byte
+			if err := rows.Scan(&gid, &typ, &target, &source, &payload); err != nil {
 				rows.Close()
 				return nil, err
 			}
@@ -745,44 +766,19 @@ func groupScopes(ctx context.Context, db *sql.DB, groupIDs []string) (map[string
 			sc.types[typ] = true
 			sc.targets[target] = true
 			sc.sources[source] = true
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		rows.Close()
-	}
-	return out, nil
-}
-
-func briefingRefEvidence(ctx context.Context, db *sql.DB, briefingIDs []string) (map[string][]refEvidence, error) {
-	out := map[string][]refEvidence{}
-	for start := 0; start < len(briefingIDs); start += maxIncidentPage {
-		end := start + maxIncidentPage
-		if end > len(briefingIDs) {
-			end = len(briefingIDs)
-		}
-		placeholders := strings.Repeat("?,", end-start)
-		placeholders = strings.TrimSuffix(placeholders, ",")
-		args := make([]any, 0, end-start)
-		for _, id := range briefingIDs[start:end] {
-			args = append(args, id)
-		}
-		rows, err := db.QueryContext(ctx, `SELECT bs.briefing_id, s.reference_class,
-			s.identity_namespace, s.identity_revision, s.upstream_reference, s.reported_confidence
-			FROM briefing_subjects bs JOIN reported_subjects s ON s.profile_id = bs.profile_id
-			WHERE bs.briefing_id IN (`+placeholders+`)`, args...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var bid string
-			var r refEvidence
-			if err := rows.Scan(&bid, &r.Class, &r.Namespace, &r.Revision, &r.Reference, &r.Confidence); err != nil {
-				rows.Close()
-				return nil, err
+			views := parseEventViews(payload, typ)
+			if len(views) == 0 {
+				sc.invalid = true
 			}
-			out[bid] = append(out[bid], r)
+			for _, v := range views {
+				class, namespace, reference := qualifiedReference(v)
+				if class != SubjectReportedDevice || v.identityRevision == "" ||
+					(v.identityConfidence != "high" && v.identityConfidence != "medium") {
+					sc.invalid = true
+				}
+				sc.refs = append(sc.refs, refEvidence{Class: class, Namespace: namespace,
+					Revision: v.identityRevision, Reference: reference, Confidence: v.identityConfidence})
+			}
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
@@ -832,17 +828,17 @@ func closeIncident(tx *sql.Tx, incidentID string, now time.Time) error {
 // Member inserts use OR IGNORE against the briefing UNIQUE: a retried
 // pass replays as already-member instead of duplicating, and quiet
 // time advances only for newly accepted members.
-func appendIncidentMembers(tx *sql.Tx, in *Incident, members []classifiedBriefing, window time.Duration, now time.Time) (int, error) {
+func appendIncidentMembers(tx *sql.Tx, in *Incident, members []classifiedBriefing, window, quiet time.Duration, now time.Time) (int, error) {
 	windowEnd := in.WindowStart.Add(window)
-	refs := map[string]bool{}
-	priorities := []string{}
+	newRefs := 0
+	priorities := []string{in.Floor}
 	appended := 0
-	var lastMember time.Time
+	lastMember := in.LastMemberAt
 	for _, m := range members {
 		if m.createdAt.Before(in.WindowStart) || m.createdAt.After(windowEnd) {
 			continue
 		}
-		if m.revision != in.IdentityRevision {
+		if m.revision != in.IdentityRevision || m.refs[0].Namespace != in.IdentityNamespace || m.createdAt.After(lastMember.Add(quiet)) {
 			continue
 		}
 		refsJSON, err := marshalMemberRefs(m.refs)
@@ -861,6 +857,14 @@ func appendIncidentMembers(tx *sql.Tx, in *Incident, members []classifiedBriefin
 			// a retried pass): never double-count, never move quiet.
 			continue
 		}
+		nr, err := insertMemberReferences(tx, in.IncidentID, m.refs)
+		if err != nil {
+			return 0, err
+		}
+		newRefs += nr
+		if err := deletePendingCandidate(tx, m.briefingID); err != nil {
+			return 0, err
+		}
 		appended++
 		priorities = append(priorities, m.priority)
 		if m.createdAt.After(lastMember) {
@@ -870,59 +874,14 @@ func appendIncidentMembers(tx *sql.Tx, in *Incident, members []classifiedBriefin
 	if appended == 0 {
 		return 0, nil
 	}
-	// Distinct references accumulate from every member snapshot, so
-	// the count survives later subject drift or purge of subject rows.
-	rows, err := tx.Query(`SELECT refs_json FROM incident_members WHERE incident_id = ?`, in.IncidentID)
-	if err != nil {
+	in.QualifiedRefs += newRefs
+	in.MemberCount += appended
+	in.Floor = incidentFloorOf(in.Kind, priorities)
+	in.LastMemberAt = lastMember
+	if _, err := tx.Exec(`UPDATE incidents SET qualified_refs=?,member_count=?,floor=?,last_member_at=?,updated_at=? WHERE incident_id=?`, in.QualifiedRefs, in.MemberCount, in.Floor, nanos(lastMember), nanos(now), in.IncidentID); err != nil {
 		return 0, err
 	}
-	for rows.Next() {
-		var raw string
-		if err := rows.Scan(&raw); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		snap, err := parseMemberRefs(raw)
-		if err != nil {
-			rows.Close()
-			return 0, err
-		}
-		for _, r := range snap {
-			refs[r.Reference] = true
-		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return 0, err
-	}
-	rows.Close()
-	// Member finals accumulate the same way: the floor reflects every
-	// accepted member, and no briefing row is ever rewritten.
-	prows, err := tx.Query(`SELECT b.priority FROM incident_members m
-		JOIN briefings b ON b.briefing_id = m.briefing_id WHERE m.incident_id = ?`, in.IncidentID)
-	if err != nil {
-		return 0, err
-	}
-	allPriorities := append([]string(nil), priorities...)
-	for prows.Next() {
-		var p string
-		if err := prows.Scan(&p); err != nil {
-			prows.Close()
-			return 0, err
-		}
-		allPriorities = append(allPriorities, p)
-	}
-	if err := prows.Err(); err != nil {
-		prows.Close()
-		return 0, err
-	}
-	prows.Close()
-	if _, err := tx.Exec(`UPDATE incidents SET qualified_refs = ?, member_count = member_count + ?,
-		floor = ?, last_member_at = MAX(last_member_at, ?), updated_at = ?
-		WHERE incident_id = ?`, len(refs), appended,
-		incidentFloorOf(in.Kind, allPriorities), nanos(lastMember), nanos(now), in.IncidentID); err != nil {
-		return 0, err
-	}
+
 	return appended, nil
 }
 
@@ -983,10 +942,10 @@ func formIncident(tx *sql.Tx, s *Store, members []classifiedBriefing, settings I
 	for attempt := 0; attempt < 5; attempt++ {
 		incidentID = fmt.Sprintf("inc-%d-%d", windowStart.UnixNano(), s.incidentSeq.Add(1))
 		res, err := tx.Exec(`INSERT OR IGNORE INTO incidents (incident_id, kind, source_scope, target,
-			status, floor, identity_revision, qualified_refs, member_count,
+			status, floor, identity_revision, identity_namespace, qualified_refs, member_count,
 			window_start, last_member_at, opened_at, updated_at)
-			VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?)`,
-			incidentID, kind, source, target, incidentFloorOf(kind, priorities), revision,
+			VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			incidentID, kind, source, target, incidentFloorOf(kind, priorities), revision, set[0].refs[0].Namespace,
 			len(refs), len(set), nanos(windowStart), nanos(set[len(set)-1].createdAt),
 			nanos(now), nanos(now))
 		if err != nil {
@@ -1019,6 +978,12 @@ func formIncident(tx *sql.Tx, s *Store, members []classifiedBriefing, settings I
 			return "", err
 		}
 		if n, _ := res.RowsAffected(); n == 1 {
+			if _, err := insertMemberReferences(tx, incidentID, m.refs); err != nil {
+				return "", err
+			}
+			if err := deletePendingCandidate(tx, m.briefingID); err != nil {
+				return "", err
+			}
 			inserted++
 		}
 	}
@@ -1158,7 +1123,7 @@ func scanIncidentRow(row interface {
 	var windowStart, lastMember, opened, updated int64
 	var closed sql.NullInt64
 	if err := row.Scan(rowID, &in.IncidentID, &in.Kind, &in.SourceScope, &in.Target, &in.Status, &in.Floor,
-		&in.IdentityRevision, &in.QualifiedRefs, &in.MemberCount, &windowStart, &lastMember,
+		&in.IdentityRevision, &in.IdentityNamespace, &in.QualifiedRefs, &in.MemberCount, &windowStart, &lastMember,
 		&opened, &closed, &updated); err != nil {
 		return err
 	}
@@ -1173,6 +1138,12 @@ func scanIncidentRow(row interface {
 // IncidentDecisionResult reports an incident decision and the member
 // decisions it generated. Members holds the snapshot-order generated
 // rows; empty when the decision stayed incident-only.
+const maxIncidentDecisionMembers = 500
+
+// ErrIncidentFanoutLimit rejects an oversized atomic review action before
+// any decision is written. Individual member reviews remain available.
+var ErrIncidentFanoutLimit = errors.New("incident member action exceeds limit")
+
 type IncidentDecisionResult struct {
 	Parent  Decision
 	Applied bool
@@ -1213,20 +1184,34 @@ func (s *Store) AppendIncidentDecision(ctx context.Context, in DecisionInput, in
 	if err := checkDecisionText(in.Kind, in.Text); err != nil {
 		return IncidentDecisionResult{}, err
 	}
-	untilNanos, err := resolveDecisionUntil(in, now)
-	if err != nil {
-		return IncidentDecisionResult{}, err
-	}
 	var hashUntil int64
 	if in.HasUntil {
 		hashUntil = in.Until.UnixNano()
 	}
-	hash := decisionHash(in.SubjectKind, in.SubjectID, in.Kind, hashUntil, in.HasUntil, in.Text, "")
+	scopeTag := "incident-only"
+	if includeMembers {
+		scopeTag = "include-members"
+	}
+	hash := decisionHash(in.SubjectKind, in.SubjectID, in.Kind, hashUntil, in.HasUntil, in.Text, scopeTag)
 
 	var res IncidentDecisionResult
-	err = s.write(ctx, func(tx *sql.Tx) error {
+	err := s.write(ctx, func(tx *sql.Tx) error {
 		if in.RequestID != "" {
-			if existing, err := findDecisionByRequest(tx, in.RequestID, hash); err != nil {
+			existing, err := findDecisionByRequest(tx, in.RequestID, hash)
+			if errors.Is(err, ErrRequestConflict) {
+				// v26 hashes predate explicit member scope. Recover its actual
+				// stored scope without rewriting retained audit at upgrade.
+				legacyHash := decisionHash(in.SubjectKind, in.SubjectID, in.Kind, hashUntil, in.HasUntil, in.Text, "")
+				existing, err = findDecisionByRequest(tx, in.RequestID, legacyHash)
+				if err == nil && existing != nil {
+					var hadMembers bool
+					err = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM operator_decisions WHERE generated_by=?)`, existing.DecisionID).Scan(&hadMembers)
+					if err == nil && hadMembers != includeMembers {
+						err = ErrRequestConflict
+					}
+				}
+			}
+			if err != nil {
 				return err
 			} else if existing != nil {
 				members, err := generatedDecisions(tx, existing.DecisionID)
@@ -1236,6 +1221,10 @@ func (s *Store) AppendIncidentDecision(ctx context.Context, in DecisionInput, in
 				res = IncidentDecisionResult{Parent: *existing, Applied: false, Reason: "duplicate_request", Members: members}
 				return nil
 			}
+		}
+		untilNanos, err := resolveDecisionUntil(in, now)
+		if err != nil {
+			return err
 		}
 		var one int
 		if err := tx.QueryRow(`SELECT 1 FROM incidents WHERE incident_id = ?`, in.SubjectID).Scan(&one); err != nil {
@@ -1247,7 +1236,7 @@ func (s *Store) AppendIncidentDecision(ctx context.Context, in DecisionInput, in
 		var members []string
 		if includeMembers {
 			rows, err := tx.Query(`SELECT briefing_id FROM incident_members WHERE incident_id = ?
-				ORDER BY member_created_at ASC, briefing_id ASC`, in.SubjectID)
+				ORDER BY member_created_at ASC, briefing_id ASC LIMIT ?`, in.SubjectID, maxIncidentDecisionMembers+1)
 			if err != nil {
 				return err
 			}
@@ -1264,6 +1253,9 @@ func (s *Store) AppendIncidentDecision(ctx context.Context, in DecisionInput, in
 				return err
 			}
 			rows.Close()
+		}
+		if len(members) > maxIncidentDecisionMembers {
+			return ErrIncidentFanoutLimit
 		}
 		parentID := fmt.Sprintf("dec-%d-%d", now.UnixNano(), s.decisionSeq.Add(1))
 		var untilVal sql.NullInt64
@@ -1318,7 +1310,7 @@ func (s *Store) AppendIncidentDecision(ctx context.Context, in DecisionInput, in
 // identify — never to rewrite — the fan-out.
 func generatedDecisions(tx *sql.Tx, parentID string) ([]Decision, error) {
 	rows, err := tx.Query(`SELECT `+decisionColumns+` FROM operator_decisions
-		WHERE generated_by = ? ORDER BY rowid ASC`, parentID)
+		WHERE generated_by = ? ORDER BY rowid ASC LIMIT ?`, parentID, maxIncidentDecisionMembers+1)
 	if err != nil {
 		return nil, err
 	}
@@ -1330,6 +1322,9 @@ func generatedDecisions(tx *sql.Tx, parentID string) ([]Decision, error) {
 			return nil, err
 		}
 		out = append(out, d)
+	}
+	if len(out) > maxIncidentDecisionMembers {
+		return nil, ErrIncidentFanoutLimit
 	}
 	return out, rows.Err()
 }

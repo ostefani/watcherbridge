@@ -569,6 +569,10 @@ for (const c of cases) {
   const { body } = render(c.component ?? Home, { props: c.props });
   // Strip SSR hydration markers, which split copy across expressions.
   const stripped = body.replaceAll(/<!--.*?-->/g, '');
+  if (c.component === Incident && (stripped.includes('[object Object]') || !stripped.includes('Source: lab'))) {
+    console.error(`[${c.name}] incident timestamps or source scope rendered incorrectly`);
+    failed++;
+  }
   // Server text is HTML-escaped; unescape the entities our copy uses.
   const text = stripped
     .replaceAll('&quot;', '"')
@@ -663,3 +667,27 @@ if (failed > 0) {
   process.exit(1);
 }
 console.log('smoke: freshness guard holds');
+
+// EventTarget exercises actual incident connection recovery without a
+// browser runner: live updates, reconnects and resync all invalidate,
+// and a closed connection cannot keep refreshing mounted screens.
+{
+  const { forwardIncidentEvents } = await import('../src/lib/incidentEvents.js');
+  const source = new EventTarget();
+  const target = new EventTarget();
+  let invalidations = 0;
+  let refreshes = 0;
+  target.addEventListener('watcherbridge:incident', () => invalidations++);
+  const stop = forwardIncidentEvents(source, target, () => refreshes++);
+  for (const kind of ['open', 'incident', 'resync', 'open']) {
+    source.dispatchEvent(new Event(kind));
+  }
+  if (invalidations !== 4 || refreshes !== 4) {
+    throw new Error('incident state did not recover on open/update/resync');
+  }
+  stop();
+  source.dispatchEvent(new Event('incident'));
+  if (invalidations !== 4 || refreshes !== 4) {
+    throw new Error('closed incident connection retained its listeners');
+  }
+}

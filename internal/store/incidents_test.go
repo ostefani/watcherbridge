@@ -20,6 +20,9 @@ import (
 func dropIncidentSchema(t *testing.T, db *sql.DB) {
 	t.Helper()
 	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS incident_pending_refs`,
+		`DROP TABLE IF EXISTS incident_pending`,
+		`DROP TABLE IF EXISTS incident_references`,
 		`DROP TABLE IF EXISTS incident_members`,
 		`DROP TABLE IF EXISTS incidents`,
 		`DROP TABLE IF EXISTS incident_progress`,
@@ -32,6 +35,9 @@ func dropIncidentSchema(t *testing.T, db *sql.DB) {
 	}
 	dropColumnIfExists(t, db, "purge_runs", "incidents_deleted")
 	dropColumnIfExists(t, db, "purge_runs", "incident_members_deleted")
+	for _, col := range []string{"incident_pending_deleted", "incident_pending_refs_deleted", "incident_refs_deleted"} {
+		dropColumnIfExists(t, db, "purge_runs", col)
+	}
 }
 
 // incidentHostJSON renders one scanner-reported host view carrying a
@@ -48,11 +54,11 @@ func incidentHostJSON(ref, confidence string) string {
 // Each distinct ref founds its own group; repeats of one ref join the
 // open group while its quiet window holds, unless maxEvents forces a
 // rollover (used to produce several briefings for one reference).
-func seedIncidentBriefing(t *testing.T, s *Store, scope, target, eventType, ref string, at time.Time, priority string) string {
+func seedIncidentBriefing(t testing.TB, s *Store, scope, target, eventType, ref string, at time.Time, priority string) string {
 	return seedIncidentBriefingMaxEvents(t, s, scope, target, eventType, ref, at, priority, 0)
 }
 
-func seedIncidentBriefingMaxEvents(t *testing.T, s *Store, scope, target, eventType, ref string, at time.Time, priority string, maxEvents int) string {
+func seedIncidentBriefingMaxEvents(t testing.TB, s *Store, scope, target, eventType, ref string, at time.Time, priority string, maxEvents int) string {
 	t.Helper()
 	ctx := context.Background()
 	eventID := fmt.Sprintf("evt-%s-%s-%s-%d", scope, target, ref, at.UnixNano())
@@ -91,7 +97,7 @@ func seedIncidentBriefingMaxEvents(t *testing.T, s *Store, scope, target, eventT
 // bindIncidentSource binds the stable-identity contract the incident
 // gate requires: a configured namespace plus the advertised
 // capability. Without it references stay uncounted by design.
-func bindIncidentSource(t *testing.T, s *Store, scope string) {
+func bindIncidentSource(t testing.TB, s *Store, scope string) {
 	t.Helper()
 	if err := s.BindSourceIdentity(context.Background(), scope, "ns-1", StableIdentityCapability); err != nil {
 		t.Fatal(err)
@@ -102,7 +108,7 @@ func incidentSettings() IncidentSettings {
 	return IncidentSettings{Window: 5 * time.Minute, Quiet: 120 * time.Second, MinRefs: 3}
 }
 
-func correlateOnce(t *testing.T, s *Store, now time.Time) IncidentReport {
+func correlateOnce(t testing.TB, s *Store, now time.Time) IncidentReport {
 	t.Helper()
 	rep, err := s.CorrelateIncidents(context.Background(), incidentSettings(), now)
 	if err != nil {

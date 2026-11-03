@@ -159,6 +159,14 @@ go test -v ./internal/store/...
 - Quality and structured-output support vary between models.
 - In proxy mode, the bridge becomes a single point of failure for event delivery to ScanRelay.
 
+### Incident review limits
+
+Incident membership is retained independently of the bounded detail page.
+An “include members” decision applies atomically to at most 500 members.
+Larger actions return HTTP 413 without recording any part of the decision;
+review the member briefing pages individually instead. Incident-only review
+remains available. New members do not inherit earlier acknowledgements.
+
 ## License
 
 MIT © 2026 Olha Stefanishyna

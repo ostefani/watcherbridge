@@ -2,7 +2,7 @@
   import { onDestroy, onMount } from 'svelte';
   import { fetchIncident } from '../api.js';
   import { createFetchGuard } from './freshness.js';
-  import { displayTime, sourceLabel } from './format.js';
+  import { displayTime } from './format.js';
   import DecisionPanel from './DecisionPanel.svelte';
 
   // Presentation incident detail (Planv4 Step 29): one burst bundle
@@ -42,7 +42,7 @@
         detail = fresh;
       }
     } catch (err) {
-      if (guard.current(token) && detail === null) {
+      if (guard.current(token)) {
         error = err instanceof Error ? err.message : String(err);
       }
     }
@@ -52,12 +52,8 @@
     load();
   }
 
-  // Live updates arrive as window events: App forwards `incident`
-  // SSE frames here because incident updates carry no SSE id and
-  // never replay through the briefing stream. Reconnect recovery is
-  // the overview refetch (attention stays current); like the
-  // briefing detail, this screen does not refetch on reconnect
-  // itself — the next incident frame or navigation reloads it.
+  // App invalidates incident state on live frames, reconnect and resync.
+  // These events have no sequence ID and cannot use briefing replay.
   onMount(() => {
     if (initial === null) {
       load();
@@ -87,27 +83,32 @@
 <p><a href="#/">Back to overview</a></p>
 
 {#if error !== null}
-  <p role="alert">{error}</p>
-{:else if shown === null}
+  <p role="alert">Refresh failed: {error} <button type="button" onclick={reload}>Retry</button></p>
+{/if}
+{#if shown === null}
   <p>Loading incident…</p>
 {:else}
   {@const inc = shown.incident}
+  {@const opened = displayTime(inc.opened_at)}
+  {@const closed = displayTime(inc.closed_at)}
+  {@const start = displayTime(inc.window_start)}
+  {@const last = displayTime(inc.last_member_at)}
   <h2>{KIND_LABEL[inc.kind] ?? inc.kind}</h2>
   <p>
     <span class="pill">{inc.status}</span>
     <span class="pill">Floor: {inc.floor}</span>
     {#if inc.status === 'closed' && inc.closed_at}
-      <span>Closed {displayTime(inc.closed_at)}</span>
+      <span>Closed <time datetime={inc.closed_at} title={closed.utc}>{closed.local}</time></span>
     {:else}
-      <span>Open since {displayTime(inc.opened_at)}</span>
+      <span>Open since <time datetime={inc.opened_at} title={opened.utc}>{opened.local}</time></span>
     {/if}
   </p>
 
   <section aria-label="Scope">
     <h3>Scope</h3>
-    <p>Source: {sourceLabel(inc.source_scope)}</p>
+    <p>Source: {inc.source_scope}</p>
     <p>Target: {inc.target}</p>
-    <p>Window start: {displayTime(inc.window_start)} · Last member: {displayTime(inc.last_member_at)}</p>
+    <p>Window start: <time datetime={inc.window_start} title={start.utc}>{start.local}</time> · Last member: <time datetime={inc.last_member_at} title={last.utc}>{last.local}</time></p>
   </section>
 
   <section aria-label="Evidence">
@@ -124,10 +125,11 @@
     {:else}
       <ol>
         {#each shown.members as m (m.briefing_id)}
+          {@const reported = displayTime(m.created_at)}
           <li>
             <a href={`#/briefing/${m.briefing_id}`}>{m.briefing_id}</a>
             <span class="pill">{m.priority}</span>
-            <span>{displayTime(m.created_at)}</span>
+            <time datetime={m.created_at} title={reported.utc}>{reported.local}</time>
             <span>{m.refs.length} qualified reference{m.refs.length === 1 ? '' : 's'}</span>
           </li>
         {/each}
@@ -142,7 +144,7 @@
     decisions={shown.decisions ?? []}
     effective={shown.effective_review ?? null}
     memberScope
-    memberCount={shown.members.length}
+    memberCount={inc.member_count}
     kindHelp={INCIDENT_KIND_HELP}
     reload={load}
   />

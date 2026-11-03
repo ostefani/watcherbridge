@@ -1,12 +1,12 @@
 <script>
-  import { onDestroy } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { fetchIncident } from '../api.js';
 
   // Attention list: server-ordered (flagged, priority, incident, newest,
   // stable ID). Briefing and incident rows link to their detail
   // screens; other kinds stay text until their screens exist.
   // Incident rows expand inline to their member briefings; the member
-  // list is cached per incident so a toggle never refetches, and a
+  // list is cached until an update/reconnect/resync invalidates it, and a
   // fetch failure surfaces on the row, never as navigation.
   let { items = [] } = $props();
 
@@ -15,6 +15,22 @@
   let expandError = $state(/** @type {Record<string, string>} */ ({}));
   let expanding = $state(/** @type {Record<string, boolean>} */ ({}));
   let alive = true;
+  let generation = 0;
+  onMount(() => {
+    window.addEventListener('watcherbridge:incident', refreshMembers);
+    return () => window.removeEventListener('watcherbridge:incident', refreshMembers);
+  });
+
+  function refreshMembers() {
+    generation++;
+    memberCache = {};
+    expandError = {};
+    expanding = {};
+    expanded = Object.fromEntries(items.filter((item) => item.kind === 'incident' && expanded[item.id]).map((item) => [item.id, true]));
+    for (const id of Object.keys(expanded)) {
+      loadMembers(id);
+    }
+  }
   onDestroy(() => {
     alive = false;
   });
@@ -28,18 +44,24 @@
     if (memberCache[id] !== undefined || expanding[id]) {
       return;
     }
+    await loadMembers(id);
+  }
+
+  async function loadMembers(id) {
+    const token = generation;
+    delete expandError[id];
     expanding[id] = true;
     try {
       const detail = await fetchIncident(id);
-      if (alive) {
+      if (alive && token === generation) {
         memberCache[id] = detail.members;
       }
     } catch (err) {
-      if (alive) {
+      if (alive && token === generation) {
         expandError[id] = err instanceof Error ? err.message : String(err);
       }
     } finally {
-      if (alive) {
+      if (alive && token === generation) {
         expanding[id] = false;
       }
     }

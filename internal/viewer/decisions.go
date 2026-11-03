@@ -317,6 +317,8 @@ func validDecisionID(id string) bool {
 // never errors.
 func writeDecisionError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, store.ErrIncidentFanoutLimit):
+		writeViewerError(w, "Too many members for one action; review member briefing pages individually.", http.StatusRequestEntityTooLarge)
 	case errors.Is(err, store.ErrUnknownSubject), errors.Is(err, store.ErrUnknownDecision):
 		writeViewerError(w, "unknown decision subject", http.StatusNotFound)
 	case errors.Is(err, store.ErrInvalidDecision):

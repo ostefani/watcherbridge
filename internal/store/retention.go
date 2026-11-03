@@ -145,25 +145,28 @@ func ruleRetentionOf(settings PurgeSettings) time.Duration {
 // progress check) counts deletions only, so an idle pass with no
 // deletions terminates even though no bookkeeping row is written.
 type PurgeReport struct {
-	BriefingLinks   int64
-	Briefings       int64
-	Traces          int64 // agent_traces rows; deleted with their briefing
-	Groups          int64
-	GroupLinks      int64 // group_subjects rows; group_events has its own counter below
-	GroupEvents     int64
-	Ports           int64
-	Observations    int64
-	Progress        int64 // projection_progress + projection_pending rows
-	RawEvents       int64
-	Subjects        int64
-	Sources         int64
-	Pseudonyms      int64
-	Decisions       int64 // expired operator-decision audit rows; labels survive in reported_subjects
-	Heartbeats      int64 // isolated H1 history; compact source state survives
-	Rules           int64 // terminal review-policy rule rows unreferenced by retained briefings
-	Incidents       int64 // closed incidents past retention with no members left
-	IncidentMembers int64 // membership rows of closed incidents past retention
-	Bookkeeping     int64 // purge_state upserts sharing the row budget
+	BriefingLinks       int64
+	Briefings           int64
+	Traces              int64 // agent_traces rows; deleted with their briefing
+	Groups              int64
+	GroupLinks          int64 // group_subjects rows; group_events has its own counter below
+	GroupEvents         int64
+	Ports               int64
+	Observations        int64
+	Progress            int64 // projection_progress + projection_pending rows
+	RawEvents           int64
+	Subjects            int64
+	Sources             int64
+	Pseudonyms          int64
+	Decisions           int64 // expired operator-decision audit rows; labels survive in reported_subjects
+	Heartbeats          int64 // isolated H1 history; compact source state survives
+	Rules               int64 // terminal review-policy rule rows unreferenced by retained briefings
+	Incidents           int64 // closed incidents past retention with no members left
+	IncidentMembers     int64 // membership rows of closed incidents past retention
+	IncidentPending     int64
+	IncidentPendingRefs int64
+	IncidentRefs        int64
+	Bookkeeping         int64 // purge_state upserts sharing the row budget
 }
 
 func (r *PurgeReport) add(o PurgeReport) {
@@ -185,13 +188,16 @@ func (r *PurgeReport) add(o PurgeReport) {
 	r.Rules += o.Rules
 	r.Incidents += o.Incidents
 	r.IncidentMembers += o.IncidentMembers
+	r.IncidentPending += o.IncidentPending
+	r.IncidentPendingRefs += o.IncidentPendingRefs
+	r.IncidentRefs += o.IncidentRefs
 	r.Bookkeeping += o.Bookkeeping
 }
 
 func (r PurgeReport) total() int64 {
 	return r.BriefingLinks + r.Briefings + r.Traces + r.Groups + r.GroupLinks + r.GroupEvents + r.Ports +
 		r.Observations + r.Progress + r.RawEvents + r.Subjects + r.Sources + r.Pseudonyms + r.Decisions + r.Rules + r.Heartbeats +
-		r.Incidents + r.IncidentMembers
+		r.Incidents + r.IncidentMembers + r.IncidentPending + r.IncidentPendingRefs + r.IncidentRefs
 }
 
 // purgeStages selects which table families one batch transaction covers.
@@ -247,7 +253,8 @@ type purgePlan struct {
 	// after discovery can pin an aged briefing whose tokens were
 	// never scanned, so a newer pin defers token expiry the same
 	// way a newer briefing does.
-	tokenDecFence int64
+	tokenDecFence      int64
+	tokenIncidentFence int64
 }
 
 // eligibleEvents selects raw events old enough to purge: not pending
@@ -362,10 +369,29 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				report.IncidentMembers += n
 			case "incidents":
 				report.Incidents += n
+			case "incident_pending":
+				report.IncidentPending += n
+			case "incident_pending_refs":
+				report.IncidentPendingRefs += n
+			case "incident_references":
+				report.IncidentRefs += n
 			}
 			return nil
 		}
 		if plan.stages&stageBriefings != 0 {
+
+			limit = deleteLimit()
+			if err := take("incident_pending_refs", plan.briefingCut, `DELETE FROM incident_pending_refs WHERE rowid IN (SELECT r.rowid FROM incident_pending_refs r JOIN incident_pending p ON p.briefing_id=r.briefing_id JOIN briefings b ON b.briefing_id=p.briefing_id WHERE b.created_at<? ORDER BY r.rowid LIMIT ?)`, limit, plan.briefingCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
+			if err := take("incident_pending", plan.briefingCut, `DELETE FROM incident_pending WHERE rowid IN(SELECT p.rowid FROM incident_pending p JOIN briefings b ON b.briefing_id=p.briefing_id WHERE b.created_at<? AND NOT EXISTS(SELECT 1 FROM incident_pending_refs r WHERE r.briefing_id=p.briefing_id) ORDER BY p.rowid LIMIT ?)`, limit, plan.briefingCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
+			if err := take("incident_references", plan.incidentCut, `DELETE FROM incident_references WHERE rowid IN(SELECT r.rowid FROM incident_references r JOIN incidents i ON i.incident_id=r.incident_id WHERE i.status='closed' AND i.closed_at<? ORDER BY r.rowid LIMIT ?)`, limit, plan.incidentCut, limit); err != nil {
+				return err
+			}
 			// Closed incidents drain past the incident horizon
 			// measured from close, before any briefing take: members
 			// drain first under an explicit childless gate, so no
@@ -385,7 +411,7 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 			}
 			limit = deleteLimit()
 			if err := take("incidents", plan.incidentCut, `DELETE FROM incidents WHERE rowid IN (SELECT rowid FROM incidents WHERE status = 'closed' AND closed_at < ?
-				AND NOT EXISTS (SELECT 1 FROM incident_members WHERE incident_members.incident_id = incidents.incident_id) ORDER BY closed_at, rowid LIMIT ?)`, limit, plan.incidentCut, limit); err != nil {
+				AND NOT EXISTS (SELECT 1 FROM incident_members WHERE incident_members.incident_id = incidents.incident_id) AND NOT EXISTS(SELECT 1 FROM incident_references WHERE incident_references.incident_id=incidents.incident_id) ORDER BY closed_at, rowid LIMIT ?)`, limit, plan.incidentCut, limit); err != nil {
 				return err
 			}
 			// A briefing a retained decision still references cannot
@@ -418,7 +444,7 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				return err
 			}
 			limit = deleteLimit()
-			if err := take("briefings", plan.briefingCut, `DELETE FROM briefings WHERE rowid IN (SELECT rowid FROM briefings WHERE created_at < ? AND NOT EXISTS (SELECT 1 FROM briefing_subjects WHERE briefing_subjects.briefing_id = briefings.briefing_id)
+			if err := take("briefings", plan.briefingCut, `DELETE FROM briefings WHERE rowid IN (SELECT rowid FROM briefings WHERE created_at < ? AND NOT EXISTS(SELECT 1 FROM incident_pending WHERE incident_pending.briefing_id=briefings.briefing_id) AND NOT EXISTS (SELECT 1 FROM briefing_subjects WHERE briefing_subjects.briefing_id = briefings.briefing_id)
 				AND NOT EXISTS (SELECT 1 FROM agent_traces WHERE agent_traces.briefing_id = briefings.briefing_id)
 				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?)`+incidentMemberPin+incidentDecisionPin+` ORDER BY created_at, rowid LIMIT ?)`, limit, plan.briefingCut, plan.decisionCut, plan.incidentCut, plan.decisionCut, limit); err != nil {
 				return err
@@ -553,7 +579,7 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				if err := take("pseudonym_map", plan.tokenCut, `DELETE FROM pseudonym_map WHERE rowid IN (SELECT rowid FROM pseudonym_map WHERE last_used_at < ?
 					AND NOT EXISTS (SELECT 1 FROM purge_protected_tokens WHERE purge_protected_tokens.token = pseudonym_map.token)
 					AND NOT EXISTS (SELECT 1 FROM briefings WHERE rowid > ?)
-					AND NOT EXISTS (SELECT 1 FROM operator_decisions WHERE subject_kind = 'briefing' AND created_at >= ? AND rowid > ?) ORDER BY last_used_at, rowid LIMIT ?)`, limit, plan.tokenCut, plan.tokenFence, plan.decisionCut, plan.tokenDecFence, limit); err != nil {
+					AND NOT EXISTS (SELECT 1 FROM operator_decisions WHERE subject_kind = 'briefing' AND created_at >= ? AND rowid > ?) AND NOT EXISTS(SELECT 1 FROM incident_progress WHERE id=0 AND pin_version>?) ORDER BY last_used_at, rowid LIMIT ?)`, limit, plan.tokenCut, plan.tokenFence, plan.decisionCut, plan.tokenDecFence, plan.tokenIncidentFence, limit); err != nil {
 					return err
 				}
 			}
@@ -624,7 +650,7 @@ const protectedRefillPasses = 5
 // discovery and deletion must agree on what is retained, or pinned
 // traces lose their restoration mappings while their briefing stands.
 const retainedBriefing = `(created_at >= ? OR EXISTS (SELECT 1 FROM operator_decisions d
-	WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?))`
+	WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?) OR EXISTS(SELECT 1 FROM incident_members m WHERE m.briefing_id=briefings.briefing_id))`
 
 // refillProtectedTokens rebuilds the per-run protected-token scratch
 // set from every retained briefing. A stale scratch row only
@@ -872,13 +898,16 @@ func addPurgeRunCounts(tx *sql.Tx, runID int64, report PurgeReport) error {
 		heartbeats_deleted = heartbeats_deleted + ?,
 		incidents_deleted = incidents_deleted + ?,
 		incident_members_deleted = incident_members_deleted + ?,
+		incident_pending_deleted=incident_pending_deleted+?,
+		incident_pending_refs_deleted=incident_pending_refs_deleted+?,
+		incident_refs_deleted=incident_refs_deleted+?,
 		bookkeeping_writes = bookkeeping_writes + ?
 		WHERE run_id = ?`,
 		report.BriefingLinks, report.Briefings, report.Traces, report.Groups, report.GroupLinks,
 		report.GroupEvents,
 		report.Ports, report.Observations, report.Progress, report.RawEvents,
 		report.Subjects, report.Sources, report.Pseudonyms, report.Decisions, report.Rules, report.Heartbeats,
-		report.Incidents, report.IncidentMembers, report.Bookkeeping,
+		report.Incidents, report.IncidentMembers, report.IncidentPending, report.IncidentPendingRefs, report.IncidentRefs, report.Bookkeeping,
 		runID)
 	return err
 }
@@ -923,7 +952,17 @@ func (s *Store) PurgeOnce(ctx context.Context, settings PurgeSettings, now time.
 		return PurgeReport{}, err
 	}
 	plan.runID = runID
+	pinBefore, pinReadErr := s.incidentPinVersion(ctx)
 	briefFence, decFence, derr := s.refillProtectedTokens(ctx, plan.briefingCut, plan.decisionCut)
+	pinAfter, pinErr := s.incidentPinVersion(ctx)
+	if pinReadErr != nil {
+		derr = pinReadErr
+	} else if pinErr != nil {
+		derr = pinErr
+	} else if pinBefore != pinAfter {
+		derr = fmt.Errorf("incident membership changed during token discovery; retry purge")
+	}
+	plan.tokenIncidentFence = pinAfter
 	if derr != nil {
 		plan.skipTokenExpiry = true
 	} else {
@@ -1066,13 +1105,13 @@ func (s *Store) LatestPurgeRun(ctx context.Context) (purgeRun, error) {
 		briefing_links_deleted, briefings_deleted, traces_deleted, groups_deleted, group_links_deleted,
 		group_events_deleted,
 		ports_deleted, observations_deleted, progress_deleted, raw_events_deleted,
-		subjects_deleted, sources_deleted, pseudonyms_deleted, decisions_deleted, rules_deleted, heartbeats_deleted, bookkeeping_writes
+		subjects_deleted, sources_deleted, pseudonyms_deleted, decisions_deleted, rules_deleted, heartbeats_deleted, incidents_deleted, incident_members_deleted, incident_pending_deleted, incident_pending_refs_deleted, incident_refs_deleted, bookkeeping_writes
 		FROM purge_runs ORDER BY run_id DESC LIMIT 1`).Scan(
 		&run.runID, &run.startedAt, &run.finishedAt, &run.status, &run.errText,
 		&run.total.BriefingLinks, &run.total.Briefings, &run.total.Traces, &run.total.Groups, &run.total.GroupLinks,
 		&run.total.GroupEvents,
 		&run.total.Ports, &run.total.Observations, &run.total.Progress, &run.total.RawEvents,
-		&run.total.Subjects, &run.total.Sources, &run.total.Pseudonyms, &run.total.Decisions, &run.total.Rules, &run.total.Heartbeats, &run.total.Bookkeeping)
+		&run.total.Subjects, &run.total.Sources, &run.total.Pseudonyms, &run.total.Decisions, &run.total.Rules, &run.total.Heartbeats, &run.total.Incidents, &run.total.IncidentMembers, &run.total.IncidentPending, &run.total.IncidentPendingRefs, &run.total.IncidentRefs, &run.total.Bookkeeping)
 	if err != nil {
 		return purgeRun{}, err
 	}
