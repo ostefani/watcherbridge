@@ -1033,8 +1033,13 @@ func TestIncidentReadsUseIndexes(t *testing.T) {
 			JOIN raw_events e ON e.event_id = ge.event_id WHERE ge.group_id IN ('g1','g2')`,
 			nil, "group_id=?"},
 		{"generated", `EXPLAIN QUERY PLAN SELECT decision_id FROM operator_decisions
-			WHERE generated_by = 'dec-1' ORDER BY rowid ASC LIMIT 1000`,
+   WHERE generated_by = 'dec-1' AND rowid > 100 ORDER BY rowid ASC LIMIT 201`,
 			nil, "decisions_generated"},
+		{"alternative window", `EXPLAIN QUERY PLAN SELECT briefing_id,created_at FROM incident_pending_refs
+   WHERE correlation_key='key' AND created_at>=0 AND created_at<=1000 ORDER BY created_at DESC LIMIT 3`,
+			nil, "incident_pending_refs_time"},
+		{"search checkpoint", `EXPLAIN QUERY PLAN SELECT briefing_id,formation_before FROM incident_pending
+   WHERE correlation_key='key' ORDER BY created_at,briefing_id LIMIT 1`, nil, "incident_pending_key"},
 	}
 	for _, q := range queries {
 		t.Run(q.name, func(t *testing.T) {

@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 27
+const supportedSchemaVersion = 28
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -162,6 +162,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 26, migrateV26)
 		case 26:
 			err = applyMigration(db, 27, migrateV27)
+		case 27:
+			err = applyMigration(db, 28, migrateV28)
 		}
 		if err != nil {
 			return err
@@ -629,6 +631,13 @@ func migrateV27(tx *sql.Tx) error {
 		}
 	}
 	return nil
+}
+
+// v28 stores alternative-window progress on the oldest pending candidate.
+// It expires with that candidate and adds no unbounded migration backfill.
+func migrateV28(tx *sql.Tx) error {
+	_, err := tx.Exec(`ALTER TABLE incident_pending ADD COLUMN formation_before INTEGER NOT NULL DEFAULT 0`)
+	return err
 }
 
 func applyMigration(db *sql.DB, to int, fn func(*sql.Tx) error) error {

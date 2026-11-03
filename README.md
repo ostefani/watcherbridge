@@ -167,6 +167,13 @@ Larger actions return HTTP 413 without recording any part of the decision;
 review the member briefing pages individually instead. Incident-only review
 remains available. New members do not inherit earlier acknowledgements.
 
+Retries of previously committed larger fan-outs still return success, with at
+most 500 generated decisions and a `members_next` cursor. Continue the original
+snapshot with `GET /api/decisions/{parent_decision_id}/members?after={cursor}&limit=200`
+(maximum limit 500). Each page returns `members` and, when more remain, `next`.
+Undo likewise supplies `generated_next` when its generated-decision IDs need
+continuation through this endpoint; undo never cascades to member decisions.
+
 ## License
 
 MIT © 2026 Olha Stefanishyna

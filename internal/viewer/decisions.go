@@ -1,6 +1,7 @@
 package viewer
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,11 +65,13 @@ func reviewWireOf(state store.ReviewState) reviewWire {
 // the member decision IDs an undone incident decision generated, for
 // individual revisit — undo itself never cascades.
 type mutationWire struct {
-	Decision  decisionWire   `json:"decision"`
-	Applied   bool           `json:"applied"`
-	Reason    string         `json:"reason,omitempty"`
-	Members   []decisionWire `json:"members,omitempty"`
-	Generated []string       `json:"generated_decision_ids,omitempty"`
+	Decision      decisionWire   `json:"decision"`
+	Applied       bool           `json:"applied"`
+	Reason        string         `json:"reason,omitempty"`
+	Members       []decisionWire `json:"members,omitempty"`
+	Generated     []string       `json:"generated_decision_ids,omitempty"`
+	MembersNext   int64          `json:"members_next,omitempty"`
+	GeneratedNext int64          `json:"generated_next,omitempty"`
 }
 
 func decisionWireOf(d store.Decision) decisionWire {
@@ -82,6 +85,52 @@ func decisionWireOf(d store.Decision) decisionWire {
 		w.Until = d.Until.UTC().Format(time.RFC3339)
 	}
 	return w
+}
+
+// handleDecisionMembers continues a committed fan-out using its parent
+// decision, never the incident's mutable membership. The cursor is exclusive.
+func (v *Viewer) handleDecisionMembers(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validDecisionID(id) {
+		writeViewerError(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+	limit := 200
+	var after int64
+	q := r.URL.Query()
+	if raw := q.Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 500 {
+			writeViewerError(w, "invalid limit", http.StatusBadRequest)
+			return
+		}
+		limit = n
+	}
+	if raw := q.Get("after"); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n < 0 {
+			writeViewerError(w, "invalid after", http.StatusBadRequest)
+			return
+		}
+		after = n
+	}
+	page, err := v.store.GeneratedDecisionPage(r.Context(), id, limit, after)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeViewerError(w, "decision not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	out := struct {
+		Members []decisionWire `json:"members"`
+		Next    int64          `json:"next,omitempty"`
+	}{Members: make([]decisionWire, 0, len(page.Members)), Next: page.Next}
+	for _, d := range page.Members {
+		out.Members = append(out.Members, decisionWireOf(d))
+	}
+	writeJSON(w, out)
 }
 
 // appendDecisionGuarded enforces the Step 16 POST contract before
@@ -202,7 +251,7 @@ func (v *Viewer) appendDecision(w http.ResponseWriter, r *http.Request) {
 		}
 		v.Overview.Trigger()
 		v.Hub().Broadcast("incident", incidentEvent{Changed: []string{in.SubjectID}})
-		out := mutationWire{Decision: decisionWireOf(res.Parent), Applied: res.Applied, Reason: res.Reason}
+		out := mutationWire{Decision: decisionWireOf(res.Parent), Applied: res.Applied, Reason: res.Reason, MembersNext: res.MembersNext}
 		for _, m := range res.Members {
 			out.Members = append(out.Members, decisionWireOf(m))
 		}
@@ -258,8 +307,11 @@ func (v *Viewer) handleDecisionUndo(w http.ResponseWriter, r *http.Request) {
 		// Undo never cascades, but when the target generated member
 		// rows the response names them so the operator can revisit
 		// each member judgment individually.
-		if gen, err := v.store.GeneratedDecisions(r.Context(), id); err == nil && len(gen) > 0 {
-			out.Generated = gen
+		if page, err := v.store.GeneratedDecisionPage(r.Context(), id, 500, 0); err == nil {
+			for _, d := range page.Members {
+				out.Generated = append(out.Generated, d.DecisionID)
+			}
+			out.GeneratedNext = page.Next
 		}
 		writeJSON(w, out)
 	})(w, r)

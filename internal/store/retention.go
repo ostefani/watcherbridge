@@ -389,7 +389,7 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				return err
 			}
 			limit = deleteLimit()
-			if err := take("incident_references", plan.incidentCut, `DELETE FROM incident_references WHERE rowid IN(SELECT r.rowid FROM incident_references r JOIN incidents i ON i.incident_id=r.incident_id WHERE i.status='closed' AND i.closed_at<? ORDER BY r.rowid LIMIT ?)`, limit, plan.incidentCut, limit); err != nil {
+			if err := take("incident_references", plan.incidentCut, `DELETE FROM incident_references WHERE rowid IN(SELECT r.rowid FROM incident_references r JOIN incidents i ON i.incident_id=r.incident_id WHERE i.status='closed' AND i.closed_at<? AND NOT EXISTS(SELECT 1 FROM operator_decisions d WHERE d.subject_kind='incident' AND d.subject_id=i.incident_id AND d.created_at>=?) ORDER BY r.rowid LIMIT ?)`, limit, plan.incidentCut, plan.decisionCut, limit); err != nil {
 				return err
 			}
 			// Closed incidents drain past the incident horizon
@@ -401,17 +401,19 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 			// deleting them first would violate the membership
 			// foreign key. Open incidents never drain. Eligibility is
 			// rechecked in the deletion transaction; a close is
-			// terminal and the next burst forms a new incident.
+			// terminal and the next burst forms a new incident. Retained
+			// incident audit pins every layer before draining any relationship.
 			// (Legacy briefing-only wrappers run this stage with a
 			// zero incident cutoff, which drains nothing.)
 			limit = deleteLimit()
 			if err := take("incident_members", plan.incidentCut, `DELETE FROM incident_members WHERE rowid IN (SELECT rowid FROM incident_members WHERE incident_id IN
-				(SELECT incident_id FROM incidents WHERE status = 'closed' AND closed_at < ?) ORDER BY rowid LIMIT ?)`, limit, plan.incidentCut, limit); err != nil {
+				(SELECT i.incident_id FROM incidents i WHERE i.status = 'closed' AND i.closed_at < ? AND NOT EXISTS(SELECT 1 FROM operator_decisions d WHERE d.subject_kind='incident' AND d.subject_id=i.incident_id AND d.created_at>=?)) ORDER BY rowid LIMIT ?)`, limit, plan.incidentCut, plan.decisionCut, limit); err != nil {
 				return err
 			}
 			limit = deleteLimit()
 			if err := take("incidents", plan.incidentCut, `DELETE FROM incidents WHERE rowid IN (SELECT rowid FROM incidents WHERE status = 'closed' AND closed_at < ?
-				AND NOT EXISTS (SELECT 1 FROM incident_members WHERE incident_members.incident_id = incidents.incident_id) AND NOT EXISTS(SELECT 1 FROM incident_references WHERE incident_references.incident_id=incidents.incident_id) ORDER BY closed_at, rowid LIMIT ?)`, limit, plan.incidentCut, limit); err != nil {
+				AND NOT EXISTS(SELECT 1 FROM operator_decisions d WHERE d.subject_kind='incident' AND d.subject_id=incidents.incident_id AND d.created_at>=?)
+				AND NOT EXISTS (SELECT 1 FROM incident_members WHERE incident_members.incident_id = incidents.incident_id) AND NOT EXISTS(SELECT 1 FROM incident_references WHERE incident_references.incident_id=incidents.incident_id) ORDER BY closed_at, rowid LIMIT ?)`, limit, plan.incidentCut, plan.decisionCut, limit); err != nil {
 				return err
 			}
 			// A briefing a retained decision still references cannot

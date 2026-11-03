@@ -445,10 +445,11 @@ func (s *Store) correlatePass(ctx context.Context, settings IncidentSettings, no
 				}
 			}
 			if in == nil {
-				members, err := formationCandidates(tx, key, settings, now, budget)
+				members, pending, err := formationCandidates(tx, key, settings, now, budget)
 				if err != nil {
 					return err
 				}
+				more = more || pending
 				id, err := formIncident(tx, s, members, settings, now)
 				if err != nil {
 					return err
@@ -1145,10 +1146,11 @@ const maxIncidentDecisionMembers = 500
 var ErrIncidentFanoutLimit = errors.New("incident member action exceeds limit")
 
 type IncidentDecisionResult struct {
-	Parent  Decision
-	Applied bool
-	Reason  string
-	Members []Decision
+	Parent      Decision
+	Applied     bool
+	Reason      string
+	Members     []Decision
+	MembersNext int64
 }
 
 // AppendIncidentDecision stores one decision on an incident with an
@@ -1214,11 +1216,11 @@ func (s *Store) AppendIncidentDecision(ctx context.Context, in DecisionInput, in
 			if err != nil {
 				return err
 			} else if existing != nil {
-				members, err := generatedDecisions(tx, existing.DecisionID)
+				page, err := generatedDecisionPage(ctx, tx, existing.DecisionID, maxIncidentDecisionMembers, 0)
 				if err != nil {
 					return err
 				}
-				res = IncidentDecisionResult{Parent: *existing, Applied: false, Reason: "duplicate_request", Members: members}
+				res = IncidentDecisionResult{Parent: *existing, Applied: false, Reason: "duplicate_request", Members: page.Members, MembersNext: page.Next}
 				return nil
 			}
 		}
@@ -1305,54 +1307,70 @@ func (s *Store) AppendIncidentDecision(ctx context.Context, in DecisionInput, in
 	return res, nil
 }
 
-// generatedDecisions lists the member rows one incident decision
-// generated, in snapshot order. Undo of the parent reads these to
-// identify — never to rewrite — the fan-out.
-func generatedDecisions(tx *sql.Tx, parentID string) ([]Decision, error) {
-	rows, err := tx.Query(`SELECT `+decisionColumns+` FROM operator_decisions
-		WHERE generated_by = ? ORDER BY rowid ASC LIMIT ?`, parentID, maxIncidentDecisionMembers+1)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Decision
-	for rows.Next() {
-		d, _, err := scanDecision(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, d)
-	}
-	if len(out) > maxIncidentDecisionMembers {
-		return nil, ErrIncidentFanoutLimit
-	}
-	return out, rows.Err()
+// GeneratedDecisionPage is a bounded page of an already committed fan-out.
+// Next is an exclusive rowid cursor; zero means the snapshot has drained.
+// New admission limits do not invalidate larger historical operations.
+type GeneratedDecisionPage struct {
+	Members []Decision
+	Next    int64
 }
 
-// GeneratedDecisions lists the member decision IDs one incident
-// decision generated. The undo response carries them so the operator
-// can revisit each member judgment individually; undo itself never
-// cascades. The read carries a backstop limit far above any plausible
-// fan-out: membership itself is the real bound.
-func (s *Store) GeneratedDecisions(ctx context.Context, parentID string) ([]string, error) {
-	if parentID == "" {
-		return nil, fmt.Errorf("empty decision id")
+type generatedDecisionReader interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func generatedDecisionPage(ctx context.Context, db generatedDecisionReader, parentID string, limit int, after int64) (GeneratedDecisionPage, error) {
+	if limit < 1 || limit > maxIncidentDecisionMembers || after < 0 {
+		return GeneratedDecisionPage{}, fmt.Errorf("invalid generated-decision page")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT decision_id FROM operator_decisions
-		WHERE generated_by = ? ORDER BY rowid ASC LIMIT 1000`, parentID)
+	rows, err := db.QueryContext(ctx, `SELECT rowid, `+decisionColumns+` FROM operator_decisions
+  WHERE generated_by=? AND rowid>? ORDER BY rowid LIMIT ?`, parentID, after, limit+1)
+	if err != nil {
+		return GeneratedDecisionPage{}, err
+	}
+	var page GeneratedDecisionPage
+	for rows.Next() {
+		d, _, err := scanDecisionRow(rows, true)
+		if err != nil {
+			rows.Close()
+			return GeneratedDecisionPage{}, err
+		}
+		page.Members = append(page.Members, d)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return GeneratedDecisionPage{}, err
+	}
+	if len(page.Members) > limit {
+		page.Members = page.Members[:limit]
+		page.Next = page.Members[limit-1].RowID
+	}
+	return page, nil
+}
+
+// GeneratedDecisionPage reads an original snapshot, not current membership.
+// Unknown parent IDs are rejected so a well-formed missing decision is a 404.
+func (s *Store) GeneratedDecisionPage(ctx context.Context, parentID string, limit int, after int64) (GeneratedDecisionPage, error) {
+	var one int
+	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM operator_decisions WHERE decision_id=?`, parentID).Scan(&one); err != nil {
+		return GeneratedDecisionPage{}, err
+	}
+	return generatedDecisionPage(ctx, s.db, parentID, limit, after)
+}
+
+// GeneratedDecisions returns the first bounded page of generated IDs.
+// Call GeneratedDecisionPage to exhaust larger historical snapshots.
+func (s *Store) GeneratedDecisions(ctx context.Context, parentID string) ([]string, error) {
+	page, err := s.GeneratedDecisionPage(ctx, parentID, maxIncidentDecisionMembers, 0)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out = append(out, id)
+	out := make([]string, 0, len(page.Members))
+	for _, d := range page.Members {
+		out = append(out, d.DecisionID)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // incidentReviewCTE selects the current review-lane record per

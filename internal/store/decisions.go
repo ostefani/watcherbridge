@@ -118,15 +118,23 @@ type DecisionResult struct {
 const decisionColumns = `decision_id, subject_kind, subject_id, kind, until,
 	text, created_at, supersedes, request_id, content_hash, prior_label, prior_owner`
 
-func scanDecision(row interface {
-	Scan(dest ...any) error
-}) (Decision, string, error) {
+type decisionScanner interface{ Scan(dest ...any) error }
+
+func scanDecision(row decisionScanner) (Decision, string, error) {
+	return scanDecisionRow(row, false)
+}
+
+func scanDecisionRow(row decisionScanner, withRowID bool) (Decision, string, error) {
 	var d Decision
 	var until, created sql.NullInt64
 	var text, supersedes, requestID, hash, priorOwner sql.NullString
 	var priorLabel sql.NullString
-	if err := row.Scan(&d.DecisionID, &d.SubjectKind, &d.SubjectID, &d.Kind,
-		&until, &text, &created, &supersedes, &requestID, &hash, &priorLabel, &priorOwner); err != nil {
+	dest := []any{&d.DecisionID, &d.SubjectKind, &d.SubjectID, &d.Kind,
+		&until, &text, &created, &supersedes, &requestID, &hash, &priorLabel, &priorOwner}
+	if withRowID {
+		dest = append([]any{&d.RowID}, dest...)
+	}
+	if err := row.Scan(dest...); err != nil {
 		return Decision{}, "", err
 	}
 	if until.Valid {

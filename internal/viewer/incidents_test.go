@@ -307,3 +307,59 @@ func TestOverviewIncidentCollapse(t *testing.T) {
 		t.Fatalf("members must return after incident-only ack: %v", bids)
 	}
 }
+
+func TestIncidentDecisionSnapshotPaging(t *testing.T) {
+	s := openViewerStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	iid := formViewerIncident(t, s, base)
+	_, mux := withHost(t, s, "127.0.0.1:8081")
+	res, err := s.AppendIncidentDecision(context.Background(), store.DecisionInput{SubjectKind: store.DecisionSubjectIncident, SubjectID: iid, Kind: store.DecisionExpected, RequestID: "paged-snapshot"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := "/api/decisions/" + res.Parent.DecisionID + "/members"
+	var page struct {
+		Members []decisionWire `json:"members"`
+		Next    int64          `json:"next"`
+	}
+	code, body := getJSON(t, mux, endpoint+"?limit=2")
+	if code != http.StatusOK {
+		t.Fatalf("first page %d: %s", code, body)
+	}
+	if err = json.Unmarshal(body, &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Members) != 2 || page.Next <= 0 {
+		t.Fatalf("first page: %+v", page)
+	}
+	for i, d := range page.Members {
+		if d.DecisionID != res.Members[i].DecisionID {
+			t.Fatalf("changed snapshot order: %+v", page)
+		}
+	}
+	cursor := page.Next
+	page.Next = 0
+	code, body = getJSON(t, mux, fmt.Sprintf("%s?limit=2&after=%d", endpoint, cursor))
+	if code != http.StatusOK {
+		t.Fatalf("second page %d: %s", code, body)
+	}
+	if err = json.Unmarshal(body, &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Members) != 1 || page.Next != 0 || page.Members[0].DecisionID != res.Members[2].DecisionID {
+		t.Fatalf("last page: %+v", page)
+	}
+	for _, query := range []string{"?limit=0", "?limit=501", "?limit=x", "?after=-1", "?after=9223372036854775808", "?after=x"} {
+		if code, body := getJSON(t, mux, endpoint+query); code != http.StatusBadRequest {
+			t.Fatalf("%s = %d: %s", query, code, body)
+		}
+	}
+	for _, tc := range []struct {
+		path string
+		code int
+	}{{"/api/decisions/dec-1-2/members", http.StatusNotFound}, {"/api/decisions/invalid/members", http.StatusBadRequest}} {
+		if code, body := getJSON(t, mux, tc.path); code != tc.code {
+			t.Fatalf("%s = %d: %s", tc.path, code, body)
+		}
+	}
+}

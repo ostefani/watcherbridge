@@ -260,6 +260,7 @@ func (v *Viewer) Attach(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/overview", v.handleOverview)
 	mux.HandleFunc("GET /api/health", v.handleHealth)
 	mux.HandleFunc("GET /api/decisions", v.listDecisions)
+	mux.HandleFunc("GET /api/decisions/{id}/members", v.handleDecisionMembers)
 	mux.HandleFunc("POST /api/decisions", v.appendDecisionGuarded)
 	mux.HandleFunc("GET /api/incidents", v.handleIncidents)
 	mux.HandleFunc("GET /api/incidents/{id}", v.handleIncident)
