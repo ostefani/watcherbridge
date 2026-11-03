@@ -28,20 +28,24 @@ type proposalWire struct {
 	SourceScope            string `json:"source_scope"`
 	ReferenceClass         string `json:"reference_class"`
 	IdentityNamespace      string `json:"identity_namespace"`
+	IdentityRevision       string `json:"identity_revision"`
 	UpstreamReference      string `json:"upstream_reference"`
 	ReportedIdentitySource string `json:"reported_identity_source"`
 	ReportedConfidence     string `json:"reported_confidence"`
 	Kind                   string `json:"kind"`
 	PortsCSV               string `json:"ports_csv"`
+	ChangedFieldsCSV       string `json:"changed_fields_csv"`
 	MatchingBriefings      int    `json:"matching_briefings"`
 }
 
 func proposalWireOf(p briefing.Proposal) proposalWire {
 	return proposalWire{
 		ProposalID: p.ProposalID, SourceScope: p.SourceScope, ReferenceClass: p.ReferenceClass,
-		IdentityNamespace: p.IdentityNamespace, UpstreamReference: p.UpstreamReference,
+		IdentityNamespace: p.IdentityNamespace, IdentityRevision: p.IdentityRevision,
+		UpstreamReference:      p.UpstreamReference,
 		ReportedIdentitySource: p.ReportedIdentitySource, ReportedConfidence: p.ReportedConfidence,
-		Kind: p.Kind, PortsCSV: p.PortsCSV, MatchingBriefings: p.MatchingBriefings,
+		Kind: p.Kind, PortsCSV: p.PortsCSV, ChangedFieldsCSV: p.ChangedFieldsCSV,
+		MatchingBriefings: p.MatchingBriefings,
 	}
 }
 
@@ -51,11 +55,13 @@ type ruleWire struct {
 	SourceScope            string  `json:"source_scope"`
 	ReferenceClass         string  `json:"reference_class"`
 	IdentityNamespace      string  `json:"identity_namespace"`
+	IdentityRevision       string  `json:"identity_revision"`
 	UpstreamReference      string  `json:"upstream_reference"`
 	ReportedIdentitySource string  `json:"reported_identity_source"`
 	ReportedConfidence     string  `json:"reported_confidence"`
 	Kind                   string  `json:"kind"`
 	PortsCSV               string  `json:"ports_csv"`
+	ChangedFieldsCSV       string  `json:"changed_fields_csv"`
 	Status                 string  `json:"status"`
 	DecidedAt              string  `json:"decided_at"`
 	ApprovedAt             *string `json:"approved_at,omitempty"`
@@ -66,9 +72,10 @@ func ruleWireOf(r store.Rule) ruleWire {
 	w := ruleWire{
 		RuleID: r.RuleID, ProposalID: r.ProposalID,
 		SourceScope: r.SourceScope, ReferenceClass: r.ReferenceClass,
-		IdentityNamespace: r.IdentityNamespace, UpstreamReference: r.UpstreamReference,
+		IdentityNamespace: r.IdentityNamespace, IdentityRevision: r.IdentityRevision,
+		UpstreamReference:      r.UpstreamReference,
 		ReportedIdentitySource: r.ReportedIdentitySource, ReportedConfidence: r.ReportedConfidence,
-		Kind: r.Kind, PortsCSV: r.PortsCSV, Status: r.Status,
+		Kind: r.Kind, PortsCSV: r.PortsCSV, ChangedFieldsCSV: r.ChangedFieldsCSV, Status: r.Status,
 		DecidedAt: r.DecidedAt.UTC().Format(time.RFC3339),
 	}
 	if r.HasApprovedAt {

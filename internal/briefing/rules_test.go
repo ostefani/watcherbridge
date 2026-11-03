@@ -3,22 +3,41 @@ package briefing
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ostefani/watcherbridge/internal/store"
 )
 
+// ruleNamespace is the reported stable-identity namespace every rule
+// fixture carries: the gate binds it to the test scope, simulating an
+// I1-qualified deployment. Fixtures without a binding stay
+// unavailable, exactly like today's bare-producer reports.
+const ruleNamespace = "ns-1"
+
 // rulePayload reports one open port on the shared MAC: every group
 // seeded with it shares one reported_device scope, one kind and one
 // canonical port set. The host_id/identity_source pair is what makes
 // the MAC a scanner-reported reference rather than a bare attribute —
 // without it the views project event-local and no rule can attach.
+// The namespace alone qualifies nothing: only the bound registration
+// (bindRuleSource) completes the stable contract.
 func rulePayload() string {
-	view := `{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[%s]}`
+	view := `{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","identity_namespace":"` + ruleNamespace + `","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[%s]}`
 	open := `{"number":22,"protocol":"tcp","state":"open"}`
 	return `{"event_id":"e1","previous":` + strings.Replace(view, "%s", "", 1) +
 		`,"current":` + strings.Replace(view, "%s", open, 1) + `}`
+}
+
+// bindRuleSource records the negotiated identity contract the gate
+// requires for one scope: the bound namespace plus the advertised
+// stable-identity capability.
+func bindRuleSource(t tb, s *store.Store, scope string) {
+	t.Helper()
+	if err := s.BindSourceIdentity(context.Background(), scope, ruleNamespace, string(store.StableIdentityCapability)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func seedRuleGroup(t tb, s *store.Store, eventID string) string {
@@ -64,6 +83,7 @@ func expectBriefing(t tb, s *store.Store, gid, req string) string {
 
 func seedThreeExpected(t tb, s *store.Store) []string {
 	t.Helper()
+	bindRuleSource(t, s, "test-scope")
 	gids := []string{
 		seedRuleGroup(t, s, "evt-r1"),
 		seedRuleGroup(t, s, "evt-r2"),
@@ -78,6 +98,7 @@ func seedThreeExpected(t tb, s *store.Store) []string {
 
 func TestDeriveProposalsNeedsThree(t *testing.T) {
 	s := openWorkerStore(t)
+	bindRuleSource(t, s, "test-scope")
 	gids := []string{seedRuleGroup(t, s, "evt-r1"), seedRuleGroup(t, s, "evt-r2")}
 	for i, gid := range gids {
 		briefRuleGroup(t, s, gid)
@@ -114,6 +135,102 @@ func TestDeriveProposalsNeedsThree(t *testing.T) {
 	if ps[0].ReferenceClass != store.SubjectReportedDevice || ps[0].Kind == "" || ps[0].PortsCSV == "" {
 		t.Fatalf("proposal must carry class, kind and ports: %+v", ps[0])
 	}
+	if ps[0].ChangedFieldsCSV != "ports" {
+		t.Fatalf("proposal must carry the canonical changed fields: %+v", ps[0])
+	}
+}
+
+// Bare-producer evidence must not propose: without the bound
+// registration contract the feature stays unavailable, even with
+// three matching expected judgments on identical MAC references.
+func TestDeriveProposalsNeedsBoundContract(t *testing.T) {
+	s := openWorkerStore(t)
+	for i, id := range []string{"evt-u1", "evt-u2", "evt-u3"} {
+		gid := seedRuleGroup(t, s, id)
+		briefRuleGroup(t, s, gid)
+		expectBriefing(t, s, gid, "unbound-req-"+string(rune('a'+i)))
+	}
+	now := time.Now()
+	if ps, err := DeriveProposals(context.Background(), s, 3, now); err != nil || len(ps) != 0 {
+		t.Fatalf("unbound scope must not propose: %+v %v", ps, err)
+	}
+}
+
+// Low upstream confidence never qualifies for automatic rules, even
+// under a bound contract.
+func TestDeriveProposalsSkipsLowConfidence(t *testing.T) {
+	s := openWorkerStore(t)
+	bindRuleSource(t, s, "test-scope")
+	payload := strings.Replace(rulePayload(), `"identity_confidence":"high"`, `"identity_confidence":"low"`, -1)
+	for i, id := range []string{"evt-l1", "evt-l2", "evt-l3"} {
+		gid := seedGroup(t, s, "host:w", id, "host.changed", payload)
+		briefRuleGroup(t, s, gid)
+		expectBriefing(t, s, gid, "low-req-"+string(rune('a'+i)))
+	}
+	now := time.Now()
+	if ps, err := DeriveProposals(context.Background(), s, 3, now); err != nil || len(ps) != 0 {
+		t.Fatalf("low confidence must not propose: %+v %v", ps, err)
+	}
+}
+
+func TestQualifyRuleSubjectMatrix(t *testing.T) {
+	base := store.ReportedSubject{
+		SourceScope: "test-scope", ReferenceClass: store.SubjectReportedDevice,
+		IdentityNamespace: ruleNamespace, UpstreamReference: "mac:aa:bb:cc:dd:ee:01",
+		ReportedIdentitySource: "mac", ReportedConfidence: "high",
+	}
+	caps := string(store.StableIdentityCapability)
+	cases := []struct {
+		name   string
+		adjust func(*store.ReportedSubject) (string, string)
+		ok     bool
+	}{
+		{"qualified", func(s *store.ReportedSubject) (string, string) { return ruleNamespace, caps }, true},
+		{"low confidence", func(s *store.ReportedSubject) (string, string) {
+			s.ReportedConfidence = "low"
+			return ruleNamespace, caps
+		}, false},
+		{"unknown confidence", func(s *store.ReportedSubject) (string, string) {
+			s.ReportedConfidence = ""
+			return ruleNamespace, caps
+		}, false},
+		{"empty namespace", func(s *store.ReportedSubject) (string, string) {
+			s.IdentityNamespace = ""
+			return ruleNamespace, caps
+		}, false},
+		{"namespace mismatch", func(s *store.ReportedSubject) (string, string) {
+			return "other-ns", caps
+		}, false},
+		{"capability missing", func(s *store.ReportedSubject) (string, string) {
+			return ruleNamespace, ""
+		}, false},
+		{"capability wrong", func(s *store.ReportedSubject) (string, string) {
+			return ruleNamespace, "heartbeat-v1"
+		}, false},
+		{"address class", func(s *store.ReportedSubject) (string, string) {
+			s.ReferenceClass = store.SubjectAddress
+			return ruleNamespace, caps
+		}, false},
+		{"empty source", func(s *store.ReportedSubject) (string, string) {
+			s.SourceScope = ""
+			return ruleNamespace, caps
+		}, false},
+		{"empty identity source", func(s *store.ReportedSubject) (string, string) {
+			s.ReportedIdentitySource = ""
+			return ruleNamespace, caps
+		}, false},
+	}
+	for _, tc := range cases {
+		sub := base
+		ns, capabilities := tc.adjust(&sub)
+		scope, ok := qualifyRuleSubject(sub, ns, capabilities)
+		if ok != tc.ok {
+			t.Fatalf("%s: qualify = %v, want %v", tc.name, ok, tc.ok)
+		}
+		if ok && (scope.UpstreamReference != sub.UpstreamReference || scope.IdentityNamespace != ruleNamespace) {
+			t.Fatalf("%s: qualified scope must carry the subject: %+v", tc.name, scope)
+		}
+	}
 }
 
 func TestDeriveProposalsSkipsIneligible(t *testing.T) {
@@ -133,6 +250,7 @@ func TestDeriveProposalsSkipsIneligible(t *testing.T) {
 
 func TestDeriveProposalsSkipsUndone(t *testing.T) {
 	s := openWorkerStore(t)
+	bindRuleSource(t, s, "test-scope")
 	gids := []string{seedRuleGroup(t, s, "evt-r1"), seedRuleGroup(t, s, "evt-r2"), seedRuleGroup(t, s, "evt-r3")}
 	first := ""
 	for i, gid := range gids {
@@ -283,7 +401,7 @@ func TestRuleStaysInScope(t *testing.T) {
 		t.Fatalf("cross-source MAC must not borrow a rule: %+v", b)
 	}
 	// A different port set is out of scope even for the same subject.
-	view := `{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[%s]}`
+	view := `{"ip":"192.168.0.5","hostname":"p","mac":"aa:bb:cc:dd:ee:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","identity_namespace":"` + ruleNamespace + `","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[%s]}`
 	otherPorts := `{"event_id":"e1","previous":` + strings.Replace(view, "%s", "", 1) +
 		`,"current":` + strings.Replace(view, "%s", `{"number":80,"protocol":"tcp","state":"open"}`, 1) + `}`
 	portsGID := seedGroup(t, s, "host:w", "evt-r9", "host.changed", otherPorts)
@@ -370,5 +488,161 @@ func TestRuleExpiryFailsClosed(t *testing.T) {
 	b := briefRuleGroupWith(t, s, d, gid)
 	if b.Priority == "low" && strings.HasPrefix(b.BaselineRule, "OP_RULE_") {
 		t.Fatalf("lapsed grant must not apply: %+v", b)
+	}
+}
+
+func TestCanonicalChangeFields(t *testing.T) {
+	view := func(hostname, os string) *hostView {
+		return &hostView{Hostname: hostname, OS: os, Ports: []portView{{Protocol: "tcp", Number: 22, State: "open"}}}
+	}
+	// Producer-reported changes name fields directly.
+	reported := []GroupEvent{{
+		EventType: "host.changed",
+		Previous:  view("p1", "o1"), Current: view("p2", "o2"),
+		Changes: []string{"hostname", "os"},
+	}}
+	if got := canonicalChangeFields(reported); got != "hostname,os" {
+		t.Fatalf("reported changes must canonicalize: %q", got)
+	}
+	// Without changes[] the salient raw differences stand in: the OS
+	// refinement family stays merged exactly like the kind derivation.
+	raw := []GroupEvent{{
+		EventType: "host.changed",
+		Previous:  view("p1", "o1"), Current: view("p2", "o2"),
+	}}
+	if got := canonicalChangeFields(raw); got != "device,hostname,os" {
+		t.Fatalf("raw differences must canonicalize: %q", got)
+	}
+	// Identical views carry no change; non-change events contribute
+	// nothing on their own.
+	if got := canonicalChangeFields([]GroupEvent{{EventType: "host.appeared", Host: view("p1", "o1")}}); got != "" {
+		t.Fatalf("changeless events must canonicalize empty: %q", got)
+	}
+	// Hostile field names cannot bloat rule rows.
+	long := []GroupEvent{{
+		EventType: "host.changed",
+		Previous:  view("p1", "o1"), Current: view("p2", "o1"),
+		Changes: []string{strings.Repeat("f", 200)},
+	}}
+	if got := canonicalChangeFields(long); len([]rune(got)) != maxChangeFieldRunes {
+		t.Fatalf("field names must truncate deterministically: %q", got)
+	}
+}
+
+// ruleChangePayload varies hostname and OS independently: the kind
+// precedence still selects hostname_change for mixed groups, but the
+// changed-field set records every difference.
+func ruleChangePayload(hostnameChanged, osChanged bool) string {
+	prevHost, curHost := "p", "p"
+	prevOS, curOS := "", ""
+	if hostnameChanged {
+		prevHost, curHost = "p1", "p2"
+	}
+	if osChanged {
+		prevOS, curOS = "o1", "o2"
+	}
+	mkView := func(hostname, os string) string {
+		return `{"ip":"192.168.0.5","hostname":"` + hostname + `","mac":"aa:bb:cc:dd:ee:01","host_id":"mac:aa:bb:cc:dd:ee:01","identity_source":"mac","identity_namespace":"` + ruleNamespace + `","os":"` + os + `","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[{"number":22,"protocol":"tcp","state":"open"}]}`
+	}
+	return `{"event_id":"e1","previous":` + mkView(prevHost, prevOS) + `,"current":` + mkView(curHost, curOS) + `}`
+}
+
+// A group carrying changes outside the approved set must not borrow
+// its rule: the hostname-only grant stays put when OS changes ride
+// along, and the mixed grant stays put for hostname-only reports.
+func TestRuleMixedChangesVoid(t *testing.T) {
+	s := openWorkerStore(t)
+	bindRuleSource(t, s, "test-scope")
+	seedHostGroups := func(ids []string, payload string, req string) {
+		for i, id := range ids {
+			gid := seedGroup(t, s, "host:w", id, "host.changed", payload)
+			briefRuleGroup(t, s, gid)
+			expectBriefing(t, s, gid, req+"-"+string(rune('a'+i)))
+		}
+	}
+	now := time.Now()
+	seedHostGroups([]string{"evt-h1", "evt-h2", "evt-h3"}, ruleChangePayload(true, false), "host")
+	ps, err := DeriveProposals(context.Background(), s, 3, now)
+	if err != nil || len(ps) != 1 {
+		t.Fatalf("hostname proposal missing: %+v %v", ps, err)
+	}
+	if ps[0].ChangedFieldsCSV != "hostname" {
+		t.Fatalf("hostname scope must record its fields: %+v", ps[0])
+	}
+	rule, applied, err := ApproveProposal(context.Background(), s, ps[0].ProposalID, 3, -1, 90*24*time.Hour, now)
+	if err != nil || !applied {
+		t.Fatalf("approve must apply: %+v %v", rule, err)
+	}
+	mixed := seedGroup(t, s, "host:w", "evt-m1", "host.changed", ruleChangePayload(true, true))
+	b := briefRuleGroup(t, s, mixed)
+	if b.Priority == "low" && b.BaselineRule == rule.RuleID {
+		t.Fatalf("mixed changes must not borrow the hostname rule: %+v", b)
+	}
+}
+
+// Concurrent approve and dismiss on one lapsed grant serialize on
+// the writer: exactly one wins and the loser reports the conflict,
+// never a silent overwrite.
+func TestRuleLifecycleConcurrentApproveDismiss(t *testing.T) {
+	s := openWorkerStore(t)
+	bindRuleSource(t, s, "test-scope")
+	seedHostGroups := func(ids []string, payload string, req string) {
+		for i, id := range ids {
+			gid := seedGroup(t, s, "host:w", id, "host.changed", payload)
+			briefRuleGroup(t, s, gid)
+			expectBriefing(t, s, gid, req+"-"+string(rune('a'+i)))
+		}
+	}
+	seedHostGroups([]string{"evt-c1", "evt-c2", "evt-c3"}, rulePayload(), "conc")
+	now := time.Now()
+	ps, err := DeriveProposals(context.Background(), s, 3, now)
+	if err != nil || len(ps) != 1 {
+		t.Fatalf("proposal missing: %+v %v", ps, err)
+	}
+	pid := ps[0].ProposalID
+	// Lapse the grant so both lifecycle paths stay resolvable: approve
+	// re-grants, dismiss declines.
+	if _, applied, err := ApproveProposal(context.Background(), s, pid, 3, 1, 90*24*time.Hour, now); err != nil || !applied {
+		t.Fatalf("approve must apply: %v", err)
+	}
+	later := now.Add(48 * time.Hour)
+	var wg sync.WaitGroup
+	var approveErr, dismissErr error
+	var approveApplied, dismissApplied bool
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, approveApplied, approveErr = ApproveProposal(context.Background(), s, pid, 3, -1, 90*24*time.Hour, later)
+	}()
+	go func() {
+		defer wg.Done()
+		_, dismissApplied, dismissErr = DismissProposal(context.Background(), s, pid, 3, later)
+	}()
+	wg.Wait()
+	wins := 0
+	if approveErr == nil && approveApplied {
+		wins++
+	}
+	if dismissErr == nil && dismissApplied {
+		wins++
+	}
+	if wins != 1 {
+		t.Fatalf("exactly one lifecycle request must win: approve(%v,%v) dismiss(%v,%v)", approveApplied, approveErr, dismissApplied, dismissErr)
+	}
+	if approveErr != nil && approveErr != store.ErrRuleDismissed {
+		t.Fatalf("losing approve must 409 dismissed: %v", approveErr)
+	}
+	if dismissErr != nil && dismissErr != store.ErrRuleActive {
+		t.Fatalf("losing dismiss must 409 active: %v", dismissErr)
+	}
+	final, err := s.GetRuleByProposal(context.Background(), pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approveApplied && final.Status != store.RuleApproved {
+		t.Fatalf("approved winner must persist: %+v", final)
+	}
+	if dismissApplied && final.Status != store.RuleDismissed {
+		t.Fatalf("dismissed winner must persist: %+v", final)
 	}
 }

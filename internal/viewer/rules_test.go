@@ -14,11 +14,20 @@ import (
 
 // ruleMACPayload reports one open port on the given MAC with a
 // scanner-reported reference: the scope rule proposals attach to.
+// The namespace alone qualifies nothing: tests bind the
+// registration contract explicitly, like an I1-qualified deployment.
 func ruleMACPayload(mac string) string {
-	view := `{"ip":"192.168.0.5","hostname":"p","mac":"` + mac + `","host_id":"mac:` + mac + `","identity_source":"mac","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[%s]}`
+	view := `{"ip":"192.168.0.5","hostname":"p","mac":"` + mac + `","host_id":"mac:` + mac + `","identity_source":"mac","identity_namespace":"ns-1","weak":false,"alive":true,"identity_confidence":"high","last_strong_seen_at":"2026-10-20T00:00:00Z","ports":[%s]}`
 	open := `{"number":22,"protocol":"tcp","state":"open"}`
 	return `{"event_id":"e1","previous":` + strings.Replace(view, "%s", "", 1) +
 		`,"current":` + strings.Replace(view, "%s", open, 1) + `}`
+}
+
+func bindRuleSource(t *testing.T, s *store.Store, scope string) {
+	t.Helper()
+	if err := s.BindSourceIdentity(context.Background(), scope, "ns-1", string(store.StableIdentityCapability)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func seedRuleBriefing(t *testing.T, s *store.Store, anchor, eventID, mac string) string {
@@ -58,6 +67,7 @@ func postRule(t *testing.T, mux http.Handler, target, body string) *httptest.Res
 
 func TestRuleRoutesLifecycle(t *testing.T) {
 	s := openViewerStore(t)
+	bindRuleSource(t, s, "test-scope")
 	const macA = "aa:bb:cc:dd:ee:0a"
 	var gids []string
 	for i, id := range []string{"evt-ra1", "evt-ra2", "evt-ra3"} {

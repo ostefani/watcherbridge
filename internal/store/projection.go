@@ -31,6 +31,11 @@ const (
 	// references fall back to event-local context (Designv9 §9); they
 	// are never truncated into a different-looking key.
 	maxReferenceRunes = 256
+	// maxNamespaceRunes bounds a reported stable-identity namespace.
+	// Over-bound namespaces are dropped, never truncated into a
+	// colliding key; the subject keeps its reference with no usable
+	// namespace, which rule eligibility reads as unqualified.
+	maxNamespaceRunes = 128
 	// maxDisplayRunes caps stored reported strings. Lists carry explicit
 	// truncation flags; missing values are preserved as null, never as
 	// false or empty defaults.
@@ -60,6 +65,7 @@ type subjectView struct {
 	hostID             string
 	identitySource     string
 	identityConfidence string
+	identityNamespace  string
 	ip                 string
 	hostname           string
 	mac                string
@@ -172,22 +178,27 @@ func (c *cappedStringList) UnmarshalJSON(data []byte) error {
 // everything else stays in the raw payload. Collections decode capped
 // so oversized arrays stay cheap; totals and cuts ride along.
 type hostViewJSON struct {
-	IP                 string           `json:"ip"`
-	Hostname           string           `json:"hostname"`
-	MAC                string           `json:"mac"`
-	RandomizedMAC      *bool            `json:"randomized_mac"`
-	Vendor             string           `json:"vendor"`
-	OS                 string           `json:"os"`
-	Device             string           `json:"device"`
-	OSEvidence         string           `json:"os_evidence"`
-	DeviceEvidence     string           `json:"device_evidence"`
-	Source             string           `json:"source"`
-	SourceName         string           `json:"source_name"`
-	Alive              *bool            `json:"alive"`
-	Weak               *bool            `json:"weak"`
-	HostID             string           `json:"host_id"`
-	IdentityConfidence string           `json:"identity_confidence"`
-	IdentitySource     string           `json:"identity_source"`
+	IP                 string `json:"ip"`
+	Hostname           string `json:"hostname"`
+	MAC                string `json:"mac"`
+	RandomizedMAC      *bool  `json:"randomized_mac"`
+	Vendor             string `json:"vendor"`
+	OS                 string `json:"os"`
+	Device             string `json:"device"`
+	OSEvidence         string `json:"os_evidence"`
+	DeviceEvidence     string `json:"device_evidence"`
+	Source             string `json:"source"`
+	SourceName         string `json:"source_name"`
+	Alive              *bool  `json:"alive"`
+	Weak               *bool  `json:"weak"`
+	HostID             string `json:"host_id"`
+	IdentityConfidence string `json:"identity_confidence"`
+	IdentitySource     string `json:"identity_source"`
+	// IdentityNamespace preserves a reported stable-identity
+	// namespace verbatim (Designv9 §1.4 I1, when a producer emits
+	// one). Preservation is not qualification: rule eligibility
+	// still requires the receiver-bound registration contract.
+	IdentityNamespace  string           `json:"identity_namespace"`
 	IdentityAliases    cappedStringList `json:"identity_aliases"`
 	IdentityAnchorKeys cappedStringList `json:"identity_anchor_keys"`
 	Fingerprint        string           `json:"evidence_fingerprint"`
@@ -215,6 +226,10 @@ func toSubjectView(role string, h *hostViewJSON) subjectView {
 	v.hostID = h.HostID
 	v.identitySource = h.IdentitySource
 	v.identityConfidence = h.IdentityConfidence
+	v.identityNamespace = strings.TrimSpace(h.IdentityNamespace)
+	if utf8.RuneCountInString(v.identityNamespace) > maxNamespaceRunes {
+		v.identityNamespace = ""
+	}
 	v.ip = strings.TrimSpace(h.IP)
 	v.hostname = h.Hostname
 	v.mac = h.MAC
@@ -353,8 +368,9 @@ func qualifiedReference(view subjectView) (class, namespace, reference string) {
 		// Scanner-reported MAC reference: exact ID equality within
 		// scope. This means only "the scanner used the same MAC
 		// reference", not spoof resistance or proof of physical
-		// identity across MAC changes.
-		return SubjectReportedDevice, "", view.hostID
+		// identity across MAC changes. A reported namespace rides
+		// along verbatim; it qualifies nothing by itself.
+		return SubjectReportedDevice, view.identityNamespace, view.hostID
 	case "ip":
 		// A scanner-reported ip-derived reference, consistent with
 		// the reported address when one is present.

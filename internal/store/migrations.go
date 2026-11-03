@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 22
+const supportedSchemaVersion = 23
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -152,6 +152,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 21, migrateV21)
 		case 21:
 			err = applyMigration(db, 22, migrateV22)
+		case 22:
+			err = applyMigration(db, 23, migrateV23)
 		}
 		if err != nil {
 			return err
@@ -423,6 +425,25 @@ func migrateV22(tx *sql.Tx) error {
 		)`,
 		`CREATE INDEX review_rules_scope ON review_rules(source_scope, identity_namespace, upstream_reference)`,
 		`ALTER TABLE purge_runs ADD COLUMN rules_deleted INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV23 records the two scope dimensions review demanded for
+// exact application: the upstream identity revision (§5.2 voids on
+// unknown/changed revision) and the canonical changed-field set
+// (out-of-scope fields void application). Both default empty so
+// existing rows keep their meaning; matching treats them as exact
+// scope fields like every other column.
+func migrateV23(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE review_rules ADD COLUMN identity_revision TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE review_rules ADD COLUMN changed_fields_csv TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt); err != nil {

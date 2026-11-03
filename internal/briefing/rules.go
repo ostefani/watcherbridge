@@ -3,6 +3,7 @@ package briefing
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -22,28 +23,33 @@ import (
 // provenance and expired grants all read as "no rule", never as trust.
 
 // RuleScope is the exact scope a rule automates: one upstream subject
-// under one source with the change kind and canonical ports the
-// operator judged expected. Matching is byte equality on every field;
-// nothing is inferred, borrowed or approximated.
+// under one source with the identity revision, change kind, canonical
+// ports and canonical changed-field set the operator judged expected.
+// Matching is byte equality on every field; nothing is inferred,
+// borrowed or approximated.
 type RuleScope struct {
 	SourceScope            string
 	ReferenceClass         string
 	IdentityNamespace      string
+	IdentityRevision       string
 	UpstreamReference      string
 	ReportedIdentitySource string
 	ReportedConfidence     string
 	Kind                   string
 	PortsCSV               string
+	ChangedFieldsCSV       string
 }
 
 // canonical renders the scope unambiguously for hashing: a JSON array
 // in fixed field order, so no separator collision can merge two scopes.
 func (s RuleScope) canonical() string {
 	raw, err := json.Marshal([]string{s.SourceScope, s.ReferenceClass, s.IdentityNamespace,
-		s.UpstreamReference, s.ReportedIdentitySource, s.ReportedConfidence, s.Kind, s.PortsCSV})
+		s.IdentityRevision, s.UpstreamReference, s.ReportedIdentitySource, s.ReportedConfidence,
+		s.Kind, s.PortsCSV, s.ChangedFieldsCSV})
 	if err != nil {
 		return strings.Join([]string{s.SourceScope, s.ReferenceClass, s.IdentityNamespace,
-			s.UpstreamReference, s.ReportedIdentitySource, s.ReportedConfidence, s.Kind, s.PortsCSV}, "\x1f")
+			s.IdentityRevision, s.UpstreamReference, s.ReportedIdentitySource, s.ReportedConfidence,
+			s.Kind, s.PortsCSV, s.ChangedFieldsCSV}, "\x1f")
 	}
 	return string(raw)
 }
@@ -104,40 +110,152 @@ func canonicalPorts(events []GroupEvent) string {
 	return strings.Join(out, ",")
 }
 
+// maxChangeFieldRunes bounds one canonicalized change-field name. A
+// hostile changes[] entry cannot bloat rule rows: over-bound names
+// truncate deterministically, identically on both scope sides.
+const maxChangeFieldRunes = 64
+
+// canonicalChangeFields reduces decoded group events to the sorted
+// changed-field set proposal derivation and application match
+// exactly: a group carrying changes outside the approved set never
+// borrows its rule. Producer-reported changes[] names fields
+// directly; without them the salient raw differences stand in —
+// hostname, os, device and the other address/identity attributes,
+// plus ports when the reported set moves. Timestamps never qualify:
+// liveness churn must not fragment scopes.
+func canonicalChangeFields(events []GroupEvent) string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(field string) {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			return
+		}
+		if runes := []rune(field); len(runes) > maxChangeFieldRunes {
+			field = string(runes[:maxChangeFieldRunes])
+		}
+		if !seen[field] {
+			seen[field] = true
+			out = append(out, field)
+		}
+	}
+	portsKey := func(v *hostView) string {
+		var keys []string
+		for _, p := range v.Ports {
+			keys = append(keys, p.Protocol+"/"+fmt.Sprint(p.Number)+"/"+p.State)
+		}
+		sort.Strings(keys)
+		return strings.Join(keys, ",")
+	}
+	for _, e := range events {
+		if e.EventType != "host.changed" || e.Previous == nil || e.Current == nil {
+			continue
+		}
+		prev, cur := e.Previous, e.Current
+		if len(e.Changes) > 0 {
+			for _, field := range e.Changes {
+				add(field)
+			}
+			continue
+		}
+		if prev.Hostname != cur.Hostname && (prev.Hostname != "" || cur.Hostname != "") {
+			add("hostname")
+		}
+		if (prev.OS != cur.OS && (prev.OS != "" || cur.OS != "")) ||
+			(prev.Device != cur.Device && (prev.Device != "" || cur.Device != "")) {
+			add("os")
+			add("device")
+		}
+		if prev.IP != cur.IP && (prev.IP != "" || cur.IP != "") {
+			add("ip")
+		}
+		if prev.MAC != cur.MAC && (prev.MAC != "" || cur.MAC != "") {
+			add("mac")
+		}
+		if prev.Vendor != cur.Vendor && (prev.Vendor != "" || cur.Vendor != "") {
+			add("vendor")
+		}
+		if prev.Weak != cur.Weak || prev.Alive != cur.Alive || prev.RandomizedMAC != cur.RandomizedMAC {
+			add("liveness")
+		}
+		if prev.IdentityConfidence != cur.IdentityConfidence &&
+			(prev.IdentityConfidence != "" || cur.IdentityConfidence != "") {
+			add("identity_confidence")
+		}
+		if portsKey(prev) != portsKey(cur) {
+			add("ports")
+		}
+	}
+	sort.Strings(out)
+	return strings.Join(out, ",")
+}
+
+// qualifyRuleSubject is the stable-identity gate (Designv9 §§1.3–1.4,
+// §5.2; Plan Step 28): a subject automates only under a qualified
+// stable contract — reported_device class, high upstream confidence,
+// a non-empty namespace bound to the source registration, and the
+// negotiated stable-identity capability. Anything else, including
+// today's bare MAC references with no namespace, reads as no scope:
+// the feature stays unavailable rather than matching local
+// attributes. Pure so every combination is unit-coverable.
+func qualifyRuleSubject(sub store.ReportedSubject, configuredNS, capabilities string) (RuleScope, bool) {
+	var zero RuleScope
+	if sub.ReferenceClass != store.SubjectReportedDevice || sub.SourceScope == "" ||
+		sub.ReportedIdentitySource == "" || sub.ReportedConfidence != "high" {
+		return zero, false
+	}
+	if sub.IdentityNamespace == "" || sub.IdentityNamespace != configuredNS ||
+		!store.HasCapability(capabilities, store.StableIdentityCapability) {
+		return zero, false
+	}
+	return RuleScope{
+		SourceScope: sub.SourceScope, ReferenceClass: sub.ReferenceClass,
+		IdentityNamespace: sub.IdentityNamespace, UpstreamReference: sub.UpstreamReference,
+		ReportedIdentitySource: sub.ReportedIdentitySource, ReportedConfidence: sub.ReportedConfidence,
+	}, true
+}
+
 // liveSubjectScope loads one group's subject scope: every linked
-// subject must share one identical reported_device scope with known
-// identity standing. Anything else — no links, mixed scopes, a
-// non-device class, an empty source or unknown confidence — reads as
-// no scope, so rules never fire on ambiguity or incomplete provenance.
+// subject must share one identical qualified stable scope. Anything
+// else — no links, mixed scopes, an unqualified class, an unbound
+// namespace or a missing capability — reads as no scope, so rules
+// never fire on ambiguity, incomplete provenance or an unnegotiated
+// identity contract.
 func liveSubjectScope(ctx context.Context, st *store.Store, groupID string) (RuleScope, bool, error) {
 	var zero RuleScope
 	links, _, err := st.GroupSubjects(ctx, groupID)
 	if err != nil || len(links) == 0 {
 		return zero, false, err
 	}
-	scope := RuleScope{}
+	var sub store.ReportedSubject
 	for i, link := range links {
-		sub, err := st.ReportedProfile(ctx, link.ProfileID)
+		one, err := st.ReportedProfile(ctx, link.ProfileID)
 		if err != nil {
 			return zero, false, err
 		}
-		part := RuleScope{
-			SourceScope: sub.SourceScope, ReferenceClass: sub.ReferenceClass,
-			IdentityNamespace: sub.IdentityNamespace, UpstreamReference: sub.UpstreamReference,
-			ReportedIdentitySource: sub.ReportedIdentitySource, ReportedConfidence: sub.ReportedConfidence,
-		}
-		part.Kind, part.PortsCSV = scope.Kind, scope.PortsCSV
 		if i == 0 {
-			scope = part
+			sub = one
 			continue
 		}
-		if part != scope {
+		if one.SourceScope != sub.SourceScope || one.ReferenceClass != sub.ReferenceClass ||
+			one.IdentityNamespace != sub.IdentityNamespace || one.UpstreamReference != sub.UpstreamReference ||
+			one.ReportedIdentitySource != sub.ReportedIdentitySource || one.ReportedConfidence != sub.ReportedConfidence {
 			return zero, false, nil
 		}
 	}
-	if scope.ReferenceClass != store.SubjectReportedDevice || scope.SourceScope == "" ||
-		scope.ReportedIdentitySource == "" ||
-		(scope.ReportedConfidence != "low" && scope.ReportedConfidence != "high") {
+	if sub.SourceScope == "" {
+		return zero, false, nil
+	}
+	configuredNS, capabilities, err := st.SourceIdentity(ctx, sub.SourceScope)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// No registration contract: unavailable, not an error.
+			return zero, false, nil
+		}
+		return zero, false, err
+	}
+	scope, ok := qualifyRuleSubject(sub, configuredNS, capabilities)
+	if !ok {
 		return zero, false, nil
 	}
 	return scope, true, nil
@@ -171,6 +289,7 @@ func scopeForBriefing(ctx context.Context, st *store.Store, b store.Briefing) (R
 	}
 	scope.Kind = b.Kind
 	scope.PortsCSV = canonicalPorts(events)
+	scope.ChangedFieldsCSV = canonicalChangeFields(events)
 	return scope, true, nil
 }
 
@@ -180,15 +299,24 @@ func scopeForBriefing(ctx context.Context, st *store.Store, b store.Briefing) (R
 // scopes with at least proposeAfter briefings. Scopes with an active
 // grant or an explicit decline are not proposals; revoked scopes
 // re-propose (the evidence still stands, the automation stopped).
+// maxProposalEvidenceIDs bounds the distinct briefing IDs one
+// derivation collects (Designv9 §4.6: explicit cardinality bounds,
+// never reliance on retention age). The scan runs newest-first, so a
+// busy history keeps recent judgments — the evidence automation acts
+// on — and drops the oldest first. Small histories never notice the
+// bound; operator routes stay bounded regardless of fleet size.
+const maxProposalEvidenceIDs = 2000
+
 func DeriveProposals(ctx context.Context, st *store.Store, proposeAfter int, now time.Time) ([]Proposal, error) {
 	if proposeAfter < 1 {
 		return nil, fmt.Errorf("%w: propose-after must be positive", store.ErrRuleInvalid)
 	}
 	var ids []string
 	seenBriefing := map[string]bool{}
-	var afterRowID int64
-	for {
-		page, err := st.ExpectedBriefingDecisions(ctx, afterRowID, 500)
+	var beforeRowID int64
+	capped := false
+	for !capped {
+		page, err := st.ExpectedBriefingDecisionsDesc(ctx, beforeRowID, 500)
 		if err != nil {
 			return nil, err
 		}
@@ -196,10 +324,14 @@ func DeriveProposals(ctx context.Context, st *store.Store, proposeAfter int, now
 			break
 		}
 		for _, d := range page {
-			afterRowID = d.RowID
+			beforeRowID = d.RowID
 			if !seenBriefing[d.BriefingID] {
 				seenBriefing[d.BriefingID] = true
 				ids = append(ids, d.BriefingID)
+				if len(ids) >= maxProposalEvidenceIDs {
+					capped = true
+					break
+				}
 			}
 		}
 		if len(page) < 500 {
@@ -290,9 +422,10 @@ func resolveScope(ctx context.Context, st *store.Store, proposalID string, propo
 	}
 	return RuleScope{
 		SourceScope: row.SourceScope, ReferenceClass: row.ReferenceClass,
-		IdentityNamespace: row.IdentityNamespace, UpstreamReference: row.UpstreamReference,
+		IdentityNamespace: row.IdentityNamespace, IdentityRevision: row.IdentityRevision,
+		UpstreamReference:      row.UpstreamReference,
 		ReportedIdentitySource: row.ReportedIdentitySource, ReportedConfidence: row.ReportedConfidence,
-		Kind: row.Kind, PortsCSV: row.PortsCSV,
+		Kind: row.Kind, PortsCSV: row.PortsCSV, ChangedFieldsCSV: row.ChangedFieldsCSV,
 	}, &row, nil
 }
 
@@ -319,9 +452,10 @@ func ruleRow(scope RuleScope, status string, now time.Time) store.Rule {
 	return store.Rule{
 		RuleID: scope.RuleID(), ProposalID: scope.ProposalID(),
 		SourceScope: scope.SourceScope, ReferenceClass: scope.ReferenceClass,
-		IdentityNamespace: scope.IdentityNamespace, UpstreamReference: scope.UpstreamReference,
+		IdentityNamespace: scope.IdentityNamespace, IdentityRevision: scope.IdentityRevision,
+		UpstreamReference:      scope.UpstreamReference,
 		ReportedIdentitySource: scope.ReportedIdentitySource, ReportedConfidence: scope.ReportedConfidence,
-		Kind: scope.Kind, PortsCSV: scope.PortsCSV,
+		Kind: scope.Kind, PortsCSV: scope.PortsCSV, ChangedFieldsCSV: scope.ChangedFieldsCSV,
 		Status: status, DecidedAt: now,
 	}
 }
@@ -331,7 +465,7 @@ func ruleRow(scope RuleScope, status string, now time.Time) store.Rule {
 // grant. Revoked and lapsed grants re-approve under the same IDs —
 // the proposal still stands, only the automation stopped.
 func ApproveProposal(ctx context.Context, st *store.Store, proposalID string, proposeAfter, ttlDays int, defaultTTL time.Duration, now time.Time) (store.Rule, bool, error) {
-	scope, row, err := resolveScope(ctx, st, proposalID, proposeAfter, now)
+	scope, _, err := resolveScope(ctx, st, proposalID, proposeAfter, now)
 	if err != nil {
 		return store.Rule{}, false, err
 	}
@@ -339,44 +473,47 @@ func ApproveProposal(ctx context.Context, st *store.Store, proposalID string, pr
 	if err != nil {
 		return store.Rule{}, false, err
 	}
-	if row != nil {
-		switch {
-		case row.Status == store.RuleDismissed:
-			return store.Rule{}, false, store.ErrRuleDismissed
-		case row.Status == store.RuleApproved && !row.Expired(now):
-			return *row, false, nil
+	// The lifecycle check rides the write transaction: a concurrent
+	// dismiss between resolution and approval loses with a 409 instead
+	// of being overwritten.
+	return st.TransitionRule(ctx, scope.RuleID(), func(existing *store.Rule) (*store.Rule, error) {
+		if existing != nil {
+			switch {
+			case existing.Status == store.RuleDismissed:
+				return nil, store.ErrRuleDismissed
+			case existing.Status == store.RuleApproved && !existing.Expired(now):
+				return existing, nil
+			}
 		}
-	}
-	r := ruleRow(scope, store.RuleApproved, now)
-	r.ApprovedAt, r.HasApprovedAt = now, true
-	r.ExpiresAt, r.HasExpiresAt = expires, hasExpires
-	if err := st.PutRule(ctx, r); err != nil {
-		return store.Rule{}, false, err
-	}
-	return r, true, nil
+		r := ruleRow(scope, store.RuleApproved, now)
+		r.ApprovedAt, r.HasApprovedAt = now, true
+		r.ExpiresAt, r.HasExpiresAt = expires, hasExpires
+		return &r, nil
+	})
 }
 
 // DismissProposal declines a proposal: unknown IDs 404, and declining
 // an active grant is a 409 (revoke ends automation; dismiss declines
 // proposals). Repeat dismissal succeeds without change.
 func DismissProposal(ctx context.Context, st *store.Store, proposalID string, proposeAfter int, now time.Time) (store.Rule, bool, error) {
-	scope, row, err := resolveScope(ctx, st, proposalID, proposeAfter, now)
+	scope, _, err := resolveScope(ctx, st, proposalID, proposeAfter, now)
 	if err != nil {
 		return store.Rule{}, false, err
 	}
-	if row != nil {
-		switch {
-		case row.Status == store.RuleApproved && !row.Expired(now):
-			return store.Rule{}, false, store.ErrRuleActive
-		case row.Status == store.RuleDismissed:
-			return *row, false, nil
+	// Like approval, the conflict check shares the write transaction
+	// so a concurrent approve cannot slip past a dismissal.
+	return st.TransitionRule(ctx, scope.RuleID(), func(existing *store.Rule) (*store.Rule, error) {
+		if existing != nil {
+			switch {
+			case existing.Status == store.RuleApproved && !existing.Expired(now):
+				return nil, store.ErrRuleActive
+			case existing.Status == store.RuleDismissed:
+				return existing, nil
+			}
 		}
-	}
-	r := ruleRow(scope, store.RuleDismissed, now)
-	if err := st.PutRule(ctx, r); err != nil {
-		return store.Rule{}, false, err
-	}
-	return r, true, nil
+		r := ruleRow(scope, store.RuleDismissed, now)
+		return &r, nil
+	})
 }
 
 // RevokeRule ends an approved grant: unknown IDs 404, and repeat
@@ -389,26 +526,25 @@ func RevokeRule(ctx context.Context, st *store.Store, ruleID string, now time.Ti
 	if !strings.HasPrefix(ruleID, "OP_RULE_") {
 		return store.Rule{}, false, fmt.Errorf("%w: not a rule id", store.ErrRuleInvalid)
 	}
-	row, err := st.GetRule(ctx, ruleID)
-	if err != nil {
-		return store.Rule{}, false, store.ErrRuleUnknown
-	}
-	switch row.Status {
-	case store.RuleRevoked:
-		return row, false, nil
-	case store.RuleApproved:
-		// A lapsed grant is already inactive; revoking records the
-		// explicit terminal state with a fresh retention horizon.
-		row.Status = store.RuleRevoked
-		row.DecidedAt = now
-		if err := st.PutRule(ctx, row); err != nil {
-			return store.Rule{}, false, err
+	return st.TransitionRule(ctx, ruleID, func(existing *store.Rule) (*store.Rule, error) {
+		if existing == nil {
+			return nil, store.ErrRuleUnknown
 		}
-		return row, true, nil
-	default:
-		// Declined scopes never carried a grant: nothing to end.
-		return store.Rule{}, false, store.ErrRuleUnknown
-	}
+		row := *existing
+		switch row.Status {
+		case store.RuleRevoked:
+			return existing, nil
+		case store.RuleApproved:
+			// A lapsed grant is already inactive; revoking records the
+			// explicit terminal state with a fresh retention horizon.
+			row.Status = store.RuleRevoked
+			row.DecidedAt = now
+			return &row, nil
+		default:
+			// Declined scopes never carried a grant: nothing to end.
+			return nil, store.ErrRuleUnknown
+		}
+	})
 }
 
 // ApplyOperatorRules applies one approved rule as an explicit
@@ -435,9 +571,10 @@ func ApplyOperatorRules(ctx context.Context, st *store.Store, taken store.TakenG
 	}
 	scope.Kind = KindForTaken(taken, outcome.RuleID)
 	scope.PortsCSV = canonicalPorts(events)
+	scope.ChangedFieldsCSV = canonicalChangeFields(events)
 	rule, found, err := st.MatchRule(ctx, scope.SourceScope, scope.ReferenceClass, scope.IdentityNamespace,
-		scope.UpstreamReference, scope.ReportedIdentitySource, scope.ReportedConfidence,
-		scope.Kind, scope.PortsCSV, now)
+		scope.IdentityRevision, scope.UpstreamReference, scope.ReportedIdentitySource, scope.ReportedConfidence,
+		scope.Kind, scope.PortsCSV, scope.ChangedFieldsCSV, now)
 	if err != nil || !found {
 		return outcome
 	}

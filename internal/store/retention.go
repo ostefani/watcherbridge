@@ -406,7 +406,12 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				AND NOT EXISTS (SELECT 1 FROM reported_observations WHERE reported_observations.profile_id = reported_subjects.profile_id)
 				AND NOT EXISTS (SELECT 1 FROM group_subjects WHERE group_subjects.profile_id = reported_subjects.profile_id)
 				AND NOT EXISTS (SELECT 1 FROM briefing_subjects WHERE briefing_subjects.profile_id = reported_subjects.profile_id)
-				AND NOT EXISTS (SELECT 1 FROM operator_decisions WHERE operator_decisions.subject_kind = 'reported_subject' AND operator_decisions.subject_id = reported_subjects.profile_id AND operator_decisions.created_at >= ?) ORDER BY last_report_at, rowid LIMIT ?)`, limit, plan.subjectCut, plan.decisionCut, limit); err != nil {
+				AND NOT EXISTS (SELECT 1 FROM operator_decisions WHERE operator_decisions.subject_kind = 'reported_subject' AND operator_decisions.subject_id = reported_subjects.profile_id AND operator_decisions.created_at >= ?)
+				AND NOT EXISTS (SELECT 1 FROM review_rules WHERE review_rules.source_scope = reported_subjects.source_scope
+					AND review_rules.reference_class = reported_subjects.reference_class
+					AND review_rules.identity_namespace = reported_subjects.identity_namespace
+					AND review_rules.upstream_reference = reported_subjects.upstream_reference
+					AND review_rules.status = 'approved' AND (review_rules.expires_at IS NULL OR review_rules.expires_at > ?)) ORDER BY last_report_at, rowid LIMIT ?)`, limit, plan.subjectCut, plan.decisionCut, plan.now, limit); err != nil {
 				return err
 			}
 			// Decision audit expires purely by row age: the effective
@@ -423,12 +428,15 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				return err
 			}
 			// Terminal rule rows (dismissed, revoked, or approved but
-			// expired) older than the rule horizon drain while no
-			// retained briefing still records their rule ID as its
-			// baseline: referenced rules retire with their briefings,
-			// never before. Live grants are never eligible.
+			// expired) drain past the rule horizon while no retained
+			// briefing still records their rule ID as its baseline:
+			// referenced rules retire with their briefings, never
+			// before. Live grants are never eligible. An expired
+			// grant's horizon runs from its expiry, not its approval:
+			// decided_at stays the approval time, so measuring from
+			// it would purge a long grant the moment it lapses.
 			limit = deleteLimit()
-			if err := take("review_rules", plan.ruleCut, `DELETE FROM review_rules WHERE rowid IN (SELECT rowid FROM review_rules WHERE decided_at < ?
+			if err := take("review_rules", plan.ruleCut, `DELETE FROM review_rules WHERE rowid IN (SELECT rowid FROM review_rules WHERE (CASE WHEN status = 'approved' THEN expires_at ELSE decided_at END) < ?
 				AND (status IN ('dismissed','revoked') OR (status = 'approved' AND expires_at IS NOT NULL AND expires_at < ?))
 				AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.baseline_rule = review_rules.rule_id) ORDER BY decided_at, rowid LIMIT ?)`, limit, plan.ruleCut, plan.now, limit); err != nil {
 				return err

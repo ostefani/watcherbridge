@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
+	"strings"
 	"time"
 )
 
@@ -53,11 +55,13 @@ type Rule struct {
 	SourceScope            string
 	ReferenceClass         string
 	IdentityNamespace      string
+	IdentityRevision       string
 	UpstreamReference      string
 	ReportedIdentitySource string
 	ReportedConfidence     string
 	Kind                   string
 	PortsCSV               string
+	ChangedFieldsCSV       string
 	Status                 string
 	DecidedAt              time.Time
 	ApprovedAt             time.Time
@@ -67,8 +71,8 @@ type Rule struct {
 }
 
 const ruleColumns = `rule_id, proposal_id, source_scope, reference_class, identity_namespace,
-	upstream_reference, reported_identity_source, reported_confidence, kind, ports_csv,
-	status, decided_at, approved_at, expires_at`
+	identity_revision, upstream_reference, reported_identity_source, reported_confidence, kind, ports_csv,
+	changed_fields_csv, status, decided_at, approved_at, expires_at`
 
 func scanRule(row interface {
 	Scan(dest ...any) error
@@ -76,8 +80,8 @@ func scanRule(row interface {
 	var decided int64
 	var approved, expires sql.NullInt64
 	if err := row.Scan(&r.RuleID, &r.ProposalID, &r.SourceScope, &r.ReferenceClass, &r.IdentityNamespace,
-		&r.UpstreamReference, &r.ReportedIdentitySource, &r.ReportedConfidence, &r.Kind, &r.PortsCSV,
-		&r.Status, &decided, &approved, &expires); err != nil {
+		&r.IdentityRevision, &r.UpstreamReference, &r.ReportedIdentitySource, &r.ReportedConfidence, &r.Kind, &r.PortsCSV,
+		&r.ChangedFieldsCSV, &r.Status, &decided, &approved, &expires); err != nil {
 		return err
 	}
 	r.DecidedAt = fromNanos(decided)
@@ -137,30 +141,97 @@ func (s *Store) PutRule(ctx context.Context, r Rule) error {
 			expires = nanos(r.ExpiresAt)
 		}
 		_, err := tx.Exec(`INSERT INTO review_rules (rule_id, proposal_id, source_scope, reference_class,
-			identity_namespace, upstream_reference, reported_identity_source, reported_confidence,
-			kind, ports_csv, status, decided_at, approved_at, expires_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			identity_namespace, identity_revision, upstream_reference, reported_identity_source, reported_confidence,
+			kind, ports_csv, changed_fields_csv, status, decided_at, approved_at, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(rule_id) DO UPDATE SET status = excluded.status, decided_at = excluded.decided_at,
 			approved_at = excluded.approved_at, expires_at = excluded.expires_at`,
-			r.RuleID, r.ProposalID, r.SourceScope, r.ReferenceClass, r.IdentityNamespace,
+			r.RuleID, r.ProposalID, r.SourceScope, r.ReferenceClass, r.IdentityNamespace, r.IdentityRevision,
 			r.UpstreamReference, r.ReportedIdentitySource, r.ReportedConfidence, r.Kind, r.PortsCSV,
-			r.Status, nanos(r.DecidedAt), approved, expires)
+			r.ChangedFieldsCSV, r.Status, nanos(r.DecidedAt), approved, expires)
 		return err
 	})
+}
+
+// TransitionRule validates and writes one rule lifecycle step inside a
+// single writer transaction: the conflicting-row read, the step's
+// conflict check and the upsert share the statement's transaction, so
+// concurrent approve/dismiss requests serialize on the writer and the
+// loser observes the winner's row instead of overwriting it. step
+// receives the current row (nil when the scope was never recorded)
+// and returns the row to store, or the current row with a nil error
+// to leave the stored row untouched (repeat approval/dismissal), or a
+// conflict error such as ErrRuleDismissed or ErrRuleActive that aborts
+// without writing. It reports the resulting row and whether it wrote.
+func (s *Store) TransitionRule(ctx context.Context, ruleID string, step func(existing *Rule) (*Rule, error)) (Rule, bool, error) {
+	var out Rule
+	var applied bool
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		var existing *Rule
+		row := tx.QueryRow(`SELECT `+ruleColumns+` FROM review_rules WHERE rule_id = ?`, ruleID)
+		var r Rule
+		if err := scanRule(row, &r); err != nil {
+			if err != sql.ErrNoRows {
+				return err
+			}
+		} else {
+			existing = &r
+		}
+		next, err := step(existing)
+		if err != nil {
+			return err
+		}
+		if next == nil || next == existing {
+			// A nil or identical row leaves storage untouched:
+			// repeat approval and dismissal succeed without change.
+			if existing != nil {
+				out = *existing
+			}
+			return nil
+		}
+		var approved, expires any
+		if next.HasApprovedAt {
+			approved = nanos(next.ApprovedAt)
+		}
+		if next.HasExpiresAt {
+			expires = nanos(next.ExpiresAt)
+		}
+		_, err = tx.Exec(`INSERT INTO review_rules (rule_id, proposal_id, source_scope, reference_class,
+			identity_namespace, identity_revision, upstream_reference, reported_identity_source, reported_confidence,
+			kind, ports_csv, changed_fields_csv, status, decided_at, approved_at, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(rule_id) DO UPDATE SET status = excluded.status, decided_at = excluded.decided_at,
+			approved_at = excluded.approved_at, expires_at = excluded.expires_at`,
+			next.RuleID, next.ProposalID, next.SourceScope, next.ReferenceClass, next.IdentityNamespace, next.IdentityRevision,
+			next.UpstreamReference, next.ReportedIdentitySource, next.ReportedConfidence, next.Kind, next.PortsCSV,
+			next.ChangedFieldsCSV, next.Status, nanos(next.DecidedAt), approved, expires)
+		if err != nil {
+			return err
+		}
+		out = *next
+		applied = true
+		return nil
+	})
+	if err != nil {
+		return Rule{}, false, err
+	}
+	return out, applied, nil
 }
 
 // MatchRule finds the approved, unexpired rule for one exact scope, or
 // reports false. Every column compares by byte equality and the grant
 // must cover now: drifted, expired or terminal scopes simply miss, so
 // application fails closed without a separate void check.
-func (s *Store) MatchRule(ctx context.Context, sourceScope, referenceClass, namespace, reference,
-	idSource, confidence, kind, portsCSV string, now time.Time) (Rule, bool, error) {
+func (s *Store) MatchRule(ctx context.Context, sourceScope, referenceClass, namespace, revision, reference,
+	idSource, confidence, kind, portsCSV, changedFields string, now time.Time) (Rule, bool, error) {
 	var r Rule
 	row := s.db.QueryRowContext(ctx, `SELECT `+ruleColumns+` FROM review_rules
-		WHERE source_scope = ? AND reference_class = ? AND identity_namespace = ? AND upstream_reference = ?
+		WHERE source_scope = ? AND reference_class = ? AND identity_namespace = ? AND identity_revision = ?
+		AND upstream_reference = ?
 		AND reported_identity_source = ? AND reported_confidence = ? AND kind = ? AND ports_csv = ?
+		AND changed_fields_csv = ?
 		AND status = 'approved' AND (expires_at IS NULL OR expires_at > ?)`,
-		sourceScope, referenceClass, namespace, reference, idSource, confidence, kind, portsCSV, nanos(now))
+		sourceScope, referenceClass, namespace, revision, reference, idSource, confidence, kind, portsCSV, changedFields, nanos(now))
 	if err := scanRule(row, &r); err != nil {
 		if err == sql.ErrNoRows {
 			return Rule{}, false, nil
@@ -168,6 +239,65 @@ func (s *Store) MatchRule(ctx context.Context, sourceScope, referenceClass, name
 		return Rule{}, false, err
 	}
 	return r, true, nil
+}
+
+// StableIdentityCapability names the negotiated upstream capability
+// (Designv9 §1.4 I1) a source registration must advertise before its
+// subjects qualify for review-policy rules. No producer emits it yet;
+// until one does, the rules feature stays unavailable rather than
+// matching on bare MAC references. The token is versioned so a future
+// incompatible identity contract cannot silently inherit old rows.
+const StableIdentityCapability = "stable-identity-v1"
+
+// SourceIdentity reads one source registration's identity contract:
+// the configured namespace the receiver bound for stable references,
+// and the capabilities the producer advertised. Empty registration
+// reads as no contract, never an inferred upgrade.
+func (s *Store) SourceIdentity(ctx context.Context, sourceScope string) (namespace, capabilities string, err error) {
+	if sourceScope == "" {
+		return "", "", fmt.Errorf("empty source scope")
+	}
+	err = s.db.QueryRowContext(ctx, `SELECT configured_identity_namespace, capabilities
+		FROM report_sources WHERE source_scope = ?`, sourceScope).Scan(&namespace, &capabilities)
+	if err != nil {
+		return "", "", err
+	}
+	return namespace, capabilities, nil
+}
+
+// HasCapability reports whether a comma-separated capabilities value
+// advertises a token with exact, trimmed equality.
+func HasCapability(capabilities, token string) bool {
+	for _, part := range strings.Split(capabilities, ",") {
+		if strings.TrimSpace(part) == token {
+			return true
+		}
+	}
+	return false
+}
+
+// BindSourceIdentity records the receiver's negotiated identity
+// contract for one source scope (Designv9 §1.4): the namespace the
+// receiver bound for stable references and the capabilities the
+// producer advertised. Rule eligibility reads this binding; an empty
+// binding means no stable contract, never an inferred upgrade. The
+// row is created when missing so a deployment can bind before first
+// ingest.
+func (s *Store) BindSourceIdentity(ctx context.Context, sourceScope, namespace, capabilities string) error {
+	if sourceScope == "" {
+		return fmt.Errorf("empty source scope")
+	}
+	if namespace == "" {
+		return fmt.Errorf("empty identity namespace")
+	}
+	return s.write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO report_sources (source_scope, configured_identity_namespace, capabilities)
+			VALUES (?, ?, ?)
+			ON CONFLICT(source_scope) DO UPDATE SET
+			configured_identity_namespace = excluded.configured_identity_namespace,
+			capabilities = excluded.capabilities`, sourceScope, namespace, capabilities)
+		return err
+	})
 }
 
 // BriefingByID reads one briefing by its briefing ID, or
@@ -215,6 +345,46 @@ func (s *Store) ExpectedBriefingDecisions(ctx context.Context, afterRowID int64,
 		FROM operator_decisions
 		WHERE kind = 'expected' AND subject_kind = 'briefing' AND rowid > ?
 		ORDER BY rowid ASC LIMIT ?`, afterRowID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ExpectedDecision
+	for rows.Next() {
+		var d ExpectedDecision
+		var created int64
+		if err := rows.Scan(&d.RowID, &d.DecisionID, &d.BriefingID, &created); err != nil {
+			return nil, err
+		}
+		d.CreatedAt = fromNanos(created)
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ExpectedBriefingDecisionsDesc pages expected decisions on briefings
+// newest-first. beforeRowID selects rows strictly below it; zero
+// starts from the newest. Proposal derivation scans this direction so
+// a bounded evidence window keeps recent judgments — the evidence
+// automation should act on — instead of the oldest rows.
+func (s *Store) ExpectedBriefingDecisionsDesc(ctx context.Context, beforeRowID int64, limit int) ([]ExpectedDecision, error) {
+	if beforeRowID < 0 {
+		return nil, fmt.Errorf("negative decision cursor")
+	}
+	bound := beforeRowID
+	if bound == 0 {
+		bound = math.MaxInt64
+	}
+	if limit <= 0 || limit > maxExpectedDecisionPage {
+		limit = maxExpectedDecisionPage
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT rowid, decision_id, subject_id, created_at
+		FROM operator_decisions
+		WHERE kind = 'expected' AND subject_kind = 'briefing' AND rowid < ?
+		ORDER BY rowid DESC LIMIT ?`, bound, limit)
 	if err != nil {
 		return nil, err
 	}
