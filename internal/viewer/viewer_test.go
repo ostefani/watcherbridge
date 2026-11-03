@@ -290,6 +290,52 @@ func TestBriefingEndpointsShapeAndHeaders(t *testing.T) {
 	_ = groups
 }
 
+// Browser links use briefing_id from the list response, while older API callers
+// may still use group_id. Both must resolve the same persisted detail.
+func TestBriefingDetailResolvesListedIDAndGroupAlias(t *testing.T) {
+	s := openViewerStore(t)
+	gid := seedBriefing(t, s, "host:identity", "evt-detail-identity")
+	v := New(s, NewHub())
+	list := httptest.NewRecorder()
+	v.handleBriefings(list, httptest.NewRequest("GET", "/api/briefings?limit=10", nil))
+	var rows []briefingView
+	if err := json.Unmarshal(list.Body.Bytes(), &rows); err != nil || len(rows) != 1 {
+		t.Fatalf("list: %d %v", list.Code, err)
+	}
+	for _, id := range []string{rows[0].BriefingID, gid} {
+		t.Run(id, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			v.handleBriefing(rec, httptest.NewRequest("GET", "/api/briefing?id="+id, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("detail for %s: %d %s", id, rec.Code, rec.Body.String())
+			}
+			var detail briefingView
+			if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+				t.Fatal(err)
+			}
+			if detail.BriefingID != rows[0].BriefingID || detail.GroupID != gid || len(detail.ReferencedEvents) != 1 {
+				t.Fatalf("wrong detail: %+v", detail)
+			}
+		})
+	}
+	for _, id := range []string{"brf-grp-missing", "grp-missing"} {
+		rec := httptest.NewRecorder()
+		v.handleBriefing(rec, httptest.NewRequest("GET", "/api/briefing?id="+id, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("missing %s: %d, want 404", id, rec.Code)
+		}
+	}
+	// An unavailable database is a real server failure, not a missing row.
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	v.handleBriefing(rec, httptest.NewRequest("GET", "/api/briefing?id="+rows[0].BriefingID, nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("closed database: %d, want 500", rec.Code)
+	}
+}
+
 func TestBriefingDetailServesTrace(t *testing.T) {
 	_ = t
 	s := openViewerStore(t)

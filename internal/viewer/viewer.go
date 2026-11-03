@@ -12,6 +12,7 @@ import (
 	"embed"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log"
@@ -926,7 +927,16 @@ func (v *Viewer) handleBriefing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	b, err := v.store.BriefingForGroup(ctx, id)
+	// Browser links use the stored briefing ID. Keep group IDs as an API
+	// alias, but only fall back on an actual miss, never on a store failure.
+	b, err := v.store.BriefingByID(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		b, err = v.store.BriefingForGroup(ctx, id)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		writeViewerError(w, "briefing not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
 		writeError(w, err)
 		return
