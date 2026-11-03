@@ -163,18 +163,18 @@ func TestProducerEnvelopeMismatchRejected(t *testing.T) {
 			`"target":"192.168.0.0/24","host":{"alive":true,"ip":"192.168.0.99","weak":false}}`)
 	}
 	for _, tc := range []struct {
-		name    string
-		bodyID  string
-		bodyKey string
-		bodyTyp string
+		name string
+		// mutate rewrites one body field away from the header values;
+		// the other two stay equal, so each case isolates its field.
+		mutate func(id, key, typ string) (string, string, string)
 	}{
-		{"event id", "evt-body-differs", "host-a", "host.appeared"},
-		{"event key", "evt-mismatch-1", "key-differs", "host.appeared"},
-		{"event type", "evt-mismatch-2", "host-a", "host.changed"},
+		{"event id", func(id, key, typ string) (string, string, string) { return "evt-body-differs", key, typ }},
+		{"event key", func(id, key, typ string) (string, string, string) { return id, "key-differs", typ }},
+		{"event type", func(id, key, typ string) (string, string, string) { return id, key, "host.changed" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			id := uniqueID()
-			body := base(tc.bodyID, tc.bodyKey, tc.bodyTyp)
+			body := base(tc.mutate(id, "host-a", "host.appeared"))
 			ts := strconv.FormatInt(now.Unix(), 10)
 			// Valid signature over the header identity plus these exact
 			// body bytes: authentication passes, consistency must fail.
