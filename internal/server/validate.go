@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -65,6 +66,28 @@ func parseAndValidate(now time.Time, tolerance time.Duration, timestamp, eventID
 		return time.Time{}, fmt.Errorf("stale timestamp")
 	}
 	return sigTime, nil
+}
+
+// checkEnvelopeConsistency requires the body's echoed event_id, event_key
+// and event_type to equal the signed headers. The HMAC covers raw body
+// bytes, not parsed semantics, so a valid signature alone cannot
+// reconcile two envelope identities: grouping keys the header identity
+// while projection reads the body, and a split envelope would fork the
+// pipeline's view of one delivery. Malformed bodies and mismatches are
+// both 400s with static text, carrying no request content.
+func checkEnvelopeConsistency(body []byte, eventID, eventKey, eventType string) error {
+	var env struct {
+		EventID   string `json:"event_id"`
+		EventKey  string `json:"event_key"`
+		EventType string `json:"event_type"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return &malformedError{"invalid event body"}
+	}
+	if env.EventID != eventID || env.EventKey != eventKey || env.EventType != eventType {
+		return &malformedError{"body envelope does not match signed headers"}
+	}
+	return nil
 }
 
 // validSignature recomputes Pro's HMAC-SHA256 over

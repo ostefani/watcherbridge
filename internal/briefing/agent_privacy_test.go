@@ -41,8 +41,13 @@ func TestAgentOversizedTranscriptBlocksWithoutSend(t *testing.T) {
 }
 
 // The scanner reports undecodable input as an error, never a silent
-// pass: the agent's err != nil branch is what keeps a scanner failure
-// fail-closed.
+// pass. Scope honesty: this pins the scanner half of the fail-closed
+// pair. The caller half (`err != nil` in scanTranscript) is defensive
+// only — neutralizeReferenceIDs returns either its valid marshaled
+// input or a fresh valid marshal, so no reachable transcript makes the
+// scan input undecodable. The zero-send mapping it guards is shared
+// with the leak and cap blocks and is covered for both; see the matrix
+// row for the inspection record.
 func TestScannerErrorIsAnError(t *testing.T) {
 	if _, err := redactor.ScanOutboundLeaks([]byte("not json {{{"), nil, nil); err == nil {
 		t.Fatal("undecodable scan input must error, not pass clean")

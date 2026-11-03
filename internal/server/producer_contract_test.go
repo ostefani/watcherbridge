@@ -149,6 +149,80 @@ type producerFixture struct {
 	views map[string]identityView // views that must be present, with exact identity
 }
 
+// serializerAlwaysEmitted pins the HostState keys the pinned producer
+// serializer emits unconditionally (no `omitempty` on watch/types.go):
+// every qualified fixture view must carry them, including empty values.
+// The unknown-compatibility fixture deliberately does not; it stays an
+// explicitly negative case, never a serializer golden.
+var serializerAlwaysEmitted = []string{
+	"ip", "hostname", "mac", "randomized_mac", "vendor", "os",
+	"device", "source", "alive", "weak",
+}
+
+// TestProducerFixturesCarrySerializerKeys pins fixture fidelity against
+// the pinned serializer: qualified views carry every always-emitted
+// key, and the compatibility fixture stays explicitly incomplete.
+func TestProducerFixturesCarrySerializerKeys(t *testing.T) {
+	qualified := []string{
+		"appeared-mac.json", "appeared-ip.json", "appeared-provided.json",
+		"changed-previous-current.json", "changed-randomized.json",
+	}
+	for _, file := range qualified {
+		body, err := os.ReadFile(filepath.Join("testdata", "producer", file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var env struct {
+			Host     map[string]any `json:"host"`
+			Previous map[string]any `json:"previous"`
+			Current  map[string]any `json:"current"`
+		}
+		if err := json.Unmarshal(body, &env); err != nil {
+			t.Fatalf("%s: %v", file, err)
+		}
+		views := map[string]map[string]any{"host": env.Host, "previous": env.Previous, "current": env.Current}
+		found := false
+		for name, view := range views {
+			if view == nil {
+				continue
+			}
+			found = true
+			for _, key := range serializerAlwaysEmitted {
+				if _, ok := view[key]; !ok {
+					t.Fatalf("%s: view %q omits always-emitted key %q", file, name, key)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("%s: no host views present", file)
+		}
+	}
+	// The compatibility fixture must stay incomplete: promoting it to
+	// a qualified golden would erase the negative case.
+	raw, err := os.ReadFile(filepath.Join("testdata", "producer", "appeared-unknown.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env struct {
+		Host map[string]any `json:"host"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Host == nil {
+		t.Fatal("appeared-unknown.json: host view missing")
+	}
+	missing := 0
+	for _, key := range serializerAlwaysEmitted {
+		if _, ok := env.Host[key]; !ok {
+			missing++
+		}
+	}
+	if missing == 0 {
+		t.Fatal("appeared-unknown.json looks serializer-complete; keep it explicitly negative")
+	}
+}
+
 type producerEnvelope struct {
 	EventID   string `json:"event_id"`
 	EventKey  string `json:"event_key"`

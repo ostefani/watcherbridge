@@ -287,6 +287,21 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Metadata consistency (Designv9 §1.1) before grouping, persistence
+	// or forwarding: the body's echoed envelope must equal the signed
+	// headers. The heartbeat branch above enforces the same comparison
+	// inside decodeHeartbeat; host events need it here.
+	if err := checkEnvelopeConsistency(body, eventID, eventKey, eventType); err != nil {
+		s.Health.AddRejected()
+		var malformed *malformedError
+		if errors.As(err, &malformed) {
+			writeError(w, http.StatusBadRequest, malformed.Error())
+		} else {
+			writeError(w, http.StatusUnauthorized, err.Error())
+		}
+		return
+	}
+
 	release, wait := s.gate.Acquire(eventID)
 	if wait != nil {
 		// Duplicate while the holder is in flight: drop our body copy

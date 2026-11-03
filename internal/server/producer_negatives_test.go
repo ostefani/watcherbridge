@@ -148,6 +148,48 @@ func TestFailureResponsesCarryNoRequestContent(t *testing.T) {
 	}
 }
 
+// A signed envelope whose body echoes different event_id, event_key or
+// event_type than the signed headers is rejected before persistence:
+// the HMAC covers raw bytes, not parsed semantics, so a valid signature
+// alone cannot reconcile two envelope identities (Designv9 §1.1
+// metadata consistency; the heartbeat path already enforces the same
+// comparison). Nothing is stored or grouped from a split envelope.
+func TestProducerEnvelopeMismatchRejected(t *testing.T) {
+	h := newTapHarness(t)
+	now := time.Now()
+	base := func(id, key, typ string) []byte {
+		return []byte(`{"event_id":` + strconv.Quote(id) + `,"event_key":` + strconv.Quote(key) +
+			`,"event_type":` + strconv.Quote(typ) + `,"occurred_at":"2026-10-20T12:00:05Z","cycle":1,` +
+			`"target":"192.168.0.0/24","host":{"alive":true,"ip":"192.168.0.99","weak":false}}`)
+	}
+	for _, tc := range []struct {
+		name    string
+		bodyID  string
+		bodyKey string
+		bodyTyp string
+	}{
+		{"event id", "evt-body-differs", "host-a", "host.appeared"},
+		{"event key", "evt-mismatch-1", "key-differs", "host.appeared"},
+		{"event type", "evt-mismatch-2", "host-a", "host.changed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := uniqueID()
+			body := base(tc.bodyID, tc.bodyKey, tc.bodyTyp)
+			ts := strconv.FormatInt(now.Unix(), 10)
+			// Valid signature over the header identity plus these exact
+			// body bytes: authentication passes, consistency must fail.
+			rec := h.post(t, body, id, "host-a", "host.appeared", now,
+				sign(h.secret, ts, id, "host-a", "host.appeared", body))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("split envelope: got %d, want 400 (%s)", rec.Code, rec.Body.String())
+			}
+			if _, err := h.srv.events.StoredEvent(context.Background(), id); err == nil {
+				t.Fatal("split envelope was persisted")
+			}
+		})
+	}
+}
+
 // A changed event carrying no previous/current views is still a valid
 // producer report: grouping falls back to the event itself and the
 // payload is preserved, not rejected for missing views.
