@@ -80,7 +80,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for engineering conventions.
 
 ## Submission scope
 
-WatcherBridge was built during the hackathon. The scanner and optional ScanRelay consumer predate this submission; their source code is outside this repository. The included demo and test fixtures use synthetic data.
+This submission consists solely of WatcherBridge, built during the hackathon. SubnetLens Pro and ScanRelay are external integrations and are not part of the submission.
 
 ## License
 
