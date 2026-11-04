@@ -576,6 +576,21 @@ cases.push(
   { component: Detail, name: 'embedded briefing keeps evidence and decisions', props: { id: 'brf-grp-1', initial: detailFixture, embedded: true }, expect: ['Reported evidence', 'Record decision', 'Recommended check'], absent: ['Back to Home', '<img'] }
 );
 
+// Live attention membership changes after decisions, window expiry or a new
+// top-N cut. The chosen review remains available even when its row disappears.
+for (const kind of ['briefing', 'incident']) {
+  const id = kind === 'briefing' ? attentionItem.id : 'inc-11-22';
+  for (const attention of [[], [{ ...attentionItem, id: 'brf-another' }]]) {
+    cases.push({
+      name: `${kind} selection survives ${attention.length ? 'replacement' : 'empty'} attention`,
+      props: { overview: base({ attention }), selected: { id, kind } },
+      expect: ['aria-label="Selected review"', `href="#/${kind === 'briefing' ? 'briefing' : 'incidents'}/${id}"`, 'Close review', 'data-empty="false"'],
+      absent: ['Select a review</h2>', 'data-empty="true"']
+    });
+  }
+}
+cases.push({ name: 'closed review allows empty layout', props: { overview: base(), selected: null }, expect: ['data-empty="true"'], absent: ['aria-label="Selected review"', 'Close review'] });
+
 for (const c of cases) {
   const { body } = render(c.component ?? Home, { props: c.props });
   // Strip SSR hydration markers, which split copy across expressions.

@@ -10,10 +10,20 @@
   // receipts -> attention -> digest. Explicit states for loading, fetch
   // errors, no reports, quiet, degraded, and blind — never a green badge
   // that hides coverage.
-  let { overview = null, loadError = null } = $props();
+  // Selection belongs to the workspace, not the live attention cut. A decision
+  // may remove its row before Detail finishes reloading the decision audit.
+  // Keep only the routing identity; Detail/Incident own the current evidence.
+  let { overview = null, loadError = null, selected = $bindable(null) } = $props();
+  const selectedId = $derived(selected?.id ?? null);
 
-  let selectedId = $state(null);
-  const selected = $derived((overview?.attention ?? []).find((item) => item.id === selectedId && (item.kind === 'briefing' || item.kind === 'incident')) ?? null);
+  function selectReview(item) {
+    selected = { id: item.id, kind: item.kind };
+  }
+
+  function closeReview() {
+    selected = null;
+    document.getElementById('review-list')?.focus();
+  }
 
   const degraded = $derived(
     overview !== null && (overview.coverage === 'degraded' || overview.coverage === 'blind')
@@ -48,18 +58,22 @@
     window={overview.window}
     lastChange={overview.last_change}
   />
-  <div class="review-workspace" data-empty={overview.attention.length === 0}>
-    <div class="review-list">
-      <AttentionList items={overview.attention} {selectedId} onselect={(item) => (selectedId = item.id)} />
+  <div class="review-workspace" data-empty={overview.attention.length === 0 && selected === null}>
+    <div class="review-list" id="review-list" tabindex="-1">
+      <AttentionList items={overview.attention} {selectedId} onselect={selectReview} />
       {#if selected}<p><a href="#selected-review" onclick={(event) => { event.preventDefault(); document.getElementById('selected-review')?.focus(); }}>Jump to selected review ↓</a></p>{/if}
       <DigestBar digest={overview.digest} explained={overview.explained ?? {}} />
       <SourceCoverage sources={overview.sources} />
       <p class="section-note"><kbd>j</kbd> <kbd>k</kbd> move between rows · <kbd>Enter</kbd> select · <kbd>?</kbd> shortcuts</p>
     </div>
-    {#if overview.attention.length > 0}
+    {#if selected !== null || overview.attention.length > 0}
     <section class="detail-pane" aria-label="Selected review" id="selected-review" tabindex="-1">
       {#if selected}
-        <div class="pane-heading"><span class="eyebrow">Selected review</span><a href={selected.kind === 'briefing' ? `#/briefing/${selected.id}` : `#/incidents/${selected.id}`}>Open full page →</a></div>
+        <div class="pane-heading">
+          <span class="eyebrow">Selected review</span>
+          <a href={selected.kind === 'briefing' ? `#/briefing/${selected.id}` : `#/incidents/${selected.id}`}>Open full page →</a>
+          <button type="button" onclick={closeReview}>Close review</button>
+        </div>
         {#key selected.id}
           {#if selected.kind === 'briefing'}<Detail id={selected.id} embedded />{:else}<Incident id={selected.id} />{/if}
         {/key}
