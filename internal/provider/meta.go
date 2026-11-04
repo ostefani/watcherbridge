@@ -180,6 +180,7 @@ type responsesOutputContent struct {
 
 type responsesOutputItem struct {
 	Type    string                   `json:"type"`
+	Phase   string                   `json:"phase"`
 	Content []responsesOutputContent `json:"content"`
 }
 
@@ -193,31 +194,41 @@ type responsesUsage struct {
 // responsesEnvelope is the Responses API result body. Only the message
 // text is briefing content; everything else is transport.
 type responsesEnvelope struct {
+	Status string                `json:"status"`
 	Output []responsesOutputItem `json:"output"`
 	Usage  *responsesUsage       `json:"usage"`
 }
 
-// extractResponse returns the model's message text — the first
-// non-empty content text in the output array — plus the envelope usage
-// when the API supplies it. An envelope with no text (an error shape,
-// an empty finish) is a provider failure, never a briefing — the worker
-// falls back and the log names this cause.
+// extractResponse joins final message output_text parts in wire order,
+// preserving JSON split across parts. Reasoning, commentary and other
+// content are not answers. The response-body cap bounds the joined text.
+// Unfinished responses and missing answer text are provider failures.
 func extractResponse(raw []byte) ([]byte, Usage, error) {
 	var env responsesEnvelope
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	if err := dec.Decode(&env); err != nil {
 		return nil, Usage{}, fmt.Errorf("decode provider envelope: %v", strings.TrimSpace(err.Error()))
 	}
+	if env.Status != "" && env.Status != "completed" {
+		return nil, Usage{}, fmt.Errorf("provider response did not complete")
+	}
 	var usage Usage
 	if env.Usage != nil {
 		usage = Usage{InputTokens: env.Usage.InputTokens, OutputTokens: env.Usage.OutputTokens, HasUsage: true}
 	}
+	var answer strings.Builder
 	for _, item := range env.Output {
+		if item.Type != "message" || (item.Phase != "" && item.Phase != "final_answer") {
+			continue
+		}
 		for _, c := range item.Content {
-			if c.Text != "" {
-				return []byte(c.Text), usage, nil
+			if c.Type == "output_text" {
+				answer.WriteString(c.Text)
 			}
 		}
+	}
+	if answer.Len() > 0 {
+		return []byte(answer.String()), usage, nil
 	}
 	return nil, Usage{}, fmt.Errorf("provider returned no text output")
 }

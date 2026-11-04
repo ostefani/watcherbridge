@@ -246,7 +246,7 @@ func (l *agentLoop) toolTurn(k int) (done bool) {
 	if call != nil {
 		res := l.env.runTool(turnCtx, call)
 		if corr, rej := isReject(res); rej {
-			return l.repairFlow(turnCtx, repairPromptForTurn(corr), true)
+			return l.repairFlow(turnCtx, corr, true)
 		}
 		if over := l.appendTool(res); over != "" {
 			log.Printf("briefing: group %s agent transcript over budget", l.taken.GroupID)
@@ -261,9 +261,9 @@ func (l *agentLoop) toolTurn(k int) (done bool) {
 			insertModelBriefing(l.parent, l.d, l.taken, l.outcome, a, l.issued, l.display, "agent", l.traces(), l.usage)
 			return true
 		}
-		return l.repairFlow(turnCtx, repairPrompt(a.Correction), true)
+		return l.repairFlow(turnCtx, a.Correction, true)
 	}
-	return l.repairFlow(turnCtx, repairPromptForTurn(correction), true)
+	return l.repairFlow(turnCtx, correction, true)
 }
 
 // finalTurn runs the reserved final turn on the whole remaining budget
@@ -298,10 +298,10 @@ func (l *agentLoop) finalTurn() bool {
 			insertModelBriefing(l.parent, l.d, l.taken, l.outcome, a, l.issued, l.display, "agent", l.traces(), l.usage)
 			return l.finish()
 		}
-		l.repairFlow(turnCtx, repairPrompt(a.Correction), false)
+		l.repairFlow(turnCtx, a.Correction, false)
 		return l.finish()
 	}
-	l.repairFlow(turnCtx, repairPromptForTurn(correction), false)
+	l.repairFlow(turnCtx, correction, false)
 	return l.finish()
 }
 
@@ -313,7 +313,13 @@ func (l *agentLoop) finalTurn() bool {
 // and no turn remains to use the result). An accepted final stores the
 // briefing; anything else falls back. True means terminal, except a
 // tool turn's executed tool call, which continues the loop.
-func (l *agentLoop) repairFlow(turnCtx context.Context, prompt string, allowTool bool) (done bool) {
+func (l *agentLoop) repairFlow(turnCtx context.Context, correction string, allowTool bool) (done bool) {
+	// correction is a fixed validation classification, never model text.
+	log.Printf("briefing: group %s agent output rejected (%s)", l.taken.GroupID, correction)
+	prompt := repairPromptForTurn(correction)
+	if !allowTool {
+		prompt += " This is the final turn: return the complete final briefing only; no further tool calls are allowed."
+	}
 	rep, failReason, ok := l.repairAsk(turnCtx, prompt)
 	if !ok {
 		if failReason == "" {
@@ -326,7 +332,7 @@ func (l *agentLoop) repairFlow(turnCtx context.Context, prompt string, allowTool
 		l.fallback = over
 		return true
 	}
-	c2, f2, _ := parseTurn(rep)
+	c2, f2, correction := parseTurn(rep)
 	if c2 != nil {
 		if !allowTool {
 			log.Printf("briefing: group %s agent tool call on the final turn", l.taken.GroupID)
@@ -346,13 +352,14 @@ func (l *agentLoop) repairFlow(turnCtx context.Context, prompt string, allowTool
 		return false
 	}
 	if f2 {
-		if a := acceptAnswer([]byte(rep), l.taken, l.issued, l.d.Redaction.Enabled, l.maxToolStep()); a.OK {
+		a := acceptAnswer([]byte(rep), l.taken, l.issued, l.d.Redaction.Enabled, l.maxToolStep())
+		if a.OK {
 			insertModelBriefing(l.parent, l.d, l.taken, l.outcome, a, l.issued, l.display, "agent", l.traces(), l.usage)
 			return true
 		}
-		log.Printf("briefing: group %s agent final invalid after repair", l.taken.GroupID)
+		log.Printf("briefing: group %s agent final invalid after repair (%s)", l.taken.GroupID, a.Correction)
 	} else {
-		log.Printf("briefing: group %s agent turn invalid after repair", l.taken.GroupID)
+		log.Printf("briefing: group %s agent turn invalid after repair (%s)", l.taken.GroupID, correction)
 	}
 	l.fallback = "agent output invalid; briefing from deterministic baseline only"
 	return true

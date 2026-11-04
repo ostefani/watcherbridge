@@ -67,7 +67,9 @@ The live adapter uses the Meta Model API with a configurable model ID and endpoi
   -agent-enabled
 ```
 
-This example enables retained-evidence investigation. Keep redaction enabled for external providers. AI explanations are advisory; the bridge remains usable without a model key.
+This example enables retained-evidence investigation. Without `-agent-enabled`, eligible groups use a single model request, with at most one repair. With the flag, groups whose deterministic baseline is medium or higher (by default) can use up to four read-only local evidence tools before a final answer, plus at most one repair across the run. Low-baseline groups still use the single-request path. The investigator can provide retained history and reported-service context, with its executed tools shown in the briefing trace; it may take longer and use more model tokens. It never scans the network or changes the deterministic priority floor. Failed investigation produces a deterministic fallback briefing.
+
+Keep redaction enabled for external providers. AI explanations are advisory; the bridge remains usable without a model key.
 
 ## Operation and development
 
