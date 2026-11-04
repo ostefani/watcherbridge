@@ -24,6 +24,15 @@ func TestDefaultPairs(t *testing.T) {
 	if c.MaxFieldChars != 256 {
 		t.Fatalf("default field cap must be 256, got %d", c.MaxFieldChars)
 	}
+	if c.HeartbeatStaleAfter != 10*time.Minute || c.HeartbeatRetention != 7*24*time.Hour {
+		t.Fatal("H1 defaults must match Designv9")
+	}
+	if c.IncidentTick != 30*time.Second || c.IncidentWindow != 5*time.Minute || c.IncidentQuiet != 120*time.Second {
+		t.Fatal("incident tick/window/quiet defaults must match Designv9 §7")
+	}
+	if c.IncidentMinRefs != 3 || c.IncidentRetention != 90*24*time.Hour {
+		t.Fatal("incident threshold/retention defaults must match Designv9 §7")
+	}
 	// The approved chain: handler = proxy + persist + margin, below Pro's 10s.
 	if want := c.ProxyForwardTimeout + c.PersistBudget + c.Margin; c.HandlerDeadline != want {
 		t.Fatalf("handler deadline %v != proxy+persist+margin %v", c.HandlerDeadline, want)
@@ -37,15 +46,52 @@ func TestDefaultPairs(t *testing.T) {
 	}
 }
 
+func TestOverviewWindowChain(t *testing.T) {
+	good := Default()
+	if err := good.Validate(); err != nil {
+		t.Fatalf("defaults rejected: %v", err)
+	}
+	cases := map[string]func(*Config){
+		"tick below range":    func(c *Config) { c.OverviewTick = 4 * time.Second },
+		"tick above range":    func(c *Config) { c.OverviewTick = 6 * time.Minute },
+		"window above max":    func(c *Config) { c.OverviewWindow = 169 * time.Hour },
+		"max above retention": func(c *Config) { c.OverviewMaxWindow = 31 * 24 * time.Hour },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := Default()
+			mutate(&c)
+			if err := c.Validate(); err == nil {
+				t.Fatal("expected rejection")
+			}
+		})
+	}
+}
+
 func TestValidateRejects(t *testing.T) {
 	cases := map[string]func(*Config){
-		"non-loopback bind":       func(c *Config) { c.Bind = "0.0.0.0:8081" },
-		"bad mode":                func(c *Config) { c.Mode = "stream" },
-		"proxy without URL":       func(c *Config) { c.Mode = ModeProxy; c.ScanRelayURL = "" },
-		"proxy bad scheme":        func(c *Config) { c.Mode = ModeProxy; c.ScanRelayURL = "ftp://x/" },
-		"proxy URL no host":       func(c *Config) { c.Mode = ModeProxy; c.ScanRelayURL = "http://" },
-		"tolerance above relay":   func(c *Config) { c.TimestampTolerance = c.ScanRelayTolerance + time.Second },
-		"handler below chain sum": func(c *Config) { c.HandlerDeadline-- },
+		"zero heartbeat stale horizon":     func(c *Config) { c.HeartbeatStaleAfter = 0 },
+		"zero heartbeat retention":         func(c *Config) { c.HeartbeatRetention = 0 },
+		"incident tick below range":        func(c *Config) { c.IncidentTick = 4 * time.Second },
+		"incident tick above range":        func(c *Config) { c.IncidentTick = 6 * time.Minute },
+		"incident window above retention":  func(c *Config) { c.IncidentWindow = c.BriefingRetention + time.Hour },
+		"incident quiet below one tick":    func(c *Config) { c.IncidentQuiet = c.IncidentTick - time.Second },
+		"incident min refs below two":      func(c *Config) { c.IncidentMinRefs = 1 },
+		"incident retention below a day":   func(c *Config) { c.IncidentRetention = 23 * time.Hour },
+		"incident retention above subject": func(c *Config) { c.IncidentRetention = c.SubjectRetention + time.Hour },
+		"rule propose-after below one":     func(c *Config) { c.RuleProposeAfter = 0 },
+		"rule default ttl non-positive":    func(c *Config) { c.RuleDefaultTTL = 0 },
+		"rule retention below a day":       func(c *Config) { c.RulePurgeAfter = 23 * time.Hour },
+		"non-loopback bind":                func(c *Config) { c.Bind = "0.0.0.0:8081" },
+		"bad mode":                         func(c *Config) { c.Mode = "stream" },
+		"briefing retention below a day":   func(c *Config) { c.BriefingRetention = 23 * time.Hour },
+		"subject retention below briefing": func(c *Config) { c.SubjectRetention = c.BriefingRetention - time.Hour },
+		"purge interval below a minute":    func(c *Config) { c.PurgeInterval = 30 * time.Second },
+		"proxy without URL":                func(c *Config) { c.Mode = ModeProxy; c.ScanRelayURL = "" },
+		"proxy bad scheme":                 func(c *Config) { c.Mode = ModeProxy; c.ScanRelayURL = "ftp://x/" },
+		"proxy URL no host":                func(c *Config) { c.Mode = ModeProxy; c.ScanRelayURL = "http://" },
+		"tolerance above relay":            func(c *Config) { c.TimestampTolerance = c.ScanRelayTolerance + time.Second },
+		"handler below chain sum":          func(c *Config) { c.HandlerDeadline-- },
 		"tolerance plus handler above relay": func(c *Config) {
 			c.TimestampTolerance = c.ScanRelayTolerance
 		},
@@ -120,15 +166,57 @@ func TestValidateRejects(t *testing.T) {
 		"zero provider timeout":   func(c *Config) { c.ProviderTimeout = 0 },
 		"zero response cap":       func(c *Config) { c.MaxModelResponseBytes = 0 },
 		"lease below 2x provider": func(c *Config) { c.ProcessingLease = 2*c.ProviderTimeout + c.Margin },
+		"zero SSE heartbeat":      func(c *Config) { c.SSEHeartbeat = 0 },
+		"zero SSE replay cap":     func(c *Config) { c.SSEReplayMax = 0 },
+		"oversize SSE replay cap": func(c *Config) { c.SSEReplayMax = 501 },
+		"zero SSE write timeout":  func(c *Config) { c.SSEWriteTimeout = 0 },
+		"SSE write over grace":    func(c *Config) { c.SSEWriteTimeout = c.ShutdownGrace },
+		"zero SSE subscribers":    func(c *Config) { c.SSEMaxSubscribers = 0 },
+		"blank viewer host":       func(c *Config) { c.ViewerAllowedHosts = []string{"127.0.0.1:8081", " "} },
+		"zero agent timeout":      func(c *Config) { c.AgentTimeout = 0 },
+		"agent below provider":    func(c *Config) { c.AgentTimeout = c.ProviderTimeout - time.Second },
+		"agent below call+repair": func(c *Config) { c.AgentTimeout = 2 * c.ProviderTimeout },
+		"lease at 2x agent":       func(c *Config) { c.ProcessingLease = 2*c.AgentTimeout + c.Margin },
 		"zero quiet window":       func(c *Config) { c.GroupQuietWindow = 0 },
 		"max window below quiet":  func(c *Config) { c.GroupMaxWindow = time.Second },
 		"group max below quiet":   func(c *Config) { c.GroupMaxWindow = c.GroupQuietWindow - time.Second },
+		"empty source ID":         func(c *Config) { c.SourceID = "" },
+		"source ID with space":    func(c *Config) { c.SourceID = "lab 1" },
+		"source ID with slash":    func(c *Config) { c.SourceID = "lab/1" },
+		"source ID too long":      func(c *Config) { c.SourceID = strings.Repeat("s", 129) },
+		// Designv9 §6.1/§6.4: the loop step count and baseline floors
+		// are startup refusals, never silent routing.
+		"agent steps zero":       func(c *Config) { c.AgentMaxSteps = 0 },
+		"agent steps above four": func(c *Config) { c.AgentMaxSteps = 5 },
+		"agent steps negative":   func(c *Config) { c.AgentMaxSteps = -1 },
+		"unknown model floor":    func(c *Config) { c.ModelMinBaseline = "urgent" },
+		"unknown agent floor":    func(c *Config) { c.AgentMinBaseline = "URGENT" },
+		"blank model floor":      func(c *Config) { c.ModelMinBaseline = "  " },
+		"floors inverted": func(c *Config) {
+			c.ModelMinBaseline, c.AgentMinBaseline = "high", "medium"
+		},
 	}
 	for name, mutate := range cases {
 		c := Default()
 		mutate(&c)
 		if err := c.Validate(); err == nil {
 			t.Errorf("%s: expected validation error", name)
+		}
+	}
+}
+
+// The lease margin is the explicit 30s hand-off margin from Designv8
+// §6.8, not the 1s handler Margin: 182s with a 90s agent budget refuses,
+// 209s refuses, and the 210s default (exactly 2×90s+30s) passes.
+func TestProcessingLeaseMargin(t *testing.T) {
+	if err := Default().Validate(); err != nil {
+		t.Fatalf("default 210s lease must pass: %v", err)
+	}
+	for _, lease := range []time.Duration{182 * time.Second, 209 * time.Second} {
+		c := Default()
+		c.ProcessingLease = lease
+		if err := c.Validate(); err == nil {
+			t.Fatalf("%v lease with a 90s agent budget must refuse", lease)
 		}
 	}
 }
@@ -250,6 +338,13 @@ func TestValidateAllows(t *testing.T) {
 		"skew at edge boundary": func(c *Config) {
 			c.ClockSkewAllowance = c.ScanRelayTolerance - c.TimestampTolerance - c.HandlerDeadline
 		},
+		// Equal floors give the level to the single call; mixed case
+		// normalizes. One tool turn is a legal (if minimal) loop.
+		"equal floors": func(c *Config) { c.ModelMinBaseline, c.AgentMinBaseline = "high", "high" },
+		"mixed-case floors": func(c *Config) {
+			c.ModelMinBaseline, c.AgentMinBaseline = "Medium", "HIGH"
+		},
+		"agent steps at one": func(c *Config) { c.AgentMaxSteps = 1 },
 	}
 	for name, mutate := range cases {
 		c := Default()

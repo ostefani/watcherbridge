@@ -1,0 +1,1 @@
+{"cycle":12,"event_id":"prod-appeared-unknown-1","event_key":"appear:ip:192.168.0.99:w12","event_type":"host.appeared","host":{"alive":true,"ip":"192.168.0.99","weak":false},"occurred_at":"2026-10-20T12:00:05Z","target":"192.168.0.0/24"}

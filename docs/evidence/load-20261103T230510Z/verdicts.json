@@ -1,0 +1,411 @@
+{
+  "verdicts": [
+    {
+      "rep": "1",
+      "workload": "burst",
+      "tap": {
+        "accepted_202": 512,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 7.863,
+        "lat_ms_p50": 2.261,
+        "lat_ms_p99": 5.917,
+        "offered": 512,
+        "rejected_4xx": 0,
+        "sent": 512
+      },
+      "direct": {
+        "accepted_202": 512,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 2.679,
+        "lat_ms_p50": 0.973,
+        "lat_ms_p99": 2.122,
+        "offered": 512,
+        "rejected_4xx": 0,
+        "sent": 512
+      },
+      "proxy": {
+        "accepted_202": 512,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 6.044,
+        "lat_ms_p50": 2.991,
+        "lat_ms_p99": 5.636,
+        "offered": 512,
+        "rejected_4xx": 0,
+        "sent": 512
+      },
+      "tap_p99_ms": 5.952,
+      "direct_p99_ms": 2.129,
+      "proxy_p99_ms": 5.652,
+      "proxy_overhead_p99_ms": null,
+      "stored_tap_phase": 512,
+      "stored_proxy_phase": 512,
+      "checks": {
+        "tap_delivery_accounted": true,
+        "proxy_delivery_accounted": true,
+        "tap_p99_le_50ms": true,
+        "paired_proxy_delta_p99_le_25ms": true
+      },
+      "paired_proxy_delta_p99_ms": 4.813
+    },
+    {
+      "rep": "1",
+      "workload": "sust",
+      "tap": {
+        "accepted_202": 3000,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 16.49,
+        "lat_ms_p50": 1.295,
+        "lat_ms_p99": 5.743,
+        "offered": 3000,
+        "rejected_4xx": 0,
+        "sent": 3000
+      },
+      "direct": {
+        "accepted_202": 3000,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 17.373,
+        "lat_ms_p50": 1.457,
+        "lat_ms_p99": 7.573,
+        "offered": 3000,
+        "rejected_4xx": 0,
+        "sent": 3000
+      },
+      "proxy": {
+        "accepted_202": 3000,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 34.796,
+        "lat_ms_p50": 2.61,
+        "lat_ms_p99": 8.296,
+        "offered": 3000,
+        "rejected_4xx": 0,
+        "sent": 3000
+      },
+      "tap_p99_ms": 5.764,
+      "direct_p99_ms": 7.615,
+      "proxy_p99_ms": 8.361,
+      "proxy_overhead_p99_ms": null,
+      "stored_tap_phase": 3000,
+      "stored_proxy_phase": 3000,
+      "checks": {
+        "tap_delivery_accounted": true,
+        "proxy_delivery_accounted": true,
+        "tap_p99_le_50ms": true,
+        "paired_proxy_delta_p99_le_25ms": true
+      },
+      "paired_proxy_delta_p99_ms": 6.765
+    },
+    {
+      "rep": "1",
+      "forwarded_byte_identity_and_count": true,
+      "expected_forwarded": 3512,
+      "observed_forwarded": 3512
+    },
+    {
+      "rep": "1",
+      "mode": "tap",
+      "resource": {
+        "heap_gc_peak_mb": 10.0,
+        "heap_gc_samples": 1643,
+        "wal_sample_max_kib": 4268.8984375,
+        "wal_samples": 15,
+        "heap_observed_samples_le_64mib": true,
+        "wal_observed_samples_le_64mib": true
+      }
+    },
+    {
+      "rep": "1",
+      "mode": "proxy",
+      "resource": {
+        "heap_gc_peak_mb": 12.0,
+        "heap_gc_samples": 2102,
+        "wal_sample_max_kib": 4731.59375,
+        "wal_samples": 15,
+        "heap_observed_samples_le_64mib": true,
+        "wal_observed_samples_le_64mib": true
+      }
+    },
+    {
+      "rep": "2",
+      "workload": "burst",
+      "tap": {
+        "accepted_202": 512,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 4.613,
+        "lat_ms_p50": 1.864,
+        "lat_ms_p99": 4.367,
+        "offered": 512,
+        "rejected_4xx": 0,
+        "sent": 512
+      },
+      "direct": {
+        "accepted_202": 512,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 2.823,
+        "lat_ms_p50": 0.982,
+        "lat_ms_p99": 2.078,
+        "offered": 512,
+        "rejected_4xx": 0,
+        "sent": 512
+      },
+      "proxy": {
+        "accepted_202": 512,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 5.838,
+        "lat_ms_p50": 2.893,
+        "lat_ms_p99": 5.621,
+        "offered": 512,
+        "rejected_4xx": 0,
+        "sent": 512
+      },
+      "tap_p99_ms": 4.419,
+      "direct_p99_ms": 2.095,
+      "proxy_p99_ms": 5.628,
+      "proxy_overhead_p99_ms": null,
+      "stored_tap_phase": 512,
+      "stored_proxy_phase": 512,
+      "checks": {
+        "tap_delivery_accounted": true,
+        "proxy_delivery_accounted": true,
+        "tap_p99_le_50ms": true,
+        "paired_proxy_delta_p99_le_25ms": true
+      },
+      "paired_proxy_delta_p99_ms": 4.775
+    },
+    {
+      "rep": "2",
+      "workload": "sust",
+      "tap": {
+        "accepted_202": 3000,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 11.372,
+        "lat_ms_p50": 1.491,
+        "lat_ms_p99": 7.117,
+        "offered": 3000,
+        "rejected_4xx": 0,
+        "sent": 3000
+      },
+      "direct": {
+        "accepted_202": 3000,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 23.306,
+        "lat_ms_p50": 1.552,
+        "lat_ms_p99": 3.193,
+        "offered": 3000,
+        "rejected_4xx": 0,
+        "sent": 3000
+      },
+      "proxy": {
+        "accepted_202": 3000,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 16.909,
+        "lat_ms_p50": 2.745,
+        "lat_ms_p99": 8.387,
+        "offered": 3000,
+        "rejected_4xx": 0,
+        "sent": 3000
+      },
+      "tap_p99_ms": 7.198,
+      "direct_p99_ms": 3.21,
+      "proxy_p99_ms": 8.393,
+      "proxy_overhead_p99_ms": null,
+      "stored_tap_phase": 3000,
+      "stored_proxy_phase": 3000,
+      "checks": {
+        "tap_delivery_accounted": true,
+        "proxy_delivery_accounted": true,
+        "tap_p99_le_50ms": true,
+        "paired_proxy_delta_p99_le_25ms": true
+      },
+      "paired_proxy_delta_p99_ms": 6.967
+    },
+    {
+      "rep": "2",
+      "forwarded_byte_identity_and_count": true,
+      "expected_forwarded": 3512,
+      "observed_forwarded": 3512
+    },
+    {
+      "rep": "2",
+      "mode": "tap",
+      "resource": {
+        "heap_gc_peak_mb": 10.0,
+        "heap_gc_samples": 1637,
+        "wal_sample_max_kib": 4156.2421875,
+        "wal_samples": 15,
+        "heap_observed_samples_le_64mib": true,
+        "wal_observed_samples_le_64mib": true
+      }
+    },
+    {
+      "rep": "2",
+      "mode": "proxy",
+      "resource": {
+        "heap_gc_peak_mb": 10.0,
+        "heap_gc_samples": 2089,
+        "wal_sample_max_kib": 4550.5390625,
+        "wal_samples": 15,
+        "heap_observed_samples_le_64mib": true,
+        "wal_observed_samples_le_64mib": true
+      }
+    },
+    {
+      "rep": "3",
+      "workload": "burst",
+      "tap": {
+        "accepted_202": 512,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 4.184,
+        "lat_ms_p50": 1.856,
+        "lat_ms_p99": 4.013,
+        "offered": 512,
+        "rejected_4xx": 0,
+        "sent": 512
+      },
+      "direct": {
+        "accepted_202": 512,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 2.825,
+        "lat_ms_p50": 0.982,
+        "lat_ms_p99": 2.39,
+        "offered": 512,
+        "rejected_4xx": 0,
+        "sent": 512
+      },
+      "proxy": {
+        "accepted_202": 512,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 5.521,
+        "lat_ms_p50": 3.05,
+        "lat_ms_p99": 5.32,
+        "offered": 512,
+        "rejected_4xx": 0,
+        "sent": 512
+      },
+      "tap_p99_ms": 4.068,
+      "direct_p99_ms": 2.421,
+      "proxy_p99_ms": 5.327,
+      "proxy_overhead_p99_ms": null,
+      "stored_tap_phase": 512,
+      "stored_proxy_phase": 512,
+      "checks": {
+        "tap_delivery_accounted": true,
+        "proxy_delivery_accounted": true,
+        "tap_p99_le_50ms": true,
+        "paired_proxy_delta_p99_le_25ms": true
+      },
+      "paired_proxy_delta_p99_ms": 4.351
+    },
+    {
+      "rep": "3",
+      "workload": "sust",
+      "tap": {
+        "accepted_202": 3000,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 14.045,
+        "lat_ms_p50": 1.502,
+        "lat_ms_p99": 7.335,
+        "offered": 3000,
+        "rejected_4xx": 0,
+        "sent": 3000
+      },
+      "direct": {
+        "accepted_202": 3000,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 17.121,
+        "lat_ms_p50": 1.432,
+        "lat_ms_p99": 2.283,
+        "offered": 3000,
+        "rejected_4xx": 0,
+        "sent": 3000
+      },
+      "proxy": {
+        "accepted_202": 3000,
+        "dropped_unsent": 0,
+        "failed": 0,
+        "lat_ms_max": 13.436,
+        "lat_ms_p50": 2.765,
+        "lat_ms_p99": 8.003,
+        "offered": 3000,
+        "rejected_4xx": 0,
+        "sent": 3000
+      },
+      "tap_p99_ms": 7.404,
+      "direct_p99_ms": 2.299,
+      "proxy_p99_ms": 8.019,
+      "proxy_overhead_p99_ms": null,
+      "stored_tap_phase": 3000,
+      "stored_proxy_phase": 3000,
+      "checks": {
+        "tap_delivery_accounted": true,
+        "proxy_delivery_accounted": true,
+        "tap_p99_le_50ms": true,
+        "paired_proxy_delta_p99_le_25ms": true
+      },
+      "paired_proxy_delta_p99_ms": 6.532
+    },
+    {
+      "rep": "3",
+      "forwarded_byte_identity_and_count": true,
+      "expected_forwarded": 3512,
+      "observed_forwarded": 3512
+    },
+    {
+      "rep": "3",
+      "mode": "tap",
+      "resource": {
+        "heap_gc_peak_mb": 10.0,
+        "heap_gc_samples": 1649,
+        "wal_sample_max_kib": 4196.4765625,
+        "wal_samples": 15,
+        "heap_observed_samples_le_64mib": true,
+        "wal_observed_samples_le_64mib": true
+      }
+    },
+    {
+      "rep": "3",
+      "mode": "proxy",
+      "resource": {
+        "heap_gc_peak_mb": 10.0,
+        "heap_gc_samples": 2096,
+        "wal_sample_max_kib": 4132.1015625,
+        "wal_samples": 15,
+        "heap_observed_samples_le_64mib": true,
+        "wal_observed_samples_le_64mib": true
+      }
+    }
+  ],
+  "breaches": [],
+  "pending": [
+    "tap rep1: GC-paced heap samples do not bound the complete interval",
+    "tap rep1: five-second WAL samples do not bound between-sample peaks or checkpoint recovery",
+    "proxy rep1: GC-paced heap samples do not bound the complete interval",
+    "proxy rep1: five-second WAL samples do not bound between-sample peaks or checkpoint recovery",
+    "tap rep2: GC-paced heap samples do not bound the complete interval",
+    "tap rep2: five-second WAL samples do not bound between-sample peaks or checkpoint recovery",
+    "proxy rep2: GC-paced heap samples do not bound the complete interval",
+    "proxy rep2: five-second WAL samples do not bound between-sample peaks or checkpoint recovery",
+    "tap rep3: GC-paced heap samples do not bound the complete interval",
+    "tap rep3: five-second WAL samples do not bound between-sample peaks or checkpoint recovery",
+    "proxy rep3: GC-paced heap samples do not bound the complete interval",
+    "proxy rep3: five-second WAL samples do not bound between-sample peaks or checkpoint recovery"
+  ],
+  "status": "pending",
+  "proxy_delta_method": "p99 nearest-rank of per-index proxy HTTP latency minus direct-to-relay HTTP latency; sequential matched workloads with run-order noise"
+}

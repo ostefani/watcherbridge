@@ -7,9 +7,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/ostefani/watcherbridge/internal/health"
 	"github.com/ostefani/watcherbridge/internal/provider"
 	"github.com/ostefani/watcherbridge/internal/redactor"
 	"github.com/ostefani/watcherbridge/internal/store"
@@ -88,12 +90,23 @@ func validAnswer(t tb, payload []byte, toks map[string]struct{}, suggestion *str
 		"event_ids": bundle.EventIDs, "host": host, "what_changed": what,
 		"context": "context for " + host, "model_suggestion": suggestion,
 		"priority_reason": "because reasons", "recommended_check": "look",
+		"likely_explanation": "likely " + host, "confidence": "medium",
+		"evidence_refs": eventRefs(bundle.EventIDs),
 	}
 	b, err := json.Marshal(m)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// eventRefs cites the first group event for schema-complete test
+// finals; empty input yields no refs, which the schema allows.
+func eventRefs(eventIDs []string) []any {
+	if len(eventIDs) == 0 {
+		return []any{}
+	}
+	return []any{map[string]any{"event_id": eventIDs[0]}}
 }
 
 func strptr(s string) *string { return &s }
@@ -237,6 +250,121 @@ func TestOversizeBundleFallsBackWithDistinctReason(t *testing.T) {
 		if fake.Briefs != 0 {
 			t.Fatalf("enabled=%v: provider called %d times", enabled, fake.Briefs)
 		}
+	}
+}
+
+// A model answer whose tokens restore past the storage budget degrades to
+// the deterministic fallback with its own reason: the 64 KiB response cap
+// bounds tokenized text, not the expanded text the row would store.
+// Rejection, never silent truncation.
+func TestRestoredBudgetFallsBackWithDistinctReason(t *testing.T) {
+	// Boundary: exactly at budget fits, one byte over fails — decided on
+	// projections, before any restored string is allocated.
+	fit := modelBriefing{What: strings.Repeat("x", maxRestoredBytes-3), Context: "c", Check: "k", Reason: "r"}
+	if got := projectedRestoredSize(fit, redactor.TokenMap{}); got > maxRestoredBytes {
+		t.Fatalf("exactly-at-budget projection %d must fit", got)
+	}
+	fit.Reason = "rr"
+	if got := projectedRestoredSize(fit, redactor.TokenMap{}); got <= maxRestoredBytes {
+		t.Fatalf("one-over-budget projection %d must fail", got)
+	}
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		if repair {
+			t.Fatal("budget rejection is not a schema error: no repair")
+		}
+		hosts := sortedTokensWithPrefix(valid, "HOST_")
+		ips := sortedTokensWithPrefix(valid, "IP_")
+		if len(hosts) == 0 || len(ips) == 0 {
+			t.Fatal("bundle must issue host and IP tokens")
+		}
+		var bundle struct {
+			EventIDs []string `json:"event_ids"`
+		}
+		if err := json.Unmarshal(payload, &bundle); err != nil {
+			t.Fatal(err)
+		}
+		// Short tokens, long values: the tokenized answer stays small
+		// while the restored row blows the budget.
+		m := map[string]any{
+			"event_ids": bundle.EventIDs, "host": hosts[0],
+			"what_changed": strings.Repeat(ips[0]+" ", 1<<15),
+			"context":      "context for " + hosts[0], "model_suggestion": nil,
+			"priority_reason": "because reasons", "recommended_check": "look",
+			"likely_explanation": "likely", "confidence": "low",
+			"evidence_refs": eventRefs(bundle.EventIDs),
+		}
+		b, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return provider.RawBriefing{JSON: b}, nil
+	}
+	briefOne(context.Background(), modelDeps(t, s, fake), gid)
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || !strings.Contains(b.Context, "restored text exceeds size budget") {
+		t.Fatalf("distinct restored-budget reason required: %+v", b)
+	}
+	if fake.Briefs != 1 || fake.Repairs != 0 {
+		t.Fatalf("provider called once with no repair: briefs=%d repairs=%d", fake.Briefs, fake.Repairs)
+	}
+}
+
+// The budget preflight must measure the effective restoration map, not
+// the normalized one: display holds first-seen originals, which can be
+// far longer (expanded IPv6 is 39 bytes against a 3-byte normalized
+// form). Repeating such a token passes a normalized-only projection yet
+// restores past the budget — the stored row must still fall back.
+func TestRestoredBudgetUsesDisplaySpelling(t *testing.T) {
+	s := openWorkerStore(t)
+	payload := `{"event_id":"e1","host":{"ip":"0000:0000:0000:0000:0000:0000:0000:0001","hostname":"v6host","mac":"aa:bb:cc:dd:ee:09","weak":false,"alive":true,"identity_confidence":"high","ports":[]}}`
+	gid := seedGroup(t, s, "host:v6", "evt-v6", "host.changed", payload)
+	fake := provider.NewFake()
+	fake.Handle = func(repair bool, bundle []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		if repair {
+			t.Fatal("budget rejection is not a schema error: no repair")
+		}
+		ips := sortedTokensWithPrefix(valid, "IP_")
+		if len(ips) == 0 {
+			t.Fatal("bundle must issue an IP token")
+		}
+		host := ""
+		for tok := range valid {
+			host = tok
+			break
+		}
+		var parsed struct {
+			EventIDs []string `json:"event_ids"`
+		}
+		if err := json.Unmarshal(bundle, &parsed); err != nil {
+			t.Fatal(err)
+		}
+		// Short token, long display value: 8000 repeats fit a
+		// normalized-only projection (~32 KiB) but restore past the
+		// budget through the 39-byte original spelling.
+		m := map[string]any{
+			"event_ids": parsed.EventIDs, "host": host,
+			"what_changed": strings.Repeat(ips[0]+" ", 8000),
+			"context":      "context", "model_suggestion": nil,
+			"priority_reason": "because reasons", "recommended_check": "look",
+			"likely_explanation": "likely", "confidence": "low",
+			"evidence_refs": eventRefs(parsed.EventIDs),
+		}
+		raw, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return provider.RawBriefing{JSON: raw}, nil
+	}
+	briefOne(context.Background(), modelDeps(t, s, fake), gid)
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || !strings.Contains(b.Context, "restored text exceeds size budget") {
+		t.Fatalf("display-spelling expansion must fall back: %+v", b)
+	}
+	if fake.Briefs != 1 || fake.Repairs != 0 {
+		t.Fatalf("provider called once with no repair: briefs=%d repairs=%d", fake.Briefs, fake.Repairs)
 	}
 }
 
@@ -446,6 +574,8 @@ func TestRedactionOffPassesRawWithWarning(t *testing.T) {
 			"event_ids": bundle.EventIDs, "host": "p", "what_changed": "traffic from 192.168.0.5",
 			"context": "raw context", "model_suggestion": "high",
 			"priority_reason": "raw reason", "recommended_check": "raw check",
+			"likely_explanation": "likely raw", "confidence": "high",
+			"evidence_refs": eventRefs(bundle.EventIDs),
 		}
 		b, _ := json.Marshal(m)
 		return provider.RawBriefing{JSON: b}, nil
@@ -546,13 +676,184 @@ func TestOnGroupsFiresPerTick(t *testing.T) {
 	}
 }
 
+// While the provider is blocked, subscribers must see the claimed group
+// as processing and the groups queued behind it as closed: the snapshot
+// publishes right after TakeGroup commits, not after the drain finishes
+// (when the group is normally already done). The handler builds its
+// answer without test helpers — it runs on the worker goroutine, where
+// t.Fatal is illegal.
+func TestProcessingVisibleWhileProviderBlocked(t *testing.T) {
+	s := openWorkerStore(t)
+	gidA := seedGroup(t, s, "host:pa", "evt-pa", "host.appeared", `{"event_id":"e"}`)
+	gidB := seedGroup(t, s, "host:pb", "evt-pb", "host.appeared", `{"event_id":"e"}`)
+	release := make(chan struct{})
+	fake := provider.NewFake()
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		if repair {
+			return provider.RawBriefing{}, fmt.Errorf("abstain path must not repair")
+		}
+		<-release
+		var bundle struct {
+			EventIDs []string `json:"event_ids"`
+		}
+		if err := json.Unmarshal(payload, &bundle); err != nil {
+			return provider.RawBriefing{}, err
+		}
+		host := ""
+		for tok := range valid {
+			host = tok
+			break
+		}
+		raw, err := json.Marshal(map[string]any{
+			"event_ids": bundle.EventIDs, "host": host,
+			"what_changed": "w", "context": "c", "model_suggestion": nil,
+			"priority_reason": "r", "recommended_check": "k",
+			"likely_explanation": "likely", "confidence": "low",
+			"evidence_refs": eventRefs(bundle.EventIDs),
+		})
+		if err != nil {
+			return provider.RawBriefing{}, err
+		}
+		return provider.RawBriefing{JSON: raw}, nil
+	}
+	d := modelDeps(t, s, fake)
+	d.ModelTimeout = 30 * time.Second
+	var mu sync.Mutex
+	var snaps [][]store.GroupSnapshot
+	d.OnGroups = func(g []store.GroupSnapshot) {
+		mu.Lock()
+		snaps = append(snaps, append([]store.GroupSnapshot(nil), g...))
+		mu.Unlock()
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); drainOnce(context.Background(), d, time.Now()) }()
+	observed := false
+	for deadline := time.Now().Add(5 * time.Second); !observed && time.Now().Before(deadline); {
+		mu.Lock()
+		for _, snap := range snaps {
+			var proc, closed string
+			for _, g := range snap {
+				if g.Status == "processing" {
+					proc = g.GroupID
+				} else if g.Status == "closed" {
+					closed = g.GroupID
+				}
+			}
+			if proc != "" && closed != "" && proc != closed {
+				observed = true
+				break
+			}
+		}
+		mu.Unlock()
+		if !observed {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if !observed {
+		close(release)
+		t.Fatal("no snapshot showed a processing group with a closed waiter while the provider was blocked")
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("drain did not finish after the provider was released")
+	}
+	for _, gid := range []string{gidA, gidB} {
+		if st, _ := s.GroupStatus(context.Background(), gid); st != "done" {
+			t.Fatalf("group %s must be briefed, got %q", gid, st)
+		}
+	}
+}
+
+// While the provider blocks a briefing, newly accepted events must still
+// project: the independent projectLoop keeps capturing through the
+// writer although the drain is stuck in briefOne. The take of the later
+// group proves projection; the suite releases the provider afterwards.
+func TestProjectionProgressesWhileProviderBlocked(t *testing.T) {
+	s := openWorkerStore(t)
+	gidA := seedGroup(t, s, "host:qa", "evt-qa", "host.appeared", `{"event_id":"e"}`)
+	release := make(chan struct{})
+	fake := provider.NewFake()
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		if repair {
+			return provider.RawBriefing{}, fmt.Errorf("abstain path must not repair")
+		}
+		<-release
+		return provider.RawBriefing{JSON: validAnswer(t, payload, valid, strptr("high"), nil)}, nil
+	}
+	d := modelDeps(t, s, fake)
+	d.ModelTimeout = 30 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- Run(ctx, d) }()
+	// Wait until the drain is provably stuck inside the provider call.
+	stuck := false
+	for deadline := time.Now().Add(5 * time.Second); !stuck && time.Now().Before(deadline); {
+		if st, _ := s.GroupStatus(context.Background(), gidA); st == "processing" {
+			stuck = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !stuck {
+		close(release)
+		cancel()
+		t.Fatal("group A was never taken, the provider is not blocked")
+	}
+	// Accept an event after the block began; it must become briefable
+	// although no briefing can complete.
+	now := time.Now().UTC().Truncate(time.Second)
+	res, err := s.PersistEventAndGroup(ctx, store.RawEvent{
+		EventID: "evt-qb", EventKey: "k", EventType: "host.appeared",
+		OccurredAt: now, Payload: []byte(`{"event_id":"e"}`), ReceivedAt: now, SignatureTimestamp: now,
+	}, "host:qb", store.GroupPolicy{QuietWindow: time.Millisecond, MaxWindow: time.Hour})
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	briefable := false
+	for deadline := time.Now().Add(10 * time.Second); !briefable && time.Now().Before(deadline); {
+		if _, err := s.CloseDue(ctx, time.Now()); err != nil {
+			t.Logf("close due: %v", err)
+		}
+		if taken, err := s.TakeGroup(ctx, res.GroupID); err == nil && taken.GroupID == res.GroupID {
+			briefable = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !briefable {
+		close(release)
+		cancel()
+		t.Fatal("event accepted during a blocked drain never projected")
+	}
+	if st, _ := s.GroupStatus(context.Background(), gidA); st != "processing" {
+		close(release)
+		cancel()
+		t.Fatalf("group A must still be blocked in the provider, got %q", st)
+	}
+	close(release)
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run returned %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not stop after release and cancel")
+	}
+}
+
 func TestDecodeModelBriefingRejects(t *testing.T) {
-	full := `{"event_ids":["e1"],"host":"HOST_1","what_changed":"w","context":"c","model_suggestion":"high","priority_reason":"r","recommended_check":"k"}`
+	full := `{"event_ids":["e1"],"host":"HOST_1","what_changed":"w","context":"c","model_suggestion":"high","priority_reason":"r","recommended_check":"k","likely_explanation":"likely","confidence":"high","evidence_refs":[{"event_id":"e1"}]}`
 	for name, raw := range map[string]string{
-		"unknown field": strings.Replace(full, `"recommended_check"`, `"bogus","recommended_check"`, 1),
-		"trailing data": full + " {}",
-		"empty field":   strings.Replace(full, `"what_changed":"w"`, `"what_changed":""`, 1),
-		"not json":      `{"event_ids":`,
+		"unknown field":  strings.Replace(full, `"recommended_check"`, `"bogus","recommended_check"`, 1),
+		"trailing data":  full + " {}",
+		"empty field":    strings.Replace(full, `"what_changed":"w"`, `"what_changed":""`, 1),
+		"missing likely": strings.Replace(full, `,"likely_explanation":"likely"`, ``, 1),
+		"not json":       `{"event_ids":`,
 	} {
 		if _, err := decodeModelBriefing([]byte(raw)); err == nil {
 			t.Fatalf("%s: expected rejection", name)
@@ -567,10 +868,11 @@ func TestCheckModelBriefingRules(t *testing.T) {
 	taken := store.TakenGroup{Events: []store.RawEvent{{EventID: "e1"}}}
 	issued := redactor.TokenMap{"HOST_1": "w", "IP_1": "10.0.0.1"}
 	base := modelBriefing{EventIDs: []string{"e1"}, Host: "HOST_1", What: "saw IP_1",
-		Context: "c", Reason: "r", Check: "k"}
+		Context: "c", Reason: "r", Check: "k", Likely: "likely IP_1", Confidence: "medium",
+		Refs: []json.RawMessage{json.RawMessage(`{"event_id":"e1"}`)}}
 	sug := "medium"
 	base.Suggestion = &sug
-	if _, err := checkModelBriefing(base, taken, issued, true); err != nil {
+	if _, _, err := checkModelBriefing(base, taken, issued, true, 0); err != nil {
 		t.Fatalf("valid rejected: %v", err)
 	}
 	cases := map[string]func(*modelBriefing){
@@ -578,24 +880,191 @@ func TestCheckModelBriefingRules(t *testing.T) {
 		"foreign host":   func(m *modelBriefing) { m.Host = "HOST_9" },
 		"bad level":      func(m *modelBriefing) { s := "urgent"; m.Suggestion = &s },
 		"invented token": func(m *modelBriefing) { m.What = "saw IP_9" },
+		"bad confidence": func(m *modelBriefing) { m.Confidence = "certain" },
+		"oversized likely": func(m *modelBriefing) {
+			m.Likely = strings.Repeat("x", maxLikelyRunes+1)
+		},
+		"invented event ref": func(m *modelBriefing) {
+			m.Refs = []json.RawMessage{json.RawMessage(`{"event_id":"e9"}`)}
+		},
+		"tool ref past the last step": func(m *modelBriefing) {
+			m.Refs = []json.RawMessage{json.RawMessage(`{"tool_step":5}`)}
+		},
+		"malformed ref": func(m *modelBriefing) {
+			m.Refs = []json.RawMessage{json.RawMessage(`{"event_id":"e1","tool_step":0}`)}
+		},
 	}
 	for name, mutate := range cases {
 		m := base
 		mutate(&m)
-		if _, err := checkModelBriefing(m, taken, issued, true); err == nil {
+		if _, _, err := checkModelBriefing(m, taken, issued, true, 0); err == nil {
 			t.Fatalf("%s: expected rejection", name)
 		}
+	}
+	// A real executed step is citable; anything past it is invented.
+	withStep := base
+	withStep.Refs = []json.RawMessage{json.RawMessage(`{"tool_step":0}`)}
+	if _, _, err := checkModelBriefing(withStep, taken, issued, true, 0); err != nil {
+		t.Fatalf("real tool step rejected: %v", err)
+	}
+	withStep.Refs = []json.RawMessage{json.RawMessage(`{"tool_step":1}`)}
+	if _, _, err := checkModelBriefing(withStep, taken, issued, true, 0); err == nil {
+		t.Fatal("unexecuted tool step must fail")
 	}
 	// Redaction off: unissued host is raw data, not an invention; a
 	// token-shaped string still fails.
 	off := base
 	off.Host = "printer-2"
+	off.Likely = "likely printer"
 	off.What = "saw 10.0.0.1"
-	if _, err := checkModelBriefing(off, taken, redactor.TokenMap{}, false); err != nil {
+	if _, _, err := checkModelBriefing(off, taken, redactor.TokenMap{}, false, 0); err != nil {
 		t.Fatalf("redaction-off raw host rejected: %v", err)
 	}
 	off.What = "saw IP_9"
-	if _, err := checkModelBriefing(off, taken, redactor.TokenMap{}, false); err == nil {
+	if _, _, err := checkModelBriefing(off, taken, redactor.TokenMap{}, false, 0); err == nil {
 		t.Fatal("token-shaped invention must fail even with redaction off")
+	}
+}
+
+// A single-call repair is a second billed send: health must count both
+// calls and sum both usages, matching the agent loop where every turn
+// counts.
+func TestSingleCallRepairCountsBothCalls(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	bad := []byte(`{"event_ids":["x"],"host":"IP_1"}`)
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		usage := provider.Usage{InputTokens: 10, OutputTokens: 5, HasUsage: true}
+		if !repair {
+			return provider.RawBriefing{JSON: bad, Usage: usage}, nil
+		}
+		// The repair call carries the correction prompt, not the
+		// bundle: rebuild a valid answer for the group's events
+		// (evt-w1, token IP_1 — the hostChangedGroup fixture).
+		m := map[string]any{
+			"event_ids": []string{"evt-w1"}, "host": "IP_1", "what_changed": "changed IP_1",
+			"context": "context for IP_1", "model_suggestion": strptr("high"),
+			"priority_reason": "because reasons", "recommended_check": "look",
+			"likely_explanation": "likely IP_1", "confidence": "high",
+			"evidence_refs": []any{map[string]any{"event_id": "evt-w1"}},
+		}
+		raw, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return provider.RawBriefing{JSON: raw, Usage: usage}, nil
+	}
+	d := modelDeps(t, s, fake)
+	d.Health = health.New()
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("repaired run must progress the group")
+	}
+	b := briefed(t, s, gid)
+	if b.FallbackUsed {
+		t.Fatalf("repaired run must store the model briefing: %+v", b)
+	}
+	snap := d.Health.Snapshot()
+	if snap.ProviderCalls != 2 {
+		t.Fatalf("initial call plus repair must count two: %+v", snap)
+	}
+	if snap.ProviderInputTokens != 20 || snap.ProviderOutputTokens != 10 {
+		t.Fatalf("both sends' usage must accumulate: %+v", snap)
+	}
+	if b.InputTokens == nil || *b.InputTokens != 20 || b.OutputTokens == nil || *b.OutputTokens != 10 {
+		t.Fatalf("briefing must sum both sends: %+v %+v", b.InputTokens, b.OutputTokens)
+	}
+}
+
+// A tokenized explanation inside the 256-char bound can still restore
+// past it: repeated short tokens expand. The restored display text is
+// bounded too, falling back when expansion breaks it.
+func TestRestoredExplanationBoundFallsBack(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		// 36 repeats at 5 runes each stay inside the tokenized bound
+		// but restore to roughly triple the display length.
+		m := map[string]any{
+			"event_ids": []string{"evt-w1"}, "host": "IP_1", "what_changed": "w",
+			"context": "c", "model_suggestion": nil,
+			"priority_reason": "r", "recommended_check": "k",
+			"likely_explanation": strings.Repeat("IP_1 ", 36),
+			"confidence":         "low",
+			"evidence_refs":      []any{map[string]any{"event_id": "evt-w1"}},
+		}
+		raw, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Sanity: the tokenized explanation itself must pass the
+		// input bound, or the test proves nothing about expansion.
+		if len([]rune(strings.Repeat("IP_1 ", 36))) > maxLikelyRunes {
+			t.Fatal("fixture must stay inside the tokenized bound")
+		}
+		return provider.RawBriefing{JSON: raw}, nil
+	}
+	d := modelDeps(t, s, fake)
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("failed run must still progress the group")
+	}
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || b.Source != "fallback" {
+		t.Fatalf("expanded explanation must fall back: %+v", b)
+	}
+	if !strings.Contains(b.Context, "exceeds 256") {
+		t.Fatalf("fallback must name the bound: %+v", b)
+	}
+}
+
+// An invalid single-call answer still bills both sends: the fallback
+// keeps their summed accounting with source fallback.
+func TestSingleCallInvalidFallbackKeepsUsage(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	usage := provider.Usage{InputTokens: 10, OutputTokens: 5, HasUsage: true}
+	bad := []byte(`{"event_ids":["x"],"host":"IP_1"}`)
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		return provider.RawBriefing{JSON: bad, Usage: usage}, nil
+	}
+	d := modelDeps(t, s, fake)
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("failed run must still progress the group")
+	}
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || b.Source != "fallback" {
+		t.Fatalf("invalid answers must fall back: %+v", b)
+	}
+	if b.InputTokens == nil || *b.InputTokens != 20 || b.OutputTokens == nil || *b.OutputTokens != 10 {
+		t.Fatalf("fallback must sum both sends: %+v %+v", b.InputTokens, b.OutputTokens)
+	}
+}
+
+// A repair transport failure must not void the initial send's
+// accounting: the fallback keeps the usage already reported.
+func TestSingleCallRepairErrorKeepsInitialUsage(t *testing.T) {
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	usage := provider.Usage{InputTokens: 10, OutputTokens: 5, HasUsage: true}
+	bad := []byte(`{"event_ids":["x"],"host":"IP_1"}`)
+	fake.Handle = func(repair bool, payload []byte, valid map[string]struct{}) (provider.RawBriefing, error) {
+		if repair {
+			return provider.RawBriefing{}, fmt.Errorf("repair transport down")
+		}
+		return provider.RawBriefing{JSON: bad, Usage: usage}, nil
+	}
+	d := modelDeps(t, s, fake)
+	if !briefOne(context.Background(), d, gid) {
+		t.Fatal("failed run must still progress the group")
+	}
+	b := briefed(t, s, gid)
+	if !b.FallbackUsed || b.Source != "fallback" {
+		t.Fatalf("repair errors must fall back: %+v", b)
+	}
+	if b.InputTokens == nil || *b.InputTokens != 10 || b.OutputTokens == nil || *b.OutputTokens != 5 {
+		t.Fatalf("fallback must keep the initial usage: %+v %+v", b.InputTokens, b.OutputTokens)
 	}
 }

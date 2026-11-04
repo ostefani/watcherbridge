@@ -159,7 +159,7 @@ func main() {
 	pub := viewer.NewPublisher(scanRelay, "", "", "", 3*time.Second, nil)
 	pub.Start()
 	defer pub.Stop()
-	onBriefing, onGroups := viewer.Fanout(srv.Viewer().Hub(), pub)
+	onBriefing, onGroups := viewer.Fanout(srv.Viewer().Hub(), pub, 45)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

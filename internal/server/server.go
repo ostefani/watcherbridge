@@ -5,8 +5,9 @@
 // 202 accepted (persisted; forwarded in proxy mode), 401 bad signature or
 // timestamp, 400 malformed, 413 oversize, 405 non-POST, 503 saturated or
 // store unavailable with Retry-After, 502 ScanRelay delivery failed.
-// A duplicate of a known event is idempotent (202 when forwarded, 502 when
-// not) — never a 401/409.
+// A duplicate host event is idempotent (202 when forwarded, 502 when not).
+// H1 is persisted separately and never forwarded; identical retries are 202,
+// while conflicting reuse of a heartbeat ID is 409.
 package server
 
 import (
@@ -17,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -24,6 +26,7 @@ import (
 
 	"github.com/ostefani/watcherbridge/internal/config"
 	"github.com/ostefani/watcherbridge/internal/forwarder"
+	"github.com/ostefani/watcherbridge/internal/health"
 	"github.com/ostefani/watcherbridge/internal/store"
 	"github.com/ostefani/watcherbridge/internal/viewer"
 )
@@ -44,6 +47,7 @@ var eventTypes = map[string]bool{
 	"host.appeared":    true,
 	"host.disappeared": true,
 	"host.changed":     true,
+	"scan.heartbeat":   true,
 }
 
 // Server serves the ingest endpoint and runs the startup sweep. The
@@ -55,6 +59,9 @@ type Server struct {
 	events *store.Store
 	gate   *forwarder.Gate
 	viewer *viewer.Viewer
+	// Health counts ingest outcomes; main sets it after New (nil-safe),
+	// and every ingest path below records its coarse outcome.
+	Health *health.Counters
 	now    func() time.Time
 
 	sem   chan struct{} // in-flight cap; acquired before reading the body
@@ -65,6 +72,15 @@ type Server struct {
 	sweepCtx    context.Context // created in New so Shutdown is safe before Start
 	sweepCancel context.CancelFunc
 	sweepDone   chan struct{}
+
+	onShutdown []func() // hooks run at shutdown start, before handlers drain
+}
+
+// RegisterOnShutdown registers f to run when Shutdown starts, before the
+// HTTP server drains handlers. The viewer registers Close so open SSE tabs
+// stop blocking shutdown.
+func (s *Server) RegisterOnShutdown(f func()) {
+	s.onShutdown = append(s.onShutdown, f)
 }
 
 // New builds a Server. It resolves the secret, validates the config, and
@@ -93,18 +109,63 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 		sweepCtx: sweepCtx, sweepCancel: sweepCancel, sweepDone: make(chan struct{}),
 	}
 	s.viewer = viewer.New(events, nil)
+	s.viewer.Heartbeat = cfg.SSEHeartbeat
+	s.viewer.ReplayMax = cfg.SSEReplayMax
+	s.viewer.WriteTimeout = cfg.SSEWriteTimeout
+	s.viewer.MaxSubscribers = cfg.SSEMaxSubscribers
+	s.viewer.GroupWindowSeconds = int64(cfg.GroupQuietWindow / time.Second)
+	s.viewer.SnoozeDefault = cfg.SnoozeDefault
+	s.viewer.RuleProposeAfter = cfg.RuleProposeAfter
+	s.viewer.RuleDefaultTTL = cfg.RuleDefaultTTL
+	hosts := cfg.ViewerAllowedHosts
+	if len(hosts) == 0 {
+		// Validate already refused non-loopback and malformed binds.
+		_, port, err := net.SplitHostPort(cfg.Bind)
+		if err != nil {
+			return nil, fmt.Errorf("invalid bind %q: %w", cfg.Bind, err)
+		}
+		hosts = viewer.LoopbackHosts(port)
+	}
+	s.viewer.AllowedHosts = hosts
+	// The overview refresher computes /api/overview, /api/health, and the
+	// connect-time `overview` event from retained rows. Health and the
+	// annotation publisher attach later in main once both exist.
+	s.viewer.Overview = viewer.NewRefresher(events, nil, nil,
+		cfg.OverviewWindow, cfg.OverviewMaxWindow, cfg.BriefingRetention)
+	s.viewer.Overview.SetSubjectRetention(cfg.SubjectRetention)
+	s.viewer.Overview.SetHeartbeatStaleAfter(cfg.HeartbeatStaleAfter)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook", s.handleWebhook)
-	// GET needs an explicit route: the viewer's "GET /" catch-all would
-	// otherwise serve the index with 200. Every other non-POST method
-	// 405s through the mux's own method mismatch.
+	// GET needs an explicit route: without it the viewer mount below
+	// answers with its own 404 instead of the webhook's 405.
 	mux.HandleFunc("GET /webhook", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	})
-	s.viewer.Attach(mux)
+	// Every other method on the webhook path stays in webhook dispatch
+	// (405), never falling through to the viewer mount.
+	mux.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	})
+	// The viewer subtree carries its own Host gate (applied before its
+	// mux-generated 405s and redirects); exact webhook patterns win over
+	// the "/" mount, so /webhook keeps its HMAC behavior.
+	mux.Handle("/", s.viewer.Handler())
+	root := mux
 	s.http = &http.Server{
-		Addr:              cfg.Bind,
-		Handler:           mux,
+		Addr: cfg.Bind,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			viewer.SetSecurityHeaders(w)
+			// Host policy applies before outer-mux canonicalization, so
+			// a foreign Host cannot pull a redirect out of the router.
+			// The webhook path is exempt and keeps HMAC dispatch for
+			// every method. Headers are already set above, also for the
+			// 403 itself.
+			if r.URL.Path != "/webhook" && !s.viewer.AllowedHost(r.Host) {
+				http.Error(w, "foreign host", http.StatusForbidden)
+				return
+			}
+			root.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
@@ -142,6 +203,9 @@ func (s *Server) Start() error {
 // can still commit its receipt.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.sweepCancel()
+	for _, f := range s.onShutdown {
+		f()
+	}
 	err := s.http.Shutdown(ctx)
 	select {
 	case <-s.sweepDone:
@@ -160,6 +224,7 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 }
 
 func (s *Server) writeSaturated(w http.ResponseWriter, msg string) {
+	s.Health.AddSaturated()
 	w.Header().Set("Retry-After", strconv.Itoa(s.cfg.RetryAfterSecs))
 	writeError(w, http.StatusServiceUnavailable, msg)
 }
@@ -178,9 +243,14 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.HandlerDeadline)
 	defer cancel()
 
-	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
+	bodyLimit := s.cfg.MaxBodyBytes
+	if r.Header.Get("X-SubnetLens-Event-Type") == "scan.heartbeat" && bodyLimit > store.MaxHeartbeatBytes {
+		bodyLimit = store.MaxHeartbeatBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, bodyLimit)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		s.Health.AddRejected()
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
@@ -197,6 +267,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	signature := r.Header.Get("X-SubnetLens-Signature-256")
 	sigTime, err := parseAndValidate(s.now(), s.cfg.TimestampTolerance, timestamp, eventID, eventKey, eventType, body)
 	if err != nil {
+		s.Health.AddRejected()
 		var malformed *malformedError
 		if errors.As(err, &malformed) {
 			writeError(w, http.StatusBadRequest, malformed.Error())
@@ -206,7 +277,28 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !validSignature(s.secret, timestamp, eventID, eventKey, eventType, body, signature) {
+		s.Health.AddRejected()
 		writeError(w, http.StatusUnauthorized, "invalid signature")
+		return
+	}
+
+	if eventType == "scan.heartbeat" {
+		s.acceptHeartbeat(ctx, w, body, eventID, eventKey, sigTime)
+		return
+	}
+
+	// Metadata consistency (Designv9 §1.1) before grouping, persistence
+	// or forwarding: the body's echoed envelope must equal the signed
+	// headers. The heartbeat branch above enforces the same comparison
+	// inside decodeHeartbeat; host events need it here.
+	if err := checkEnvelopeConsistency(body, eventID, eventKey, eventType); err != nil {
+		s.Health.AddRejected()
+		var malformed *malformedError
+		if errors.As(err, &malformed) {
+			writeError(w, http.StatusBadRequest, malformed.Error())
+		} else {
+			writeError(w, http.StatusUnauthorized, err.Error())
+		}
 		return
 	}
 
@@ -229,9 +321,13 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
-	anchor, fallback := anchorForEvent(body, eventType, eventKey)
-	if fallback {
-		log.Printf("ingest: event %s has no host identifier, grouping by event key", eventID)
+	// Grouping keys are exact scoped upstream references, addresses
+	// kept address-scoped, or the event itself when the report carries
+	// no usable reference (Designv9 §1.5). No MAC/hostname/IP
+	// preference heuristic runs here anymore.
+	anchor, eventScoped := store.GroupKeyForEvent(s.cfg.SourceID, eventType, eventID, body)
+	if eventScoped {
+		log.Printf("ingest: event %s has no usable reference, event-local grouping", eventID)
 	}
 	if perr := s.persistAndReply(ctx, w, body, r, eventID, eventKey, eventType, anchor, sigTime); perr != nil {
 		s.reportPersistError(w, eventID, perr)
@@ -272,14 +368,16 @@ func (s *Server) persistAndReply(ctx context.Context, w http.ResponseWriter, bod
 		HeadersJSON:        string(headersJSON),
 		ReceivedAt:         s.now().UTC(),
 		SignatureTimestamp: sigTime,
+		SourceScope:        s.cfg.SourceID,
 	}
 	if ev.OccurredAt.IsZero() {
 		ev.OccurredAt = ev.ReceivedAt
 	}
 	res, err := s.events.PersistEventAndGroup(pctx, ev, anchor, store.GroupPolicy{
-		QuietWindow: s.cfg.GroupQuietWindow,
-		MaxWindow:   s.cfg.GroupMaxWindow,
-		MaxEvents:   s.cfg.GroupMaxEvents,
+		GroupingVersion: store.GroupingScoped,
+		QuietWindow:     s.cfg.GroupQuietWindow,
+		MaxWindow:       s.cfg.GroupMaxWindow,
+		MaxEvents:       s.cfg.GroupMaxEvents,
 	})
 	if err != nil {
 		return err
@@ -290,6 +388,7 @@ func (s *Server) persistAndReply(ctx context.Context, w http.ResponseWriter, bod
 		// otherwise forward inline — this is Pro's outbox retry
 		// doing its job. In-flight duplicates never reach here:
 		// they wait on the gate and follow the stored state.
+		s.Health.AddDuplicate()
 		if fwd, _, _, ferr := s.events.ForwardState(ctx, eventID); ferr == nil && fwd {
 			writeAccepted(w, eventID, eventType)
 			return nil
@@ -303,10 +402,12 @@ func (s *Server) persistAndReply(ctx context.Context, w http.ResponseWriter, bod
 	}
 
 	if s.cfg.Mode == config.ModeTap {
+		s.Health.AddAccepted()
 		writeAccepted(w, eventID, eventType)
 		return nil
 	}
 	if s.forwardOne(ctx, body, headerMap(r.Header), eventID) {
+		s.Health.AddAccepted()
 		writeAccepted(w, eventID, eventType)
 		return nil
 	}
@@ -319,6 +420,7 @@ func (s *Server) persistAndReply(ctx context.Context, w http.ResponseWriter, bod
 // 503 so Pro retries, and the failure is logged without request content.
 func (s *Server) reportPersistError(w http.ResponseWriter, eventID string, err error) {
 	if errors.Is(err, errMalformedBody) {
+		s.Health.AddRejected()
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -330,6 +432,7 @@ func (s *Server) reportPersistError(w http.ResponseWriter, eventID string, err e
 // the event landed at ScanRelay, 502 when it did not so Pro retries. It never
 // forwards inline — a second forward inside this deadline could exceed it.
 func (s *Server) replyForStoredState(ctx context.Context, w http.ResponseWriter, eventID, eventType string) {
+	s.Health.AddDuplicate()
 	forwarded, _, _, err := s.events.ForwardState(ctx, eventID)
 	if err != nil || !forwarded {
 		writeError(w, http.StatusBadGateway, "scanrelay delivery failed")

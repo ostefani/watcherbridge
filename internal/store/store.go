@@ -51,16 +51,56 @@ func WithQueueCap(n int) Option { return func(o *options) { o.queueCap = n } }
 
 // Store owns the database. The zero value is invalid; use Open.
 type Store struct {
-	db       *sql.DB
-	jobs     chan writeJob // never closed; quit signals shutdown
-	quit     chan struct{}
-	wg       sync.WaitGroup
-	closeMu  sync.Mutex
-	closed   bool
-	closeErr error
-	groupSeq atomic.Int64
-	now      func() time.Time
+	db          *sql.DB
+	jobs        chan writeJob // never closed; quit signals shutdown
+	queueCap    int           // jobs capacity; the purge loop yields past half
+	quit        chan struct{}
+	wg          sync.WaitGroup
+	closeMu     sync.Mutex
+	closed      bool
+	closeErr    error
+	groupSeq    atomic.Int64
+	decisionSeq atomic.Int64
+	incidentSeq atomic.Int64
+	now         func() time.Time
+	// decisionRetention bounds how long operator-decision audit stays
+	// effective; zero means the 180d default. Purge deletes audit rows
+	// past it, and the effective-state queries ignore them even before
+	// the purge runs, so a stalled purge never extends a verdict.
+	decisionRetention time.Duration
+	// protectedRefillPassHook runs synchronously inside protected
+	// token discovery, with the 1-based pass number. It fires twice
+	// per pass: after the pass snapshots before scanning, and after
+	// the end-of-pass check when another pass will run. Nil in
+	// production. Tests use it to stage rows at exact pass
+	// boundaries — an interleaving a sleep-based race cannot place
+	// deterministically. Rows staged at the second site land strictly
+	// between passes: invisible to the finished pass's end-of-pass
+	// check, visible to the next pass's snapshots.
+	protectedRefillPassHook func(pass int)
 }
+
+// SetDecisionRetention attaches the operator-decision audit horizon
+// from config. Effective-state selection and purge share it, so what
+// the UI applies always matches what retention deletes.
+func (s *Store) SetDecisionRetention(d time.Duration) { s.decisionRetention = d }
+
+func (s *Store) decisionCutoff(now time.Time) int64 {
+	ret := s.decisionRetention
+	if ret <= 0 {
+		ret = defaultDecisionRetention
+	}
+	return nanos(now.Add(-ret))
+}
+
+// QueueDepth reports the current writer backlog without blocking. The
+// purge loop yields while the backlog passes half the cap so retention
+// never starves ingest; the value is advisory, never a gate.
+func (s *Store) QueueDepth() int { return len(s.jobs) }
+
+// QueueCap reports the writer queue capacity QueueDepth is measured
+// against. Zero on a Store that bypassed Open, which never purges.
+func (s *Store) QueueCap() int { return s.queueCap }
 
 func nanos(t time.Time) int64 { return t.UTC().UnixNano() }
 func fromNanos(n int64) time.Time {
@@ -192,6 +232,26 @@ func openStore(path string, opts ...Option) (*Store, error) {
 	} else {
 		return nil, fmt.Errorf("stat database file: %w", err)
 	}
+	// The normal DSN switches SQLite to WAL on its first connection. Refuse
+	// unsupported databases through a read-only connection first, so even
+	// the journal header is not rewritten before the refusal.
+	readURI := &url.URL{Scheme: "file", Path: fileURIPath(path)}
+	readQuery := readURI.Query()
+	readQuery.Set("mode", "ro")
+	readQuery.Set("_busy_timeout", "5000")
+	readURI.RawQuery = readQuery.Encode()
+	preflight, err := sql.Open("sqlite3", readURI.String())
+	if err != nil {
+		return nil, fmt.Errorf("open database for schema check: %w", err)
+	}
+	_, checkErr := validateSchemaLineage(preflight)
+	closeErr := preflight.Close()
+	if checkErr != nil {
+		return nil, fmt.Errorf("check database schema: %w", checkErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close schema check: %w", closeErr)
+	}
 	dsn, err := dsnForPath(path)
 	if err != nil {
 		return nil, err
@@ -210,7 +270,7 @@ func openStore(path string, opts ...Option) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("tighten database permissions: %w", err)
 	}
-	s := &Store{db: db, jobs: make(chan writeJob, o.queueCap), quit: make(chan struct{}), now: time.Now}
+	s := &Store{db: db, jobs: make(chan writeJob, o.queueCap), queueCap: o.queueCap, quit: make(chan struct{}), now: time.Now}
 	s.wg.Add(1)
 	go s.writer()
 	return s, nil

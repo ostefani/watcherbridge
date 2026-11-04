@@ -16,16 +16,25 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: gofmt
-        run: test -z "$(gofmt -l .)"
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: ui/.nvmrc
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: gofmt (tracked files only; never third-party node_modules)
+        run: test -z "$(gofmt -l $(git ls-files '*.go'))"
       - name: vet
-        run: go vet ./...
+        run: go vet $(go list ./... | grep -v '/node_modules/')
+      - name: ui-check (lint, dist build, 200 KiB gzip budget)
+        run: make ui-check
       - name: build
-        run: go build ./...
+        run: go build $(go list ./... | grep -v '/node_modules/')
+      - name: ui drift check (committed dist matches sources)
+        run: make ui-drift
       - name: test
-        run: go test ./... -count=1
+        run: go test $(go list ./... | grep -v '/node_modules/') -count=1
       - name: race (touched packages)
-        run: go test -race ./internal/store/ ./internal/redactor/ ./internal/briefing/ ./internal/server/ ./internal/config/ ./internal/forwarder/ ./internal/provider/ ./internal/viewer/ -count=1
+        run: go test -race ./internal/store/ ./internal/redactor/ ./internal/briefing/ ./internal/server/ ./internal/config/ ./internal/forwarder/ ./internal/provider/ ./internal/viewer/ ./internal/overview/ -count=1
 
   e2e:
     runs-on: ubuntu-latest

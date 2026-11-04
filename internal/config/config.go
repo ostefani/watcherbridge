@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ostefani/watcherbridge/internal/limits"
+	"github.com/ostefani/watcherbridge/internal/overview"
 )
 
 // Mode selects tap (persist + 202, all work async) or proxy (persist,
@@ -43,6 +44,18 @@ const maxInflightBytes = 64 << 20
 // (single-transaction read, decode, tokenize) and bundle size.
 const maxGroupEvents = 128
 
+// levelRank orders baseline levels for the single-call/agent floor
+// pairing (Designv9 §6.1): the agent floor sits at or above the
+// single-call floor, so exactly one provider path owns every baseline.
+var levelRank = map[string]int{"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+// leaseMargin is the Designv9 §6.4 hand-off margin for the processing
+// lease: PROCESSING_LEASE must cover 2×AGENT_TIMEOUT plus this. It is
+// deliberately not Margin (1s of handler slack): a 182s lease with a 90s
+// agent budget must refuse startup, and the 210s default (2×90s+30s)
+// must pass, so the comparison is "at least", not strict inequality.
+const leaseMargin = 30 * time.Second
+
 // Secret is key material that must never appear in logs, errors, or
 // dumps: its formatted forms all render as ***. Convert back to string
 // only at the exact use site (HMAC, outgoing header, provider client).
@@ -69,6 +82,12 @@ func (s Secret) MarshalText() ([]byte, error) { return []byte("***"), nil }
 type Config struct {
 	Bind string // loopback only; anything else is refused at startup
 	Mode string // "tap" or "proxy"
+
+	// SourceID is the durable receiver-configured ID for the one
+	// authenticated scanner deployment. It scopes every reported
+	// reference and receipt key; it is never derived from payload
+	// content (sender names, hostnames, remote IPs).
+	SourceID string
 
 	// Secret material. Exactly one of Secret / SecretFile must be set; the
 	// value is never logged or stored in the DB. The file form is
@@ -117,6 +136,16 @@ type Config struct {
 	WriterQueueCap int // enforced by the writer queue depth; overflow is 503
 	RetryAfterSecs int
 
+	// ViewerAllowedHosts overrides the viewer Host allowlist. Empty
+	// (default) derives 127.0.0.1/localhost/[::1] + bind port, so only a
+	// browser pointed at this machine's loopback passes.
+	ViewerAllowedHosts []string
+
+	SSEHeartbeat      time.Duration // SSE comment ping; also dead-peer detection
+	SSEReplayMax      int           // replay cap per reconnect; over it is resync, never partial
+	SSEWriteTimeout   time.Duration // per-write bound on streams; a stalled peer fails fast
+	SSEMaxSubscribers int           // concurrent stream cap; over it is 503
+
 	SweepSafetyMargin time.Duration
 	SweepBatch        int
 	SweepWorkers      int // must be 1: a single worker keeps the sweep bounded
@@ -145,8 +174,52 @@ type Config struct {
 	GroupMaxWindow   time.Duration
 	GroupMaxEvents   int
 
+	// Retention horizons (Designv9 §4.6). Subjects must outlive the
+	// briefings that reference them; the purge interval bounds how
+	// often the purge loop wakes. Decision audit (180d) outlives
+	// subjects so undo stays interpretable while subjects are
+	// retained; materialized labels live in reported_subjects and
+	// survive audit expiry. Snooze stays within the audit horizon so
+	// a snooze never silently outlives the row that justifies it.
+	BriefingRetention time.Duration
+	SubjectRetention  time.Duration
+	PurgeInterval     time.Duration
+	SnoozeDefault     time.Duration
+	DecisionRetention time.Duration
+	// Review-policy rules (Designv9 §5.2): matching expected
+	// decisions that derive a proposal, the default approval grant,
+	// and the terminal-row purge horizon.
+	RuleProposeAfter int
+	RuleDefaultTTL   time.Duration
+	RulePurgeAfter   time.Duration
+	// H1 source progress, independent of SSE connection comment pings.
+	HeartbeatStaleAfter time.Duration
+	HeartbeatRetention  time.Duration
+	// Presentation incidents (Designv9 §7): formation window, quiet
+	// close, distinct-reference threshold and closed retention. The
+	// 30s tick is applied by the loop owner, like the overview tick.
+	IncidentTick      time.Duration
+	IncidentWindow    time.Duration
+	IncidentQuiet     time.Duration
+	IncidentMinRefs   int
+	IncidentRetention time.Duration
+	// Optional AI summary of a closed incident (Plan incident-summary
+	// addition, Designv9 §7): default off, generated once after close
+	// from fixed membership using briefing.Resolve. Enabling applies
+	// to subsequent closures only; historical incidents are never
+	// backfilled automatically.
+	IncidentSummaryEnabled bool
+
 	GrouperTick          time.Duration
-	ProcessingLease      time.Duration // stale processing age; must exceed 2 x provider timeout + margin
+	OverviewWindow       time.Duration // default overview window; window <= max <= briefing retention
+	OverviewMaxWindow    time.Duration // configured overview maximum; 168h initial
+	OverviewTick         time.Duration // overview recompute timer; 5s-5m
+	ProcessingLease      time.Duration // stale processing age; must exceed 2 x agent timeout + margin
+	AgentTimeout         time.Duration // run budget for the bounded loop; must cover the provider timeout
+	AgentEnabled         bool          // bounded investigator loop; opt-in, default off
+	AgentMaxSteps        int           // read-only tool turns per run, 1-4, validated
+	ModelMinBaseline     string        // single-call provider available at/below this baseline level
+	AgentMinBaseline     string        // agent loop investigates at/above this baseline level; >= ModelMin
 	EstablishedAge       time.Duration // first-seen age for established; dormant until Pro ships the field
 	StrongHistoryAge     time.Duration // first-seen age for strong history; dormant until Pro ships the field
 	StableIdentityFields []string      // change-field names that break stability; validated at startup
@@ -159,6 +232,7 @@ func Default() Config {
 	return Config{
 		Bind:                "127.0.0.1:8081",
 		Mode:                ModeTap,
+		SourceID:            "default",
 		ScanRelayURL:        "http://127.0.0.1:8080",
 		ForwardAPIKeyHeader: "X-API-Key",
 		ScanRelayTolerance:  300 * time.Second,
@@ -180,6 +254,11 @@ func Default() Config {
 		InFlightCap:    16,
 		WriterQueueCap: 64,
 		RetryAfterSecs: 2,
+
+		SSEHeartbeat:      15 * time.Second,
+		SSEReplayMax:      200,
+		SSEWriteTimeout:   5 * time.Second,
+		SSEMaxSubscribers: 32,
 
 		SweepSafetyMargin: 30 * time.Second,
 		SweepBatch:        20,
@@ -204,8 +283,33 @@ func Default() Config {
 		GroupMaxWindow:   120 * time.Second,
 		GroupMaxEvents:   10,
 
+		BriefingRetention:      30 * 24 * time.Hour,
+		SubjectRetention:       90 * 24 * time.Hour,
+		PurgeInterval:          6 * time.Hour,
+		SnoozeDefault:          24 * time.Hour,
+		DecisionRetention:      180 * 24 * time.Hour,
+		RuleProposeAfter:       3,
+		RuleDefaultTTL:         90 * 24 * time.Hour,
+		RulePurgeAfter:         180 * 24 * time.Hour,
+		HeartbeatStaleAfter:    10 * time.Minute,
+		HeartbeatRetention:     7 * 24 * time.Hour,
+		IncidentTick:           30 * time.Second,
+		IncidentWindow:         5 * time.Minute,
+		IncidentQuiet:          120 * time.Second,
+		IncidentMinRefs:        3,
+		IncidentRetention:      90 * 24 * time.Hour,
+		IncidentSummaryEnabled: false,
+
 		GrouperTick:          1 * time.Second,
-		ProcessingLease:      90 * time.Second,
+		OverviewWindow:       24 * time.Hour,
+		OverviewMaxWindow:    168 * time.Hour,
+		OverviewTick:         30 * time.Second,
+		ProcessingLease:      210 * time.Second,
+		AgentTimeout:         90 * time.Second,
+		AgentEnabled:         false,
+		AgentMaxSteps:        4,
+		ModelMinBaseline:     "low",
+		AgentMinBaseline:     "medium",
 		EstablishedAge:       1 * time.Hour,
 		StrongHistoryAge:     24 * time.Hour,
 		StableIdentityFields: []string{"mac", "hostname", "host_id", "identity_confidence", "identity_source"},
@@ -380,6 +484,19 @@ func (c Config) Validate() error {
 	if c.Mode != ModeTap && c.Mode != ModeProxy {
 		return fmt.Errorf("mode must be %q or %q", ModeTap, ModeProxy)
 	}
+	if c.SourceID == "" {
+		return fmt.Errorf("source ID must not be empty: it scopes every reported reference")
+	}
+	if len(c.SourceID) > 128 {
+		return fmt.Errorf("source ID must be at most 128 characters")
+	}
+	for i := 0; i < len(c.SourceID); i++ {
+		b := c.SourceID[i]
+		if b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '-' || b == '_' || b == '.' {
+			continue
+		}
+		return fmt.Errorf("source ID must use only letters, digits, '-', '_' and '.'")
+	}
 	if c.Mode == ModeProxy && c.ScanRelayURL == "" {
 		return fmt.Errorf("proxy mode requires a ScanRelay URL")
 	}
@@ -467,6 +584,32 @@ func (c Config) Validate() error {
 	if c.RetryAfterSecs <= 0 {
 		return fmt.Errorf("retry-after seconds must be positive")
 	}
+	for _, h := range c.ViewerAllowedHosts {
+		if strings.TrimSpace(h) == "" {
+			return fmt.Errorf("viewer allowed hosts must not contain blank entries")
+		}
+	}
+	if c.SSEHeartbeat <= 0 {
+		return fmt.Errorf("SSE heartbeat must be positive")
+	}
+	if c.SSEReplayMax <= 0 {
+		return fmt.Errorf("SSE replay cap must be positive")
+	}
+	// The replay fetch is replayMax+1 rows; above the UI page clamp a
+	// permitted replay would silently truncate instead of resyncing.
+	if c.SSEReplayMax > 500 {
+		return fmt.Errorf("SSE replay cap %d exceeds the 500-row briefing page", c.SSEReplayMax)
+	}
+	if c.SSEWriteTimeout <= 0 {
+		return fmt.Errorf("SSE write timeout must be positive")
+	}
+	if c.SSEWriteTimeout >= c.ShutdownGrace {
+		return fmt.Errorf("SSE write timeout %v must stay below shutdown grace %v, or a stalled peer consumes the whole drain",
+			c.SSEWriteTimeout, c.ShutdownGrace)
+	}
+	if c.SSEMaxSubscribers <= 0 {
+		return fmt.Errorf("SSE subscriber cap must be positive")
+	}
 	if c.SweepSafetyMargin <= 0 {
 		return fmt.Errorf("sweep safety margin must be positive")
 	}
@@ -499,6 +642,72 @@ func (c Config) Validate() error {
 	if c.GroupMaxWindow < c.GroupQuietWindow {
 		return fmt.Errorf("group max window must be >= quiet window")
 	}
+	// Designv9 §4.6: briefing history is pageable client history, so a
+	// sub-day horizon would page into gaps; subjects must outlive the
+	// briefings whose relations reference them, or purge orphans
+	// briefing links. The interval floor keeps a misconfigured purge
+	// from hot-looping the writer.
+	if c.BriefingRetention < 24*time.Hour {
+		return fmt.Errorf("briefing retention %v must be at least 24h", c.BriefingRetention)
+	}
+	if c.SubjectRetention < c.BriefingRetention {
+		return fmt.Errorf("subject retention %v must cover briefing retention %v", c.SubjectRetention, c.BriefingRetention)
+	}
+	if c.DecisionRetention < 24*time.Hour {
+		return fmt.Errorf("decision retention %v must be at least 24h", c.DecisionRetention)
+	}
+	if c.SnoozeDefault <= 0 || c.SnoozeDefault > c.DecisionRetention {
+		return fmt.Errorf("snooze default %v must be positive and within decision retention %v", c.SnoozeDefault, c.DecisionRetention)
+	}
+	if c.HeartbeatStaleAfter <= 0 || c.HeartbeatRetention <= 0 {
+		return fmt.Errorf("heartbeat stale-after and retention must be positive")
+	}
+	// Designv9 §7: the correlator tick shares the overview timer
+	// range (5s-5m); the window must fit briefing retention or
+	// formation would read purged evidence; quiet must cover at
+	// least one tick or every incident closes before the next pass
+	// can extend it; single- and double-report bursts stay
+	// individual, never incidents; incident retention shares the
+	// subject horizon so pins never outlive their subjects.
+	if c.IncidentTick < 5*time.Second || c.IncidentTick > 5*time.Minute {
+		return fmt.Errorf("incident tick %v must be between 5s and 5m", c.IncidentTick)
+	}
+	if c.IncidentWindow <= 0 || c.IncidentWindow > c.BriefingRetention {
+		return fmt.Errorf("incident window %v must be positive and within briefing retention %v", c.IncidentWindow, c.BriefingRetention)
+	}
+	if c.IncidentQuiet < c.IncidentTick {
+		return fmt.Errorf("incident quiet %v must cover at least one tick %v", c.IncidentQuiet, c.IncidentTick)
+	}
+	if c.IncidentMinRefs < 2 || c.IncidentMinRefs > 500 {
+		return fmt.Errorf("incident min refs %d must be between 2 and 500", c.IncidentMinRefs)
+	}
+	if c.IncidentRetention < 24*time.Hour {
+		return fmt.Errorf("incident retention %v must be at least 24h", c.IncidentRetention)
+	}
+	if c.IncidentRetention > c.SubjectRetention {
+		return fmt.Errorf("incident retention %v must not exceed subject retention %v", c.IncidentRetention, c.SubjectRetention)
+	}
+	// Incident summaries reuse the existing provider transport, endpoint
+	// security, cancellation, response limits and accounting: no separate
+	// spending policy is introduced by enabling them. The startup wiring
+	// additionally asserts the configured provider exposes the explicit
+	// incident-summary capability; config validation keeps the shared
+	// provider budgets intact here.
+	if c.IncidentSummaryEnabled && c.ProviderTimeout <= 0 {
+		return fmt.Errorf("incident summaries require a positive provider timeout")
+	}
+	if c.RuleProposeAfter < 1 {
+		return fmt.Errorf("rule propose-after %d must be at least 1", c.RuleProposeAfter)
+	}
+	if c.RuleDefaultTTL <= 0 {
+		return fmt.Errorf("rule default ttl %v must be positive", c.RuleDefaultTTL)
+	}
+	if c.RulePurgeAfter < 24*time.Hour {
+		return fmt.Errorf("rule retention %v must be at least 24h", c.RulePurgeAfter)
+	}
+	if c.PurgeInterval < time.Minute {
+		return fmt.Errorf("purge interval %v must be at least 1m", c.PurgeInterval)
+	}
 	if c.MaxBodyBytes > limits.MaxGroupBytes {
 		return fmt.Errorf("max body bytes %d must fit the %d-byte group budget, or a single event never fits a fresh group",
 			c.MaxBodyBytes, limits.MaxGroupBytes)
@@ -512,8 +721,56 @@ func (c Config) Validate() error {
 	if c.ProcessingLease <= 0 {
 		return fmt.Errorf("processing lease must be positive")
 	}
+	if c.AgentTimeout <= 0 {
+		return fmt.Errorf("agent timeout must be positive")
+	}
+	// Designv9 §6.4: the lease only governs a live worker that stalls,
+	// so it must cover twice the agent budget plus the explicit 30s
+	// hand-off margin — not the 1s handler Margin above, which is a
+	// different pairing. At least, not strictly above: the 210s default
+	// is exactly 2×90s+30s and must pass.
+	if c.ProcessingLease < 2*c.AgentTimeout+leaseMargin {
+		return fmt.Errorf("processing lease %v must be at least 2 x agent timeout %v + %v lease margin, or a live worker is reaped mid-turn",
+			c.ProcessingLease, c.AgentTimeout, leaseMargin)
+	}
+	// Designv9 §6.4: the agent budget must cover the provider call it
+	// wraps, including the repair attempt it may need.
+	if c.AgentTimeout < c.ProviderTimeout {
+		return fmt.Errorf("agent timeout %v must cover the provider timeout %v", c.AgentTimeout, c.ProviderTimeout)
+	}
+	if c.AgentMaxSteps < 1 || c.AgentMaxSteps > 4 {
+		return fmt.Errorf("agent max steps %d must be within 1-4: more turns exceed the per-run budget", c.AgentMaxSteps)
+	}
+	if c.AgentTimeout < time.Duration(c.AgentMaxSteps+1)*(c.ProviderTimeout/2) {
+		return fmt.Errorf("agent timeout %v must allow a full call plus repair within %d steps (provider timeout %v)",
+			c.AgentTimeout, c.AgentMaxSteps+1, c.ProviderTimeout)
+	}
+	// Designv9 §6.1 floors: unknown strings refuse startup (never route
+	// on a typo), and the single-call ceiling must not overtake the
+	// agent floor, or a baseline would own two provider paths.
+	modelMin, ok := levelRank[strings.ToLower(strings.TrimSpace(c.ModelMinBaseline))]
+	if !ok {
+		return fmt.Errorf("model min baseline %q must be one of low, medium, high, critical", c.ModelMinBaseline)
+	}
+	agentMin, ok := levelRank[strings.ToLower(strings.TrimSpace(c.AgentMinBaseline))]
+	if !ok {
+		return fmt.Errorf("agent min baseline %q must be one of low, medium, high, critical", c.AgentMinBaseline)
+	}
+	if modelMin > agentMin {
+		return fmt.Errorf("model min baseline %q must not exceed agent min baseline %q, or both paths claim the gap",
+			c.ModelMinBaseline, c.AgentMinBaseline)
+	}
 	if c.GrouperTick >= c.ProcessingLease {
 		return fmt.Errorf("grouper tick %v must be below the processing lease %v, or a stale worker is never reaped in time", c.GrouperTick, c.ProcessingLease)
+	}
+	// Designv9 §3.3: the timer range is 5s-5m, and window <= max <=
+	// briefing retention — the same chain the API and CLI validate per
+	// request, checked here once for the configured defaults.
+	if c.OverviewTick < 5*time.Second || c.OverviewTick > 5*time.Minute {
+		return fmt.Errorf("overview tick %v must be between 5s and 5m", c.OverviewTick)
+	}
+	if _, err := overview.ValidateWindow(c.OverviewWindow, c.OverviewMaxWindow, c.BriefingRetention); err != nil {
+		return fmt.Errorf("overview window: %w", err)
 	}
 	if c.EstablishedAge <= 0 || c.StrongHistoryAge <= 0 {
 		return fmt.Errorf("established and strong-history ages must be positive")

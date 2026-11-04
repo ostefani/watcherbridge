@@ -419,7 +419,28 @@ func splitAliases(s string) []string {
 	return []string{s}
 }
 
+// providerAnchor strips the deployment scope from scoped group anchors
+// ("sub:<scope>:<rest>", "addr:<scope>:<rest>"). The scope identifies
+// the local deployment, not the observed device: it is dropped before
+// discovery and serialization so it can never reach the provider —
+// only the tokenized identity remainder is sent. Legacy anchors pass
+// through unchanged.
+func providerAnchor(anchor string) string {
+	for _, class := range []string{"sub:", "addr:"} {
+		if rest, ok := strings.CutPrefix(anchor, class); ok {
+			if _, remainder, ok := strings.Cut(rest, ":"); ok {
+				return class + remainder
+			}
+			return anchor
+		}
+	}
+	return anchor
+}
+
 // discoverAnchor registers the anchor's identity value by its prefix.
+// Scoped remainders ("sub:<ns>:<ref>", scope already stripped) type the
+// reference by its namespace through the same cases as legacy anchors,
+// so a scoped MAC reference registers exactly like "mac:…".
 func (b *builder) discoverAnchor(anchor string) {
 	kind, val, ok := strings.Cut(anchor, ":")
 	if !ok {
@@ -427,6 +448,12 @@ func (b *builder) discoverAnchor(anchor string) {
 	}
 	val = strings.TrimSpace(val)
 	switch kind {
+	case "sub", "addr":
+		ns, ref, ok := strings.Cut(val, ":")
+		if !ok {
+			return
+		}
+		b.discoverAnchor(ns + ":" + strings.TrimSpace(ref))
 	case "mac":
 		b.addPending(catMAC, canonicalMAC(val), val)
 	case "host":
@@ -667,11 +694,13 @@ func BuildBundle(ctx context.Context, st *store.Store, in BundleInput, pol Polic
 		b.discoverKeys(v)
 	}
 	// Anchor and target seed the map typed: the anchor carries the host
-	// identity by construction ("mac:…", "host:…", "ip:…"), and the target
-	// is usually the scan CIDR.
-	b.discoverAnchor(in.Anchor)
+	// identity by construction ("mac:…", "host:…", "ip:…", or a scoped
+	// remainder), and the target is usually the scan CIDR. The
+	// deployment scope never seeds the map and never serializes.
+	anchor := providerAnchor(in.Anchor)
+	b.discoverAnchor(anchor)
 	b.discoverTarget(in.Target)
-	b.discoverString("anchor", in.Anchor)
+	b.discoverString("anchor", anchor)
 	b.discoverString("target", in.Target)
 	if b.overCap {
 		return nil, nil, nil, fmt.Errorf("bundle exceeds redaction bounds")
@@ -690,7 +719,7 @@ func BuildBundle(ctx context.Context, st *store.Store, in BundleInput, pol Polic
 	// literally "IP_1"), so a token-shaped anchor must trip the same
 	// fail-closed path as a token-shaped banner — not ride through
 	// unchecked after it.
-	anchor := b.tokenizeString(in.Anchor)
+	anchor = b.tokenizeString(anchor)
 	if b.tokenSpoof {
 		return nil, nil, nil, fmt.Errorf("input contains token-shaped text")
 	}

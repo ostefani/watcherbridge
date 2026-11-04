@@ -2,18 +2,22 @@ package viewer
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/ostefani/watcherbridge/internal/health"
 	"github.com/ostefani/watcherbridge/internal/store"
 )
 
-func openViewerStore(t *testing.T) *store.Store {
+func openViewerStore(t testing.TB) *store.Store {
 	t.Helper()
 	s, err := store.Open(t.TempDir() + "/viewer.db")
 	if err != nil {
@@ -23,7 +27,7 @@ func openViewerStore(t *testing.T) *store.Store {
 	return s
 }
 
-func seedOpenGroup(t *testing.T, s *store.Store, anchor, eventID string) {
+func seedOpenGroup(t testing.TB, s *store.Store, anchor, eventID string) {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
 	_, err := s.PersistEventAndGroup(context.Background(), store.RawEvent{
@@ -33,9 +37,20 @@ func seedOpenGroup(t *testing.T, s *store.Store, anchor, eventID string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Mirror production order (persist -> project -> close -> take).
+	if _, err := s.ProjectReported(context.Background(), "test-scope", 64); err != nil {
+		t.Fatal(err)
+	}
 }
 
-func seedBriefing(t *testing.T, s *store.Store, anchor, eventID string) string {
+func seedBriefing(t testing.TB, s *store.Store, anchor, eventID string) string {
+	t.Helper()
+	return seedPriorityBriefing(t, s, anchor, eventID, "high", time.Now().UTC())
+}
+
+// seedPriorityBriefing seeds one briefing with an explicit priority and
+// report time, closing and taking its group like production.
+func seedPriorityBriefing(t testing.TB, s *store.Store, anchor, eventID, priority string, at time.Time) string {
 	t.Helper()
 	seedOpenGroup(t, s, anchor, eventID)
 	groups, err := s.OpenGroupSnapshots(context.Background())
@@ -43,7 +58,9 @@ func seedBriefing(t *testing.T, s *store.Store, anchor, eventID string) string {
 		t.Fatalf("seed group missing: %v", groups)
 	}
 	gid := groups[len(groups)-1].GroupID
-	// Advance past the quiet window so TakeGroup accepts the group.
+	// Advance past the quiet window so TakeGroup accepts the group. The
+	// horizon is wall-clock based, independent of the briefing's report
+	// time, so backdated seeds close too.
 	if _, err := s.CloseDue(context.Background(), time.Now().UTC().Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
@@ -53,9 +70,9 @@ func seedBriefing(t *testing.T, s *store.Store, anchor, eventID string) string {
 	}
 	if err := s.InsertBriefing(context.Background(), store.Briefing{
 		BriefingID: "brf-" + taken.GroupID, GroupID: taken.GroupID, HostAnchorKey: anchor,
-		Baseline: "medium", Priority: "high", PriorityReason: "r", Clamped: true,
+		Baseline: "medium", Priority: priority, PriorityReason: "r", Clamped: true,
 		FallbackUsed: false, WhatChanged: "w", Context: "c", RecommendedCheck: "k",
-		CreatedAt: time.Now().UTC(),
+		CreatedAt: at,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +94,7 @@ func TestHubBroadcastAndSlowSkip(t *testing.T) {
 	n := 0
 	for {
 		select {
-		case ev := <-fast:
+		case ev := <-fast.C:
 			if ev.Name != "briefing" {
 				t.Fatalf("event name = %q", ev.Name)
 			}
@@ -93,8 +110,24 @@ drained:
 	if d := h.Dropped(); d == 0 {
 		t.Fatal("slow subscriber must be skipped, never waited on")
 	}
-	_ = slow
+	if !slow.Lagged() {
+		t.Fatal("skipped subscriber must be flagged lagged for resync")
+	}
+	if !slow.ConsumeLagged() || slow.Lagged() {
+		t.Fatal("ConsumeLagged must return and clear the flag")
+	}
 	unsubSlow()
+	// One slot taken (fast): max 2 admits one more, then refuses, and the
+	// check-and-insert holds the hub lock so the cap cannot be raced past.
+	extra, unsubExtra, ok := h.TrySubscribe(8, 2)
+	if !ok {
+		t.Fatal("one free slot must admit a subscriber")
+	}
+	_ = extra
+	if _, _, ok := h.TrySubscribe(8, 2); ok {
+		t.Fatal("a full hub must refuse, so the handler can answer 503")
+	}
+	unsubExtra()
 	if got := h.SubscriberCount(); got != 1 {
 		t.Fatalf("unsubscribe leaking: %d", got)
 	}
@@ -161,7 +194,10 @@ func TestSSEOnlyEmitsBridgeNames(t *testing.T) {
 		t.Fatalf("no group snapshot on connect: %q", body)
 	}
 	for _, line := range strings.Split(body, "\n") {
-		if strings.HasPrefix(line, "event: ") && line != "event: group" && line != "event: briefing" {
+		// The bridge stream carries briefing, group, overview and resync;
+		// annotation belongs to ScanRelay's stream and must never appear.
+		if strings.HasPrefix(line, "event: ") && line != "event: group" && line != "event: briefing" &&
+			line != "event: overview" && line != "event: resync" {
 			t.Fatalf("foreign event name on bridge stream: %q", line)
 		}
 	}
@@ -185,8 +221,8 @@ func TestBriefingEndpointsShapeAndHeaders(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 		t.Fatalf("briefings content type = %q", ct)
 	}
-	if csp := rec.Header().Get("Content-Security-Policy"); csp != "default-src 'self'" {
-		t.Fatalf("briefings CSP = %q", csp)
+	if got := rec.Header().Get("Content-Security-Policy"); got != csp {
+		t.Fatalf("briefings CSP = %q, want %q", got, csp)
 	}
 	var rows []map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil || len(rows) != 1 {
@@ -200,6 +236,14 @@ func TestBriefingEndpointsShapeAndHeaders(t *testing.T) {
 	if rows[0]["host"] != "host:api" || rows[0]["priority"] != "high" {
 		t.Fatalf("row = %v", rows[0])
 	}
+	// Step 19: kind and source ride the API; the seed insert leaves
+	// both unset, so the store defaults apply (other/model).
+	if rows[0]["kind"] != "other" || rows[0]["source"] != "model" {
+		t.Fatalf("kind/source missing from API: %v", rows[0])
+	}
+	if rows[0]["grouping_version"] != float64(store.GroupingUnknown) {
+		t.Fatalf("grouping provenance missing from list: %v", rows[0])
+	}
 
 	rec = serve(v.handleBriefing, "/api/briefing?id="+gid)
 	var one map[string]any
@@ -209,10 +253,35 @@ func TestBriefingEndpointsShapeAndHeaders(t *testing.T) {
 	if one["group_id"] != gid {
 		t.Fatalf("wrong briefing: %v", one)
 	}
+	if one["kind"] != "other" || one["source"] != "model" {
+		t.Fatalf("kind/source missing from detail: %v", one)
+	}
+	// Step 24: persisted links, the event index and the retained
+	// observations ride the detail; empty sections stay arrays.
+	profiles, ok := one["profiles"].([]any)
+	if !ok {
+		t.Fatalf("profiles not an array: %v", one["profiles"])
+	}
+	if len(profiles) != 0 {
+		t.Fatalf("event-local seed must link no profiles: %v", profiles)
+	}
+	refs, ok := one["referenced_events"].([]any)
+	if !ok || len(refs) != 1 {
+		t.Fatalf("referenced_events = %v, want the one group event", one["referenced_events"])
+	}
+	ref, ok := refs[0].(map[string]any)
+	if !ok || ref["event_id"] != "evt-api" || ref["event_type"] != "host.appeared" {
+		t.Fatalf("referenced pair = %v, want id+type", refs[0])
+	}
+	if _, ok := one["observations"].([]any); !ok {
+		t.Fatalf("observations not an array: %v", one["observations"])
+	}
+	if one["grouping_version"] != rows[0]["grouping_version"] {
+		t.Fatalf("detail/list grouping provenance disagree: %v", one)
+	}
 	if rec := serve(v.handleBriefing, "/api/briefing"); rec.Code != http.StatusBadRequest {
 		t.Fatalf("missing id = %d", rec.Code)
 	}
-
 	rec = serve(v.handleGroups, "/api/groups")
 	var groups []map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &groups); err != nil {
@@ -221,22 +290,187 @@ func TestBriefingEndpointsShapeAndHeaders(t *testing.T) {
 	_ = groups
 }
 
+// Browser links use briefing_id from the list response, while older API callers
+// may still use group_id. Both must resolve the same persisted detail.
+func TestBriefingDetailResolvesListedIDAndGroupAlias(t *testing.T) {
+	s := openViewerStore(t)
+	gid := seedBriefing(t, s, "host:identity", "evt-detail-identity")
+	v := New(s, NewHub())
+	list := httptest.NewRecorder()
+	v.handleBriefings(list, httptest.NewRequest("GET", "/api/briefings?limit=10", nil))
+	var rows []briefingView
+	if err := json.Unmarshal(list.Body.Bytes(), &rows); err != nil || len(rows) != 1 {
+		t.Fatalf("list: %d %v", list.Code, err)
+	}
+	for _, id := range []string{rows[0].BriefingID, gid} {
+		t.Run(id, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			v.handleBriefing(rec, httptest.NewRequest("GET", "/api/briefing?id="+id, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("detail for %s: %d %s", id, rec.Code, rec.Body.String())
+			}
+			var detail briefingView
+			if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+				t.Fatal(err)
+			}
+			if detail.BriefingID != rows[0].BriefingID || detail.GroupID != gid || len(detail.ReferencedEvents) != 1 {
+				t.Fatalf("wrong detail: %+v", detail)
+			}
+		})
+	}
+	for _, id := range []string{"brf-grp-missing", "grp-missing"} {
+		rec := httptest.NewRecorder()
+		v.handleBriefing(rec, httptest.NewRequest("GET", "/api/briefing?id="+id, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("missing %s: %d, want 404", id, rec.Code)
+		}
+	}
+	// An unavailable database is a real server failure, not a missing row.
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	v.handleBriefing(rec, httptest.NewRequest("GET", "/api/briefing?id="+rows[0].BriefingID, nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("closed database: %d, want 500", rec.Code)
+	}
+}
+
+func TestBriefingDetailServesTrace(t *testing.T) {
+	_ = t
+	s := openViewerStore(t)
+	seedOpenGroup(t, s, "host:trace", "evt-trace")
+	groups, err := s.OpenGroupSnapshots(context.Background())
+	if err != nil || len(groups) == 0 {
+		t.Fatalf("seed group missing: %v", groups)
+	}
+	gid := groups[len(groups)-1].GroupID
+	if _, err := s.CloseDue(context.Background(), time.Now().UTC().Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := s.TakeGroup(context.Background(), gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	explanation := "likely a reappearing host"
+	in, out := int64(120), int64(45)
+	if err := s.InsertBriefing(context.Background(), store.Briefing{
+		BriefingID: "brf-" + taken.GroupID, GroupID: taken.GroupID, HostAnchorKey: "host:trace",
+		Baseline: "medium", Priority: "high", PriorityReason: "r",
+		WhatChanged: "w", Context: "c", RecommendedCheck: "k", CreatedAt: time.Now().UTC(),
+		Source:            "agent",
+		LikelyExplanation: &explanation,
+		Confidence:        "medium",
+		EvidenceRefs:      []store.EvidenceRef{store.EventRef("evt-trace"), store.ToolRef(0)},
+		InputTokens:       &in,
+		OutputTokens:      &out,
+		Traces: []store.AgentTrace{
+			{Step: 0, Tool: "get_reported_profile", ArgsJSON: `{"host":"IP_1"}`, ResultJSON: `{"tool":"get_reported_profile"}`, Status: "ok", DurationMS: 2},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	v := New(s, NewHub())
+	rec := httptest.NewRecorder()
+	v.handleBriefing(rec, httptest.NewRequest("GET", "/api/briefing?id="+gid, nil))
+	var one map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &one); err != nil {
+		t.Fatalf("single briefing: %v", err)
+	}
+	if one["likely_explanation"] != explanation || one["confidence"] != "medium" {
+		t.Fatalf("explanation missing from detail: %v", one)
+	}
+	refs, ok := one["evidence_refs"].([]any)
+	if !ok || len(refs) != 2 {
+		t.Fatalf("evidence_refs = %v, want event + tool refs", one["evidence_refs"])
+	}
+	if ref, ok := refs[0].(map[string]any); !ok || ref["event_id"] != "evt-trace" {
+		t.Fatalf("event ref = %v", refs[0])
+	}
+	if ref, ok := refs[1].(map[string]any); !ok || ref["tool_step"] != float64(0) {
+		t.Fatalf("tool ref = %v", refs[1])
+	}
+	traces, ok := one["traces"].([]any)
+	if !ok || len(traces) != 1 {
+		t.Fatalf("traces = %v, want the one executed step", one["traces"])
+	}
+	step, ok := traces[0].(map[string]any)
+	if !ok || step["step"] != float64(0) || step["tool"] != "get_reported_profile" || step["status"] != "ok" {
+		t.Fatalf("trace step = %v", traces[0])
+	}
+	if step["args"] != `{"host":"IP_1"}` {
+		t.Fatalf("trace args must stay tokenized: %v", step["args"])
+	}
+	if one["input_tokens"] != float64(120) || one["output_tokens"] != float64(45) {
+		t.Fatalf("usage missing from detail: %v", one)
+	}
+	if _, present := one["cost_usd"]; present {
+		t.Fatalf("unsupplied cost must stay absent: %v", one["cost_usd"])
+	}
+}
+
+func TestBriefingsCursorPaging(t *testing.T) {
+	s := openViewerStore(t)
+	seedBriefing(t, s, "host:pg1", "evt-pg1")
+	seedBriefing(t, s, "host:pg2", "evt-pg2")
+	v := New(s, NewHub())
+	serve := func(path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		v.handleBriefings(rec, httptest.NewRequest("GET", path, nil))
+		return rec
+	}
+	decode := func(rec *httptest.ResponseRecorder) []map[string]any {
+		t.Helper()
+		var rows []map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+			t.Fatalf("briefings = %q, err %v", rec.Body.String(), err)
+		}
+		return rows
+	}
+	// Default: latest page, ascending seq.
+	rows := decode(serve("/api/briefings"))
+	if len(rows) != 2 || rows[0]["seq"] != 1.0 || rows[1]["seq"] != 2.0 {
+		t.Fatalf("default page = %v", rows)
+	}
+	// Gap-fill newer than seq 1.
+	rows = decode(serve("/api/briefings?after=1"))
+	if len(rows) != 1 || rows[0]["seq"] != 2.0 {
+		t.Fatalf("after=1 = %v", rows)
+	}
+	// Older history before seq 2.
+	rows = decode(serve("/api/briefings?before=2&limit=10"))
+	if len(rows) != 1 || rows[0]["seq"] != 1.0 {
+		t.Fatalf("before=2 = %v", rows)
+	}
+	// Garbage, negative and out-of-range params are 400, never silent.
+	for _, path := range []string{
+		"/api/briefings?after=12abc",
+		"/api/briefings?after=-1",
+		"/api/briefings?before=1.5",
+		"/api/briefings?limit=12abc",
+		"/api/briefings?limit=0",
+		"/api/briefings?limit=501",
+	} {
+		if rec := serve(path); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s = %d, want 400", path, rec.Code)
+		}
+	}
+}
+
 func TestStaticAssetsHeaders(t *testing.T) {
 	v := New(openViewerStore(t), NewHub())
 	for path, ct := range map[string]string{
-		"/":          "text/html; charset=utf-8",
-		"/app.js":    "text/javascript; charset=utf-8",
-		"/style.css": "text/css; charset=utf-8",
+		"/":                 "text/html; charset=utf-8",
+		"/assets/index.js":  "text/javascript; charset=utf-8",
+		"/assets/index.css": "text/css; charset=utf-8",
 	} {
 		req := httptest.NewRequest("GET", path, nil)
 		rec := httptest.NewRecorder()
 		switch path {
 		case "/":
 			v.handleIndex(rec, req)
-		case "/app.js":
-			v.serveAsset("web/app.js", "text/javascript; charset=utf-8")(rec, req)
-		case "/style.css":
-			v.serveAsset("web/style.css", "text/css; charset=utf-8")(rec, req)
+		default:
+			v.handleAssets(rec, req)
 		}
 		if rec.Code != 200 {
 			t.Fatalf("%s = %d", path, rec.Code)
@@ -244,23 +478,75 @@ func TestStaticAssetsHeaders(t *testing.T) {
 		if got := rec.Header().Get("Content-Type"); got != ct {
 			t.Fatalf("%s content type = %q", path, got)
 		}
-		if got := rec.Header().Get("Content-Security-Policy"); got != "default-src 'self'" {
+		if got := rec.Header().Get("Content-Security-Policy"); got != csp {
 			t.Fatalf("%s CSP = %q", path, got)
+		}
+	}
+	// Only .js and .css inside the bundle directory are reachable;
+	// traversal, extension smuggling, and bare prefixes are 404.
+	for _, path := range []string{
+		"/assets/", "/assets/../index.html", "/assets/%2e%2e/index.html",
+		"/assets/index.map", "/assets/index.html",
+	} {
+		req := httptest.NewRequest("GET", path, nil)
+		rec := httptest.NewRecorder()
+		v.handleAssets(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s = %d, want 404", path, rec.Code)
 		}
 	}
 }
 
 func TestShippedJSRendersTextOnly(t *testing.T) {
-	raw, err := assets.ReadFile("web/app.js")
+	// The Svelte bundle replaces the old hand-written client. Svelte's
+	// runtime sets innerHTML on static compiled templates (never on
+	// hostile data), so a bundle substring check cannot distinguish
+	// framework machinery from a data sink. The enforceable invariant
+	// is at the source level: no {@html} directive may exist, with or
+	// without an expression (primary enforcement is `npm run lint` via
+	// svelte/no-at-html-tags, which CI runs; this test keeps a checkout
+	// honest when the bundle is rebuilt without lint).
+	entries, err := os.ReadDir("../../ui/src")
 	if err != nil {
 		t.Fatal(err)
 	}
-	js := string(raw)
-	if strings.Contains(js, "innerHTML") {
-		t.Fatal("viewer JS must not use innerHTML: hostile strings render via textContent only")
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		raw, err := os.ReadFile("../../ui/src/" + e.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "{@html") {
+			t.Fatalf("ui/src/%s uses {@html}: hostile strings must stay inert", e.Name())
+		}
 	}
-	if !strings.Contains(js, "textContent") {
-		t.Fatal("viewer JS must render through textContent")
+	// The served shell must load under the viewer CSP: no inline
+	// scripts, no inline event handlers — only src-referenced bundle
+	// assets, which the route test above proves servable.
+	page, err := assets.ReadFile("web/dist/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(page), "<script>") || strings.Contains(string(page), "onclick=") ||
+		strings.Contains(string(page), "onload=") || strings.Contains(string(page), "onerror=") {
+		t.Fatal("served shell must not carry inline scripts or handlers")
+	}
+	// The committed bundle must still exist: an empty dist would pass
+	// every content assertion vacuously.
+	dist, err := assets.ReadDir("web/dist/assets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var js int
+	for _, e := range dist {
+		if strings.HasSuffix(e.Name(), ".js") {
+			js++
+		}
+	}
+	if js == 0 {
+		t.Fatal("no JS bundle committed")
 	}
 }
 
@@ -268,7 +554,7 @@ func TestFanoutNamesAndShapes(t *testing.T) {
 	h := NewHub()
 	ch, unsub := h.Subscribe(8)
 	defer unsub()
-	onBriefing, onGroups := Fanout(h, nil)
+	onBriefing, onGroups := Fanout(h, nil, 45)
 	onBriefing(store.Briefing{BriefingID: "brf-g", GroupID: "g", HostAnchorKey: "host:f",
 		Baseline: "low", Priority: "low", PriorityReason: "r", CreatedAt: time.Now().UTC(),
 		EventIDs: []string{"e1"}})
@@ -277,7 +563,7 @@ func TestFanoutNamesAndShapes(t *testing.T) {
 	got := map[string]json.RawMessage{}
 	for i := 0; i < 2; i++ {
 		select {
-		case ev := <-ch:
+		case ev := <-ch.C:
 			got[ev.Name] = ev.Data
 		case <-time.After(2 * time.Second):
 			t.Fatal("fanout did not deliver")
@@ -327,5 +613,677 @@ func TestHostileStringsSurviveAsInertText(t *testing.T) {
 	}
 	if groups[0]["anchor"] != "host:"+evil {
 		t.Fatalf("anchor mangled: %v", groups[0]["anchor"])
+	}
+}
+
+func TestParseLastEventID(t *testing.T) {
+	for _, tc := range []struct {
+		in    string
+		want  int64
+		valid bool
+	}{
+		{"", 0, false},
+		{"abc", 0, false},
+		{"12abc", 0, false},
+		{"-1", 0, false},
+		{"1.5", 0, false},
+		{"0", 0, true},
+		{"42", 42, true},
+		{"4611686018427387904", 1 << 62, true}, // exactly 2^62: valid
+		{"4611686018427387905", 0, false},      // 2^62+1: no replay
+		{"18446744073709551615", 0, false},     // max uint64: no replay
+	} {
+		got, ok := parseLastEventID(tc.in)
+		if ok != tc.valid || (ok && got != tc.want) {
+			t.Fatalf("parseLastEventID(%q) = %d, %v; want %d, %v", tc.in, got, ok, tc.want, tc.valid)
+		}
+	}
+}
+
+// streamCase runs handleEvents until body contains want (or timeout), then
+// cancels and returns the full body. The recorder is mutex-guarded: the
+// handler writes while the test polls.
+func streamCase(t *testing.T, v *Viewer, headers map[string]string, want string) string {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest("GET", "/events", nil)
+	for k, val := range headers {
+		req.Header.Set(k, val)
+	}
+	req = req.WithContext(ctx)
+	rec := &syncRecorder{rec: httptest.NewRecorder()}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.handleEvents(rec, req)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if strings.Contains(rec.body(), want) {
+			cancel()
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("stream never contained %q; body:\n%s", want, rec.body())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	<-done
+	return rec.body()
+}
+
+func TestHandleEventsReplay(t *testing.T) {
+	s := openViewerStore(t)
+	seedBriefing(t, s, "host:re1", "evt-re1")
+	seedBriefing(t, s, "host:re2", "evt-re2")
+	v := New(s, NewHub())
+
+	// Valid id replays newer briefings with id: lines, ascending.
+	body := streamCase(t, v, map[string]string{"Last-Event-ID": "1"}, "id: 2")
+	if strings.Count(body, "event: briefing") != 1 {
+		t.Fatalf("want exactly the seq-2 replay, body:\n%s", body)
+	}
+	if !strings.Contains(body, "event: group") || !strings.Contains(body, "event: overview") {
+		t.Fatalf("connect must send snapshot and overview first, body:\n%s", body)
+	}
+
+	// Garbage replays nothing: snapshot and overview only, no id: lines.
+	body = streamCase(t, v, map[string]string{"Last-Event-ID": "12abc"}, "event: overview")
+	if strings.Contains(body, "id: ") || strings.Contains(body, "event: briefing") {
+		t.Fatalf("garbage Last-Event-ID must replay nothing, body:\n%s", body)
+	}
+
+	// Future id (restored database) resyncs with the current maximum.
+	body = streamCase(t, v, map[string]string{"Last-Event-ID": "9999"}, "event: resync")
+	if strings.Contains(body, "event: briefing") {
+		t.Fatalf("future Last-Event-ID must not replay, body:\n%s", body)
+	}
+	if !strings.Contains(body, `"max_seq":2`) {
+		t.Fatalf("resync must carry max_seq 2, body:\n%s", body)
+	}
+
+	// Over the replay cap: resync, never a partial replay.
+	v.ReplayMax = 1
+	body = streamCase(t, v, map[string]string{"Last-Event-ID": "0"}, "event: resync")
+	if strings.Contains(body, "event: briefing") {
+		t.Fatalf("over-cap replay must send resync only, body:\n%s", body)
+	}
+}
+
+// deadlineRecorder records every SetWriteDeadline the stream sets, so the
+// test proves each write carries a bound (a stalled peer fails fast).
+type deadlineRecorder struct {
+	*syncRecorder
+	mu        sync.Mutex
+	deadlines []time.Time
+}
+
+func (d *deadlineRecorder) SetWriteDeadline(t time.Time) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.deadlines = append(d.deadlines, t)
+	return nil
+}
+
+func TestHandleEventsBoundsEveryWrite(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	v.WriteTimeout = 5 * time.Second
+	start := time.Now()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest("GET", "/events", nil).WithContext(ctx)
+	rec := &deadlineRecorder{syncRecorder: &syncRecorder{rec: httptest.NewRecorder()}}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.handleEvents(rec, req)
+	}()
+	deadline := start.Add(3 * time.Second)
+	for {
+		rec.mu.Lock()
+		n := len(rec.deadlines)
+		rec.mu.Unlock()
+		// Connect sequence alone performs two writes (group, overview).
+		if n >= 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.deadlines) < 2 {
+		t.Fatalf("only %d writes carried a deadline", len(rec.deadlines))
+	}
+	for _, d := range rec.deadlines {
+		if d.IsZero() || d.Before(start) || d.After(start.Add(10*time.Second)) {
+			t.Fatalf("unbounded stream write, deadlines = %v", rec.deadlines)
+		}
+	}
+}
+
+// A refused subscription answers 503 without touching the store: the
+// ingest path never queues behind stream demand.
+func TestHandleEventsSubscriberCap(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	v.MaxSubscribers = 1
+	_, unsub := v.hub.Subscribe(8)
+	defer unsub()
+	rec := httptest.NewRecorder()
+	v.handleEvents(rec, httptest.NewRequest("GET", "/events", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("over-cap subscriber = %d, want 503", rec.Code)
+	}
+}
+
+// A replay-path store failure resyncs instead of streaming on silently:
+// the client must refetch, never advance its cursor past missed history.
+func TestHandleEventsReplayErrorResyncs(t *testing.T) {
+	s := openViewerStore(t)
+	seedBriefing(t, s, "host:rx", "evt-rx")
+	s.Close()
+	v := New(s, NewHub())
+	body := streamCase(t, v, map[string]string{"Last-Event-ID": "0"}, "event: resync")
+	if strings.Contains(body, "event: briefing") {
+		t.Fatalf("failed replay must not emit briefings, body:\n%s", body)
+	}
+}
+
+func TestHandleEventsHeartbeat(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	v.Heartbeat = 10 * time.Millisecond
+	body := streamCase(t, v, nil, ": ping")
+	if strings.Count(body, ": ping") < 1 {
+		t.Fatalf("no heartbeat comments, body:\n%s", body)
+	}
+}
+
+func TestViewerCloseUnblocksStream(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest("GET", "/events", nil).WithContext(ctx)
+	rec := &syncRecorder{rec: httptest.NewRecorder()}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.handleEvents(rec, req)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if strings.Contains(rec.body(), "event: overview") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stream never sent the connect sequence")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	v.Close()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not unblock the stream handler")
+	}
+	v.Close() // idempotent: shutdown paths may race
+}
+
+func TestLaggedSubscriberGetsResync(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest("GET", "/events", nil).WithContext(ctx)
+	rec := &syncRecorder{rec: httptest.NewRecorder()}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.handleEvents(rec, req)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if strings.Contains(rec.body(), "event: overview") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stream never sent the connect sequence")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// White-box: flag the handler's subscription lagged, then deliver one
+	// live event. The loop must answer resync, never a partial replay.
+	v.hub.mu.Lock()
+	for sub := range v.hub.subs {
+		sub.lagged.Store(true)
+	}
+	v.hub.mu.Unlock()
+	v.hub.Broadcast("group", map[string]string{"note": "live"})
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		if strings.Contains(rec.body(), "event: resync") {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("lagged subscriber got no resync, body:\n%s", rec.body())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+}
+
+// A closed viewer replays nothing and returns promptly: snapshot and
+// replay reads inherit a context cancelled by Close, and no new write
+// starts after it — the handler may end with zero bytes written.
+func TestReplayObservesClose(t *testing.T) {
+	s := openViewerStore(t)
+	seedBriefing(t, s, "host:rc1", "evt-rc1")
+	seedBriefing(t, s, "host:rc2", "evt-rc2")
+	v := New(s, NewHub())
+	v.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req := httptest.NewRequest("GET", "/events", nil)
+	req.Header.Set("Last-Event-ID", "0")
+	req = req.WithContext(ctx)
+	rec := &syncRecorder{rec: httptest.NewRecorder()}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.handleEvents(rec, req)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("closed viewer did not end the stream")
+	}
+	if strings.Contains(rec.body(), "event: briefing") {
+		t.Fatalf("closed viewer must not replay, body:\n%s", rec.body())
+	}
+}
+
+// gateWriter blocks one numbered stream write until released, so the test
+// can close the viewer mid-replay: the handler must abort promptly
+// instead of emitting the remaining rows.
+type gateWriter struct {
+	*syncRecorder
+	mu      sync.Mutex
+	n       int
+	blockOn int
+	release chan struct{}
+	started chan struct{}
+}
+
+func (g *gateWriter) Write(b []byte) (int, error) {
+	g.mu.Lock()
+	g.n++
+	fire := g.n == g.blockOn
+	g.mu.Unlock()
+	if fire {
+		close(g.started)
+		<-g.release
+	}
+	return g.syncRecorder.Write(b)
+}
+
+func TestReplayAbortsOnMidReplayClose(t *testing.T) {
+	s := openViewerStore(t)
+	seedBriefing(t, s, "host:mc1", "evt-mc1")
+	seedBriefing(t, s, "host:mc2", "evt-mc2")
+	v := New(s, NewHub())
+	v.ReplayMax = 100
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest("GET", "/events", nil)
+	req.Header.Set("Last-Event-ID", "0")
+	req = req.WithContext(ctx)
+	rec := &gateWriter{syncRecorder: &syncRecorder{rec: httptest.NewRecorder()},
+		blockOn: 3, release: make(chan struct{}), started: make(chan struct{})}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.handleEvents(rec, req)
+	}()
+	select {
+	case <-rec.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("replay never reached the first row")
+	}
+	v.Close()
+	close(rec.release)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("mid-replay Close did not abort the handler")
+	}
+	// Writes 1-2 are the snapshot and overview; the blocked replay row
+	// was in flight. Nothing after it may be emitted once closed.
+	if n := strings.Count(rec.body(), "event: briefing"); n != 1 {
+		t.Fatalf("replay continued after Close: %d briefing events", n)
+	}
+}
+
+// withHost returns the viewer with an allowlist for tests, plus the
+// handler the browser would talk to: mounted exactly like the server
+// mounts it, so mux-generated responses go through the same gate.
+func withHost(t *testing.T, s *store.Store, hosts ...string) (*Viewer, http.Handler) {
+	t.Helper()
+	v := New(s, NewHub())
+	v.AllowedHosts = hosts
+	mux := http.NewServeMux()
+	mux.Handle("/", v.Handler())
+	return v, mux
+}
+
+func serveMux(mux http.Handler, method, target, host string, headers map[string]string, body string) *httptest.ResponseRecorder {
+	var rdr io.Reader
+	if body != "" {
+		rdr = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, target, rdr)
+	req.Host = host
+	req.URL.Host = host
+	for k, val := range headers {
+		req.Header.Set(k, val)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
+func assertViewerHeaders(t *testing.T, h http.Header) {
+	t.Helper()
+	if got := h.Get("Content-Security-Policy"); got != csp {
+		t.Fatalf("CSP = %q", got)
+	}
+	if got := h.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("nosniff = %q", got)
+	}
+	if got := h.Get("Referrer-Policy"); got != "no-referrer" {
+		t.Fatalf("referrer = %q", got)
+	}
+}
+
+func TestHostAllowlist(t *testing.T) {
+	s := openViewerStore(t)
+	seedBriefing(t, s, "host:h", "evt-h")
+	_, mux := withHost(t, s, "127.0.0.1:8081", "localhost:8081", "[::1]:8081")
+	for _, tc := range []struct {
+		host string
+		code int
+	}{
+		{"127.0.0.1:8081", 200},
+		{"LOCALHOST:8081", 200}, // matching is case-insensitive
+		{"[::1]:8081", 200},
+		{"evil.example:8081", 403},
+		{"127.0.0.1:9999", 403}, // wrong port is foreign
+		{"", 403},               // missing Host is refused
+	} {
+		rec := serveMux(mux, "GET", "/api/groups", tc.host, nil, "")
+		if rec.Code != tc.code {
+			t.Fatalf("host %q = %d, want %d", tc.host, rec.Code, tc.code)
+		}
+		if tc.code == 403 {
+			assertViewerHeaders(t, rec.Header())
+		}
+	}
+}
+
+// An unset allowlist denies everything: the gate fails closed and only
+// the server wiring (derived from the loopback bind) opens it.
+func TestHostAllowlistDenyByDefault(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	mux := http.NewServeMux()
+	mux.Handle("/", v.Handler())
+	rec := serveMux(mux, "GET", "/api/groups", "127.0.0.1:8081", nil, "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("empty allowlist = %d, want 403", rec.Code)
+	}
+}
+
+// LoopbackHosts covers the bind IP plus the names a local browser sends.
+func TestLoopbackHosts(t *testing.T) {
+	got := LoopbackHosts("8081")
+	want := []string{"127.0.0.1:8081", "localhost:8081", "[::1]:8081"}
+	if len(got) != len(want) {
+		t.Fatalf("hosts = %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("hosts = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestViewerSecurityHeaders(t *testing.T) {
+	s := openViewerStore(t)
+	seedBriefing(t, s, "host:sec", "evt-sec")
+	_, mux := withHost(t, s, "127.0.0.1:8081")
+	for _, target := range []string{"/", "/app.js", "/api/briefings", "/api/groups", "/api/overview"} {
+		rec := serveMux(mux, "GET", target, "127.0.0.1:8081", nil, "")
+		if rec.Code != 200 {
+			t.Fatalf("%s = %d", target, rec.Code)
+		}
+		assertViewerHeaders(t, rec.Header())
+	}
+	// Errors carry the headers too.
+	rec := serveMux(mux, "GET", "/api/briefings?limit=12abc", "127.0.0.1:8081", nil, "")
+	if rec.Code != 400 {
+		t.Fatalf("garbage limit = %d", rec.Code)
+	}
+	assertViewerHeaders(t, rec.Header())
+}
+
+func TestPostGuard(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	v.AllowedHosts = []string{"127.0.0.1:8081"}
+	ok := v.guardStateChanging(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		writeJSON(w, map[string]string{"ok": "true"})
+	})
+	post := func(headers map[string]string, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/api/decisions", strings.NewReader(body))
+		req.Host = "127.0.0.1:8081"
+		for k, val := range headers {
+			req.Header.Set(k, val)
+		}
+		rec := httptest.NewRecorder()
+		ok(rec, req)
+		return rec
+	}
+	jsonCT := map[string]string{"Content-Type": "application/json"}
+	// Wrong method, wrong content type, cross-site, missing and foreign origins.
+	if rec := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest("GET", "/api/decisions", nil)
+		req.Host = "127.0.0.1:8081"
+		rec := httptest.NewRecorder()
+		ok(rec, req)
+		return rec
+	}(); rec.Code != 405 {
+		t.Fatalf("GET = %d, want 405", rec.Code)
+	}
+	if rec := post(map[string]string{"Content-Type": "text/plain", "Origin": "http://127.0.0.1:8081"}, "{}"); rec.Code != 415 {
+		t.Fatalf("text/plain = %d, want 415", rec.Code)
+	}
+	if rec := post(map[string]string{"Content-Type": "application/json", "Origin": "http://127.0.0.1:8081", "Sec-Fetch-Site": "cross-site"}, "{}"); rec.Code != 403 {
+		t.Fatalf("cross-site = %d, want 403", rec.Code)
+	}
+	if rec := post(jsonCT, "{}"); rec.Code != 403 {
+		t.Fatalf("missing origin = %d, want 403", rec.Code)
+	}
+	if rec := post(map[string]string{"Content-Type": "application/json", "Origin": "http://evil.example/"}, "{}"); rec.Code != 403 {
+		t.Fatalf("foreign origin = %d, want 403", rec.Code)
+	}
+	// Same-origin JSON passes and keeps the header set.
+	rec := post(map[string]string{
+		"Content-Type": "application/json", "Origin": "http://127.0.0.1:8081", "Sec-Fetch-Site": "same-origin",
+	}, `{"decision":"expected"}`)
+	if rec.Code != 200 {
+		t.Fatalf("same-origin = %d", rec.Code)
+	}
+	assertViewerHeaders(t, rec.Header())
+	// Bodies past 8 KiB cannot be read through the guard.
+	big := strings.Repeat("x", (8<<10)+1)
+	req := httptest.NewRequest("POST", "/api/decisions", strings.NewReader(`{"pad":"`+big+`"}`))
+	req.Host = "127.0.0.1:8081"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://127.0.0.1:8081")
+	capped := v.guardStateChanging(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.ReadAll(r.Body); err == nil {
+			t.Error("over-cap body read must fail")
+		}
+	})
+	capped(httptest.NewRecorder(), req)
+}
+
+func TestSameOriginBinding(t *testing.T) {
+	v := New(nil, NewHub())
+	v.AllowedHosts = []string{"127.0.0.1:8081"}
+	plain := httptest.NewRequest("POST", "/api/decisions", nil)
+	plain.Host = "127.0.0.1:8081"
+	for _, tc := range []struct {
+		origin string
+		want   bool
+	}{
+		{"http://127.0.0.1:8081", true},
+		{"http://localhost:8081", false},      // allowed host, different origin
+		{"https://127.0.0.1:8081", false},     // scheme follows the connection
+		{"http://user@127.0.0.1:8081", false}, // userinfo is not a serialized origin
+		{"http://127.0.0.1:8081/x", false},    // paths are not a serialized origin
+		{"http://127.0.0.1:8081/?x=1", false}, // queries are not a serialized origin
+		{"http://127.0.0.1:8081#x", false},    // fragments are not a serialized origin
+		{"http://127.0.0.1:9999", false},      // port must match the request
+		{"ftp://127.0.0.1:8081", false},       // HTTP(S) only
+		{"null", false},                       // sandboxed iframes never pass
+		{"", false},                           // missing origin is refused
+		{"http://[::1]:8081", false},          // must equal r.Host, not just the list
+	} {
+		if got := v.sameOrigin(tc.origin, plain); got != tc.want {
+			t.Fatalf("origin %q = %v, want %v", tc.origin, got, tc.want)
+		}
+	}
+	// An https request accepts only the https twin of its own host.
+	tlsReq := httptest.NewRequest("POST", "https://127.0.0.1:8081/api/decisions", nil)
+	tlsReq.Host = "127.0.0.1:8081"
+	tlsReq.TLS = &tls.ConnectionState{}
+	if !v.sameOrigin("https://127.0.0.1:8081", tlsReq) {
+		t.Fatal("https twin of the request host must pass")
+	}
+	if v.sameOrigin("http://127.0.0.1:8081", tlsReq) {
+		t.Fatal("http origin on a TLS request must fail")
+	}
+}
+
+// Router-generated viewer responses go through the same gate and headers:
+// a method mismatch is 405 (not a headerless mux default) and still
+// refuses foreign hosts.
+func TestMuxResponsesGatedAndHeaded(t *testing.T) {
+	s := openViewerStore(t)
+	_, h := withHost(t, s, "127.0.0.1:8081")
+	rec := serveMux(h, "POST", "/api/groups", "127.0.0.1:8081", nil, "")
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST on a GET route = %d, want 405", rec.Code)
+	}
+	assertViewerHeaders(t, rec.Header())
+	if rec := serveMux(h, "POST", "/api/groups", "evil.example:8081", nil, ""); rec.Code != 403 {
+		t.Fatalf("foreign host on mux 405 = %d, want 403", rec.Code)
+	}
+}
+
+func TestGroupWireShape(t *testing.T) {
+	s := openViewerStore(t)
+	seedOpenGroup(t, s, "host:gw", "evt-gw")
+	v := New(s, NewHub())
+	v.GroupWindowSeconds = 45
+	rec := httptest.NewRecorder()
+	v.handleGroups(rec, httptest.NewRequest("GET", "/api/groups", nil))
+	var rows []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil || len(rows) != 1 {
+		t.Fatalf("groups = %q, err %v", rec.Body.String(), err)
+	}
+	for _, key := range []string{"group_id", "anchor", "status", "now_unix", "opened_unix",
+		"last_event_unix", "deadline_unix", "window_seconds", "event_count"} {
+		if _, ok := rows[0][key]; !ok {
+			t.Fatalf("group wire missing %q: %v", key, rows[0])
+		}
+	}
+	if rows[0]["window_seconds"] != 45.0 || rows[0]["status"] != "open" {
+		t.Fatalf("group wire = %v", rows[0])
+	}
+	if rows[0]["now_unix"] == 0.0 || rows[0]["opened_unix"] == 0.0 || rows[0]["last_event_unix"] == 0.0 {
+		t.Fatalf("group times missing: %v", rows[0])
+	}
+}
+
+// An unchanged snapshot stays silent: the per-tick broadcast must not
+// rewrite countdown DOM every second. Only a content change emits.
+func TestFanoutDedupsUnchangedSnapshot(t *testing.T) {
+	h := NewHub()
+	sub, unsub := h.Subscribe(32)
+	defer unsub()
+	_, onGroups := Fanout(h, nil, 45)
+	groups := []store.GroupSnapshot{{
+		GroupID: "grp-1", Anchor: "host:d", Status: "open",
+		Deadline: time.Now().Add(time.Minute), OpenedAt: time.Now(),
+		LastEvent: time.Now(), EventCount: 1,
+	}}
+	onGroups(groups)
+	onGroups(groups)
+	select {
+	case ev := <-sub.C:
+		if ev.Name != "group" {
+			t.Fatalf("event = %q", ev.Name)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first snapshot never broadcast")
+	}
+	select {
+	case ev := <-sub.C:
+		t.Fatalf("unchanged snapshot rebroadcast: %q", ev.Name)
+	case <-time.After(100 * time.Millisecond):
+	}
+	groups[0].EventCount = 2
+	onGroups(groups)
+	select {
+	case <-sub.C:
+	case <-time.After(2 * time.Second):
+		t.Fatal("changed snapshot never broadcast")
+	}
+}
+
+func TestOverviewFrozenKeys(t *testing.T) {
+	s := openViewerStore(t)
+	v := New(s, NewHub())
+	// Step 20 retires the Step 15 stub: the computation is live, so the
+	// durable contract is the frozen client keys, the honesty rule (no
+	// receipts means quiet, never act or review), and the headers —
+	// not the placeholder verdict.
+	v.Overview = NewRefresher(s, health.New(), nil, 24*time.Hour, 168*time.Hour, 30*24*time.Hour)
+	rec := httptest.NewRecorder()
+	v.handleOverview(rec, httptest.NewRequest("GET", "/api/overview", nil))
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("overview = %q", rec.Body.String())
+	}
+	for _, key := range []string{"verdict", "headline", "receipts", "coverage", "liveness", "sources", "attention", "digest", "window"} {
+		if _, ok := body[key]; !ok {
+			t.Fatalf("overview missing frozen key %q: %v", key, body)
+		}
+	}
+	if body["verdict"] != "quiet" {
+		t.Fatalf("empty store must read quiet, got %v", body["verdict"])
+	}
+	if rec.Header().Get("Content-Security-Policy") != csp {
+		t.Fatalf("overview CSP = %q", rec.Header().Get("Content-Security-Policy"))
 	}
 }

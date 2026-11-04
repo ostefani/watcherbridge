@@ -11,10 +11,19 @@ import (
 // pages until empty, checking its context between groups.
 const DefaultBriefingPage = 64
 
+// Grouping provenance describes the algorithm used when a group was formed.
+// Unknown is retained for historical rows whose origin cannot be established.
+const (
+	GroupingUnknown = iota
+	GroupingLegacy
+	GroupingScoped
+)
+
 type GroupPolicy struct {
-	QuietWindow time.Duration // debounce: group closes this long after last event
-	MaxWindow   time.Duration // hard cap from first event
-	MaxEvents   int           // size cap; config requires 1..128, store treats <= 0 as unlimited
+	GroupingVersion int           // caller-declared grouping algorithm; zero means unknown
+	QuietWindow     time.Duration // debounce: group closes this long after last event
+	MaxWindow       time.Duration // hard cap from first event
+	MaxEvents       int           // size cap; config requires 1..128, store treats <= 0 as unlimited
 }
 
 type PersistResult struct {
@@ -35,10 +44,11 @@ func groupDeadline(opened, last int64, pol GroupPolicy) int64 {
 }
 
 type TakenGroup struct {
-	GroupID    string
-	Anchor     string
-	OpenedAt   time.Time
-	RetryCount int // see LastAttempt
+	GroupingVersion int
+	GroupID         string
+	Anchor          string
+	OpenedAt        time.Time
+	RetryCount      int // see LastAttempt
 	// TransientRefunds counts takes forgiven for transient store
 	// pressure. The worker drives its release backoff from this, so
 	// repeated saturation escalates instead of retrying flat out.
@@ -52,12 +62,43 @@ func (g TakenGroup) LastAttempt() bool { return g.RetryCount >= maxGroupRetries-
 
 var ErrGroupNotClosed = errors.New("group is not closed")
 
+// ErrGroupNotReady reports a closed group whose events are not all
+// projected yet. The worker skips it without burning a take: the next
+// projection pass makes it eligible. This gates briefing associations
+// on completed projection, so inserts never copy a partial link set.
+var ErrGroupNotReady = errors.New("group is not fully projected")
+
+// groupFullyProjected reports whether every event of a group has a
+// completed projection. Briefing eligibility requires this: copying
+// links early would permanently omit subjects projected later, and
+// nothing repairs briefing relations after the insert.
+// queryRower is the read half shared by *sql.DB and *sql.Tx.
+type queryRower interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func groupFullyProjected(ctx context.Context, q queryRower, groupID string) (bool, error) {
+	var unprojected int64
+	err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM group_events ge
+		LEFT JOIN projection_progress p ON p.event_id = ge.event_id
+		WHERE ge.group_id = ? AND (p.event_id IS NULL OR p.state <> 'done')`, groupID).Scan(&unprojected)
+	return unprojected == 0, err
+}
+
 // TakeGroup atomically moves a closed group -> processing and reads the
 // group and its events in the same transaction, so a failure cannot strand
-// the group in processing. Only closed groups may be taken.
+// the group in processing. Only closed, fully projected groups may be
+// taken; anything earlier returns a sentinel without touching state.
 func (s *Store) TakeGroup(ctx context.Context, groupID string) (TakenGroup, error) {
 	var taken TakenGroup
 	err := s.write(ctx, func(tx *sql.Tx) error {
+		ready, err := groupFullyProjected(ctx, tx, groupID)
+		if err != nil {
+			return err
+		}
+		if !ready {
+			return ErrGroupNotReady
+		}
 		// The take is the attempt: the counter advances here and only
 		// here, so a crash between take and briefing still counts and a
 		// poison group cannot crash-loop forever. Release paths never
@@ -72,7 +113,7 @@ func (s *Store) TakeGroup(ctx context.Context, groupID string) (TakenGroup, erro
 		}
 		taken.GroupID = groupID
 		var openedNanos int64
-		if err := tx.QueryRow(`SELECT host_anchor_key, opened_at, retry_count, transient_refunds FROM active_groups WHERE group_id = ?`, groupID).Scan(&taken.Anchor, &openedNanos, &taken.RetryCount, &taken.TransientRefunds); err != nil {
+		if err := tx.QueryRow(`SELECT host_anchor_key, opened_at, retry_count, transient_refunds, grouping_version FROM active_groups WHERE group_id = ?`, groupID).Scan(&taken.Anchor, &openedNanos, &taken.RetryCount, &taken.TransientRefunds, &taken.GroupingVersion); err != nil {
 			return err
 		}
 		taken.OpenedAt = fromNanos(openedNanos)
@@ -306,7 +347,11 @@ func (s *Store) NeedsBriefing(ctx context.Context, limit int, now time.Time) ([]
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT group_id FROM active_groups WHERE status = 'closed'
 		AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-		AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id) ORDER BY opened_at LIMIT ?`, nanos(now), limit)
+		AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id)
+		AND NOT EXISTS (SELECT 1 FROM group_events ge
+			LEFT JOIN projection_progress p ON p.event_id = ge.event_id
+			WHERE ge.group_id = active_groups.group_id AND (p.event_id IS NULL OR p.state <> 'done'))
+		ORDER BY opened_at LIMIT ?`, nanos(now), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -343,22 +388,33 @@ func (s *Store) GroupDeadline(ctx context.Context, groupID string) (time.Time, e
 
 // GroupSnapshot is the viewer-facing view of an in-progress group: all
 // fields are safe for local display (anchors are raw local identifiers).
+// Open, closed and processing rows all appear. A closed row is queued
+// behind a slow provider call, not gone: hiding it would drop queued
+// groups from the viewer for the whole provider timeout. Closed renders
+// as waiting; processing renders as "Analysing…" until its briefing
+// lands, never vanishing early.
 type GroupSnapshot struct {
 	GroupID    string
 	Anchor     string
 	Status     string
 	Deadline   time.Time
+	OpenedAt   time.Time
+	LastEvent  time.Time
 	EventCount int
 }
 
-// OpenGroupSnapshots lists groups still accumulating events, oldest
-// deadline first. The groups_status_deadline index serves the filter and
-// order; the event count comes from the join table in the same query.
+// OpenGroupSnapshots lists groups still accumulating events plus queued
+// and in-flight ones, oldest deadline first. Closed-but-untaken groups
+// are the briefing queue: while one group waits on the provider, the
+// rest wait closed behind it, and the snapshot must show them waiting.
+// The groups_status_deadline index serves the filter and order; the event
+// count comes from the join table in the same query, and opened/last-
+// event times ride along from the group row the writer already maintains.
 func (s *Store) OpenGroupSnapshots(ctx context.Context) ([]GroupSnapshot, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT ag.group_id, ag.host_anchor_key, ag.status, ag.deadline_at,
-		COUNT(ge.event_id) FROM active_groups ag
+		ag.opened_at, ag.last_event_at, COUNT(ge.event_id) FROM active_groups ag
 		LEFT JOIN group_events ge ON ge.group_id = ag.group_id
-		WHERE ag.status = 'open' GROUP BY ag.group_id ORDER BY ag.deadline_at`)
+		WHERE ag.status IN ('open', 'closed', 'processing') GROUP BY ag.group_id ORDER BY ag.deadline_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -366,11 +422,13 @@ func (s *Store) OpenGroupSnapshots(ctx context.Context) ([]GroupSnapshot, error)
 	var out []GroupSnapshot
 	for rows.Next() {
 		var g GroupSnapshot
-		var deadline int64
-		if err := rows.Scan(&g.GroupID, &g.Anchor, &g.Status, &deadline, &g.EventCount); err != nil {
+		var deadline, opened, last int64
+		if err := rows.Scan(&g.GroupID, &g.Anchor, &g.Status, &deadline, &opened, &last, &g.EventCount); err != nil {
 			return nil, err
 		}
 		g.Deadline = fromNanos(deadline)
+		g.OpenedAt = fromNanos(opened)
+		g.LastEvent = fromNanos(last)
 		out = append(out, g)
 	}
 	return out, rows.Err()

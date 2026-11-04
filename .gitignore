@@ -29,10 +29,23 @@ config.local.*
 /reports/
 /scan-reports/
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 *.log
 pseudonyms.*
+
+# --- UI toolchain (project-local, never commit) ---
+ui/node_modules/
+ui/.smoke-tmp/
+
+# --- E2E harness output (rebuilt/preserved per run, never committed) ---
+.e2e-bin/
+.e2e-last-failure/
+.e2e-failures/
+.e2e-pending.txt
+e2e/results/
 
 # --- Editors and IDEs ---
 .idea/
@@ -45,3 +58,4 @@ pseudonyms.*
 .DS_Store
 Thumbs.db
 .innerdoc
+AGENTS.md

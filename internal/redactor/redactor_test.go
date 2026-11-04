@@ -45,6 +45,65 @@ func buildOne(t *testing.T, s *store.Store, p Policy, payload []byte) (*Redacted
 	return b, issued, display
 }
 
+// Hostile enrichment text (vendor, device, OS, service, evidence)
+// travels as inert JSON string data: markup survives byte-identical
+// for the operator, embedded address shapes are tokenized, and the
+// final leak scan stays clean. Nothing in the enrichment fields may
+// break the bundle schema or leak raw identifiers.
+func TestHostileEnrichmentStaysInert(t *testing.T) {
+	s := testStore(t)
+	host := `{"ip":"192.168.0.5","hostname":"printer","mac":"AA:BB:CC:DD:EE:FF","weak":false,"alive":true,` +
+		`"identity_confidence":"high",` +
+		`"vendor":"Acme <script>alert(1)</script> 10.9.9.9",` +
+		`"device":"evil-router\"; DROP TABLE briefings;--",` +
+		`"os":"Debian <img src=x onerror=alert(2)>",` +
+		`"os_evidence":"banner from 192.168.0.99",` +
+		`"device_evidence":"mDNS at AA-BB-CC-DD-EE-11",` +
+		`"ports":[{"number":22,"protocol":"tcp","state":"open","service":"ssh <b>evil</b>"}]}`
+	b, issued, display := buildOne(t, s, testPolicy(), payload(t, host, ""))
+	ser, err := json.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{"10.9.9.9", "192.168.0.99", "AA-BB-CC-DD-EE-11"} {
+		if strings.Contains(string(ser), raw) {
+			t.Fatalf("enrichment identifier leaked raw: %s", raw)
+		}
+	}
+	if hits, err := ScanOutboundLeaks(ser, issued, nil); err != nil || len(hits) != 0 {
+		t.Fatalf("leaks in hostile bundle: %v %v", hits, err)
+	}
+	if err := ValidateTokens(string(ser), issued); err != nil {
+		t.Fatalf("hostile bundle must validate: %v", err)
+	}
+	// Markup is data, not code: restoration returns the original
+	// spellings for display, never executed. The bundle is JSON, so
+	// decode it first: Go escapes < > & as \u003c \u003e \u0026 on the
+	// wire, which is still byte-identical data, not mangling.
+	var decoded struct {
+		Events []struct {
+			Host map[string]any `json:"host"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal([]byte(Restore(string(ser), issued)), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Events) != 1 {
+		t.Fatalf("decoded events = %d, want 1", len(decoded.Events))
+	}
+	got := decoded.Events[0].Host
+	for key, want := range map[string]string{
+		"vendor": "Acme <script>alert(1)</script> 10.9.9.9",
+		"device": "evil-router\"; DROP TABLE briefings;--",
+		"os":     "Debian <img src=x onerror=alert(2)>",
+	} {
+		if got[key] != want {
+			t.Fatalf("host.%s = %q, want %q", key, got[key], want)
+		}
+	}
+	_ = display
+}
+
 func TestRoundTrip(t *testing.T) {
 	s := testStore(t)
 	b, issued, _ := buildOne(t, s, testPolicy(), payload(t, richHost, ""))
@@ -186,6 +245,26 @@ func TestRestoreGluedTokens(t *testing.T) {
 	}
 	if got := Restore("see XIP_1 now", issued); got != "see XIP_1 now" {
 		t.Fatalf("word-glued text must stay literal: %q", got)
+	}
+}
+
+// The projection must equal the built length exactly — the budget
+// preflight is only sound if no allocation can exceed it. Unknown tokens
+// restore to themselves, so they contribute zero delta.
+func TestProjectedRestoreSizeExact(t *testing.T) {
+	issued := TokenMap{"IP_1": "192.168.0.5", "HOST_2": "nebula-1.local"}
+	for _, text := range []string{
+		"",
+		"no tokens here",
+		"from IP_1 to HOST_2 done",
+		"IP_1 IP_1 IP_1",           // repeats expand linearly
+		"XIP_1 and IP_10 stay put", // word-glued and unknown: no delta
+		"IP_1:8080, (HOST_2).",
+		strings.Repeat("IP_1 ", 1000),
+	} {
+		if got, want := ProjectedRestoreSize(text, issued), len(Restore(text, issued)); got != want {
+			t.Fatalf("projection %d != restored %d for %q", got, want, text[:min(64, len(text))])
+		}
 	}
 }
 
@@ -853,5 +932,47 @@ func TestDisplayRestoresOriginalCase(t *testing.T) {
 	restored := Restore(string(ser), display)
 	if !strings.Contains(restored, "Printer-2") || !strings.Contains(restored, "AA:BB:CC:DD:EE:FF") {
 		t.Fatalf("display restore lost spelling: %q", restored)
+	}
+}
+
+// Scoped group anchors must never leak the deployment scope or the raw
+// reference to the provider: the scope is dropped before discovery and
+// the remainder tokenizes exactly like the equivalent legacy anchor.
+func TestScopedAnchorDropsScope(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		anchor string
+		raw    string
+	}{
+		{"device", "sub:customer-office:mac:AA:BB:CC:DD:EE:FF", "AA:BB:CC:DD:EE:FF"},
+		{"address", "addr:customer-office:192.168.0.23", "192.168.0.23"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testStore(t)
+			b, issued, _, err := BuildBundle(context.Background(), s, BundleInput{
+				GroupID: "grp-1", Anchor: tc.anchor, Target: "192.168.0.0/24",
+				Baseline: "low",
+				Events:   []InputEvent{{EventID: "e1", EventType: "host.appeared", Payload: []byte(`{"event_id":"e1"}`)}},
+			}, testPolicy())
+			if err != nil {
+				t.Fatal(err)
+			}
+			ser, err := json.Marshal(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(ser), "customer-office") {
+				t.Fatalf("deployment scope left the machine: %s", ser)
+			}
+			if strings.Contains(string(ser), tc.raw) {
+				t.Fatalf("raw anchor reference left the machine: %s", ser)
+			}
+			if strings.Contains(b.Anchor, "customer-office") || strings.Contains(b.Anchor, tc.raw) {
+				t.Fatalf("bundle anchor not tokenized: %q", b.Anchor)
+			}
+			if hits, err := ScanOutboundLeaks(ser, issued, nil); err != nil || len(hits) != 0 {
+				t.Fatalf("leaks in scoped-anchor bundle: %v %v", hits, err)
+			}
+		})
 	}
 }

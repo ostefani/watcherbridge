@@ -186,7 +186,7 @@ func TestFanoutNeverBlocksOnFullQueue(t *testing.T) {
 	for i := 0; i < publisherQueueCap; i++ {
 		p.Enqueue(testBriefing())
 	}
-	onBriefing, onGroups := Fanout(h, p)
+	onBriefing, onGroups := Fanout(h, p, 45)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -208,7 +208,7 @@ func TestFanoutToPublisherAndHub(t *testing.T) {
 	stub := &stubTripper{respond: func(*http.Request) (*http.Response, error) { return okResp(), nil }}
 	p, stop := runPublisher(t, stub, "", "")
 	defer stop()
-	onBriefing, _ := Fanout(h, p)
+	onBriefing, _ := Fanout(h, p, 45)
 	ch, unsub := h.Subscribe(8)
 	defer unsub()
 	var wg sync.WaitGroup
@@ -217,7 +217,7 @@ func TestFanoutToPublisherAndHub(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		select {
-		case ev := <-ch:
+		case ev := <-ch.C:
 			got.Store(ev)
 		case <-time.After(3 * time.Second):
 		}

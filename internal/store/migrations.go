@@ -70,26 +70,48 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 7
+const supportedSchemaVersion = 30
 
-func migrate(db *sql.DB) error {
+// validateSchemaLineage is read-only so callers can reject unsupported
+// databases before the writable connection switches journal mode.
+func validateSchemaLineage(db *sql.DB) (int, error) {
 	var version int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
-		return err
+		return 0, err
 	}
 	if version > supportedSchemaVersion {
-		return fmt.Errorf("database schema version %d is newer than supported %d; upgrade the binary", version, supportedSchemaVersion)
+		return 0, fmt.Errorf("database schema version %d is newer than supported %d; upgrade the binary", version, supportedSchemaVersion)
+	}
+	// The archived device engine used overlapping version numbers.
+	if version >= 10 {
+		var tables int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+            AND name IN ('report_sources', 'reported_subjects', 'projection_progress')`).Scan(&tables); err != nil {
+			return 0, err
+		}
+		if tables != 3 {
+			return 0, fmt.Errorf("unsupported database schema lineage at version %d; archived device databases require a separate upgrade path", version)
+		}
 	}
 	if version == 0 {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='raw_events'`).Scan(&name)
 		if err == nil {
-			return fmt.Errorf("unversioned legacy database is not supported; delete the database file and restart to recreate it")
+			return 0, fmt.Errorf("unversioned legacy database is not supported; delete the database file and restart to recreate it")
 		}
 		if err != sql.ErrNoRows {
-			return err
+			return 0, err
 		}
 	}
+	return version, nil
+}
+
+func migrate(db *sql.DB) error {
+	version, err := validateSchemaLineage(db)
+	if err != nil {
+		return err
+	}
+	initialVersion := version
 	for version < supportedSchemaVersion {
 		var err error
 		switch version {
@@ -107,11 +129,591 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 6, migrateV6)
 		case 6:
 			err = applyMigration(db, 7, migrateV7)
+		case 7:
+			err = applyMigration(db, 8, migrateV8)
+		case 8:
+			err = applyMigration(db, 9, migrateV9)
+		case 9:
+			err = applyMigration(db, 10, migrateV10)
+		case 10:
+			err = applyMigration(db, 11, migrateV11)
+		case 11:
+			err = applyMigration(db, 12, func(tx *sql.Tx) error {
+				return migrateV12(tx, initialVersion <= 9)
+			})
+		case 12:
+			err = applyMigration(db, 13, migrateV13)
+		case 13:
+			err = applyMigration(db, 14, migrateV14)
+		case 14:
+			err = applyMigration(db, 15, migrateV15)
+		case 15:
+			err = applyMigration(db, 16, migrateV16)
+		case 16:
+			err = applyMigration(db, 17, migrateV17)
+		case 17:
+			err = applyMigration(db, 18, migrateV18)
+		case 18:
+			err = applyMigration(db, 19, migrateV19)
+		case 19:
+			err = applyMigration(db, 20, migrateV20)
+		case 20:
+			err = applyMigration(db, 21, migrateV21)
+		case 21:
+			err = applyMigration(db, 22, migrateV22)
+		case 22:
+			err = applyMigration(db, 23, migrateV23)
+		case 23:
+			err = applyMigration(db, 24, migrateV24)
+		case 24:
+			err = applyMigration(db, 25, migrateV25)
+		case 25:
+			err = applyMigration(db, 26, migrateV26)
+		case 26:
+			err = applyMigration(db, 27, migrateV27)
+		case 27:
+			err = applyMigration(db, 28, migrateV28)
+		case 28:
+			err = applyMigration(db, 29, migrateV29)
+		case 29:
+			err = applyMigration(db, 30, migrateV30)
 		}
 		if err != nil {
 			return err
 		}
 		version++
+	}
+	return nil
+}
+
+// migrateV12 adds grouping provenance without rewriting historical payloads,
+// text, identifiers or sequence values. SQLite's constant column default
+// supplies the historical value without a table-wide UPDATE/rebuild.
+// Phase-5 databases used legacy grouping. Existing v10/v11 databases can
+// contain both algorithms; without a durable marker their origin is unknown.
+// Never recover provenance by interpreting attacker-controlled anchor text.
+func migrateV12(tx *sql.Tx, phase5 bool) error {
+	version := GroupingUnknown
+	if phase5 {
+		version = GroupingLegacy
+	}
+	for _, table := range []string{"active_groups", "briefings"} {
+		stmt := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN grouping_version INTEGER NOT NULL DEFAULT %d CHECK(grouping_version IN (0,1,2))`, table, version)
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV13 adds purge-run state, purge-serving indexes, and token
+// usage tracking (Designv9 §4.6). purge_state persists per-table purge
+// totals so Step 20 health can report them; each batch reselects its
+// own remaining work, so a restart deletes whatever is still eligible.
+// pseudonym_map gains last_used_at: creation age
+// alone cannot prove a token is still referenced, so assignment and
+// every later lookup bump it, and expiry compares against it. Rows
+// predating tracking get the migration instant as their last known use:
+// usage before tracking began is unknown, and deleting a token that a
+// retained briefing still references would break viewer restoration.
+func migrateV13(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE purge_state (
+			table_name TEXT PRIMARY KEY,
+			last_run_at INTEGER NOT NULL DEFAULT 0,
+			last_cutoff INTEGER NOT NULL DEFAULT 0,
+			rows_deleted_total INTEGER NOT NULL DEFAULT 0
+		)`,
+		`ALTER TABLE pseudonym_map ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0`,
+		`UPDATE pseudonym_map SET last_used_at = CAST(strftime('%s','now') AS INTEGER) * 1000000000`,
+		`CREATE INDEX IF NOT EXISTS reported_observations_received ON reported_observations(received_at)`,
+		`CREATE INDEX IF NOT EXISTS reported_subjects_last_report ON reported_subjects(last_report_at)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV14 adds the purge run ledger, the protected-token scratch
+// table, and profile-leading association indexes (Designv9 §§3.3, 4.6).
+// purge_runs records per-run status, duration and per-table counts so
+// Step 20 health can distinguish a completed run from one that
+// committed batches and then failed; only the latest 30 rows are kept.
+// purge_protected_tokens is a per-run scratch set of tokens named by
+// retained briefings, rebuilt at each purge start (stale rows only ever
+// over-protect). The association indexes serve the read API's
+// per-subject counts without scanning the relation tables.
+func migrateV14(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE purge_runs (
+			run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			started_at INTEGER NOT NULL,
+			finished_at INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','completed','failed','interrupted')),
+			error TEXT NOT NULL DEFAULT '',
+			briefing_links_deleted INTEGER NOT NULL DEFAULT 0,
+			briefings_deleted INTEGER NOT NULL DEFAULT 0,
+			groups_deleted INTEGER NOT NULL DEFAULT 0,
+			group_links_deleted INTEGER NOT NULL DEFAULT 0,
+			ports_deleted INTEGER NOT NULL DEFAULT 0,
+			observations_deleted INTEGER NOT NULL DEFAULT 0,
+			progress_deleted INTEGER NOT NULL DEFAULT 0,
+			raw_events_deleted INTEGER NOT NULL DEFAULT 0,
+			subjects_deleted INTEGER NOT NULL DEFAULT 0,
+			sources_deleted INTEGER NOT NULL DEFAULT 0,
+			pseudonyms_deleted INTEGER NOT NULL DEFAULT 0,
+			bookkeeping_writes INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE purge_protected_tokens (
+			token TEXT PRIMARY KEY
+		)`,
+		`CREATE INDEX IF NOT EXISTS group_subjects_profile ON group_subjects(profile_id)`,
+		`CREATE INDEX IF NOT EXISTS briefing_subjects_profile ON briefing_subjects(profile_id)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV15 adds the receipt-ordered observation index backing the
+// latest-evidence read. The existing profile index orders by reported
+// time, so LIMIT 1 by receipt time could scan and sort one subject's
+// whole retained history; the new key serves the exact filter and
+// ordering directly.
+func migrateV15(tx *sql.Tx) error {
+	_, err := tx.Exec(`CREATE INDEX IF NOT EXISTS reported_observations_profile_received ON reported_observations(profile_id, received_at, observation_id)`)
+	return err
+}
+
+// migrateV16 adds the reported-change kind and briefing source to
+// briefings (Designv9 §6.1, Plan Step 19). kind classifies the reported
+// change for digest grouping and defaults to other; source names the
+// briefing producer. The backfill is deliberately conservative: every
+// retained row becomes legacy except rows the store knows came from the
+// deterministic fallback, which become fallback. Historical model or
+// rules output is never guessed. The (created_at, kind) index serves
+// the digest window query directly.
+func migrateV16(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE briefings ADD COLUMN kind TEXT NOT NULL DEFAULT 'other' CHECK(kind IN ('weak_appearance','weak_disappearance','port_closed','hostname_change','os_refinement','other'))`,
+		`ALTER TABLE briefings ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy' CHECK(source IN ('rules','model','agent','fallback','legacy'))`,
+		`UPDATE briefings SET source = 'fallback' WHERE fallback_used`,
+		`CREATE INDEX IF NOT EXISTS briefings_created_kind ON briefings(created_at, kind)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV17 persists the per-run group_events deletion count the
+// retention engine already deletes but never attributed: without its
+// own ledger column the run totals and health breakdown omit those
+// rows. A plain ADD COLUMN suffices — no table rebuild.
+func migrateV17(tx *sql.Tx) error {
+	if _, err := tx.Exec(`ALTER TABLE purge_runs ADD COLUMN group_events_deleted INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migrateV18 adds operator decisions (Designv9 §5.1): immutable local
+// audit rows with an explicit undo record instead of mutation, plus
+// the durable label-ownership head on reported subjects. supersedes
+// carries no foreign key: audit rows and their targets purge as
+// age-selected pairs in one batch, so the pointer never needs the
+// database to enforce it. label_owner is plain state, never joined —
+// it may name a purged audit row, which only reads as "undo
+// unavailable" (404), never as corruption.
+func migrateV18(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE operator_decisions (
+			decision_id TEXT PRIMARY KEY,
+			subject_kind TEXT NOT NULL CHECK(subject_kind IN ('briefing','reported_subject')),
+			subject_id TEXT NOT NULL,
+			kind TEXT NOT NULL CHECK(kind IN ('expected','not_expected','snooze','note','label','undo')),
+			until INTEGER,
+			text TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			supersedes TEXT NOT NULL DEFAULT '',
+			request_id TEXT UNIQUE,
+			content_hash TEXT NOT NULL DEFAULT '',
+			prior_label TEXT,
+			prior_owner TEXT
+		)`,
+		`CREATE INDEX decisions_subject ON operator_decisions(subject_kind, subject_id, created_at)`,
+		`CREATE INDEX decisions_created ON operator_decisions(created_at)`,
+		`ALTER TABLE reported_subjects ADD COLUMN label_owner TEXT`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV19 persists the per-run decision-audit deletion count the
+// retention engine already deletes but never attributed: without its
+// own ledger column the run totals and health breakdown omit those
+// rows. A plain ADD COLUMN suffices — no table rebuild.
+func migrateV19(tx *sql.Tx) error {
+	if _, err := tx.Exec(`ALTER TABLE purge_runs ADD COLUMN decisions_deleted INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migrateV20 records the resulting review head on every undo row.
+// Repeat-undo conflict detection compares the current head against
+// the head as the undo left it; recomputing that baseline from
+// surviving rows cannot tell "no head existed" from "the head was
+// purged", so the baseline must be pinned at commit time. NULL marks
+// pre-migration undo rows with unavailable history, which repeat
+// handling rejects conservatively. A plain ADD COLUMN suffices.
+func migrateV20(tx *sql.Tx) error {
+	if _, err := tx.Exec(`ALTER TABLE operator_decisions ADD COLUMN head_asof TEXT`); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migrateV21 adds the Step 27 investigator audit surface (Designv9
+// §6.3): display-only explanation fields and usage accounting on
+// briefings, the tokenized agent_traces audit table, and its purge
+// ledger column. Every briefing column stays nullable: retained rows
+// predate the fields and deterministic briefings carry no model
+// output, so NULL reads as unknown rather than a fabricated value. A
+// plain ADD COLUMN plus one new table suffices — no rebuild.
+func migrateV21(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE briefings ADD COLUMN likely_explanation TEXT`,
+		`ALTER TABLE briefings ADD COLUMN confidence TEXT CHECK(confidence IN ('low','medium','high'))`,
+		`ALTER TABLE briefings ADD COLUMN evidence_refs_json TEXT`,
+		`ALTER TABLE briefings ADD COLUMN input_tokens INTEGER`,
+		`ALTER TABLE briefings ADD COLUMN output_tokens INTEGER`,
+		`ALTER TABLE briefings ADD COLUMN cost_micros INTEGER`,
+		`CREATE TABLE agent_traces (
+			briefing_id TEXT NOT NULL,
+			step INTEGER NOT NULL,
+			tool TEXT NOT NULL,
+			args_json TEXT NOT NULL DEFAULT '',
+			result_json TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL CHECK(status IN ('ok','blocked','error')),
+			duration_ms INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY(briefing_id, step)
+		)`,
+		`CREATE INDEX agent_traces_briefing ON agent_traces(briefing_id, step)`,
+		`ALTER TABLE purge_runs ADD COLUMN traces_deleted INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV22 adds the Step 28 review-policy rule registry (Designv9
+// §5.2): one row per deterministic scope with its approval lifecycle,
+// plus the purge ledger column for rule deletes. Scopes are exact
+// source/namespace/reference snapshots with change kind and canonical
+// ports; matching is byte equality, never attribute similarity. A plain
+// new table plus one ledger column suffices — no rebuild.
+func migrateV22(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE review_rules (
+			rule_id TEXT PRIMARY KEY,
+			proposal_id TEXT NOT NULL UNIQUE,
+			source_scope TEXT NOT NULL,
+			reference_class TEXT NOT NULL CHECK(reference_class = 'reported_device'),
+			identity_namespace TEXT NOT NULL DEFAULT '',
+			upstream_reference TEXT NOT NULL,
+			reported_identity_source TEXT NOT NULL,
+			reported_confidence TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			ports_csv TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL CHECK(status IN ('approved','dismissed','revoked')),
+			decided_at INTEGER NOT NULL,
+			approved_at INTEGER,
+			expires_at INTEGER
+		)`,
+		`CREATE INDEX review_rules_scope ON review_rules(source_scope, identity_namespace, upstream_reference)`,
+		`ALTER TABLE purge_runs ADD COLUMN rules_deleted INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV23 records the two scope dimensions review demanded for
+// exact application: the upstream identity revision (§5.2 voids on
+// unknown/changed revision) and the canonical changed-field set
+// (out-of-scope fields void application). Both default empty so
+// existing rows keep their meaning; matching treats them as exact
+// scope fields like every other column.
+func migrateV23(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE review_rules ADD COLUMN identity_revision TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE review_rules ADD COLUMN changed_fields_csv TEXT NOT NULL DEFAULT ''`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV24 records the reported stable-identity revision on
+// subjects (Designv9 §§1.4, 5.2): the revision rides the projection
+// high-water mark like every other current-state provenance column,
+// so replays never roll a reference back to a previous epoch. The
+// subject identity key is unchanged — a revision change voids rules,
+// it never forks or merges the subject.
+func migrateV24(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE reported_subjects ADD COLUMN identity_revision TEXT NOT NULL DEFAULT ''`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV25 adds isolated H1 history and compact source progress. H1 rows
+// never enter raw_events, projection queues, or the forwarding sweep.
+func migrateV25(tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`CREATE TABLE heartbeats (
+            source_scope TEXT NOT NULL REFERENCES report_sources(source_scope),
+            event_id TEXT NOT NULL,
+            completed_at INTEGER NOT NULL,
+            received_at INTEGER NOT NULL,
+            payload BLOB NOT NULL CHECK(length(payload) <= 8192),
+            PRIMARY KEY(source_scope, event_id)
+        )`,
+		`CREATE INDEX heartbeats_received ON heartbeats(received_at)`,
+		`ALTER TABLE report_sources ADD COLUMN heartbeat_completed_at INTEGER`,
+		`ALTER TABLE report_sources ADD COLUMN heartbeat_summary TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE purge_runs ADD COLUMN heartbeats_deleted INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV26 adds the Step 29 presentation-incident registry (Designv9
+// §7): incidents with durable membership and catch-up progress, plus
+// incident decision subjects. Incident rows name their correlation key
+// (kind, source, target), floor, counts, window start and quiet state;
+// members carry an immutable qualification snapshot taken at accept
+// time so later subject drift cannot rewrite burst evidence. A briefing
+// belongs to at most one incident (UNIQUE), and purge drains members
+// before parents under explicit childless gates. The incident_progress
+// cursor survives restarts next to the rows it protects.
+//
+// operator_decisions needs a rebuild, not an ALTER: SQLite cannot widen
+// a CHECK constraint. The rebuild copies every column explicitly and
+// adds the 'incident' subject kind plus the generated_by linkage that
+// records which incident decision generated a member row (” for
+// operator-authored rows). Existing rows satisfy the wider CHECK, and
+// the request_id uniqueness and subject/created indexes are recreated.
+func migrateV26(tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`CREATE TABLE incidents (
+			incident_id TEXT PRIMARY KEY,
+			kind TEXT NOT NULL CHECK(kind IN ('burst_appearance','burst_disappearance')),
+			source_scope TEXT NOT NULL,
+			target TEXT NOT NULL,
+			status TEXT NOT NULL CHECK(status IN ('open','closed')),
+			floor TEXT NOT NULL CHECK(floor IN ('low','medium','high','critical')),
+			identity_revision TEXT NOT NULL DEFAULT '',
+			qualified_refs INTEGER NOT NULL DEFAULT 0,
+			member_count INTEGER NOT NULL DEFAULT 0,
+			window_start INTEGER NOT NULL,
+			last_member_at INTEGER NOT NULL,
+			opened_at INTEGER NOT NULL,
+			closed_at INTEGER,
+			updated_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE incident_members (
+			incident_id TEXT NOT NULL REFERENCES incidents(incident_id),
+			briefing_id TEXT NOT NULL REFERENCES briefings(briefing_id),
+			member_created_at INTEGER NOT NULL,
+			refs_json TEXT NOT NULL DEFAULT '[]',
+			PRIMARY KEY(incident_id, briefing_id),
+			UNIQUE(briefing_id)
+		)`,
+		`CREATE TABLE incident_progress (
+			id INTEGER PRIMARY KEY CHECK(id = 0),
+			last_briefing_rowid INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX incidents_open_key ON incidents(kind, source_scope, target, status)`,
+		`CREATE INDEX incidents_opened ON incidents(opened_at)`,
+		`CREATE INDEX incidents_status_closed ON incidents(status, closed_at)`,
+		`CREATE INDEX incident_members_incident ON incident_members(incident_id)`,
+		`ALTER TABLE purge_runs ADD COLUMN incidents_deleted INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE purge_runs ADD COLUMN incident_members_deleted INTEGER NOT NULL DEFAULT 0`,
+		`CREATE TABLE operator_decisions_new (
+			decision_id TEXT PRIMARY KEY,
+			subject_kind TEXT NOT NULL CHECK(subject_kind IN ('briefing','reported_subject','incident')),
+			subject_id TEXT NOT NULL,
+			kind TEXT NOT NULL CHECK(kind IN ('expected','not_expected','snooze','note','label','undo')),
+			until INTEGER,
+			text TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			supersedes TEXT NOT NULL DEFAULT '',
+			request_id TEXT UNIQUE,
+			content_hash TEXT NOT NULL DEFAULT '',
+			prior_label TEXT,
+			prior_owner TEXT,
+			head_asof TEXT,
+			generated_by TEXT NOT NULL DEFAULT ''
+		)`,
+		`INSERT INTO operator_decisions_new (decision_id, subject_kind, subject_id, kind, until, text,
+			created_at, supersedes, request_id, content_hash, prior_label, prior_owner, head_asof)
+			SELECT decision_id, subject_kind, subject_id, kind, until, text,
+			created_at, supersedes, request_id, content_hash, prior_label, prior_owner, head_asof
+			FROM operator_decisions`,
+		`DROP TABLE operator_decisions`,
+		`ALTER TABLE operator_decisions_new RENAME TO operator_decisions`,
+		`CREATE INDEX decisions_subject ON operator_decisions(subject_kind, subject_id, created_at)`,
+		`CREATE INDEX decisions_created ON operator_decisions(created_at)`,
+		// After the rebuild: generated_by exists only here, so its
+		// index must follow, not precede, the new table.
+		`CREATE INDEX decisions_generated ON operator_decisions(generated_by)`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// v27 stores bounded incident work durably. Existing reference snapshots
+// are indexed incrementally by the correlator, not rewritten at upgrade.
+func migrateV27(tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`ALTER TABLE incidents ADD COLUMN identity_namespace TEXT NOT NULL DEFAULT ''`,
+		`CREATE TABLE incident_pending (
+			briefing_id TEXT PRIMARY KEY REFERENCES briefings(briefing_id),
+			correlation_key TEXT NOT NULL, created_at INTEGER NOT NULL, data_json TEXT NOT NULL)`,
+		`CREATE INDEX incident_pending_key ON incident_pending(correlation_key, created_at, briefing_id)`,
+		`CREATE INDEX incident_pending_created ON incident_pending(created_at)`,
+		`CREATE TABLE incident_pending_refs (
+			correlation_key TEXT NOT NULL, reference TEXT NOT NULL,
+			briefing_id TEXT NOT NULL REFERENCES incident_pending(briefing_id), created_at INTEGER NOT NULL,
+			PRIMARY KEY(correlation_key, reference))`,
+		`CREATE INDEX incident_pending_refs_time ON incident_pending_refs(correlation_key, created_at DESC)`,
+		`CREATE INDEX incident_pending_refs_briefing ON incident_pending_refs(briefing_id)`,
+		`CREATE TABLE incident_references (
+			incident_id TEXT NOT NULL REFERENCES incidents(incident_id), reference TEXT NOT NULL,
+			PRIMARY KEY(incident_id, reference))`,
+		`ALTER TABLE incident_progress RENAME COLUMN last_briefing_rowid TO last_briefing_seq`,
+		`ALTER TABLE incident_progress ADD COLUMN pending_after TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE incident_progress ADD COLUMN pin_version INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE incident_progress ADD COLUMN refs_cursor INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE incident_progress ADD COLUMN refs_through INTEGER NOT NULL DEFAULT 0`,
+		`INSERT OR IGNORE INTO incident_progress(id,last_briefing_seq) VALUES (0,0)`,
+		// The legacy cursor used recyclable SQLite rowids. Revisit retained
+		// briefings once using their durable sequence; membership is unique.
+		`UPDATE incident_progress SET last_briefing_seq=0,
+			refs_through=(SELECT COALESCE(MAX(rowid),0) FROM incident_members) WHERE id=0`,
+		`ALTER TABLE purge_runs ADD COLUMN incident_pending_deleted INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE purge_runs ADD COLUMN incident_pending_refs_deleted INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE purge_runs ADD COLUMN incident_refs_deleted INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// v28 stores alternative-window progress on the oldest pending candidate.
+// It expires with that candidate and adds no unbounded migration backfill.
+func migrateV28(tx *sql.Tx) error {
+	_, err := tx.Exec(`ALTER TABLE incident_pending ADD COLUMN formation_before INTEGER NOT NULL DEFAULT 0`)
+	return err
+}
+
+// migrateV30 adds the closed-incident summary registry (Plan
+// incident-summary addition, Designv9 §7): one row per closed
+// incident, durable queue state included. status runs
+// pending->running->model|fallback|skipped; pending+running rows are
+// the outstanding queue capped at 100. floor/suggestion/final/clamped
+// record the resolver inputs and outcome separately from the
+// deterministic incident floor, which is never rewritten. snapshot_json
+// is the exact provider-bound input, alias_map_json the opaque
+// citation aliases issued for that snapshot, citations_json the
+// validated returned citations. Usage columns ride only when the
+// adapter supplies them (nil reads as unknown). A plain new table
+// plus one ledger column suffices — no rebuild.
+func migrateV30(tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`CREATE TABLE incident_summaries (
+			incident_id TEXT PRIMARY KEY REFERENCES incidents(incident_id),
+			status TEXT NOT NULL CHECK(status IN ('pending','running','model','fallback','skipped')),
+			claim TEXT NOT NULL DEFAULT '',
+			lease_expires INTEGER NOT NULL DEFAULT 0,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			floor TEXT NOT NULL CHECK(floor IN ('low','medium','high','critical')),
+			suggestion TEXT CHECK(suggestion IS NULL OR suggestion IN ('low','medium','high','critical')),
+			final_priority TEXT NOT NULL CHECK(final_priority IN ('low','medium','high','critical')),
+			clamped INTEGER NOT NULL DEFAULT 0,
+			summary TEXT NOT NULL DEFAULT '',
+			hypothesis TEXT NOT NULL DEFAULT '',
+			confidence TEXT NOT NULL DEFAULT '',
+			reason TEXT NOT NULL DEFAULT '',
+			citations_json TEXT NOT NULL DEFAULT '[]',
+			snapshot_json TEXT NOT NULL DEFAULT '',
+			alias_map_json TEXT NOT NULL DEFAULT '{}',
+			sampled INTEGER NOT NULL DEFAULT 0,
+			omitted INTEGER NOT NULL DEFAULT 0,
+			input_tokens INTEGER,
+			output_tokens INTEGER,
+			cost_micros INTEGER,
+			error TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX incident_summaries_status ON incident_summaries(status, updated_at)`,
+		`ALTER TABLE purge_runs ADD COLUMN summaries_deleted INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// v29 resumes historical searches through immutable pending reports. The
+// briefing cursor distinguishes new scan state from v28's window endpoints.
+func migrateV29(tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`ALTER TABLE incident_pending ADD COLUMN formation_briefing TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE incident_pending ADD COLUMN formation_refs_json TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE incident_pending ADD COLUMN formation_settings TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -257,4 +859,201 @@ func migrateV6(tx *sql.Tx) error {
 func migrateV7(tx *sql.Tx) error {
 	_, err := tx.Exec(`ALTER TABLE active_groups ADD COLUMN transient_refunds INTEGER NOT NULL DEFAULT 0`)
 	return err
+}
+
+// migrateV8: briefings gain seq, the resumable-stream cursor (Designv8
+// §2.2). Assigned by the writer as COALESCE(MAX(seq),0)+1 inside the
+// briefing-insert transaction, so the single writer makes it race-free.
+// Backfill orders by (created_at, rowid): rowid breaks created_at ties
+// deterministically. Purge leaves gaps; replay by seq > last is
+// unaffected. A rebuild (not ADD COLUMN) enforces NOT NULL at the
+// schema level — ADD COLUMN cannot add the constraint afterwards, and a
+// UNIQUE index alone still admits multiple NULLs.
+func migrateV8(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE briefings_v8 (
+			briefing_id TEXT PRIMARY KEY,
+			group_id TEXT NOT NULL REFERENCES active_groups(group_id),
+			host_anchor_key TEXT NOT NULL,
+			baseline TEXT NOT NULL CHECK(baseline IN ('low','medium','high','critical')),
+			model_suggestion TEXT CHECK(model_suggestion IS NULL OR model_suggestion IN ('low','medium','high','critical')),
+			priority TEXT NOT NULL CHECK(priority IN ('low','medium','high','critical')),
+			priority_reason TEXT NOT NULL,
+			baseline_rule TEXT,
+			clamped INTEGER NOT NULL DEFAULT 0,
+			fallback_used INTEGER NOT NULL DEFAULT 0,
+			what_changed TEXT NOT NULL,
+			context TEXT NOT NULL,
+			recommended_check TEXT NOT NULL,
+			model_raw_json TEXT,
+			created_at INTEGER NOT NULL,
+			event_ids_json TEXT NOT NULL DEFAULT '[]',
+			seq INTEGER NOT NULL
+		)`,
+		`INSERT INTO briefings_v8 (briefing_id, group_id, host_anchor_key, baseline, model_suggestion, priority, priority_reason, baseline_rule, clamped, fallback_used, what_changed, context, recommended_check, model_raw_json, created_at, event_ids_json, seq)
+			SELECT briefing_id, group_id, host_anchor_key, baseline, model_suggestion, priority, priority_reason, baseline_rule, clamped, fallback_used, what_changed, context, recommended_check, model_raw_json, created_at, event_ids_json,
+				ROW_NUMBER() OVER (ORDER BY created_at, rowid)
+			FROM briefings`,
+		`DROP TABLE briefings`,
+		`ALTER TABLE briefings_v8 RENAME TO briefings`,
+		`CREATE UNIQUE INDEX one_briefing_per_group ON briefings(group_id)`,
+		`CREATE INDEX IF NOT EXISTS briefings_created ON briefings(created_at)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS briefings_seq ON briefings(seq)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV9: seq gets a durable high-water mark independent of retained
+// briefing rows. MAX(seq)+1 reuses ids after a purge deletes the maximum
+// (or everything), and a client holding an old cursor would then silently
+// skip new briefings on reconnect. seq_state survives purges; the insert
+// path bumps it in the same transaction (UPDATE ... RETURNING), so ids
+// stay monotonic across purges and restarts under the single writer.
+func migrateV9(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE seq_state (
+			id INTEGER PRIMARY KEY CHECK(id = 0),
+			next_seq INTEGER NOT NULL
+		)`,
+		`INSERT INTO seq_state (id, next_seq) SELECT 0, COALESCE(MAX(seq), 0) + 1 FROM briefings`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV10: reported-context projection tables (Designv9 §4.1). Subjects
+// are opaque read-model rows keyed by exact scoped upstream references,
+// never inferred identities. Observations carry one row per event view;
+// ports hang off observations; group/briefing relations are explicit
+// link rows written in the same transactions as their parents.
+// projection_progress records per-event projection state so restarts and
+// the bounded projector resume without rework, and the purge (Step 18e)
+// can protect unprojected evidence. legacy_profile_state is an empty
+// read-only shelf for pre-Step-18 inferred profiles, if that development
+// line is ever supported; this checkout creates no legacy rows.
+func migrateV10(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE report_sources (
+			source_scope TEXT PRIMARY KEY,
+			configured_identity_namespace TEXT NOT NULL DEFAULT '',
+			capabilities TEXT NOT NULL DEFAULT '',
+			last_report_at INTEGER,
+			heartbeat_enabled INTEGER NOT NULL DEFAULT 0,
+			last_heartbeat_at INTEGER,
+			delivery_status TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE reported_subjects (
+			profile_id TEXT PRIMARY KEY,
+			source_scope TEXT NOT NULL REFERENCES report_sources(source_scope),
+			reference_class TEXT NOT NULL CHECK(reference_class IN ('reported_device','address','event','legacy')),
+			identity_namespace TEXT NOT NULL DEFAULT '',
+			upstream_reference TEXT NOT NULL,
+			reported_identity_source TEXT NOT NULL DEFAULT '',
+			reported_confidence TEXT NOT NULL DEFAULT '',
+			association_status TEXT NOT NULL DEFAULT 'active',
+			operator_label TEXT,
+			first_report_at INTEGER NOT NULL,
+			last_report_at INTEGER NOT NULL,
+			UNIQUE(source_scope, reference_class, identity_namespace, upstream_reference)
+		)`,
+		`CREATE INDEX reported_subjects_scope ON reported_subjects(source_scope, last_report_at)`,
+		`CREATE TABLE reported_observations (
+			observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			event_id TEXT NOT NULL REFERENCES raw_events(event_id),
+			view_role TEXT NOT NULL CHECK(view_role IN ('host','previous','current')),
+			profile_id TEXT NOT NULL REFERENCES reported_subjects(profile_id),
+			reported_at INTEGER NOT NULL,
+			received_at INTEGER NOT NULL,
+			attributes_json TEXT NOT NULL DEFAULT '{}',
+			UNIQUE(event_id, view_role)
+		)`,
+		`CREATE INDEX reported_observations_event ON reported_observations(event_id)`,
+		`CREATE INDEX reported_observations_profile ON reported_observations(profile_id, reported_at)`,
+		`CREATE TABLE reported_ports (
+			observation_id INTEGER NOT NULL REFERENCES reported_observations(observation_id) ON DELETE CASCADE,
+			proto TEXT NOT NULL,
+			port INTEGER NOT NULL,
+			reported_state TEXT NOT NULL DEFAULT '',
+			reported_service TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(observation_id, proto, port)
+		)`,
+		`CREATE TABLE group_subjects (
+			group_id TEXT NOT NULL REFERENCES active_groups(group_id) ON DELETE CASCADE,
+			profile_id TEXT NOT NULL REFERENCES reported_subjects(profile_id),
+			role TEXT NOT NULL,
+			PRIMARY KEY(group_id, profile_id, role)
+		)`,
+		`CREATE INDEX group_subjects_group ON group_subjects(group_id)`,
+		`CREATE TABLE briefing_subjects (
+			briefing_id TEXT NOT NULL REFERENCES briefings(briefing_id) ON DELETE CASCADE,
+			profile_id TEXT NOT NULL REFERENCES reported_subjects(profile_id),
+			role TEXT NOT NULL,
+			PRIMARY KEY(briefing_id, profile_id, role)
+		)`,
+		`CREATE INDEX briefing_subjects_briefing ON briefing_subjects(briefing_id)`,
+		`CREATE TABLE projection_progress (
+			event_id TEXT PRIMARY KEY REFERENCES raw_events(event_id) ON DELETE CASCADE,
+			projection_version INTEGER NOT NULL,
+			state TEXT NOT NULL CHECK(state IN ('pending','done'))
+		)`,
+		`CREATE INDEX projection_progress_state ON projection_progress(state)`,
+		`CREATE TABLE legacy_profile_state (
+			old_device_id TEXT PRIMARY KEY,
+			association_status TEXT NOT NULL DEFAULT '',
+			operator_label TEXT,
+			split_metadata TEXT NOT NULL DEFAULT ''
+		)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV11: source ownership and bounded projection discovery.
+//
+// source_scope records which configured scanner deployment accepted
+// each event, in the same transaction as the event itself. Rows
+// predating scopes keep ” and are adopted once by the single
+// configured scope at projection; rows carrying any other concrete
+// scope fail the startup binding check instead of being reattributed.
+//
+// projection_pending is the indexed pending-work queue. The projector
+// drains it in received order instead of anti-joining retention on
+// every tick, so steady state costs one small indexed read whether
+// ten events or ten million are retained. The migration backfills it
+// from retained events, so pre-projection databases resume without a
+// full-history scan. It lives here rather than in v10 so dev
+// databases created at v10 replay this step instead of silently
+// missing the queue table.
+func migrateV11(tx *sql.Tx) error {
+	if _, err := tx.Exec(`ALTER TABLE raw_events ADD COLUMN source_scope TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	stmts := []string{
+		`CREATE TABLE projection_pending (
+			event_id TEXT PRIMARY KEY REFERENCES raw_events(event_id) ON DELETE CASCADE,
+			received_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX projection_pending_received ON projection_pending(received_at)`,
+		`INSERT INTO projection_pending (event_id, received_at)
+			SELECT event_id, received_at FROM raw_events`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }

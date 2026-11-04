@@ -7,8 +7,12 @@ import (
 	"log"
 	"runtime/debug"
 	"sort"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
+	"github.com/ostefani/watcherbridge/internal/health"
 	"github.com/ostefani/watcherbridge/internal/provider"
 	"github.com/ostefani/watcherbridge/internal/redactor"
 	"github.com/ostefani/watcherbridge/internal/store"
@@ -29,10 +33,29 @@ type Deps struct {
 	Lease  time.Duration
 	Now    func() time.Time
 	Policy Policy
+	// SourceScope identifies the authenticated scanner deployment for
+	// reported-context projection. Empty skips projection (tests that
+	// do not exercise it); production always sets it from config.
+	SourceScope string
 
 	Provider     provider.Provider
 	Redaction    redactor.Policy
 	ModelTimeout time.Duration
+	// Step 26 agent floors (Designv9 §6.1). AgentEnabled is opt-in
+	// (default off); AgentMaxSteps bounds read-only tool turns per run
+	// (1-4, validated); ModelMinBaseline is the lowest baseline the
+	// single call serves (lower answers deterministically);
+	// AgentMinBaseline is the lowest baseline the loop investigates.
+	// AgentTimeout bounds one loop run; zero means the loop default.
+	// Zero values disable the loop.
+	AgentEnabled     bool
+	AgentMaxSteps    int
+	ModelMinBaseline Level
+	AgentMinBaseline Level
+	AgentTimeout     time.Duration
+	// Health counts provider outcomes and writer-saturation refunds;
+	// nil-safe, unset in tests that do not exercise it.
+	Health *health.Counters
 
 	// OnBriefing fires after each stored briefing (model or fallback)
 	// with the exact row served and published. OnGroups fires once per
@@ -45,7 +68,9 @@ type Deps struct {
 
 // notifyBriefing fans a stored briefing out to the observer. Event IDs
 // come from the taken events (the insert already proved them equal to
-// the derived set), sorted to match the stored order.
+// the derived set), sorted to match the stored order. The writer assigns
+// seq inside the insert transaction, so the stored row is re-read for the
+// cursor the SSE id: field carries; on a read error the fanout still runs.
 func notifyBriefing(d Deps, taken store.TakenGroup, b store.Briefing) {
 	if d.OnBriefing == nil {
 		return
@@ -56,12 +81,53 @@ func notifyBriefing(d Deps, taken store.TakenGroup, b store.Briefing) {
 	}
 	sort.Strings(ids)
 	b.EventIDs = ids
+	b.GroupingVersion = taken.GroupingVersion
+	if stored, err := d.Store.BriefingForGroup(context.Background(), taken.GroupID); err == nil {
+		b.Seq = stored.Seq
+	} else {
+		log.Printf("briefing: group %s reread for seq: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
+	}
 	d.OnBriefing(b)
 }
 
-// Run ticks until ctx ends: close due groups, reap stale leases, then drain
-// the briefing queue page by page. It returns nil when ctx ends; per-group
-// panics are recovered so one poison group cannot stop the worker.
+// projectStep runs one bounded projection batch through the writer.
+// Projection is scheduled independently of briefing progress (see
+// projectLoop) so a backlog of ready groups behind slow provider calls
+// never delays capture of newly accepted events (Designv9 §4.1).
+// drainOnce also calls it first to preserve persist -> project ->
+// close -> take order for direct callers; the second call on an empty
+// queue is a single indexed lookup.
+func projectStep(ctx context.Context, d Deps) {
+	if d.SourceScope == "" {
+		return
+	}
+	if _, err := d.Store.ProjectReported(ctx, d.SourceScope, 256); err != nil {
+		log.Printf("briefing: project reported: %s", store.SanitizeErrorText(err.Error()))
+	}
+}
+
+// projectLoop projects reported context on its own tick, independent of
+// the briefing drain: provider calls happen outside the writer, so this
+// loop keeps capturing newly accepted events while briefOne blocks on
+// the model. Batches stay bounded; leftovers resume next tick.
+func projectLoop(ctx context.Context, d Deps, tick time.Duration) {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		projectStep(ctx, d)
+		timer.Reset(tick)
+	}
+}
+
+// Run ticks until ctx ends: project reported context on its own loop,
+// then close due groups, reap stale leases, and drain the briefing
+// queue page by page. It returns nil when ctx ends; per-group panics
+// are recovered so one poison group cannot stop the worker.
 func Run(ctx context.Context, d Deps) error {
 	if d.Store == nil {
 		return fmt.Errorf("briefing worker requires a store")
@@ -69,6 +135,9 @@ func Run(ctx context.Context, d Deps) error {
 	// Operator-chosen degradations are loud at startup, never silent.
 	if d.Provider == nil || d.Provider.Name() == "fake" {
 		log.Print("briefing: no model provider; all briefings will be deterministic fallbacks")
+	}
+	if d.AgentEnabled && !isTurner(d.Provider) {
+		log.Print("briefing: agent enabled but the provider has no turn capability; eligible groups use the single call")
 	}
 	if !d.Redaction.Enabled {
 		log.Print("briefing: WARNING: redaction is off; raw values go to the provider and the leak scan is bypassed")
@@ -81,6 +150,13 @@ func Run(ctx context.Context, d Deps) error {
 	if tick <= 0 {
 		tick = time.Second
 	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		projectLoop(ctx, d, tick)
+	}()
+	defer wg.Wait()
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
@@ -96,20 +172,36 @@ func Run(ctx context.Context, d Deps) error {
 	}
 }
 
+// publishGroups emits the current open/processing snapshot. It runs both
+// before the briefing drain (so closures show promptly) and after it (so
+// the closed→processing transitions TakeGroup committed mid-drain reach
+// subscribers in the same tick instead of vanishing until the next one).
+func publishGroups(ctx context.Context, d Deps) {
+	if d.OnGroups == nil {
+		return
+	}
+	groups, err := d.Store.OpenGroupSnapshots(ctx)
+	if err != nil {
+		log.Printf("briefing: group snapshot: %s", store.SanitizeErrorText(err.Error()))
+		return
+	}
+	d.OnGroups(groups)
+}
+
 func drainOnce(ctx context.Context, d Deps, now time.Time) {
+	// Project reported context before closing anything: briefing
+	// inserts copy group_subjects, so subjects must already be linked
+	// when a group is taken. The independent projectLoop repeats this
+	// between drains; this call keeps direct callers ordered.
+	projectStep(ctx, d)
 	if _, err := d.Store.CloseDue(ctx, now); err != nil {
 		log.Printf("briefing: close-due: %s", store.SanitizeErrorText(err.Error()))
 	}
 	if _, err := d.Store.ReleaseStale(ctx, now, d.Lease); err != nil {
 		log.Printf("briefing: release-stale: %s", store.SanitizeErrorText(err.Error()))
 	}
-	if d.OnGroups != nil {
-		if groups, err := d.Store.OpenGroupSnapshots(ctx); err != nil {
-			log.Printf("briefing: group snapshot: %s", store.SanitizeErrorText(err.Error()))
-		} else {
-			d.OnGroups(groups)
-		}
-	}
+	publishGroups(ctx, d)
+	drained := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -122,7 +214,7 @@ func drainOnce(ctx context.Context, d Deps, now time.Time) {
 			return
 		}
 		if len(ids) == 0 {
-			return
+			break
 		}
 		progress := false
 		for _, id := range ids {
@@ -135,12 +227,20 @@ func drainOnce(ctx context.Context, d Deps, now time.Time) {
 				progress = true
 			}
 		}
+		drained = drained || progress
 		if !progress {
 			// A full page changed no group state (lost races, store
 			// hiccups): re-reading would spin on the same rows until
 			// the next tick, so end the pass here.
-			return
+			break
 		}
+	}
+	if drained {
+		// The drain took groups closed→processing; republish so the
+		// snapshot carries those transitions in this tick. Idle ticks
+		// stay silent: the hash dedup downstream drops no-change
+		// snapshots anyway, and one publish is enough.
+		publishGroups(ctx, d)
 	}
 }
 
@@ -185,11 +285,16 @@ func briefOne(ctx context.Context, d Deps, groupID string) (progressed bool) {
 	}()
 	taken, err := d.Store.TakeGroup(ctx, groupID)
 	if err != nil {
-		if !errors.Is(err, store.ErrGroupNotClosed) {
+		if !errors.Is(err, store.ErrGroupNotClosed) && !errors.Is(err, store.ErrGroupNotReady) {
 			log.Printf("briefing: group %s take: %s", groupID, store.SanitizeErrorText(err.Error()))
 		}
-		return false // lost race or store hiccup; next tick retries
+		return false // lost race, unprojected group, or store hiccup; next tick retries
 	}
+	// The claim committed: publish before any provider work, so a group
+	// that waits on the model is visible as processing (and the groups
+	// queued closed behind it as waiting) for the whole call — not only
+	// after the drain finishes, when the group is normally already done.
+	publishGroups(ctx, d)
 	outcome, berr := Baseline(decodeTaken(taken), asOf(taken), d.Policy)
 	if berr != nil {
 		// Empty group: nothing to resolve. Retry while takes remain; the
@@ -197,37 +302,57 @@ func briefOne(ctx context.Context, d Deps, groupID string) (progressed bool) {
 		log.Printf("briefing: group %s has no events", groupID)
 		return releaseOrPark(ctx, d, taken, "no events")
 	}
-	if d.Provider != nil {
-		return briefWithModel(ctx, d, taken, outcome)
-	}
-	// No provider in Step 9 scope: the deterministic minimal briefing.
-	// Resolve(level, nil) is identity, which fallbackBriefing encodes.
+	// Approved operator rules act as deterministic baseline policy
+	// (Designv9 §5.2): on exact scope match a non-critical outcome
+	// selects low before any provider floor is consulted, so
+	// operator-trusted routine never bills a call.
 	now := time.Now()
 	if d.Now != nil {
 		now = d.Now()
 	}
-	b := fallbackBriefing(taken, outcome, now, "provider unavailable; briefing from deterministic baseline only")
+	outcome = ApplyOperatorRules(ctx, d.Store, taken, outcome, now)
+	if d.Provider != nil {
+		if selectMode(outcome.Level, d.ModelMinBaseline, d.AgentMinBaseline, d.AgentEnabled, isTurner(d.Provider)) == modeAgent {
+			return runAgent(ctx, d, taken, outcome)
+		}
+		if outcome.Level < d.ModelMinBaseline {
+			// Below the single-call floor (Designv9 §6.1): the
+			// intentional rules-only briefing answers without
+			// billing a provider call. Source "rules", not
+			// "fallback": fallback is distinct from intentionally
+			// rules-only output.
+			return insertRules(ctx, d, taken, outcome, "baseline below the single-call floor; briefing from deterministic rules only")
+		}
+		return briefWithModel(ctx, d, taken, outcome)
+	}
+	// No provider in Step 9 scope: the deterministic minimal briefing.
+	// Resolve(level, nil) is identity, which fallbackBriefing encodes.
+	// now was fixed above for rule application; the same instant stamps
+	// the deterministic briefing.
+	b := fallbackBriefing(taken, outcome, now, "provider unavailable; briefing from deterministic baseline only", nil, provider.Usage{})
 	if taken.LastAttempt() {
 		// Final attempt: write the deterministic briefing inline instead
 		// of releasing, so a poison group converges to done, not failed.
 		if err := d.Store.InsertBriefing(ctx, b); err != nil {
 			log.Printf("briefing: group %s final insert: %s", groupID, store.SanitizeErrorText(err.Error()))
 			if transientStoreErr(ctx, err) {
-				return releaseTransient(ctx, d, taken)
+				return releaseTransientErr(ctx, d, taken, err)
 			}
 			parkFailed(ctx, d, groupID, "final insert failed")
 			return true
 		}
+		d.Health.AddProviderFallback()
 		notifyBriefing(d, taken, b)
 		return true
 	}
 	if err := d.Store.InsertBriefing(ctx, b); err != nil {
 		log.Printf("briefing: group %s insert: %s", groupID, store.SanitizeErrorText(err.Error()))
 		if transientStoreErr(ctx, err) {
-			return releaseTransient(ctx, d, taken)
+			return releaseTransientErr(ctx, d, taken, err)
 		}
 		return releaseOrPark(ctx, d, taken, "insert failed")
 	}
+	d.Health.AddProviderFallback()
 	notifyBriefing(d, taken, b)
 	if len(outcome.Skipped) > 0 {
 		log.Printf("briefing: group %s baseline %s skipped %d unknown-input rules", groupID, outcome.RuleID, len(outcome.Skipped))
@@ -282,6 +407,15 @@ func releaseOrPark(ctx context.Context, d Deps, taken store.TakenGroup, reason s
 		log.Printf("briefing: group %s parked failed (%s) after %d attempts", taken.GroupID, reason, taken.RetryCount)
 	}
 	return true
+}
+
+// releaseTransientErr refunds like releaseTransient, counting the refunds
+// whose cause was the saturated writer queue rather than shutdown.
+func releaseTransientErr(ctx context.Context, d Deps, taken store.TakenGroup, err error) bool {
+	if errors.Is(err, store.ErrQueueSaturated) {
+		d.Health.AddWriterSaturated()
+	}
+	return releaseTransient(ctx, d, taken)
 }
 
 // releaseTransient refunds one take and requeues with a backoff. The
@@ -362,8 +496,32 @@ func asOf(taken store.TakenGroup) time.Time {
 	return last
 }
 
+// maxAnchorLabelRunes caps the anchor label in deterministic text.
+// Ingest does not impose the redactor's 253-byte hostname limit on
+// anchors, so a hostile multi-hundred-KiB hostname would otherwise sail
+// through the model-budget rejection and land verbatim in the fallback
+// sentence that replaces it. The cap (one MAX_FIELD_CHARS width, rune
+// sound, marked) keeps fallback generation bounded independently of
+// model restoration; falling back must not reproduce the oversized value
+// that caused rejection. The stored anchor key itself is untouched —
+// grouping identity still compares exact values.
+const maxAnchorLabelRunes = 256
+
+// anchorLabel strips the anchor-key prefix and caps degenerate labels.
+func anchorLabel(anchor string) string {
+	label := stripAnchorPrefix(anchor)
+	if r := []rune(label); len(r) > maxAnchorLabelRunes {
+		return string(r[:maxAnchorLabelRunes]) + "…"
+	}
+	return label
+}
+
 // describeEvents renders fixed templates plus event-type counts (enum
-// values only) — no payload free text, per the Step 9 scope.
+// values only) — no payload free text, per the Step 9 scope. Parts pass
+// through dedupStrings and the anchor through stripAnchorPrefix so the
+// production sentence never repeats a value or prints an anchor-key
+// prefix; both are no-ops on today's already-unique parts, and guard the
+// helpers' future callers.
 func describeEvents(taken store.TakenGroup) string {
 	counts := map[string]int{}
 	order := []string{}
@@ -373,12 +531,10 @@ func describeEvents(taken store.TakenGroup) string {
 		}
 		counts[ev.EventType]++
 	}
-	parts := ""
-	for i, typ := range order {
-		if i > 0 {
-			parts += ", "
-		}
-		parts += fmt.Sprintf("%d %s", counts[typ], typ)
+	parts := make([]string, 0, len(order))
+	for _, typ := range order {
+		parts = append(parts, strconv.Itoa(counts[typ])+" "+typ)
 	}
-	return fmt.Sprintf("%d events in group: %s", len(taken.Events), parts)
+	parts = dedupStrings(parts)
+	return plural(len(taken.Events), "event") + " on " + anchorLabel(taken.Anchor) + ": " + strings.Join(parts, ", ")
 }

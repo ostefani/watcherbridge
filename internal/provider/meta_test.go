@@ -2,6 +2,7 @@ package provider
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -219,5 +220,156 @@ func TestFakeCountsSharedDeadline(t *testing.T) {
 	}
 	if len(f.Received) != 2 || string(f.Received[1]) != "fix" {
 		t.Fatalf("repair payload not recorded: %q", f.Received)
+	}
+}
+
+func TestMarshalTurnRequestResendsTranscript(t *testing.T) {
+	tr := []TurnMessage{
+		{Role: "system", Text: "sys"},
+		{Role: "user", Text: `{"bundle":1}`},
+		{Role: "assistant", Text: `{"tool":"get_reported_profile","arguments":{"host":"IP_1"}}`},
+		{Role: "tool", Text: `{"result":{"report_count":2}}`},
+	}
+	raw, err := MarshalTurnRequest("m", tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body struct {
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
+		Input  []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"input"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Model != "m" || body.Stream {
+		t.Fatalf("model and stream flags wrong: %+v", body)
+	}
+	if len(body.Input) != len(tr) {
+		t.Fatalf("every transcript turn must cross: %d of %d", len(body.Input), len(tr))
+	}
+	// Roles map onto Responses roles; tool results travel as user
+	// text with an explicit marker — never a new speaker, never a
+	// session ID.
+	wantRoles := []string{"system", "user", "assistant", "user"}
+	for i, want := range wantRoles {
+		if body.Input[i].Role != want {
+			t.Fatalf("turn %d role: got %q want %q", i, body.Input[i].Role, want)
+		}
+	}
+	if !strings.Contains(body.Input[3].Content[0].Text, "Tool result: ") {
+		t.Fatalf("tool result must be marked: %q", body.Input[3].Content[0].Text)
+	}
+	if strings.Contains(string(raw), "previous_response_id") || strings.Contains(string(raw), "session") {
+		t.Fatal("turn request must chain nothing provider-side")
+	}
+}
+
+func TestMetaTurnSendsFullTranscript(t *testing.T) {
+	const answer = `{"event_ids":["e1"],"host":"HOST_1"}`
+	stub := &stubTripper{respond: func(*http.Request) (*http.Response, error) {
+		return okResponse(`{"output":[{"type":"message","content":[{"type":"output_text","text":` + strconv.Quote(answer) + `}]}]}`), nil
+	}}
+	a := testAdapter(t, stub, 64<<10)
+	tr := []TurnMessage{{Role: "system", Text: "s"}, {Role: "user", Text: "b"}}
+	res, err := a.Turn(t.Context(), tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Text != answer {
+		t.Fatalf("turn must return the assistant text: %q", res.Text)
+	}
+	if res.Usage.HasUsage {
+		t.Fatalf("envelope without usage must read unknown: %+v", res.Usage)
+	}
+	if len(stub.requests) != 1 {
+		t.Fatalf("one turn is one POST: %d", len(stub.requests))
+	}
+	// The full transcript is the input: stateless resend, same caps and
+	// redirect policy as Brief.
+	for _, want := range []string{`"role":"system"`, `"role":"user"`, `"stream":false`} {
+		if !bytes.Contains(stub.bodies[0], []byte(want)) {
+			t.Fatalf("turn body missing %s in %s", want, stub.bodies[0])
+		}
+	}
+}
+
+func TestFakeTurnScripts(t *testing.T) {
+	f := NewFake()
+	f.Turns = []FakeStep{{JSON: []byte("one")}, {Err: errors.New("down")}}
+	if res, err := f.Turn(context.Background(), []TurnMessage{{Role: "user", Text: "a"}}); err != nil || res.Text != "one" {
+		t.Fatalf("scripted turn must play: %q %v", res.Text, err)
+	}
+	if _, err := f.Turn(context.Background(), []TurnMessage{{Role: "user", Text: "b"}}); err == nil {
+		t.Fatal("scripted turn error must surface")
+	}
+	// Extra calls replay the last step; deadlines ride every turn for
+	// the per-turn budget assertions.
+	if _, err := f.Turn(context.Background(), []TurnMessage{{Role: "user", Text: "c"}}); err == nil {
+		t.Fatal("replay must repeat the last step")
+	}
+	if f.TurnCalls != 3 || len(f.TurnReceived) != 3 {
+		t.Fatalf("turns must record: calls=%d received=%d", f.TurnCalls, len(f.TurnReceived))
+	}
+	if len(f.Deadlines) != 3 {
+		t.Fatalf("deadlines must ride every turn: %d", len(f.Deadlines))
+	}
+}
+
+func TestTurnUsageRidesWhenSupplied(t *testing.T) {
+	const answer = `{"event_ids":["e1"],"host":"HOST_1"}`
+	stub := &stubTripper{respond: func(*http.Request) (*http.Response, error) {
+		return okResponse(`{"output":[{"type":"message","content":[{"type":"output_text","text":` +
+			strconv.Quote(answer) + `}]}],"usage":{"input_tokens":120,"output_tokens":45}}`), nil
+	}}
+	a := testAdapter(t, stub, 64<<10)
+	res, err := a.Turn(t.Context(), []TurnMessage{{Role: "user", Text: "b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Usage.HasUsage || res.Usage.InputTokens != 120 || res.Usage.OutputTokens != 45 {
+		t.Fatalf("envelope usage must ride the turn: %+v", res.Usage)
+	}
+	if res.Usage.HasCost {
+		t.Fatalf("the API reports no cost, so cost stays unknown: %+v", res.Usage)
+	}
+}
+
+func TestFakeStepUsageScripts(t *testing.T) {
+	f := NewFake(FakeStep{JSON: []byte("one"), Usage: Usage{InputTokens: 7, OutputTokens: 3, HasUsage: true}})
+	f.Turns = []FakeStep{{JSON: []byte("one"), Usage: Usage{InputTokens: 7, OutputTokens: 3, HasUsage: true}}}
+	res, err := f.Turn(context.Background(), []TurnMessage{{Role: "user", Text: "a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Usage.HasUsage || res.Usage.InputTokens != 7 || res.Usage.OutputTokens != 3 {
+		t.Fatalf("scripted usage must ride the turn: %+v", res.Usage)
+	}
+	raw, err := f.Brief(context.Background(), []byte("{}"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !raw.Usage.HasUsage || raw.Usage.InputTokens != 7 {
+		t.Fatalf("scripted usage must ride briefs too: %+v", raw.Usage)
+	}
+}
+
+func TestUsageAdd(t *testing.T) {
+	sum := Usage{InputTokens: 1, OutputTokens: 2, HasUsage: true}.Add(
+		Usage{InputTokens: 10, OutputTokens: 20, HasUsage: true, CostMicros: 5, HasCost: true})
+	if sum.InputTokens != 11 || sum.OutputTokens != 22 || !sum.HasUsage {
+		t.Fatalf("tokens must add: %+v", sum)
+	}
+	if !sum.HasCost || sum.CostMicros != 5 {
+		t.Fatalf("supplied cost must survive beside unsupplied: %+v", sum)
+	}
+	if (Usage{}.Add(Usage{})).HasUsage || (Usage{}.Add(Usage{})).HasCost {
+		t.Fatal("empty add must stay unknown")
 	}
 }

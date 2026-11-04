@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"log"
 	"os"
@@ -16,6 +17,8 @@ import (
 	"github.com/ostefani/watcherbridge/internal/briefing"
 	"github.com/ostefani/watcherbridge/internal/config"
 	"github.com/ostefani/watcherbridge/internal/forwarder"
+	"github.com/ostefani/watcherbridge/internal/health"
+	"github.com/ostefani/watcherbridge/internal/incidentsummary"
 	"github.com/ostefani/watcherbridge/internal/provider"
 	"github.com/ostefani/watcherbridge/internal/redactor"
 	"github.com/ostefani/watcherbridge/internal/server"
@@ -24,10 +27,16 @@ import (
 )
 
 func main() {
+	// `status` is a read-only API client, not a bridge instance: it must
+	// not parse bridge flags, open the database, or start workers.
+	if len(os.Args) > 1 && os.Args[1] == "status" {
+		os.Exit(runStatus(os.Args[2:]))
+	}
 	def := config.Default()
 	fs := flag.NewFlagSet("watcherbridge", flag.ExitOnError)
 	bind := fs.String("bind", def.Bind, "loopback bind address")
 	mode := fs.String("mode", def.Mode, "tap or proxy")
+	sourceID := fs.String("source-id", "", "authenticated scanner deployment ID scoping reported references (or SOURCE_ID)")
 	db := fs.String("db", "watcherbridge.db", "sqlite path (0600)")
 	secret := fs.String("secret", "", "webhook HMAC secret (or WEBHOOK_SECRET)")
 	secretFile := fs.String("secret-file", "", "file holding the webhook secret")
@@ -37,8 +46,32 @@ func main() {
 	forwardKey := fs.String("forward-api-key", "", "API key injected into ScanRelay forwards/annotations (or FORWARD_API_KEY)")
 	quiet := fs.Duration("group-quiet-window", def.GroupQuietWindow, "grouping quiet window")
 	maxWindow := fs.Duration("group-max-window", def.GroupMaxWindow, "grouping hard cap")
+	overviewWindow := fs.Duration("overview-window", def.OverviewWindow, "default overview window")
+	overviewMax := fs.Duration("overview-max-window", def.OverviewMaxWindow, "configured overview maximum")
+	overviewTick := fs.Duration("overview-tick", def.OverviewTick, "overview recompute timer (5s-5m)")
+	briefRet := fs.Duration("briefing-retention", def.BriefingRetention, "retained briefing history (min 24h)")
+	subjRet := fs.Duration("subject-retention", def.SubjectRetention, "retained reported-subject context (min briefing retention)")
+	purgeEvery := fs.Duration("purge-interval", def.PurgeInterval, "purge loop interval (min 1m)")
+	snoozeDefault := fs.Duration("snooze-default", def.SnoozeDefault, "default briefing snooze horizon")
+	decisionRet := fs.Duration("decision-retention", def.DecisionRetention, "retained operator-decision audit (min 24h)")
+	heartbeatStale := fs.Duration("heartbeat-stale-after", def.HeartbeatStaleAfter, "source heartbeat freshness limit")
+	heartbeatRetention := fs.Duration("heartbeat-retention", def.HeartbeatRetention, "retained heartbeat history")
+	ruleProposeAfter := fs.Int("rule-propose-after", def.RuleProposeAfter, "matching expected decisions that derive a rule proposal (min 1)")
+	ruleDefaultTTL := fs.Duration("rule-default-ttl", def.RuleDefaultTTL, "default rule approval grant")
+	ruleRet := fs.Duration("rule-retention", def.RulePurgeAfter, "retained terminal review-policy rules (min 24h)")
+	incidentTick := fs.Duration("incident-tick", def.IncidentTick, "presentation incident correlator tick (5s-5m)")
+	incidentWindow := fs.Duration("incident-window", def.IncidentWindow, "incident formation window (within briefing retention)")
+	incidentQuiet := fs.Duration("incident-quiet", def.IncidentQuiet, "incident quiet close (min one tick)")
+	incidentMinRefs := fs.Int("incident-min-refs", def.IncidentMinRefs, "distinct qualified references per incident (min 2)")
+	incidentRet := fs.Duration("incident-retention", def.IncidentRetention, "retained closed incidents (min 24h, max subject retention)")
+	incidentSummary := fs.Bool("incident-summary-enabled", def.IncidentSummaryEnabled, "generate one AI summary after each incident closes (opt-in)")
 	tick := fs.Duration("grouper-tick", def.GrouperTick, "worker tick")
 	lease := fs.Duration("processing-lease", def.ProcessingLease, "stale processing lease")
+	agentTimeout := fs.Duration("agent-timeout", def.AgentTimeout, "bounded investigator loop run budget")
+	agentEnabled := fs.Bool("agent-enabled", def.AgentEnabled, "enable the bounded investigator loop (opt-in)")
+	agentMaxSteps := fs.Int("agent-max-steps", def.AgentMaxSteps, "read-only tool turns per run (1-4)")
+	modelMin := fs.String("model-min-baseline", def.ModelMinBaseline, "single-call provider available at/below this baseline")
+	agentMin := fs.String("agent-min-baseline", def.AgentMinBaseline, "agent loop investigates at/above this baseline")
 	modelProvider := fs.String("model-provider", def.ModelProvider, "meta or fake")
 	modelID := fs.String("model-id", def.ModelID, "model ID for the meta provider")
 	modelKey := fs.String("model-key", "", "model API key (or MODEL_API_KEY)")
@@ -52,6 +85,7 @@ func main() {
 	cfg := config.Default()
 	cfg.Bind = *bind
 	cfg.Mode = *mode
+	cfg.SourceID = firstNonEmpty(*sourceID, os.Getenv("SOURCE_ID"), def.SourceID)
 	cfg.Secret = config.Secret(firstNonEmpty(*secret, os.Getenv("WEBHOOK_SECRET")))
 	cfg.SecretFile = *secretFile
 	cfg.ScanRelayURL = *relay
@@ -60,8 +94,36 @@ func main() {
 	cfg.ForwardAPIKey = config.Secret(firstNonEmpty(*forwardKey, os.Getenv("FORWARD_API_KEY")))
 	cfg.GroupQuietWindow = *quiet
 	cfg.GroupMaxWindow = *maxWindow
+	cfg.BriefingRetention = *briefRet
+	cfg.SubjectRetention = *subjRet
+	cfg.PurgeInterval = *purgeEvery
+	cfg.SnoozeDefault = *snoozeDefault
+	cfg.DecisionRetention = *decisionRet
+	cfg.HeartbeatStaleAfter = *heartbeatStale
+	cfg.HeartbeatRetention = *heartbeatRetention
+	cfg.RuleProposeAfter = *ruleProposeAfter
+	cfg.RuleDefaultTTL = *ruleDefaultTTL
+	cfg.RulePurgeAfter = *ruleRet
+	cfg.IncidentTick = *incidentTick
+	cfg.IncidentWindow = *incidentWindow
+	cfg.IncidentQuiet = *incidentQuiet
+	cfg.IncidentMinRefs = *incidentMinRefs
+	cfg.IncidentRetention = *incidentRet
+	if *incidentSummary {
+		cfg.IncidentSummaryEnabled = true
+	} else if os.Getenv("INCIDENT_SUMMARY_ENABLED") == "true" {
+		cfg.IncidentSummaryEnabled = true
+	}
 	cfg.GrouperTick = *tick
+	cfg.OverviewWindow = *overviewWindow
+	cfg.OverviewMaxWindow = *overviewMax
+	cfg.OverviewTick = *overviewTick
 	cfg.ProcessingLease = *lease
+	cfg.AgentTimeout = *agentTimeout
+	cfg.AgentEnabled = *agentEnabled
+	cfg.AgentMaxSteps = *agentMaxSteps
+	cfg.ModelMinBaseline = *modelMin
+	cfg.AgentMinBaseline = *agentMin
 	cfg.ModelProvider = *modelProvider
 	cfg.ModelID = *modelID
 	cfg.ModelAPIKey = config.Secret(firstNonEmpty(*modelKey, os.Getenv("MODEL_API_KEY")))
@@ -71,9 +133,25 @@ func main() {
 	cfg.Redaction = *redaction
 	cfg.StableIdentityFields = strings.Split(*stableFields, ",")
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	st, err := store.Open(*db)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
+	}
+	// Effective-state queries share the configured audit horizon with
+	// purge, so a stalled purge never extends a verdict past retention.
+	st.SetDecisionRetention(cfg.DecisionRetention)
+	// Step 26 floors are validated in server.New before the worker
+	// starts; the parse here cannot fail on a validated config.
+	modelMinLevel, _ := briefing.ParseLevel(cfg.ModelMinBaseline)
+	agentMinLevel, _ := briefing.ParseLevel(cfg.AgentMinBaseline)
+	// Single-source binding: refuse to serve a database that already
+	// holds another deployment's scoped receipts instead of mixing
+	// their subjects. Pre-scope rows carry '' and stay adoptable.
+	if err := st.BindSourceScope(context.Background(), cfg.SourceID); err != nil {
+		log.Fatalf("source scope: %v", err)
 	}
 	// Shutdown closes the store last, after the worker and publisher.
 	defer func() {
@@ -82,10 +160,33 @@ func main() {
 		}
 	}()
 
+	// Startup ordering is a synchronization boundary, not launch order:
+	// recovery first, then the completed startup sweep, then the initial
+	// purge — only afterwards do serving and the background loops start.
+	// Each step runs to completion so retained work is never purged on
+	// a stale view and the sweep never races the first purge.
+	if recovered, err := st.Recover(ctx, time.Now()); err != nil {
+		log.Fatalf("startup recovery: %v", err)
+	} else if len(recovered) > 0 {
+		log.Printf("startup recovery: requeued %d groups", len(recovered))
+	}
 	srv, err := server.New(cfg, st, forwarder.NewGate())
 	if err != nil {
 		log.Fatalf("server: %v", err)
 	}
+	// Operational counters are process-lifetime: the start time travels
+	// with every reading so a restart is interpretable, never silent.
+	opHealth := health.New()
+	srv.Health = opHealth
+	srv.Viewer().Overview.SetHealth(opHealth)
+	srv.SweepOnce(ctx)
+	purgeSettings := store.PurgeSettings{BriefingRetention: cfg.BriefingRetention, SubjectRetention: cfg.SubjectRetention, DecisionRetention: cfg.DecisionRetention, RuleRetention: cfg.RulePurgeAfter, HeartbeatRetention: cfg.HeartbeatRetention, IncidentRetention: cfg.IncidentRetention, ActiveSource: cfg.SourceID}
+	if rep, err := st.PurgeOnce(ctx, purgeSettings, time.Now()); err != nil {
+		log.Fatalf("startup purge: %v", err)
+	} else {
+		log.Printf("startup purge: %+v", rep)
+	}
+	srv.RegisterOnShutdown(srv.Viewer().Close)
 	hub := srv.Viewer().Hub()
 
 	var prov provider.Provider
@@ -117,14 +218,79 @@ func main() {
 	} else {
 		log.Print("watcherbridge: no ScanRelay URL; annotations disabled")
 	}
-	onBriefing, onGroups := viewer.Fanout(hub, pub)
+	onBriefing, onGroups := viewer.Fanout(hub, pub, int64(cfg.GroupQuietWindow/time.Second))
+	srv.Viewer().Overview.SetPublisher(pub)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	// The overview refresher recomputes on briefing inserts and its own
+	// timer, coalesced to 1/s, broadcasting only on hash change.
+	ov := srv.Viewer().Overview
+	overviewDone := make(chan struct{})
+	go func() {
+		defer close(overviewDone)
+		ov.Run(ctx, cfg.OverviewTick, func(body []byte) {
+			hub.Broadcast("overview", json.RawMessage(body))
+		})
+	}()
+	onBriefingChanged := func(b store.Briefing) {
+		onBriefing(b)
+		ov.Trigger()
+	}
+
+	// The purge loop sits beside the briefing worker: both share only the
+	// serialized writer, so a slow purge batch delays individual writes
+	// but never blocks provider calls or the briefing tick. Small batches
+	// plus pressure yield provide the isolation; join before the store.
+	purgeDone := make(chan error, 1)
+	go func() { purgeDone <- runPurgeLoop(ctx, st, cfg, purgeSettings) }()
+
+	// The incident correlator sits beside them on the same terms: one
+	// bounded pass per tick through the serialized writer, joined
+	// before the store. A pass that changes incidents broadcasts one
+	// `incident` event (no SSE id: clients refetch the list) and
+	// triggers an overview refresh for the attention cut.
+	incidentSettings := store.IncidentSettings{
+		Window: cfg.IncidentWindow, Quiet: cfg.IncidentQuiet, MinRefs: cfg.IncidentMinRefs,
+		SummaryEnabled: cfg.IncidentSummaryEnabled,
+	}
+	incidentDone := make(chan error, 1)
+	go func() {
+		incidentDone <- runIncidentLoop(ctx, st, hub, ov, cfg.IncidentTick, incidentSettings)
+	}()
+
+	// The closed-incident summary worker sits beside them on the same
+	// terms: one worker, one durable queue capped at 100 outstanding
+	// jobs, no blocking of correlation, ingestion or briefing work.
+	// Enabling applies to subsequent closures only. Completion reuses
+	// incident SSE invalidation and reconnect/resync behavior (one
+	// incident event plus an overview refresh) without changing
+	// membership, reopening incidents, modifying decisions or
+	// publishing scanner annotations.
+	summaryDone := make(chan error, 1)
+	if cfg.IncidentSummaryEnabled {
+		summarizer, ok := prov.(provider.Summarizer)
+		if !ok {
+			log.Fatalf("incident summaries require a provider with explicit summary capability")
+		}
+		onSummary := func(incidentID string) {
+			hub.Broadcast("incident", viewer.IncidentEventOf(store.IncidentReport{Changed: []string{incidentID}}))
+			ov.Trigger()
+		}
+		go func() {
+			summaryDone <- incidentsummary.Run(ctx, incidentsummary.Deps{
+				Store: st, Provider: summarizer,
+				Redaction: redactor.Policy{Enabled: cfg.Redaction, MaxFieldChars: cfg.MaxFieldChars},
+				Now:       time.Now, Health: opHealth, OnComplete: onSummary,
+			})
+		}()
+	} else {
+		close(summaryDone)
+	}
+
 	workerDone := make(chan error, 1)
 	go func() {
 		workerDone <- briefing.Run(ctx, briefing.Deps{
-			Store: st,
+			Store:       st,
+			SourceScope: cfg.SourceID,
 			Groups: store.GroupPolicy{QuietWindow: cfg.GroupQuietWindow,
 				MaxWindow: cfg.GroupMaxWindow, MaxEvents: cfg.GroupMaxEvents},
 			Tick:  cfg.GrouperTick,
@@ -132,11 +298,17 @@ func main() {
 			Now:   time.Now,
 			Policy: briefing.Policy{EstablishedAge: cfg.EstablishedAge,
 				StrongHistoryAge: cfg.StrongHistoryAge, StableFields: cfg.StableIdentityFields},
-			Provider:     prov,
-			Redaction:    redactor.Policy{Enabled: cfg.Redaction, MaxFieldChars: cfg.MaxFieldChars},
-			ModelTimeout: cfg.ProviderTimeout,
-			OnBriefing:   onBriefing,
-			OnGroups:     onGroups,
+			Provider:         prov,
+			Redaction:        redactor.Policy{Enabled: cfg.Redaction, MaxFieldChars: cfg.MaxFieldChars},
+			ModelTimeout:     cfg.ProviderTimeout,
+			AgentTimeout:     cfg.AgentTimeout,
+			AgentEnabled:     cfg.AgentEnabled,
+			AgentMaxSteps:    cfg.AgentMaxSteps,
+			ModelMinBaseline: modelMinLevel,
+			AgentMinBaseline: agentMinLevel,
+			Health:           opHealth,
+			OnBriefing:       onBriefingChanged,
+			OnGroups:         onGroups,
 		})
 	}()
 
@@ -152,13 +324,74 @@ func main() {
 	if err := srv.Start(); err != nil {
 		log.Printf("server: %v", err)
 	}
-	// Ingest stopped: drain the worker, then shut the publisher down so
-	// queued annotations flush before the store closes.
+	// Ingest stopped: drain the worker, the purge loop, and the overview
+	// refresher, then shut the publisher down so queued annotations
+	// flush before the store closes.
 	stop()
 	if err := <-workerDone; err != nil {
 		log.Printf("worker: %v", err)
 	}
+	if err := <-purgeDone; err != nil {
+		log.Printf("purge loop: %v", err)
+	}
+	if err := <-incidentDone; err != nil {
+		log.Printf("incident loop: %v", err)
+	}
+	if err := <-summaryDone; err != nil {
+		log.Printf("summary loop: %v", err)
+	}
+	<-overviewDone
 	log.Print("watcherbridge: stopped")
+}
+
+// runIncidentLoop ticks CorrelateIncidents until ctx ends. A pass
+// that creates, extends or closes incidents broadcasts one `incident`
+// event and triggers an overview refresh; quiet passes stay silent.
+// Errors are logged and retried next tick: the durable cursor makes
+// every pass safely repeatable.
+func runIncidentLoop(ctx context.Context, st *store.Store, hub *viewer.Hub, ov *viewer.Refresher, tick time.Duration, settings store.IncidentSettings) error {
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+		rep, err := st.CorrelateIncidents(ctx, settings, time.Now())
+		if err != nil {
+			log.Printf("incidents: %v", err)
+			continue
+		}
+		if rep.Created+rep.Appended+rep.Closed == 0 {
+			continue
+		}
+		hub.Broadcast("incident", viewer.IncidentEventOf(rep))
+		ov.Trigger()
+	}
+}
+
+// runPurgeLoop ticks PurgeOnce until ctx ends. Errors are logged and
+// retried next tick: a transient failure must not kill the process,
+// and the next pass reselects remaining eligible work.
+func runPurgeLoop(ctx context.Context, st *store.Store, cfg config.Config, settings store.PurgeSettings) error {
+	tick := time.NewTicker(cfg.PurgeInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-tick.C:
+		}
+		rep, err := st.PurgeOnce(ctx, settings, time.Now())
+		if err != nil {
+			log.Printf("purge: %v", err)
+			continue
+		}
+		if rep != (store.PurgeReport{}) {
+			log.Printf("purge: %+v", rep)
+		}
+	}
 }
 
 func firstNonEmpty(vals ...string) string {

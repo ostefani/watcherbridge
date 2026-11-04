@@ -3,9 +3,33 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"regexp"
 	"time"
 )
+
+// Retention bounds (Designv9 §4.6). Every purge runs in bounded
+// transactions sharing one ≤200-row budget, oldest first, so a large
+// backlog drains over resumable batches instead of one unbounded
+// commit. Children are explicitly pre-deleted and parents gated on
+// childlessness, so cascades stay empty and every deleted row is
+// counted against the budget in its own statement.
+
+// maxPurgeRowsPerTxn caps committed writes across all statements in
+// one purge transaction: deletions plus purge_state and run-ledger
+// bookkeeping. Reserving those auxiliary rows before choosing delete
+// limits keeps the committed total within budget.
+const maxPurgeRowsPerTxn = 200
+
+// purgeLedgerTimeout bounds terminal run-ledger finalization when the
+// caller's context is already cancelled. Shutdown must record the run
+// outcome without waiting indefinitely behind writer pressure.
+const purgeLedgerTimeout = 5 * time.Second
+
+// heartbeatRetention is the default H1 history horizon and the existing
+// retired-source cleanup horizon. Configured or referenced sources survive.
+const heartbeatRetention = 7 * 24 * time.Hour
 
 // Checkpoint runs a TRUNCATE checkpoint on the single writer goroutine (but
 // outside a transaction, which SQLite forbids for checkpoints) so the -wal
@@ -40,41 +64,1177 @@ func (s *Store) MarkUndeliverable(ctx context.Context, eventID, reason string) e
 
 const briefingPurgeFloor = 24 * time.Hour
 
-// PurgeBriefings deletes briefings (and their emptied done groups) created
-// before cutoff. Separate from raw-event retention: briefing history may
-// outlive the raw log.
-func (s *Store) PurgeBriefings(ctx context.Context, now, cutoff time.Time) (int64, error) {
-	if now.Sub(cutoff) < briefingPurgeFloor {
-		return 0, fmt.Errorf("briefing purge cutoff must be at least %s old", briefingPurgeFloor)
-	}
-	var affected int64
-	err := s.write(ctx, func(tx *sql.Tx) error {
-		res, err := tx.Exec(`DELETE FROM briefings WHERE created_at < ?`, nanos(cutoff))
-		if err != nil {
-			return err
-		}
-		affected, _ = res.RowsAffected()
-		_, err = tx.Exec(`DELETE FROM active_groups WHERE status = 'done' AND group_id NOT IN (SELECT group_id FROM briefings) AND group_id NOT IN (SELECT group_id FROM group_events)`)
-		return err
-	})
-	if err != nil {
-		return 0, err
-	}
-	return affected, nil
-}
-
 // purgeFloor is the youngest age PurgeRawEvents will ever accept.
 const purgeFloor = time.Hour
 
 // failedEventFloor keeps failed groups' events for debugging a week.
 const failedEventFloor = 7 * 24 * time.Hour
 
+// PurgeSettings carries validated retention horizons. Raw events share
+// the briefing horizon: briefing history may not outlive its evidence
+// while the briefing is retained, so raw eligibility excludes events
+// whose group still has a briefing row.
+type PurgeSettings struct {
+	BriefingRetention time.Duration
+	SubjectRetention  time.Duration
+	// DecisionRetention bounds the operator-decision audit horizon;
+	// materialized labels are columns on reported_subjects and survive
+	// audit expiry. Zero means the 180d default, so existing callers
+	// keep history. Audit expires purely by row age with no exemption
+	// for rows the effective view still uses.
+	DecisionRetention time.Duration
+	// RuleRetention bounds the review-policy rule horizon; unset means
+	// the 180d default. Only terminal (dismissed/revoked/expired) rows
+	// older than this drain, and only while no retained briefing still
+	// records their rule ID as its baseline.
+	RuleRetention time.Duration
+	// HeartbeatRetention bounds isolated H1 history; zero selects 7d.
+	// Compact source progress survives this history horizon.
+	HeartbeatRetention time.Duration
+	// IncidentRetention bounds closed presentation incidents measured
+	// from close; zero selects the 90d default. Open incidents and
+	// member briefings (plus their subject links and traces) of any
+	// retained incident are pinned until the incident itself drains.
+	IncidentRetention time.Duration
+	// ActiveSource names the configured SOURCE_ID. A quiet-but-live
+	// registration is never retired by inactivity alone (Designv9 §4.6);
+	// when empty, source cleanup keeps its legacy behavior for tests.
+	ActiveSource string
+}
+
+// defaultDecisionRetention is the operator-decision audit horizon when
+// PurgeSettings leaves DecisionRetention unset.
+const defaultDecisionRetention = 180 * 24 * time.Hour
+
+func decisionRetentionOf(settings PurgeSettings) time.Duration {
+	if settings.DecisionRetention > 0 {
+		return settings.DecisionRetention
+	}
+	return defaultDecisionRetention
+}
+
+// defaultRuleRetention is the review-policy rule horizon when
+// PurgeSettings leaves RuleRetention unset.
+const defaultRuleRetention = 180 * 24 * time.Hour
+
+// defaultIncidentRetention is the closed-incident horizon when
+// PurgeSettings leaves IncidentRetention unset (Designv9 §4.6: 90d
+// since close).
+const defaultIncidentRetention = 90 * 24 * time.Hour
+
+func incidentRetentionOf(settings PurgeSettings) time.Duration {
+	if settings.IncidentRetention > 0 {
+		return settings.IncidentRetention
+	}
+	return defaultIncidentRetention
+}
+
+func ruleRetentionOf(settings PurgeSettings) time.Duration {
+	if settings.RuleRetention > 0 {
+		return settings.RuleRetention
+	}
+	return defaultRuleRetention
+}
+
+// PurgeReport counts committed deletions per table for Step 20 health.
+// Relation, observation, queue and progress rows are counted in their
+// own statements; cascades are kept empty by childless gating, never
+// relied on for accounting. Bookkeeping counts the purge_state
+// upserts that share the transaction's row budget: a 200-row delete
+// commits at least 201 affected rows. total (and therefore the drain
+// progress check) counts deletions only, so an idle pass with no
+// deletions terminates even though no bookkeeping row is written.
+type PurgeReport struct {
+	BriefingLinks       int64
+	Briefings           int64
+	Traces              int64 // agent_traces rows; deleted with their briefing
+	Groups              int64
+	GroupLinks          int64 // group_subjects rows; group_events has its own counter below
+	GroupEvents         int64
+	Ports               int64
+	Observations        int64
+	Progress            int64 // projection_progress + projection_pending rows
+	RawEvents           int64
+	Subjects            int64
+	Sources             int64
+	Pseudonyms          int64
+	Decisions           int64 // expired operator-decision audit rows; labels survive in reported_subjects
+	Heartbeats          int64 // isolated H1 history; compact source state survives
+	Rules               int64 // terminal review-policy rule rows unreferenced by retained briefings
+	Incidents           int64 // closed incidents past retention with no members left
+	IncidentMembers     int64 // membership rows of closed incidents past retention
+	IncidentPending     int64
+	IncidentPendingRefs int64
+	IncidentRefs        int64
+	Summaries           int64 // closed-incident summary rows; children drained before incidents
+	Bookkeeping         int64 // purge_state upserts sharing the row budget
+}
+
+func (r *PurgeReport) add(o PurgeReport) {
+	r.BriefingLinks += o.BriefingLinks
+	r.Briefings += o.Briefings
+	r.Traces += o.Traces
+	r.Groups += o.Groups
+	r.GroupLinks += o.GroupLinks
+	r.GroupEvents += o.GroupEvents
+	r.Ports += o.Ports
+	r.Observations += o.Observations
+	r.Progress += o.Progress
+	r.RawEvents += o.RawEvents
+	r.Subjects += o.Subjects
+	r.Sources += o.Sources
+	r.Pseudonyms += o.Pseudonyms
+	r.Decisions += o.Decisions
+	r.Heartbeats += o.Heartbeats
+	r.Rules += o.Rules
+	r.Incidents += o.Incidents
+	r.IncidentMembers += o.IncidentMembers
+	r.IncidentPending += o.IncidentPending
+	r.IncidentPendingRefs += o.IncidentPendingRefs
+	r.IncidentRefs += o.IncidentRefs
+	r.Summaries += o.Summaries
+	r.Bookkeeping += o.Bookkeeping
+}
+
+func (r PurgeReport) total() int64 {
+	return r.BriefingLinks + r.Briefings + r.Traces + r.Groups + r.GroupLinks + r.GroupEvents + r.Ports +
+		r.Observations + r.Progress + r.RawEvents + r.Subjects + r.Sources + r.Pseudonyms + r.Decisions + r.Rules + r.Heartbeats +
+		r.Incidents + r.IncidentMembers + r.IncidentPending + r.IncidentPendingRefs + r.IncidentRefs + r.Summaries
+}
+
+// purgeStages selects which table families one batch transaction covers.
+// PurgeOnce runs all three; the legacy wrappers run their own family so
+// existing callers keep their contracts while the deletes stay bounded.
+type purgeStages uint8
+
+const (
+	stageBriefings purgeStages = 1 << iota
+	stageEvents
+	stageSubjects
+	stageAll = stageBriefings | stageEvents | stageSubjects
+)
+
+// purgePlan carries one batch's horizons. Cutoffs are absolute nanos so
+// every statement in the transaction agrees on eligibility.
+type purgePlan struct {
+	stages       purgeStages
+	briefingCut  int64
+	rawCut       int64
+	failedCut    int64
+	subjectCut   int64
+	sourceCut    int64
+	tokenCut     int64
+	decisionCut  int64
+	ruleCut      int64
+	heartbeatCut int64
+	// incidentCut is the closed_at horizon for incident drains. Open
+	// incidents never drain; member briefings of any retained
+	// incident (open, or closed within this horizon) are pinned in
+	// the briefing stage below.
+	incidentCut int64
+	// now is the run's wall clock for liveness checks (expiry is
+	// relative to now; the horizon cuts are relative to retention).
+	now int64
+	// activeSource names the configured SOURCE_ID. A quiet-but-live
+	// registration is never retired by inactivity alone (Designv9 §4.6).
+	activeSource string
+	// skipTokenExpiry keeps token deletions out of the drain when
+	// reference discovery could not establish completeness. Every other
+	// stage still proceeds; expiry is deferred to a later run.
+	skipTokenExpiry bool
+	// runID carries the purge_runs ledger row updated atomically with
+	// each deleting batch. Zero disables ledger updates for direct
+	// bounded-batch tests.
+	runID int64
+	// tokenFence is the maximum briefing rowid included by protected
+	// reference discovery. A newer briefing inserted during discovery
+	// blocks token deletions until the next purge includes it.
+	tokenFence int64
+	// tokenDecFence is the maximum briefing-subject decision rowid
+	// seen by protected reference discovery. A decision committed
+	// after discovery can pin an aged briefing whose tokens were
+	// never scanned, so a newer pin defers token expiry the same
+	// way a newer briefing does.
+	tokenDecFence      int64
+	tokenIncidentFence int64
+}
+
+// eligibleEvents selects raw events old enough to purge: not pending
+// projection, not evidence for a retained briefing, and not evidence
+// for a group that has not reached a terminal state (Designv9 §4.6).
+// Open and closed-unbriefed groups pin their aged observations, ports
+// and projection markers until the group closes and briefs or fails;
+// processing groups likewise keep their full context across restarts.
+// Failed groups use the longer debug floor. Oldest first with a small
+// batch cap so the IN lists stay bounded; per-statement LIMITs enforce
+// the row budget regardless of per-event fan-out.
+const eligibleEvents = `event_id IN (SELECT DISTINCT re.event_id FROM raw_events re
+	LEFT JOIN group_events ge0 ON ge0.event_id = re.event_id
+	LEFT JOIN active_groups ag0 ON ag0.group_id = ge0.group_id
+	WHERE re.received_at < CASE WHEN ag0.status = 'failed' THEN MIN(?, ?) ELSE ? END
+	AND NOT EXISTS (SELECT 1 FROM projection_pending p WHERE p.event_id = re.event_id)
+	AND NOT EXISTS (SELECT 1 FROM group_events ge JOIN briefings b ON b.group_id = ge.group_id WHERE ge.event_id = re.event_id)
+	AND COALESCE(ag0.status, 'done') NOT IN ('open', 'closed', 'processing')
+	ORDER BY re.received_at, re.rowid LIMIT 64)`
+
+// incidentMemberPin keeps member briefings of retained incidents:
+// open incidents pin unconditionally, closed ones while their close
+// stays within the incident horizon. It references the inner briefings
+// selection, like the decision pin beside it.
+// incidentDecisionPin keeps member briefings an incident decision
+// still justifies, mirroring the briefing-decision pin: the audit
+// outlives the rows it justifies.
+const incidentMemberPin = `AND NOT EXISTS (SELECT 1 FROM incident_members m JOIN incidents i
+	ON i.incident_id = m.incident_id WHERE m.briefing_id = briefings.briefing_id
+	AND (i.status = 'open' OR i.closed_at >= ?))`
+const incidentDecisionPin = `AND NOT EXISTS (SELECT 1 FROM operator_decisions d
+	JOIN incident_members m ON m.incident_id = d.subject_id
+	WHERE d.subject_kind = 'incident' AND m.briefing_id = briefings.briefing_id
+	AND d.created_at >= ?)`
+
+// purgeBatch deletes at most maxPurgeRowsPerTxn rows in one transaction,
+// oldest first, in dependency order. Eligibility is checked inside the
+// deletion transaction: retained briefings, pending projection and live
+// groups protect their evidence atomically.
+func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (PurgeReport, bool, error) {
+	var report PurgeReport
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		remaining := int64(maxPurgeRowsPerTxn)
+		if plan.runID != 0 {
+			// Reserve the atomic per-batch ledger update before any
+			// delete limit is chosen.
+			remaining--
+		}
+		deleteLimit := func() int64 {
+			limit := remaining - 1 // the purge_state upsert for this take
+			if limit < 0 {
+				return 0
+			}
+			return limit
+		}
+		limit := int64(0)
+		take := func(table string, cutoff int64, stmt string, limit int64, args ...any) error {
+			if limit <= 0 {
+				return nil
+			}
+			n, err := deleteBounded(tx, stmt, args...)
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return nil
+			}
+			remaining -= n
+			// The purge_state upsert is a real write in the same
+			// transaction, so it shares the row budget: a 200-row
+			// delete commits at least 201 affected rows, and the
+			// report charges it instead of hiding it.
+			remaining--
+			report.Bookkeeping++
+			if err := recordPurgeState(tx, table, nanos(now), cutoff, n); err != nil {
+				return err
+			}
+			switch table {
+			case "briefing_subjects":
+				report.BriefingLinks += n
+			case "agent_traces":
+				report.Traces += n
+			case "briefings":
+				report.Briefings += n
+			case "active_groups":
+				report.Groups += n
+			case "group_subjects":
+				report.GroupLinks += n
+			case "group_events":
+				report.GroupEvents += n
+			case "reported_ports":
+				report.Ports += n
+			case "reported_observations":
+				report.Observations += n
+			case "projection_progress", "projection_pending":
+				report.Progress += n
+			case "raw_events":
+				report.RawEvents += n
+			case "reported_subjects":
+				report.Subjects += n
+			case "report_sources":
+				report.Sources += n
+			case "pseudonym_map":
+				report.Pseudonyms += n
+			case "operator_decisions":
+				report.Decisions += n
+			case "heartbeats":
+				report.Heartbeats += n
+			case "review_rules":
+				report.Rules += n
+			case "incident_members":
+				report.IncidentMembers += n
+			case "incidents":
+				report.Incidents += n
+			case "incident_pending":
+				report.IncidentPending += n
+			case "incident_pending_refs":
+				report.IncidentPendingRefs += n
+			case "incident_references":
+				report.IncidentRefs += n
+			case "incident_summaries":
+				report.Summaries += n
+			}
+			return nil
+		}
+		if plan.stages&stageBriefings != 0 {
+
+			limit = deleteLimit()
+			if err := take("incident_pending_refs", plan.briefingCut, `DELETE FROM incident_pending_refs WHERE rowid IN (SELECT r.rowid FROM incident_pending_refs r JOIN incident_pending p ON p.briefing_id=r.briefing_id JOIN briefings b ON b.briefing_id=p.briefing_id WHERE b.created_at<? ORDER BY r.rowid LIMIT ?)`, limit, plan.briefingCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
+			if err := take("incident_pending", plan.briefingCut, `DELETE FROM incident_pending WHERE rowid IN(SELECT p.rowid FROM incident_pending p JOIN briefings b ON b.briefing_id=p.briefing_id WHERE b.created_at<? AND NOT EXISTS(SELECT 1 FROM incident_pending_refs r WHERE r.briefing_id=p.briefing_id) ORDER BY p.rowid LIMIT ?)`, limit, plan.briefingCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
+			if err := take("incident_references", plan.incidentCut, `DELETE FROM incident_references WHERE rowid IN(SELECT r.rowid FROM incident_references r JOIN incidents i ON i.incident_id=r.incident_id WHERE i.status='closed' AND i.closed_at<? AND NOT EXISTS(SELECT 1 FROM operator_decisions d WHERE d.subject_kind='incident' AND d.subject_id=i.incident_id AND d.created_at>=?) ORDER BY r.rowid LIMIT ?)`, limit, plan.incidentCut, plan.decisionCut, limit); err != nil {
+				return err
+			}
+			// Closed incidents drain past the incident horizon
+			// measured from close, before any briefing take: members
+			// drain first under an explicit childless gate, so no
+			// retained member ID dangles and SQLite RowsAffected stays
+			// exact (cascades kept empty). Draining here matters
+			// because member briefings age out on the same horizon —
+			// deleting them first would violate the membership
+			// foreign key. Open incidents never drain. Eligibility is
+			// rechecked in the deletion transaction; a close is
+			// terminal and the next burst forms a new incident. Retained
+			// incident audit pins every layer before draining any relationship.
+			// (Legacy briefing-only wrappers run this stage with a
+			// zero incident cutoff, which drains nothing.)
+			limit = deleteLimit()
+			if err := take("incident_members", plan.incidentCut, `DELETE FROM incident_members WHERE rowid IN (SELECT rowid FROM incident_members WHERE incident_id IN
+				(SELECT i.incident_id FROM incidents i WHERE i.status = 'closed' AND i.closed_at < ? AND NOT EXISTS(SELECT 1 FROM operator_decisions d WHERE d.subject_kind='incident' AND d.subject_id=i.incident_id AND d.created_at>=?)) ORDER BY rowid LIMIT ?)`, limit, plan.incidentCut, plan.decisionCut, limit); err != nil {
+				return err
+			}
+			// Summaries are children of incidents: they drain under the
+			// same decision pin once members and references are gone,
+			// explicitly before the incident parent so cascades stay
+			// empty and RowsAffected stays exact. Retained summaries
+			// keep their snapshot/alias/citation audit and their
+			// restoration mappings until the incident itself drains.
+			limit = deleteLimit()
+			if err := take("incident_summaries", plan.incidentCut, `DELETE FROM incident_summaries WHERE rowid IN (SELECT rowid FROM incident_summaries WHERE incident_id IN
+				(SELECT i.incident_id FROM incidents i WHERE i.status = 'closed' AND i.closed_at < ? AND NOT EXISTS(SELECT 1 FROM operator_decisions d WHERE d.subject_kind='incident' AND d.subject_id=i.incident_id AND d.created_at>=?))
+				AND NOT EXISTS (SELECT 1 FROM incident_members WHERE incident_members.incident_id = incident_summaries.incident_id)
+				AND NOT EXISTS (SELECT 1 FROM incident_references WHERE incident_references.incident_id = incident_summaries.incident_id) ORDER BY rowid LIMIT ?)`, limit, plan.incidentCut, plan.decisionCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
+			if err := take("incidents", plan.incidentCut, `DELETE FROM incidents WHERE rowid IN (SELECT rowid FROM incidents WHERE status = 'closed' AND closed_at < ?
+				AND NOT EXISTS(SELECT 1 FROM operator_decisions d WHERE d.subject_kind='incident' AND d.subject_id=incidents.incident_id AND d.created_at>=?)
+				AND NOT EXISTS (SELECT 1 FROM incident_members WHERE incident_members.incident_id = incidents.incident_id) AND NOT EXISTS(SELECT 1 FROM incident_references WHERE incident_references.incident_id=incidents.incident_id) AND NOT EXISTS (SELECT 1 FROM incident_summaries WHERE incident_summaries.incident_id = incidents.incident_id) ORDER BY closed_at, rowid LIMIT ?)`, limit, plan.incidentCut, plan.decisionCut, limit); err != nil {
+				return err
+			}
+			// A briefing a retained decision still references cannot
+			// purge: its audit outlives it, and deleting the briefing
+			// would orphan the trail and unblock evidence the decision
+			// still justifies. The pin follows the audit cutoff, never
+			// the effective view, so no backup audit is needed. The pin
+			// lives inside the age selection before LIMIT: selecting
+			// oldest-first and filtering after would stall the drain
+			// on a fully pinned batch while eligible work waits behind
+			// it. The outer takes repeat the pin as an invariant.
+			// The incident pins ride the same selection: a member
+			// briefing of a retained incident (or one an incident
+			// decision still justifies) is never age-eligible, so its
+			// subject links and trace steps survive with it.
+			oldBriefings := `briefing_id IN (SELECT briefing_id FROM briefings WHERE created_at < ?
+				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?)` + incidentMemberPin + incidentDecisionPin + ` ORDER BY created_at, rowid LIMIT ?)`
+			limit = deleteLimit()
+			if err := take("briefing_subjects", plan.briefingCut, `DELETE FROM briefing_subjects WHERE rowid IN (SELECT rowid FROM briefing_subjects WHERE `+oldBriefings+`
+				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefing_subjects.briefing_id AND d.created_at >= ?) ORDER BY rowid LIMIT ?)`, limit, plan.briefingCut, plan.decisionCut, plan.incidentCut, plan.decisionCut, limit, plan.decisionCut, limit); err != nil {
+				return err
+			}
+			// Trace steps are audit children of their briefing: they drain
+			// under the same decision pin before the briefing row, so no
+			// retained audit outlives its briefing and no briefing deletes
+			// while steps remain.
+			limit = deleteLimit()
+			if err := take("agent_traces", plan.briefingCut, `DELETE FROM agent_traces WHERE rowid IN (SELECT rowid FROM agent_traces WHERE briefing_id IN (SELECT briefing_id FROM briefings WHERE created_at < ?
+				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?)`+incidentMemberPin+incidentDecisionPin+`) ORDER BY rowid LIMIT ?)`, limit, plan.briefingCut, plan.decisionCut, plan.incidentCut, plan.decisionCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
+			if err := take("briefings", plan.briefingCut, `DELETE FROM briefings WHERE rowid IN (SELECT rowid FROM briefings WHERE created_at < ? AND NOT EXISTS(SELECT 1 FROM incident_pending WHERE incident_pending.briefing_id=briefings.briefing_id) AND NOT EXISTS (SELECT 1 FROM briefing_subjects WHERE briefing_subjects.briefing_id = briefings.briefing_id)
+				AND NOT EXISTS (SELECT 1 FROM agent_traces WHERE agent_traces.briefing_id = briefings.briefing_id)
+				AND NOT EXISTS (SELECT 1 FROM operator_decisions d WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?)`+incidentMemberPin+incidentDecisionPin+` ORDER BY created_at, rowid LIMIT ?)`, limit, plan.briefingCut, plan.decisionCut, plan.incidentCut, plan.decisionCut, limit); err != nil {
+				return err
+			}
+			deletableDone := `status = 'done'
+				AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id)
+				AND NOT EXISTS (SELECT 1 FROM group_events WHERE group_events.group_id = active_groups.group_id)`
+			limit = deleteLimit()
+			if err := take("group_subjects", plan.briefingCut, `DELETE FROM group_subjects WHERE rowid IN (SELECT rowid FROM group_subjects WHERE group_id IN (SELECT group_id FROM active_groups WHERE `+deletableDone+`) ORDER BY rowid LIMIT ?)`, limit, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
+			if err := take("active_groups", plan.briefingCut, `DELETE FROM active_groups WHERE rowid IN (SELECT rowid FROM active_groups WHERE `+deletableDone+`
+				AND NOT EXISTS (SELECT 1 FROM group_subjects WHERE group_subjects.group_id = active_groups.group_id) ORDER BY opened_at, rowid LIMIT ?)`, limit, limit); err != nil {
+				return err
+			}
+		}
+		if plan.stages&stageEvents != 0 {
+			limit = deleteLimit()
+			if err := take("reported_ports", plan.rawCut, `DELETE FROM reported_ports WHERE rowid IN (SELECT rowid FROM reported_ports WHERE observation_id IN (SELECT observation_id FROM reported_observations WHERE `+eligibleEvents+`) ORDER BY rowid LIMIT ?)`, limit, plan.rawCut, plan.failedCut, plan.rawCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
+			if err := take("reported_observations", plan.rawCut, `DELETE FROM reported_observations WHERE rowid IN (SELECT observation_id FROM reported_observations WHERE `+eligibleEvents+` AND NOT EXISTS (SELECT 1 FROM reported_ports WHERE reported_ports.observation_id = reported_observations.observation_id) ORDER BY observation_id LIMIT ?)`, limit, plan.rawCut, plan.failedCut, plan.rawCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
+			if err := take("projection_progress", plan.rawCut, `DELETE FROM projection_progress WHERE rowid IN (SELECT rowid FROM projection_progress WHERE `+eligibleEvents+` ORDER BY rowid LIMIT ?)`, limit, plan.rawCut, plan.failedCut, plan.rawCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
+			if err := take("projection_pending", plan.rawCut, `DELETE FROM projection_pending WHERE rowid IN (SELECT rowid FROM projection_pending WHERE `+eligibleEvents+` ORDER BY rowid LIMIT ?)`, limit, plan.rawCut, plan.failedCut, plan.rawCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
+			if err := take("group_events", plan.rawCut, `DELETE FROM group_events WHERE rowid IN (SELECT rowid FROM group_events WHERE group_id IN (SELECT group_id FROM active_groups WHERE status IN ('done','failed')) AND `+eligibleEvents+` ORDER BY rowid LIMIT ?)`, limit, plan.rawCut, plan.failedCut, plan.rawCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
+			if err := take("raw_events", plan.rawCut, `DELETE FROM raw_events WHERE rowid IN (SELECT rowid FROM raw_events WHERE received_at < ?
+				AND NOT EXISTS (SELECT 1 FROM group_events WHERE group_events.event_id = raw_events.event_id)
+				AND NOT EXISTS (SELECT 1 FROM reported_observations WHERE reported_observations.event_id = raw_events.event_id)
+				AND NOT EXISTS (SELECT 1 FROM projection_pending WHERE projection_pending.event_id = raw_events.event_id)
+				AND NOT EXISTS (SELECT 1 FROM projection_progress WHERE projection_progress.event_id = raw_events.event_id) ORDER BY received_at, rowid LIMIT ?)`, limit, plan.rawCut, limit); err != nil {
+				return err
+			}
+			failedGroups := `group_id IN (SELECT group_id FROM active_groups WHERE status = 'failed' AND deadline_at < ?
+				AND NOT EXISTS (SELECT 1 FROM group_events WHERE group_events.group_id = active_groups.group_id)
+				AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id))`
+			limit = deleteLimit()
+			if err := take("group_subjects", plan.failedCut, `DELETE FROM group_subjects WHERE rowid IN (SELECT rowid FROM group_subjects WHERE `+failedGroups+` ORDER BY rowid LIMIT ?)`, limit, plan.failedCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
+			if err := take("active_groups", plan.failedCut, `DELETE FROM active_groups WHERE rowid IN (SELECT rowid FROM active_groups WHERE status = 'failed' AND deadline_at < ?
+				AND NOT EXISTS (SELECT 1 FROM group_events WHERE group_events.group_id = active_groups.group_id)
+				AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id)
+				AND NOT EXISTS (SELECT 1 FROM group_subjects WHERE group_subjects.group_id = active_groups.group_id) ORDER BY deadline_at, rowid LIMIT ?)`, limit, plan.failedCut, limit); err != nil {
+				return err
+			}
+		}
+		if plan.stages&stageSubjects != 0 {
+			limit = deleteLimit()
+			if err := take("heartbeats", plan.heartbeatCut, `DELETE FROM heartbeats WHERE rowid IN
+                (SELECT rowid FROM heartbeats WHERE received_at < ? ORDER BY received_at, rowid LIMIT ?)`,
+				limit, plan.heartbeatCut, limit); err != nil {
+				return err
+			}
+			limit = deleteLimit()
+			// A retained rule record keeps its subject like a retained
+			// briefing keeps its rule: terminal rows (dismissed,
+			// revoked, lapsed) still name the scope an operator
+			// judged, so the subject survives until the rule itself
+			// drains. Status and expiry do not filter here; the rule
+			// purge bounds how long any row can hold a subject.
+			if err := take("reported_subjects", plan.subjectCut, `DELETE FROM reported_subjects WHERE rowid IN (SELECT rowid FROM reported_subjects WHERE last_report_at < ?
+				AND NOT EXISTS (SELECT 1 FROM reported_observations WHERE reported_observations.profile_id = reported_subjects.profile_id)
+				AND NOT EXISTS (SELECT 1 FROM group_subjects WHERE group_subjects.profile_id = reported_subjects.profile_id)
+				AND NOT EXISTS (SELECT 1 FROM briefing_subjects WHERE briefing_subjects.profile_id = reported_subjects.profile_id)
+				AND NOT EXISTS (SELECT 1 FROM operator_decisions WHERE operator_decisions.subject_kind = 'reported_subject' AND operator_decisions.subject_id = reported_subjects.profile_id AND operator_decisions.created_at >= ?)
+				AND NOT EXISTS (SELECT 1 FROM review_rules WHERE review_rules.source_scope = reported_subjects.source_scope
+					AND review_rules.reference_class = reported_subjects.reference_class
+					AND review_rules.identity_namespace = reported_subjects.identity_namespace
+					AND review_rules.upstream_reference = reported_subjects.upstream_reference) ORDER BY last_report_at, rowid LIMIT ?)`, limit, plan.subjectCut, plan.decisionCut, limit); err != nil {
+				return err
+			}
+			// Decision audit expires purely by row age: the effective
+			// view never exempts a row, so no backup audit is needed.
+			// An undo outlives its target by construction (the target
+			// is always older, and the batch order is oldest-first),
+			// but the pair gate below defers an undo while its target
+			// row still exists, so a bounded pass never orphans one.
+			// Materialized labels are columns on reported_subjects,
+			// never audit rows, so they survive this delete.
+			limit = deleteLimit()
+			if err := take("operator_decisions", plan.decisionCut, `DELETE FROM operator_decisions WHERE rowid IN (SELECT rowid FROM operator_decisions WHERE created_at < ?
+				AND NOT (kind = 'undo' AND EXISTS (SELECT 1 FROM operator_decisions target WHERE target.decision_id = operator_decisions.supersedes)) ORDER BY created_at, rowid LIMIT ?)`, limit, plan.decisionCut, limit); err != nil {
+				return err
+			}
+			// Terminal rule rows (dismissed, revoked, or approved but
+			// expired) drain past the rule horizon while no retained
+			// briefing still records their rule ID as its baseline:
+			// referenced rules retire with their briefings, never
+			// before. Live grants are never eligible. An expired
+			// grant's horizon runs from its expiry, not its approval:
+			// decided_at stays the approval time, so measuring from
+			// it would purge a long grant the moment it lapses.
+			limit = deleteLimit()
+			if err := take("review_rules", plan.ruleCut, `DELETE FROM review_rules WHERE rowid IN (SELECT rowid FROM review_rules WHERE (CASE WHEN status = 'approved' THEN expires_at ELSE decided_at END) < ?
+				AND (status IN ('dismissed','revoked') OR (status = 'approved' AND expires_at IS NOT NULL AND expires_at < ?))
+				AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.baseline_rule = review_rules.rule_id) ORDER BY decided_at, rowid LIMIT ?)`, limit, plan.ruleCut, plan.now, limit); err != nil {
+				return err
+			}
+			sourceScope := "last_report_at IS NOT NULL AND last_report_at < ?\n\t\t\t\tAND NOT EXISTS (SELECT 1 FROM reported_subjects WHERE reported_subjects.source_scope = report_sources.source_scope) AND NOT EXISTS (SELECT 1 FROM heartbeats WHERE heartbeats.source_scope = report_sources.source_scope)"
+			sourceArgs := []any{plan.sourceCut}
+			if plan.activeSource != "" {
+				sourceScope += " AND source_scope <> ?"
+				sourceArgs = append(sourceArgs, plan.activeSource)
+			}
+			limit = deleteLimit()
+			sourceArgs = append(sourceArgs, limit)
+			if err := take("report_sources", plan.sourceCut, `DELETE FROM report_sources WHERE rowid IN (SELECT rowid FROM report_sources WHERE `+sourceScope+` ORDER BY last_report_at, rowid LIMIT ?)`, limit, sourceArgs...); err != nil {
+				return err
+			}
+			if !plan.skipTokenExpiry {
+				// A pin committed after discovery can retain an aged
+				// briefing whose tokens never entered the scratch set,
+				// so a newer briefing-subject decision defers expiry
+				// exactly like a newer briefing: the next run
+				// rediscovers with the pin included.
+				limit = deleteLimit()
+				if err := take("pseudonym_map", plan.tokenCut, `DELETE FROM pseudonym_map WHERE rowid IN (SELECT rowid FROM pseudonym_map WHERE last_used_at < ?
+					AND NOT EXISTS (SELECT 1 FROM purge_protected_tokens WHERE purge_protected_tokens.token = pseudonym_map.token)
+					AND NOT EXISTS (SELECT 1 FROM briefings WHERE rowid > ?)
+					AND NOT EXISTS (SELECT 1 FROM operator_decisions WHERE subject_kind = 'briefing' AND created_at >= ? AND rowid > ?) AND NOT EXISTS(SELECT 1 FROM incident_progress WHERE id=0 AND pin_version>?) ORDER BY last_used_at, rowid LIMIT ?)`, limit, plan.tokenCut, plan.tokenFence, plan.decisionCut, plan.tokenDecFence, plan.tokenIncidentFence, limit); err != nil {
+					return err
+				}
+			}
+		}
+		if plan.runID != 0 && report.total() > 0 {
+			// Persist this batch atomically with its deletions: a crash
+			// leaves completed batches attributed instead of only the
+			// final totals. This consumes the ledger row reserved before
+			// delete limits were chosen, so no second reservation is
+			// taken here: a batch filled exactly to capacity still
+			// commits instead of rolling back.
+			report.Bookkeeping++
+			if err := addPurgeRunCounts(tx, plan.runID, report); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return PurgeReport{}, false, err
+	}
+	return report, report.total() > 0, nil
+}
+
+// deleteBounded deletes the rows matching stmt, which must carry its own
+// ORDER BY age-column, rowid LIMIT ? tail: SQLite rejects a bare LIMIT
+// without ORDER BY, and the tail keeps every batch deterministic and
+// oldest-first. Only directly deleted rows surface in RowsAffected;
+// cascades are kept empty by the childless gates above, so the count
+// is exact.
+func deleteBounded(tx *sql.Tx, stmt string, args ...any) (int64, error) {
+	res, err := tx.Exec(stmt, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// protectedTokenRe matches issued tokens (IP_1, MAC_2, HOST_3, NET_4)
+// named inside retained briefing text. priority_reason and
+// model_raw_json are stored tokenized, so they must be scanned too:
+// deleting a token they name would corrupt the retained rendering.
+var protectedTokenRe = regexp.MustCompile(`\b(?:IP|MAC|HOST|NET)_[0-9]+\b`)
+
+// protectedTokenScanPage bounds one reference-discovery read: one
+// briefing row is decoded at a time and only the page's distinct
+// references are retained before the transaction commits.
+const protectedTokenScanPage = 100
+
+// protectedTokenWritePage bounds one scratch-write transaction to the
+// shared maintenance row budget.
+const protectedTokenWritePage = maxPurgeRowsPerTxn
+
+// protectedTokenClearPage bounds one scratch-clear transaction to the
+// shared maintenance row budget.
+const protectedTokenClearPage = maxPurgeRowsPerTxn
+
+// protectedRefillPasses bounds catch-up discovery when retained
+// briefings are inserted concurrently with a purge. Discovery remains
+// complete for a quiescent database; sustained inserts fail closed and
+// leave token deletions for a later run.
+const protectedRefillPasses = 5
+
+// retainedBriefing matches every briefing purge must keep: inside the
+// retention window, or pinned by a retained decision at any age. The
+// pin predicate mirrors the stageBriefings delete gate exactly —
+// discovery and deletion must agree on what is retained, or pinned
+// traces lose their restoration mappings while their briefing stands.
+const retainedBriefing = `(created_at >= ? OR EXISTS (SELECT 1 FROM operator_decisions d
+	WHERE d.subject_kind = 'briefing' AND d.subject_id = briefings.briefing_id AND d.created_at >= ?) OR EXISTS(SELECT 1 FROM incident_members m WHERE m.briefing_id=briefings.briefing_id))`
+
+// refillProtectedTokens rebuilds the per-run protected-token scratch
+// set from every retained briefing. A stale scratch row only
+// over-protects, so the rebuild runs before any deletion batch;
+// per-batch exclusion then keeps referenced tokens alive while expiry
+// deletes the rest. Decision-pinned briefings join at any age: their
+// traces' mappings retire with them, never before. It returns the
+// highest briefing rowid included and the highest briefing-subject
+// decision rowid seen, fencing token deletes against briefings
+// inserted and pins committed during discovery.
+func (s *Store) refillProtectedTokens(ctx context.Context, briefingCut, decisionCut int64) (int64, int64, error) {
+	return s.refillProtectedTokensPaged(ctx, briefingCut, decisionCut, protectedTokenScanPage, protectedTokenWritePage, protectedTokenClearPage, protectedRefillPasses)
+}
+
+func (s *Store) refillProtectedTokensPaged(ctx context.Context, briefingCut, decisionCut int64, scanPage, writePage, clearPage, maxPasses int) (int64, int64, error) {
+	if scanPage <= 0 || writePage <= 0 || clearPage <= 0 || maxPasses <= 0 {
+		return 0, 0, fmt.Errorf("protected token page sizes must be positive")
+	}
+	// Plain reads stay outside the writer; scratch writes use bounded
+	// transactions. A briefing inserted during discovery is handled by
+	// catch-up passes and, ultimately, by the delete-time rowid fence.
+	// A decision appended mid-pass can pin an already-scanned old
+	// briefing (rowid order cannot catch that), so the decisions table
+	// is fenced too: whenever its snapshot advances beyond the covered
+	// fence — mid-pass or between passes — the next scan restarts from
+	// the beginning. Rescans are idempotent (INSERT OR IGNORE) and
+	// bounded by maxPasses like every other catch-up.
+	var fence, decFence int64
+	if err := s.clearProtectedTokensPaged(ctx, clearPage); err != nil {
+		return 0, 0, err
+	}
+	for pass := 1; pass <= maxPasses; pass++ {
+		var snapshot, decSnapshot int64
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) FROM briefings WHERE `+retainedBriefing, briefingCut, decisionCut).Scan(&snapshot); err != nil {
+			return 0, 0, err
+		}
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) FROM operator_decisions WHERE subject_kind = 'briefing' AND created_at >= ?`, decisionCut).Scan(&decSnapshot); err != nil {
+			return 0, 0, err
+		}
+		if s.protectedRefillPassHook != nil {
+			s.protectedRefillPassHook(pass)
+		}
+		if decSnapshot > decFence {
+			// A pin committed since the last covered pass may retain
+			// an already-scanned aged briefing below the scan floor:
+			// rescan from the start. The end-of-pass check catches
+			// mid-pass pins; this catches pins that landed between
+			// passes, which the briefing fence alone would mask.
+			fence = 0
+		}
+		// Pins standing at pass start are covered by this pass's own
+		// scan; only pins appended mid-pass force a rescan.
+		decFence = decSnapshot
+		if err := s.refillProtectedTokensThrough(ctx, briefingCut, decisionCut, fence, snapshot, scanPage, writePage); err != nil {
+			return 0, 0, err
+		}
+		fence = snapshot
+		var current, decCurrent int64
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) FROM briefings WHERE `+retainedBriefing, briefingCut, decisionCut).Scan(&current); err != nil {
+			return 0, 0, err
+		}
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) FROM operator_decisions WHERE subject_kind = 'briefing' AND created_at >= ?`, decisionCut).Scan(&decCurrent); err != nil {
+			return 0, 0, err
+		}
+		if current <= fence && decCurrent <= decFence {
+			// Retained summaries carry tokenized snapshots and restored
+			// display text: their mappings retire with the incident,
+			// never before. The summary scan is bounded per page and
+			// runs once per successful briefing discovery.
+			if err := s.protectSummaryTokens(ctx, scanPage, writePage); err != nil {
+				return 0, 0, err
+			}
+			return fence, decFence, nil
+		}
+		if decCurrent > decFence {
+			// New pins may cover already-scanned rows: rescan.
+			decFence, fence = decCurrent, 0
+		}
+		if s.protectedRefillPassHook != nil {
+			s.protectedRefillPassHook(pass)
+		}
+	}
+	return fence, decFence, fmt.Errorf("protected token references changed during discovery; retry purge")
+}
+
+func (s *Store) refillProtectedTokensThrough(ctx context.Context, briefingCut, decisionCut, afterRowID, throughRowID int64, scanPage, writePage int) error {
+	lastRowID := afterRowID
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT rowid, COALESCE(model_raw_json, ''), COALESCE(priority_reason, '') FROM briefings
+			WHERE `+retainedBriefing+` AND rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`,
+			briefingCut, decisionCut, lastRowID, throughRowID, scanPage)
+		if err != nil {
+			return err
+		}
+		seen := map[string]struct{}{}
+		var tokens []string
+		scanned := int64(0)
+		pageStart := lastRowID
+		for rows.Next() {
+			var rowID int64
+			var rawJSON, reason string
+			if err := rows.Scan(&rowID, &rawJSON, &reason); err != nil {
+				rows.Close()
+				return err
+			}
+			tokens = appendProtectedTokens(seen, tokens, rawJSON)
+			tokens = appendProtectedTokens(seen, tokens, reason)
+			lastRowID = rowID
+			scanned++
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		// Trace envelopes are tokenized audit for the same window:
+		// validated args name issued tokens and results echo them, so
+		// their mappings need the same protection. Executions are
+		// loop-bounded far below the page multiple, so the cap is a
+		// backstop, not a silent occurrence drop.
+		trows, err := s.db.QueryContext(ctx, `SELECT args_json, result_json FROM agent_traces
+			WHERE briefing_id IN (SELECT briefing_id FROM briefings WHERE `+retainedBriefing+` AND rowid > ? AND rowid <= ?)
+			ORDER BY briefing_id, step LIMIT ?`,
+			briefingCut, decisionCut, pageStart, lastRowID, scanPage*8)
+		if err != nil {
+			return err
+		}
+		for trows.Next() {
+			var argsJSON, resultJSON string
+			if err := trows.Scan(&argsJSON, &resultJSON); err != nil {
+				trows.Close()
+				return err
+			}
+			tokens = appendProtectedTokens(seen, tokens, argsJSON)
+			tokens = appendProtectedTokens(seen, tokens, resultJSON)
+		}
+		if err := trows.Err(); err != nil {
+			trows.Close()
+			return err
+		}
+		trows.Close()
+		if len(tokens) > 0 {
+			if err := s.storeProtectedTokensPaged(ctx, tokens, writePage); err != nil {
+				return err
+			}
+		}
+		if scanned < int64(scanPage) {
+			return nil
+		}
+	}
+}
+
+// protectSummaryTokens scans retained incident summaries (open incidents
+// plus closed ones) for token references so their restoration mappings
+// survive until the incident itself drains. Paged by incident_id; every
+// page commits in its own bounded writer transaction.
+func (s *Store) protectSummaryTokens(ctx context.Context, scanPage, writePage int) error {
+	after := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT incident_id, COALESCE(snapshot_json, ''), COALESCE(summary, ''), COALESCE(hypothesis, '') FROM incident_summaries
+			WHERE incident_id > ? ORDER BY incident_id ASC LIMIT ?`, after, scanPage)
+		if err != nil {
+			return err
+		}
+		seen := map[string]struct{}{}
+		var tokens []string
+		count := 0
+		last := after
+		for rows.Next() {
+			var id, snapshot, summary, hypothesis string
+			if err := rows.Scan(&id, &snapshot, &summary, &hypothesis); err != nil {
+				rows.Close()
+				return err
+			}
+			tokens = appendProtectedTokens(seen, tokens, snapshot)
+			tokens = appendProtectedTokens(seen, tokens, summary)
+			tokens = appendProtectedTokens(seen, tokens, hypothesis)
+			last = id
+			count++
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		if len(tokens) > 0 {
+			if err := s.storeProtectedTokensPaged(ctx, tokens, writePage); err != nil {
+				return err
+			}
+		}
+		if count < scanPage {
+			return nil
+		}
+		after = last
+	}
+}
+
+// appendProtectedTokens collects every distinct token occurrence. The
+// caller bounds memory with paged reads and writes; no occurrence cap
+// may silently drop a later retained reference.
+func appendProtectedTokens(seen map[string]struct{}, tokens []string, text string) []string {
+	for _, match := range protectedTokenRe.FindAllString(text, -1) {
+		if _, ok := seen[match]; !ok {
+			seen[match] = struct{}{}
+			tokens = append(tokens, match)
+		}
+	}
+	return tokens
+}
+
+func (s *Store) clearProtectedTokensPaged(ctx context.Context, clearPage int) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.yieldOnPressure(ctx)
+		var deleted int64
+		err := s.write(ctx, func(tx *sql.Tx) error {
+			res, err := tx.Exec(`DELETE FROM purge_protected_tokens WHERE rowid IN (SELECT rowid FROM purge_protected_tokens ORDER BY rowid LIMIT ?)`, clearPage)
+			if err != nil {
+				return err
+			}
+			n, _ := res.RowsAffected()
+			deleted = n
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if deleted < int64(clearPage) {
+			return nil
+		}
+	}
+}
+
+func (s *Store) storeProtectedTokensPaged(ctx context.Context, tokens []string, writePage int) error {
+	for start := 0; start < len(tokens); start += writePage {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.yieldOnPressure(ctx)
+		end := start + writePage
+		if end > len(tokens) {
+			end = len(tokens)
+		}
+		chunk := tokens[start:end]
+		if err := s.write(ctx, func(tx *sql.Tx) error {
+			for _, token := range chunk {
+				if _, err := tx.Exec(`INSERT OR IGNORE INTO purge_protected_tokens (token) VALUES (?)`, token); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// recordPurgeState persists per-table progress in the same transaction
+// as the deletions it describes. The rows carry cumulative totals for
+// Step 20 health, not resume checkpoints: each batch reselects its own
+// remaining work, so a restart deletes whatever is still eligible.
+func recordPurgeState(tx *sql.Tx, table string, now, cutoff, added int64) error {
+	_, err := tx.Exec(`INSERT INTO purge_state (table_name, last_run_at, last_cutoff, rows_deleted_total)
+		VALUES (?, ?, ?, ?) ON CONFLICT(table_name) DO UPDATE SET
+		last_run_at = excluded.last_run_at, last_cutoff = excluded.last_cutoff,
+		rows_deleted_total = rows_deleted_total + excluded.rows_deleted_total`,
+		table, now, cutoff, added)
+	return err
+}
+
+// addPurgeRunCounts adds one batch's counts to its ledger row in the
+// same transaction. Interim attribution survives a crash even when the
+// run never reaches terminal finalization.
+func addPurgeRunCounts(tx *sql.Tx, runID int64, report PurgeReport) error {
+	_, err := tx.Exec(`UPDATE purge_runs SET
+		briefing_links_deleted = briefing_links_deleted + ?,
+		briefings_deleted = briefings_deleted + ?,
+		traces_deleted = traces_deleted + ?,
+		groups_deleted = groups_deleted + ?,
+		group_links_deleted = group_links_deleted + ?,
+		group_events_deleted = group_events_deleted + ?,
+		ports_deleted = ports_deleted + ?,
+		observations_deleted = observations_deleted + ?,
+		progress_deleted = progress_deleted + ?,
+		raw_events_deleted = raw_events_deleted + ?,
+		subjects_deleted = subjects_deleted + ?,
+		sources_deleted = sources_deleted + ?,
+		pseudonyms_deleted = pseudonyms_deleted + ?,
+		decisions_deleted = decisions_deleted + ?,
+		rules_deleted = rules_deleted + ?,
+		heartbeats_deleted = heartbeats_deleted + ?,
+		incidents_deleted = incidents_deleted + ?,
+		incident_members_deleted = incident_members_deleted + ?,
+		incident_pending_deleted=incident_pending_deleted+?,
+		incident_pending_refs_deleted=incident_pending_refs_deleted+?,
+		incident_refs_deleted=incident_refs_deleted+?,
+		summaries_deleted = summaries_deleted + ?,
+		bookkeeping_writes = bookkeeping_writes + ?
+		WHERE run_id = ?`,
+		report.BriefingLinks, report.Briefings, report.Traces, report.Groups, report.GroupLinks,
+		report.GroupEvents,
+		report.Ports, report.Observations, report.Progress, report.RawEvents,
+		report.Subjects, report.Sources, report.Pseudonyms, report.Decisions, report.Rules, report.Heartbeats,
+		report.Incidents, report.IncidentMembers, report.IncidentPending, report.IncidentPendingRefs, report.IncidentRefs, report.Summaries, report.Bookkeeping,
+		runID)
+	return err
+}
+
+// PurgeOnce drains all eligible retention work in bounded transactions,
+// yielding while writer pressure passes half the queue cap so retention
+// never starves ingest. It returns the summed per-table counts and
+// records a run row: completed when the drain finishes, interrupted
+// when ctx ends mid-run, failed when a batch errors. Partial batches
+// commit before the failure, so a later run safely deletes the rest;
+// only cumulative counts transfer, and the stored cutoff must not be
+// read as a resume position.
+//
+// The run ledger opens before reference discovery, so a discovery
+// failure is recorded instead of escaping run history. When discovery
+// cannot establish completeness, token expiry is skipped while every
+// independently safe stage still drains; the skip is noted in the run
+// and surfaced to the caller, and a later run retries expiry.
+func (s *Store) PurgeOnce(ctx context.Context, settings PurgeSettings, now time.Time) (PurgeReport, error) {
+	heartbeatAge := settings.HeartbeatRetention
+	if heartbeatAge <= 0 {
+		heartbeatAge = heartbeatRetention
+	}
+	rawCut := nanos(now.Add(-settings.BriefingRetention))
+	plan := purgePlan{
+		stages:       stageAll,
+		briefingCut:  rawCut,
+		rawCut:       rawCut,
+		failedCut:    min(rawCut, nanos(now.Add(-failedEventFloor))),
+		subjectCut:   nanos(now.Add(-settings.SubjectRetention)),
+		sourceCut:    nanos(now.Add(-heartbeatRetention)),
+		tokenCut:     rawCut,
+		decisionCut:  nanos(now.Add(-decisionRetentionOf(settings))),
+		ruleCut:      nanos(now.Add(-ruleRetentionOf(settings))),
+		heartbeatCut: nanos(now.Add(-heartbeatAge)),
+		incidentCut:  nanos(now.Add(-incidentRetentionOf(settings))),
+		now:          nanos(now),
+		activeSource: settings.ActiveSource,
+	}
+	runID, err := s.beginPurgeRun(ctx, nanos(now))
+	if err != nil {
+		return PurgeReport{}, err
+	}
+	plan.runID = runID
+	pinBefore, pinReadErr := s.incidentPinVersion(ctx)
+	briefFence, decFence, derr := s.refillProtectedTokens(ctx, plan.briefingCut, plan.decisionCut)
+	pinAfter, pinErr := s.incidentPinVersion(ctx)
+	if pinReadErr != nil {
+		derr = pinReadErr
+	} else if pinErr != nil {
+		derr = pinErr
+	} else if pinBefore != pinAfter {
+		derr = fmt.Errorf("incident membership changed during token discovery; retry purge")
+	}
+	plan.tokenIncidentFence = pinAfter
+	if derr != nil {
+		plan.skipTokenExpiry = true
+	} else {
+		plan.tokenFence, plan.tokenDecFence = briefFence, decFence
+	}
+	status, errText, runErr, total := s.runPurgeBatches(ctx, now, plan, PurgeReport{})
+	if derr != nil {
+		note := "token discovery incomplete; token expiry skipped: " + SanitizeErrorText(derr.Error())
+		if runErr != nil {
+			errText = errText + "; " + note
+			runErr = errors.Join(runErr, derr)
+		} else {
+			errText = note
+			runErr = derr
+		}
+	}
+	return total, s.finishPurgeRun(ctx, runID, status, errText, runErr)
+}
+
+// drainPlan runs purgeBatch until no eligible row remains. Every run is
+// recorded in purge_runs with its status, duration and per-batch plus
+// final per-table counts, so Step 20 health can tell a completed run
+// from one that committed batches and then failed or was interrupted.
+// Batch counts are persisted atomically with their deletions; terminal
+// finalization uses detached bounded work so cancellation still records
+// the outcome.
+func (s *Store) drainPlan(ctx context.Context, now time.Time, plan purgePlan) (PurgeReport, error) {
+	runID, err := s.beginPurgeRun(ctx, nanos(now))
+	if err != nil {
+		return PurgeReport{}, err
+	}
+	plan.runID = runID
+	status, errText, runErr, total := s.runPurgeBatches(ctx, now, plan, PurgeReport{})
+	return total, s.finishPurgeRun(ctx, runID, status, errText, runErr)
+}
+
+func (s *Store) runPurgeBatches(ctx context.Context, now time.Time, plan purgePlan, total PurgeReport) (string, string, error, PurgeReport) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return "interrupted", SanitizeErrorText(err.Error()), err, total
+		}
+		s.yieldOnPressure(ctx)
+		if err := ctx.Err(); err != nil {
+			return "interrupted", SanitizeErrorText(err.Error()), err, total
+		}
+		report, progress, err := s.purgeBatch(ctx, now, plan)
+		if err != nil {
+			status, statusErr := batchRunStatus(ctx, err)
+			return status, SanitizeErrorText(statusErr.Error()), statusErr, total
+		}
+		total.add(report)
+		if !progress {
+			return "completed", "", nil, total
+		}
+	}
+}
+
+// batchRunStatus maps a purgeBatch error to its terminal run status. A
+// cancelled context means interrupted even when the batch itself
+// reports the failure: the store permits cancellation to race a
+// successful commit, so the batch may have committed while its caller
+// never collected the report.
+func batchRunStatus(ctx context.Context, err error) (string, error) {
+	if ctx.Err() != nil {
+		return "interrupted", ctx.Err()
+	}
+	return "failed", err
+}
+
+// beginPurgeRun inserts a running ledger row and prunes history beyond
+// the newest 30 runs. A previous process that crashed between begin and
+// finish leaves a running row; reconciling it here bounds the outage
+// window before the new run starts deleting.
+func (s *Store) beginPurgeRun(ctx context.Context, startedAt int64) (int64, error) {
+	var runID int64
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		res, err := tx.Exec(`INSERT INTO purge_runs (started_at) VALUES (?)`, startedAt)
+		if err != nil {
+			return err
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		runID = id
+		_, err = tx.Exec(`UPDATE purge_runs SET finished_at = ?, status = 'interrupted', error = 'previous process ended before finalizing run'
+			WHERE status = 'running' AND run_id <> ?`, startedAt, runID)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(`DELETE FROM purge_runs WHERE run_id NOT IN (SELECT run_id FROM purge_runs ORDER BY run_id DESC LIMIT 30)`)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return runID, nil
+}
+
+// finishPurgeRun stamps the run row with its terminal status, finish
+// time and error text. It never rewrites the per-table counters:
+// batches persist their counts atomically with their deletions, and
+// those committed counters stay authoritative even when cancellation
+// raced the commit and the caller-side totals are short. It runs
+// detached from the caller's cancellation under a shutdown bound: an
+// interrupted run still needs its ledger outcome, but finalization
+// must not wait indefinitely.
+func (s *Store) finishPurgeRun(ctx context.Context, runID int64, status, errText string, runErr error) error {
+	finalizeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), purgeLedgerTimeout)
+	defer cancel()
+	err := s.write(finalizeCtx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE purge_runs SET finished_at = ?, status = ?, error = ? WHERE run_id = ?`,
+			nanos(s.now()), status, errText, runID)
+		return err
+	})
+	if err != nil {
+		if runErr != nil {
+			return errors.Join(runErr, err)
+		}
+		return err
+	}
+	return runErr
+}
+
+// purgeRun describes one ledger row for Step 20 health.
+type purgeRun struct {
+	runID      int64
+	startedAt  int64
+	finishedAt int64
+	status     string
+	errText    string
+	total      PurgeReport
+}
+
+// LatestPurgeRun returns the newest ledger row, or sql.ErrNoRows when no
+// purge has run yet.
+func (s *Store) LatestPurgeRun(ctx context.Context) (purgeRun, error) {
+	var run purgeRun
+	err := s.db.QueryRowContext(ctx, `SELECT run_id, started_at, finished_at, status, error,
+		briefing_links_deleted, briefings_deleted, traces_deleted, groups_deleted, group_links_deleted,
+		group_events_deleted,
+		ports_deleted, observations_deleted, progress_deleted, raw_events_deleted,
+		subjects_deleted, sources_deleted, pseudonyms_deleted, decisions_deleted, rules_deleted, heartbeats_deleted, incidents_deleted, incident_members_deleted, incident_pending_deleted, incident_pending_refs_deleted, incident_refs_deleted, bookkeeping_writes
+		FROM purge_runs ORDER BY run_id DESC LIMIT 1`).Scan(
+		&run.runID, &run.startedAt, &run.finishedAt, &run.status, &run.errText,
+		&run.total.BriefingLinks, &run.total.Briefings, &run.total.Traces, &run.total.Groups, &run.total.GroupLinks,
+		&run.total.GroupEvents,
+		&run.total.Ports, &run.total.Observations, &run.total.Progress, &run.total.RawEvents,
+		&run.total.Subjects, &run.total.Sources, &run.total.Pseudonyms, &run.total.Decisions, &run.total.Rules, &run.total.Heartbeats, &run.total.Incidents, &run.total.IncidentMembers, &run.total.IncidentPending, &run.total.IncidentPendingRefs, &run.total.IncidentRefs, &run.total.Bookkeeping)
+	if err != nil {
+		return purgeRun{}, err
+	}
+	return run, nil
+}
+
+// yieldOnPressure sleeps while the writer backlog passes half the queue
+// cap. Advisory only: a saturated queue still fails fast at enqueue,
+// this only spaces retention batches behind live traffic.
+func (s *Store) yieldOnPressure(ctx context.Context) {
+	cap := s.QueueCap()
+	if cap <= 0 {
+		return
+	}
+	for s.QueueDepth() > cap/2 {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// PurgeBriefings deletes briefings (and their emptied done groups) created
+// before cutoff. Separate from raw-event retention: briefing history may
+// outlive the raw log. Batches stay within the shared row budget and
+// resume until no eligible row remains.
+func (s *Store) PurgeBriefings(ctx context.Context, now, cutoff time.Time) (int64, error) {
+	if now.Sub(cutoff) < briefingPurgeFloor {
+		return 0, fmt.Errorf("briefing purge cutoff must be at least %s old", briefingPurgeFloor)
+	}
+	plan := purgePlan{stages: stageBriefings, briefingCut: nanos(cutoff)}
+	report, err := s.drainPlan(ctx, now, plan)
+	if err != nil {
+		return report.Briefings, err
+	}
+	return report.Briefings, nil
+}
+
 // PurgeRawEvents deletes raw events received before cutoff, but only those
 // whose group is done (or that belong to no group). Failed groups' events
 // use a longer floor (failedEventFloor, 7 days) and the failed row is
-// deleted once its events are gone. Briefings and groups are
-// kept: they have their own retention (PurgeBriefings). The cutoff must be at
-// least minAge old, so replay/sweep windows are never weakened.
+// deleted once its events are gone. Events pending projection or backing
+// a retained briefing are protected, as are their observations, ports
+// and progress rows, which are deleted in the same bounded batches.
+// Briefings and groups keep their own retention (PurgeBriefings). The
+// cutoff must be at least minAge old, so replay/sweep windows are never
+// weakened.
 func (s *Store) PurgeRawEvents(ctx context.Context, now, cutoff time.Time, minAge time.Duration) (int64, error) {
 	if minAge < purgeFloor {
 		minAge = purgeFloor
@@ -82,38 +1242,14 @@ func (s *Store) PurgeRawEvents(ctx context.Context, now, cutoff time.Time, minAg
 	if now.Sub(cutoff) < minAge {
 		return 0, fmt.Errorf("purge cutoff must be at least %s old", minAge)
 	}
-	var affected int64
-	err := s.write(ctx, func(tx *sql.Tx) error {
-		cut := nanos(cutoff)
-		if _, err := tx.Exec(`DELETE FROM group_events
-			WHERE group_id IN (SELECT group_id FROM active_groups WHERE status = 'done')
-			  AND event_id IN (SELECT event_id FROM raw_events WHERE received_at < ?)`, cut); err != nil {
-			return err
-		}
-		// Failed groups keep their events longer (debugging evidence):
-		// their effective cutoff is at least failedEventFloor old.
-		failedCut := cut
-		if latest := nanos(now.Add(-failedEventFloor)); failedCut > latest {
-			failedCut = latest
-		}
-		if _, err := tx.Exec(`DELETE FROM group_events
-			WHERE group_id IN (SELECT group_id FROM active_groups WHERE status = 'failed')
-			  AND event_id IN (SELECT event_id FROM raw_events WHERE received_at < ?)`, failedCut); err != nil {
-			return err
-		}
-		res, err := tx.Exec(`DELETE FROM raw_events WHERE received_at < ? AND event_id NOT IN (SELECT event_id FROM group_events)`, cut)
-		if err != nil {
-			return err
-		}
-		affected, _ = res.RowsAffected()
-		// Failed groups are deleted together with their purged events.
-		_, err = tx.Exec(`DELETE FROM active_groups WHERE status = 'failed' AND deadline_at < ?
-			AND NOT EXISTS (SELECT 1 FROM group_events WHERE group_events.group_id = active_groups.group_id)
-			AND NOT EXISTS (SELECT 1 FROM briefings WHERE briefings.group_id = active_groups.group_id)`, failedCut)
-		return err
-	})
-	if err != nil {
-		return 0, err
+	plan := purgePlan{
+		stages:    stageEvents,
+		rawCut:    nanos(cutoff),
+		failedCut: min(nanos(cutoff), nanos(now.Add(-failedEventFloor))),
 	}
-	return affected, nil
+	report, err := s.drainPlan(ctx, now, plan)
+	if err != nil {
+		return report.RawEvents, err
+	}
+	return report.RawEvents, nil
 }

@@ -25,7 +25,9 @@ func openTestStore(t *testing.T) *Store {
 	return s
 }
 
-// seedFeedGroup persists one open group and returns its ID.
+// seedFeedGroup persists one open group and returns its ID. The event is
+// projected (persist -> project) so the group is fully projected and
+// briefable, mirroring production order.
 func seedFeedGroup(t *testing.T, s *Store, anchor, eventID string) string {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
@@ -36,7 +38,20 @@ func seedFeedGroup(t *testing.T, s *Store, anchor, eventID string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.ProjectReported(context.Background(), "test-scope", 64); err != nil {
+		t.Fatal(err)
+	}
 	return res.GroupID
+}
+
+// projectAll runs the projector over every pending event, mirroring the
+// worker tick order (persist -> project -> close -> take) so groups under
+// test are fully projected and briefable.
+func projectAll(t *testing.T, s *Store) {
+	t.Helper()
+	if _, err := s.ProjectReported(context.Background(), "test-scope", 1<<20); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestViewerFeeds(t *testing.T) {
@@ -75,18 +90,70 @@ func TestViewerFeeds(t *testing.T) {
 	// it instead of opening a new one.
 	seedFeedGroup(t, s, "host:c", "evt-c1")
 	snaps, err = s.OpenGroupSnapshots(context.Background())
-	if err != nil || len(snaps) != 1 || snaps[0].Anchor != "host:c" {
+	// The briefed group is gone; the unbriefed closed host:b group stays
+	// visible as queued alongside the fresh open host:c group.
+	if err != nil || len(snaps) != 2 {
 		t.Fatalf("after brief: %+v %v", snaps, err)
 	}
-	rows, err := s.RecentBriefings(context.Background(), 10)
+	byAnchor := map[string]GroupSnapshot{}
+	for _, g := range snaps {
+		byAnchor[g.Anchor] = g
+	}
+	if byAnchor["host:b"].Status != "closed" {
+		t.Fatalf("queued row = %+v", byAnchor["host:b"])
+	}
+	if byAnchor["host:c"].Status != "open" {
+		t.Fatalf("open row = %+v", byAnchor["host:c"])
+	}
+	rows, err := s.BriefingsPage(context.Background(), 0, 0, 10)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("recent = %+v %v", rows, err)
 	}
 	if rows[0].GroupID != g1 || len(rows[0].EventIDs) != 1 || rows[0].EventIDs[0] != "evt-a1" {
 		t.Fatalf("row = %+v", rows[0])
 	}
-	if got, _ := s.RecentBriefings(context.Background(), 0); len(got) != 1 {
+	if rows[0].Seq != 1 {
+		t.Fatalf("first briefing seq = %d, want 1", rows[0].Seq)
+	}
+	if got, _ := s.BriefingsPage(context.Background(), 0, 0, 0); len(got) != 1 {
 		t.Fatalf("zero limit must default, got %d", len(got))
+	}
+}
+
+// A group being briefed stays visible until its briefing lands: the
+// snapshot carries open, closed and processing rows with the times the
+// wire needs for countdowns. A group queued behind a taken one stays
+// closed in the snapshot — waiting, not gone.
+func TestSnapshotKeepsProcessingGroups(t *testing.T) {
+	s := openTestStore(t)
+	gid := seedFeedGroup(t, s, "host:proc", "evt-proc")
+	waiter := seedFeedGroup(t, s, "host:wait", "evt-wait")
+	if _, err := s.CloseDue(context.Background(), time.Now().UTC().Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TakeGroup(context.Background(), gid); err != nil {
+		t.Fatal(err)
+	}
+	snaps, err := s.OpenGroupSnapshots(context.Background())
+	if err != nil || len(snaps) != 2 {
+		t.Fatalf("snapshot = %+v %v", snaps, err)
+	}
+	byID := map[string]GroupSnapshot{}
+	for _, g := range snaps {
+		byID[g.GroupID] = g
+	}
+	if byID[gid].Status != "processing" {
+		t.Fatalf("taken status = %q, want processing", byID[gid].Status)
+	}
+	if byID[waiter].Status != "closed" {
+		t.Fatalf("queued status = %q, want closed", byID[waiter].Status)
+	}
+	g := byID[gid]
+	if g.OpenedAt.IsZero() || g.LastEvent.IsZero() || g.Deadline.IsZero() {
+		t.Fatalf("snapshot times missing: %+v", g)
+	}
+	if g.EventCount != 1 {
+		t.Fatalf("event count = %d", g.EventCount)
 	}
 }
 
@@ -94,7 +161,10 @@ func TestViewerFeedQueriesUseIndexes(t *testing.T) {
 	s := openTestStore(t)
 	for _, q := range []string{
 		`EXPLAIN QUERY PLAN SELECT briefing_id FROM briefings ORDER BY created_at DESC LIMIT 10`,
-		`EXPLAIN QUERY PLAN SELECT ag.group_id FROM active_groups ag LEFT JOIN group_events ge ON ge.group_id = ag.group_id WHERE ag.status = 'open' GROUP BY ag.group_id ORDER BY ag.deadline_at`,
+		`EXPLAIN QUERY PLAN SELECT briefing_id FROM briefings WHERE seq > 5 ORDER BY seq ASC LIMIT 10`,
+		`EXPLAIN QUERY PLAN SELECT briefing_id, group_id FROM briefings WHERE seq > 5 ORDER BY seq ASC LIMIT 11`,
+		`EXPLAIN QUERY PLAN SELECT briefing_id FROM briefings WHERE seq < 5 ORDER BY seq DESC LIMIT 10`,
+		`EXPLAIN QUERY PLAN SELECT ag.group_id FROM active_groups ag LEFT JOIN group_events ge ON ge.group_id = ag.group_id WHERE ag.status IN ('open','processing') GROUP BY ag.group_id ORDER BY ag.deadline_at`,
 	} {
 		rows, err := s.db.Query(q)
 		if err != nil {
@@ -262,6 +332,9 @@ func TestDebounceExtendsAndTakeGroup(t *testing.T) {
 	if !d2.After(d1) || !d2.Equal(now.Add(75*time.Second)) {
 		t.Fatalf("deadline must extend to last+quiet: %v -> %v", d1, d2)
 	}
+	if _, err := s.ProjectReported(context.Background(), "test-scope", 64); err != nil {
+		t.Fatalf("project: %v", err)
+	}
 	if _, err := s.CloseDue(context.Background(), now.Add(200*time.Second)); err != nil {
 		t.Fatalf("close due: %v", err)
 	}
@@ -375,6 +448,7 @@ func TestReopenRecoversExpiredGroupAndSidecarPerms(t *testing.T) {
 	if err != nil || len(closed) != 1 {
 		t.Fatalf("recover after reopen: %v %v", closed, err)
 	}
+	projectAll(t, s2)
 	needs, err := s2.NeedsBriefing(context.Background(), 64, time.Now())
 	if err != nil || len(needs) != 1 {
 		t.Fatalf("needs briefing: %v %v", needs, err)
@@ -475,6 +549,7 @@ func TestPersistReportsOverdueClosedGroupAndStaleRelease(t *testing.T) {
 	if len(r2.ClosedGroupIDs) != 1 || r2.ClosedGroupIDs[0] != r1.GroupID || r2.GroupID == r1.GroupID {
 		t.Fatalf("overdue group must be reported closed and a new one opened: %+v vs %+v", r2, r1)
 	}
+	projectAll(t, s)
 	taken, err := s.TakeGroup(context.Background(), r1.GroupID)
 	if err != nil || len(taken.Events) != 1 {
 		t.Fatalf("take overdue group: %+v %v", taken, err)
@@ -560,6 +635,7 @@ func TestTakeIncrementsOnce(t *testing.T) {
 	if _, err := s.CloseDue(context.Background(), now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	projectAll(t, s)
 	taken, err := s.TakeGroup(context.Background(), res.GroupID)
 	if err != nil || taken.RetryCount != 1 {
 		t.Fatalf("first take must count 1, got %d %v", taken.RetryCount, err)
@@ -586,6 +662,7 @@ func TestReleaseParksAtCapWithoutIncrement(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Drive to cap-1 = 4 through takes; releases must not move the counter.
+	projectAll(t, s)
 	for i := 0; i < 4; i++ {
 		taken, err := s.TakeGroup(ctx, res.GroupID)
 		if err != nil {
@@ -712,6 +789,7 @@ func TestMigrateV3ToV4WithData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	projectAll(t, s)
 	if _, err := s.CloseDue(context.Background(), now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -728,7 +806,7 @@ func TestMigrateV3ToV4WithData(t *testing.T) {
 	s.Close()
 
 	// Rewind to v3: drop the v4, v5, and v6 columns and the v5 index,
-	// keeping the data. The reopen replays 3->4->5->6. The rewind must
+	// keeping the data. The reopen replays 3->4->5->6->7->8->9. The rewind must
 	// cover every later column or the forward migration re-adds an
 	// existing one.
 	db, err := sql.Open("sqlite3", path)
@@ -750,6 +828,19 @@ func TestMigrateV3ToV4WithData(t *testing.T) {
 	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN transient_refunds`); err != nil {
 		t.Fatalf("drop v7 column: %v", err)
 	}
+	if _, err := db.Exec(`DROP INDEX IF EXISTS briefings_seq`); err != nil {
+		t.Fatalf("drop v8 index: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE briefings DROP COLUMN seq`); err != nil {
+		t.Fatalf("drop v8 column: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS seq_state`); err != nil {
+		t.Fatalf("drop v9 state: %v", err)
+	}
+	dropProjectionSchema(t, db)
+	dropDecisionSchema(t, db)
+	dropTraceSchema(t, db)
+	dropRuleSchema(t, db)
 	if _, err := db.Exec(`PRAGMA user_version = 3`); err != nil {
 		t.Fatal(err)
 	}
@@ -777,6 +868,7 @@ func TestPurgeFailedGroupEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}
+	projectAll(t, s)
 	if _, err := s.CloseDue(context.Background(), now.Add(time.Second)); err != nil {
 		t.Fatalf("close due: %v", err)
 	}
@@ -901,6 +993,7 @@ func TestReleaseBackoffRefundAndDueGuard(t *testing.T) {
 	}
 	gid := mk("evt-b1", "host:b")
 
+	projectAll(t, s)
 	taken, err := s.TakeGroup(ctx, gid)
 	if err != nil || taken.RetryCount != 1 {
 		t.Fatalf("first take: %+v %v", taken, err)
@@ -970,6 +1063,7 @@ func TestTakeGroupOrdersTiesByEventID(t *testing.T) {
 	if _, err := s.CloseDue(ctx, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	projectAll(t, s)
 	taken, err := s.TakeGroup(ctx, gid)
 	if err != nil {
 		t.Fatal(err)
@@ -1019,6 +1113,7 @@ func TestTransientRefundAtCapRequeues(t *testing.T) {
 	if _, err := s.CloseDue(ctx, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	projectAll(t, s)
 	gid := res.GroupID
 	var taken TakenGroup
 	for want := 1; want <= maxGroupRetries; want++ {
@@ -1068,6 +1163,7 @@ func TestTransientRefundRunawayParks(t *testing.T) {
 	if _, err := s.CloseDue(ctx, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	projectAll(t, s)
 	gid := res.GroupID
 	for i := 1; i <= maxTransientRefunds; i++ {
 		if _, err := s.TakeGroup(ctx, gid); err != nil {
@@ -1131,6 +1227,19 @@ func TestMigrationV4ToV5KeepsBackoffNull(t *testing.T) {
 	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN transient_refunds`); err != nil {
 		t.Fatalf("drop v7 column: %v", err)
 	}
+	if _, err := db.Exec(`DROP INDEX IF EXISTS briefings_seq`); err != nil {
+		t.Fatalf("drop v8 index: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE briefings DROP COLUMN seq`); err != nil {
+		t.Fatalf("drop v8 column: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS seq_state`); err != nil {
+		t.Fatalf("drop v9 state: %v", err)
+	}
+	dropProjectionSchema(t, db)
+	dropDecisionSchema(t, db)
+	dropTraceSchema(t, db)
+	dropRuleSchema(t, db)
 	if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
 		t.Fatal(err)
 	}
@@ -1146,6 +1255,7 @@ func TestMigrationV4ToV5KeepsBackoffNull(t *testing.T) {
 		t.Fatalf("want user_version %d, got %d %v", supportedSchemaVersion, version, err)
 	}
 	// The pre-v5 group has no backoff: due immediately.
+	projectAll(t, s2)
 	needs, err := s2.NeedsBriefing(context.Background(), 64, now.Add(time.Second))
 	if err != nil || len(needs) != 1 || needs[0] != res.GroupID {
 		t.Fatalf("migrated group must be due: %v %v", needs, err)
@@ -1271,7 +1381,8 @@ func TestMigrationV5ToV6KeepsByteCounter(t *testing.T) {
 	}
 	s.Close()
 
-	// Rewind to v5: drop the v6 and v7 columns, keeping the data.
+	// Rewind to v5: drop the v6 and v7 columns, the v8 column and index,
+	// and the v9 state, keeping the data.
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		t.Fatal(err)
@@ -1282,6 +1393,19 @@ func TestMigrationV5ToV6KeepsByteCounter(t *testing.T) {
 	if _, err := db.Exec(`ALTER TABLE active_groups DROP COLUMN transient_refunds`); err != nil {
 		t.Fatalf("drop v7 column: %v", err)
 	}
+	if _, err := db.Exec(`DROP INDEX IF EXISTS briefings_seq`); err != nil {
+		t.Fatalf("drop v8 index: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE briefings DROP COLUMN seq`); err != nil {
+		t.Fatalf("drop v8 column: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS seq_state`); err != nil {
+		t.Fatalf("drop v9 state: %v", err)
+	}
+	dropProjectionSchema(t, db)
+	dropDecisionSchema(t, db)
+	dropTraceSchema(t, db)
+	dropRuleSchema(t, db)
 	if _, err := db.Exec(`PRAGMA user_version = 5`); err != nil {
 		t.Fatal(err)
 	}
@@ -1302,6 +1426,248 @@ func TestMigrationV5ToV6KeepsByteCounter(t *testing.T) {
 	}
 	if total != int64(len(`{"host":"v5"}`)) {
 		t.Fatalf("backfill must sum stored payloads, got %d", total)
+	}
+}
+
+// waitNextSecond blocks until the wall clock crosses a second boundary
+// (at most ~1s). Group ids embed the received second, so a test that
+// reopens the store and founds another group in the same second would
+// reuse an id: the in-memory counter restarts at zero on every Open.
+func waitNextSecond() {
+	cur := time.Now().UTC().Truncate(time.Second)
+	for time.Now().UTC().Before(cur.Add(time.Second)) {
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// briefGroup seeds one event group and stores its briefing with an
+// explicit creation time, returning the group ID.
+func briefGroup(t *testing.T, s *Store, anchor, eventID string, created time.Time) string {
+	t.Helper()
+	gid := seedFeedGroup(t, s, anchor, eventID)
+	if _, err := s.CloseDue(context.Background(), time.Now().UTC().Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := s.TakeGroup(context.Background(), gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertBriefing(context.Background(), Briefing{
+		BriefingID: "brf-" + taken.GroupID, GroupID: taken.GroupID, HostAnchorKey: anchor,
+		Baseline: "low", Priority: "low", PriorityReason: "r",
+		WhatChanged: "w", Context: "c", RecommendedCheck: "k", CreatedAt: created,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return gid
+}
+
+// Migration v8: the writer assigns seq 1, 2, 3 in insert order, and
+// MaxSeq tracks the maximum.
+func TestBriefingSeqAssignedInOrder(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC()
+	for i, a := range []string{"host:s1", "host:s2", "host:s3"} {
+		briefGroup(t, s, a, fmt.Sprintf("evt-s%d", i+1), now.Add(time.Duration(i)*time.Minute))
+	}
+	page, err := s.BriefingsPage(context.Background(), 0, 0, 10)
+	if err != nil || len(page) != 3 {
+		t.Fatalf("page = %+v %v", page, err)
+	}
+	for i, b := range page {
+		if b.Seq != int64(i+1) {
+			t.Fatalf("page[%d].Seq = %d, want %d", i, b.Seq, i+1)
+		}
+	}
+	if max, err := s.MaxSeq(context.Background()); err != nil || max != 3 {
+		t.Fatalf("max seq = %d, err %v", max, err)
+	}
+	got, err := s.BriefingForGroup(context.Background(), page[1].GroupID)
+	if err != nil || got.Seq != 2 {
+		t.Fatalf("single briefing seq = %+v %v", got, err)
+	}
+}
+
+// BriefingsPage: after selects newer rows ascending, before pages older
+// history ascending, the default is the latest page, and negative
+// cursors are errors.
+func TestBriefingsPageCursors(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC()
+	for i := 0; i < 5; i++ {
+		briefGroup(t, s, fmt.Sprintf("host:p%d", i), fmt.Sprintf("evt-p%d", i), now.Add(time.Duration(i)*time.Minute))
+	}
+	// Gap-fill newer than seq 2.
+	rows, err := s.BriefingsPage(context.Background(), 2, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 || rows[0].Seq != 3 || rows[2].Seq != 5 {
+		t.Fatalf("after=2 = %+v", rows)
+	}
+	// Older history before seq 5, capped at 2: the two latest below 5.
+	rows, err = s.BriefingsPage(context.Background(), 0, 5, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].Seq != 3 || rows[1].Seq != 4 {
+		t.Fatalf("before=5 limit 2 = %+v", rows)
+	}
+	// Bounded window: 2 < seq < 5.
+	rows, err = s.BriefingsPage(context.Background(), 2, 5, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].Seq != 3 || rows[1].Seq != 4 {
+		t.Fatalf("after=2 before=5 = %+v", rows)
+	}
+	// Default latest page.
+	rows, err = s.BriefingsPage(context.Background(), 0, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].Seq != 4 || rows[1].Seq != 5 {
+		t.Fatalf("latest page = %+v", rows)
+	}
+	for _, tc := range [][2]int64{{-1, 0}, {0, -1}} {
+		if _, err := s.BriefingsPage(context.Background(), tc[0], tc[1], 10); err == nil {
+			t.Fatalf("negative cursor %+v must fail", tc)
+		}
+	}
+}
+
+// Migration v8 rewind: dropping back to v7 (index first, then the
+// column) replays the backfill ordered by (created_at, rowid), not by
+// insert order. The second-inserted briefing has the earlier timestamp
+// and must take seq 1.
+func TestMigrateV8BackfillsByCreatedAt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v8.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	briefGroup(t, s, "host:late", "evt-late", now)
+	briefGroup(t, s, "host:early", "evt-early", now.Add(-time.Hour))
+	s.Close()
+
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`DROP INDEX briefings_seq`,
+		`ALTER TABLE briefings DROP COLUMN seq`,
+		`DROP TABLE seq_state`,
+		`PRAGMA user_version = 7`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	dropProjectionSchema(t, db)
+	dropDecisionSchema(t, db)
+	dropTraceSchema(t, db)
+	dropRuleSchema(t, db)
+	db.Close()
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("migrate 7->8: %v", err)
+	}
+	defer s2.Close()
+	var version int
+	if err := s2.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != supportedSchemaVersion {
+		t.Fatalf("want user_version %d, got %d %v", supportedSchemaVersion, version, err)
+	}
+	rows, err := s2.BriefingsPage(context.Background(), 0, 0, 10)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("page = %+v %v", rows, err)
+	}
+	// Ascending: earlier timestamp first regardless of insert order.
+	if rows[0].Seq != 1 || rows[1].Seq != 2 {
+		t.Fatalf("seqs = %d, %d", rows[0].Seq, rows[1].Seq)
+	}
+	if rows[0].HostAnchorKey != "host:early" || rows[1].HostAnchorKey != "host:late" {
+		t.Fatalf("backfill order wrong: %+v", rows)
+	}
+	if !rows[0].CreatedAt.Before(rows[1].CreatedAt) {
+		t.Fatalf("backfill ignored created_at: %+v", rows)
+	}
+}
+
+// Purging the maximum (or every) briefing must not recycle ids: the
+// high-water mark lives in seq_state, outside the purged rows. A client
+// holding an old cursor would otherwise skip the new rows on reconnect.
+func TestSeqMonotonicAcrossPurge(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC()
+	briefGroup(t, s, "host:doomed1", "evt-doomed1", now.Add(-72*time.Hour))
+	briefGroup(t, s, "host:doomed2", "evt-doomed2", now.Add(-71*time.Hour))
+	if n, err := s.PurgeBriefings(context.Background(), now, now.Add(-48*time.Hour)); err != nil || n != 2 {
+		t.Fatalf("purge = %d, %v", n, err)
+	}
+	gid := briefGroup(t, s, "host:after", "evt-after", now)
+	got, err := s.BriefingForGroup(context.Background(), gid)
+	if err != nil || got.Seq != 3 {
+		t.Fatalf("post-purge briefing seq = %+v %v; id reuse would skip it on reconnect", got, err)
+	}
+	if max, err := s.MaxSeq(context.Background()); err != nil || max != 3 {
+		t.Fatalf("max seq = %d, %v", max, err)
+	}
+}
+
+// Migration v9 reseed: dropping back to v8 (no seq_state) replays the
+// seed from MAX(seq), so a new briefing continues the old numbering
+// instead of restarting at 1.
+func TestMigrateV9ReseedsHighWater(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v9.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	briefGroup(t, s, "host:v9a", "evt-v9a", now)
+	briefGroup(t, s, "host:v9b", "evt-v9b", now.Add(time.Minute))
+	s.Close()
+
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`DROP TABLE seq_state`,
+		`PRAGMA user_version = 8`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	dropProjectionSchema(t, db)
+	dropDecisionSchema(t, db)
+	dropTraceSchema(t, db)
+	dropRuleSchema(t, db)
+	db.Close()
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("migrate 8->9: %v", err)
+	}
+	defer s2.Close()
+	var version int
+	if err := s2.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != supportedSchemaVersion {
+		t.Fatalf("want user_version %d, got %d %v", supportedSchemaVersion, version, err)
+	}
+	// Group ids carry the received second plus a process-local counter
+	// that restarts at zero on reopen: wait for the next second so the
+	// post-reopen group cannot reuse a pre-reopen id.
+	waitNextSecond()
+	gid := briefGroup(t, s2, "host:v9c", "evt-v9c", now.Add(2*time.Minute))
+	got, err := s2.BriefingForGroup(context.Background(), gid)
+	if err != nil || got.Seq != 3 {
+		t.Fatalf("post-reseed briefing seq = %+v %v", got, err)
 	}
 }
 
