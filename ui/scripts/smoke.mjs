@@ -317,7 +317,7 @@ const cases = [
     expect: [
       'Why this priority',
       'Baseline floor',
-      'clamped to one step above baseline',
+      'Suggestion adjusted to respect the baseline floor and one-step raise limit.',
       'Referenced events',
       'evt-1 — host.appeared',
       'Reported evidence',
@@ -569,6 +569,44 @@ const cases = [
 ];
 
 let failed = 0;
+const confidenceViews = (before, after, currentEvent = 'evt-1') => [
+  { event_id: 'evt-1', view_role: 'previous', attributes: { identity_confidence: before } },
+  { event_id: currentEvent, view_role: 'current', attributes: { identity_confidence: after } }
+];
+const confidenceTitle = 'Reported identity confidence decreased';
+const { reviewTitle } = await import('../src/lib/format.js');
+for (const [name, views, expected] of [
+  ['confidence decrease', confidenceViews('high', 'low'), confidenceTitle],
+  ['confidence increase', confidenceViews('low', 'high'), 'Reported details changed'],
+  ['unchanged confidence', confidenceViews('high', 'high'), 'Reported details changed'],
+  ['unknown confidence', confidenceViews('high', 'unknown'), 'Reported details changed'],
+  ['missing previous', confidenceViews('high', 'low').slice(1), 'Reported details changed'],
+  ['different events', confidenceViews('high', 'low', 'evt-2'), 'Reported details changed']
+]) {
+  if (reviewTitle('other', views) !== expected) {
+    throw new Error(`Incorrect review title: ${name}`);
+  }
+}
+if (reviewTitle('port_closed', confidenceViews('high', 'low')) !== 'Ports closed') {
+  throw new Error('Specific reported-change categories must retain their title');
+}
+cases.push(
+  { component: Detail, name: 'appearance review uses reported event title', props: { id: 'brf-grp-1', initial: { ...detailFixture, kind: 'other', observations: [], referenced_events: [{ event_id: 'evt-1', event_type: 'host.appeared' }] } }, expect: ['<h2>New host reported</h2>'], absent: ['Other changes', confidenceTitle] },
+  { component: AttentionList, name: 'unloaded other review has neutral heading', props: { items: [{ ...attentionItem, change_kind: 'other' }] }, expect: ['Reported details changed'], absent: ['Other changes', confidenceTitle] },
+  { component: Detail, name: 'reported confidence decrease heading', props: { id: 'brf-grp-1', initial: { ...detailFixture, kind: 'other', observations: confidenceViews('high', 'low') } }, expect: [`<h2>${confidenceTitle}</h2>`] },
+  { component: AttentionList, name: 'loaded review title in attention list', props: { items: [{ ...attentionItem, change_kind: 'other' }], titles: { [attentionItem.id]: confidenceTitle } }, expect: [confidenceTitle], absent: ['Other changes'] }
+);
+for (const [types, expected] of [
+  [['host.appeared'], 'New host reported'],
+  [['host.disappeared'], 'Host disappearance reported'],
+  [['host.changed'], 'Reported host details changed'],
+  [['host.appeared', 'host.changed'], 'Reported network changes'],
+  [['unexpected'], 'Reported details changed']
+]) {
+  if (reviewTitle('other', [], types.map((event_type) => ({ event_type }))) !== expected) {
+    throw new Error('Review title must follow reported event types');
+  }
+}
 cases.push(
   { component: AttentionList, name: 'standalone review navigation', props: { items: [attentionItem] }, expect: ['href="#/briefing/brf-grp-1"', 'Ports closed'] },
   { component: AttentionList, name: 'standalone incident navigation', props: { items: [{ ...attentionItem, id: 'inc-11-22', kind: 'incident' }] }, expect: ['href="#/incidents/inc-11-22"', 'Show members'] },

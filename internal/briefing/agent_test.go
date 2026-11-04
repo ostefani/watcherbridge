@@ -499,23 +499,37 @@ func TestAgentDisabledUsesSingleCall(t *testing.T) {
 }
 
 func TestAgentFinalTurnReserved(t *testing.T) {
+	for _, steps := range []int{1, 4} {
+		t.Run(strconv.Itoa(steps), func(t *testing.T) {
+			testAgentFinalTurnReserved(t, steps)
+		})
+	}
+}
+
+func testAgentFinalTurnReserved(t *testing.T, steps int) {
+	t.Helper()
 	s := openWorkerStore(t)
 	gid := hostChangedGroup(t, s)
 	fake := provider.NewFake()
 	calls := 0
 	fake.TurnHandle = func(tr []provider.TurnMessage) (string, error) {
 		calls++
-		if calls == 1 {
-			return `{"tool":"find_similar_reported_changes","arguments":{"kind":"changed"}}`, nil
+		last := tr[len(tr)-1]
+		if last.Role == "user" && strings.Contains(last.Text, "Tool budget exhausted") &&
+			strings.Contains(last.Text, "no further tool calls") {
+			if calls != steps+1 || tr[len(tr)-2].Role != "tool" {
+				t.Fatal("final instruction must follow the last allowed tool result")
+			}
+			return finalFromTranscript(t, tr, nil), nil
 		}
-		return finalFromTranscript(t, tr, nil), nil
+		return `{"tool":"find_similar_reported_changes","arguments":{"kind":"changed"}}`, nil
 	}
 	d := agentTestDeps(t, s, fake)
-	d.AgentMaxSteps = 1
+	d.AgentMaxSteps = steps
 	if !briefOne(context.Background(), d, gid) {
 		t.Fatal("one tool turn plus the reserved final must progress the group")
 	}
-	if fake.TurnCalls != 2 {
+	if fake.TurnCalls != steps+1 {
 		t.Fatalf("one tool turn plus the reserved final: %d calls", fake.TurnCalls)
 	}
 	if b := briefed(t, s, gid); b.Source != "agent" {

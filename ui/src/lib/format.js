@@ -62,6 +62,44 @@ export function changeLabel(kind) {
     os_refinement: 'OS refinements', other: 'Other changes' })[kind] ?? kind;
 }
 
+// Describe a reported confidence decrease only from paired event views.
+// Missing evidence or unknown confidence never implies a decrease.
+export function reviewTitle(kind, observations = [], references = []) {
+  if (kind !== 'other') {
+    return changeLabel(kind);
+  }
+  const ranks = new Map([['low', 0], ['medium', 1], ['high', 2]]);
+  const previous = new Map();
+  for (const obs of observations) {
+    if (obs.view_role === 'previous' && obs.event_id) {
+      previous.set(obs.event_id, ranks.get(obs.attributes?.identity_confidence));
+    }
+  }
+  for (const obs of observations) {
+    if (obs.view_role !== 'current') {
+      continue;
+    }
+    const before = previous.get(obs.event_id);
+    const after = ranks.get(obs.attributes?.identity_confidence);
+    if (before !== undefined && after !== undefined && after < before) {
+      return 'Reported identity confidence decreased';
+    }
+  }
+  const types = new Set(references.map((event) => event.event_type));
+  if (types.size === 1) {
+    if (types.has('host.appeared')) {
+      return 'New host reported';
+    }
+    if (types.has('host.disappeared')) {
+      return 'Host disappearance reported';
+    }
+    if (types.has('host.changed')) {
+      return 'Reported host details changed';
+    }
+  }
+  return types.size > 1 ? 'Reported network changes' : 'Reported details changed';
+}
+
 /** Format the server's duration without changing the selected window. */
 export function windowLabel(value) {
   const match = /^(\d+)h0m0s$/.exec(value);
