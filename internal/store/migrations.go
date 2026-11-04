@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 29
+const supportedSchemaVersion = 30
 
 // validateSchemaLineage is read-only so callers can reject unsupported
 // databases before the writable connection switches journal mode.
@@ -175,6 +175,8 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 28, migrateV28)
 		case 28:
 			err = applyMigration(db, 29, migrateV29)
+		case 29:
+			err = applyMigration(db, 30, migrateV30)
 		}
 		if err != nil {
 			return err
@@ -649,6 +651,56 @@ func migrateV27(tx *sql.Tx) error {
 func migrateV28(tx *sql.Tx) error {
 	_, err := tx.Exec(`ALTER TABLE incident_pending ADD COLUMN formation_before INTEGER NOT NULL DEFAULT 0`)
 	return err
+}
+
+// migrateV30 adds the closed-incident summary registry (Plan
+// incident-summary addition, Designv9 §7): one row per closed
+// incident, durable queue state included. status runs
+// pending->running->model|fallback|skipped; pending+running rows are
+// the outstanding queue capped at 100. floor/suggestion/final/clamped
+// record the resolver inputs and outcome separately from the
+// deterministic incident floor, which is never rewritten. snapshot_json
+// is the exact provider-bound input, alias_map_json the opaque
+// citation aliases issued for that snapshot, citations_json the
+// validated returned citations. Usage columns ride only when the
+// adapter supplies them (nil reads as unknown). A plain new table
+// plus one ledger column suffices — no rebuild.
+func migrateV30(tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`CREATE TABLE incident_summaries (
+			incident_id TEXT PRIMARY KEY REFERENCES incidents(incident_id),
+			status TEXT NOT NULL CHECK(status IN ('pending','running','model','fallback','skipped')),
+			claim TEXT NOT NULL DEFAULT '',
+			lease_expires INTEGER NOT NULL DEFAULT 0,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			floor TEXT NOT NULL CHECK(floor IN ('low','medium','high','critical')),
+			suggestion TEXT CHECK(suggestion IS NULL OR suggestion IN ('low','medium','high','critical')),
+			final_priority TEXT NOT NULL CHECK(final_priority IN ('low','medium','high','critical')),
+			clamped INTEGER NOT NULL DEFAULT 0,
+			summary TEXT NOT NULL DEFAULT '',
+			hypothesis TEXT NOT NULL DEFAULT '',
+			confidence TEXT NOT NULL DEFAULT '',
+			reason TEXT NOT NULL DEFAULT '',
+			citations_json TEXT NOT NULL DEFAULT '[]',
+			snapshot_json TEXT NOT NULL DEFAULT '',
+			alias_map_json TEXT NOT NULL DEFAULT '{}',
+			sampled INTEGER NOT NULL DEFAULT 0,
+			omitted INTEGER NOT NULL DEFAULT 0,
+			input_tokens INTEGER,
+			output_tokens INTEGER,
+			cost_micros INTEGER,
+			error TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX incident_summaries_status ON incident_summaries(status, updated_at)`,
+		`ALTER TABLE purge_runs ADD COLUMN summaries_deleted INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // v29 resumes historical searches through immutable pending reports. The

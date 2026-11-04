@@ -212,6 +212,10 @@ type IncidentSettings struct {
 	Quiet     time.Duration
 	MinRefs   int
 	Retention time.Duration
+	// SummaryEnabled records summary eligibility atomically with
+	// closure for the optional closed-incident summary; enabling
+	// applies to subsequent closures only and never backfills history.
+	SummaryEnabled bool
 }
 
 // DefaultIncidentSettings mirrors Designv9 §7: 30s tick (applied by
@@ -435,8 +439,14 @@ func (s *Store) correlatePass(ctx context.Context, settings IncidentSettings, no
 					return err
 				}
 				if len(waiting) == 0 {
+					floor := in.Floor
 					if err := closeIncident(tx, in.IncidentID, now); err != nil {
 						return err
+					}
+					if settings.SummaryEnabled {
+						if err := enqueueIncidentSummary(tx, in.IncidentID, floor, now); err != nil {
+							return err
+						}
 					}
 					report.Closed++
 					report.markChanged(in.IncidentID)
@@ -480,8 +490,14 @@ func (s *Store) correlatePass(ctx context.Context, settings IncidentSettings, no
 				}
 			}
 			if !qualified {
+				floor := in.Floor
 				if err := closeIncident(tx, in.IncidentID, now); err != nil {
 					return err
+				}
+				if settings.SummaryEnabled {
+					if err := enqueueIncidentSummary(tx, in.IncidentID, floor, now); err != nil {
+						return err
+					}
 				}
 				report.Closed++
 				report.markChanged(in.IncidentID)
@@ -1395,10 +1411,10 @@ const incidentReviewCTE = `ieff AS (
 // both arms index-backed on incidents_status_closed: a single OR
 // predicate would scan the table on every refresh.
 const incidentEligibleCTE = `eligible AS (
-	SELECT incident_id, kind, floor, updated_at FROM incidents WHERE status = 'open'
+	SELECT i.incident_id, i.kind, COALESCE(s.final_priority, i.floor) AS floor, i.updated_at FROM incidents i LEFT JOIN incident_summaries s ON s.incident_id = i.incident_id WHERE i.status = 'open'
 	UNION ALL
-	SELECT incident_id, kind, floor, updated_at FROM incidents
-		WHERE status = 'closed' AND closed_at IS NOT NULL AND closed_at >= ?
+	SELECT i.incident_id, i.kind, COALESCE(s.final_priority, i.floor) AS floor, i.updated_at FROM incidents i LEFT JOIN incident_summaries s ON s.incident_id = i.incident_id
+		WHERE i.status = 'closed' AND i.closed_at IS NOT NULL AND i.closed_at >= ?
 )`
 
 // IncidentCandidate is the narrow incident projection for overview:

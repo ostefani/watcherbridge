@@ -107,6 +107,37 @@ func (a *MetaAdapter) Repair(ctx context.Context, correction string, _ map[strin
 	return a.post(ctx, body)
 }
 
+// Summarize implements Summarizer: one stateless incident-snapshot
+// send. Transport, redirect policy, response cap and status mapping
+// match Brief exactly; the incident contract travels as literal input
+// text. Prohibit tool execution and scanner access: the adapter sends
+// text and returns text, nothing else.
+func (a *MetaAdapter) Summarize(ctx context.Context, snapshot []byte, _ map[string]struct{}) (RawSummary, error) {
+	body, err := MarshalSummaryRequest(a.modelID, snapshot)
+	if err != nil {
+		return RawSummary{}, fmt.Errorf("encode summary request: %w", err)
+	}
+	raw, err := a.post(ctx, body)
+	if err != nil {
+		return RawSummary{}, err
+	}
+	return RawSummary{JSON: raw.JSON, Usage: raw.Usage}, nil
+}
+
+// RepairSummary implements Summarizer: one bounded correction re-ask
+// carrying the safe validation classification only.
+func (a *MetaAdapter) RepairSummary(ctx context.Context, correction string, _ map[string]struct{}) (RawSummary, error) {
+	body, err := MarshalSummaryRepairRequest(a.modelID, correction)
+	if err != nil {
+		return RawSummary{}, fmt.Errorf("encode summary repair request: %w", err)
+	}
+	raw, err := a.post(ctx, body)
+	if err != nil {
+		return RawSummary{}, err
+	}
+	return RawSummary{JSON: raw.JSON, Usage: raw.Usage}, nil
+}
+
 func (a *MetaAdapter) post(ctx context.Context, body []byte) (RawBriefing, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL, bytes.NewReader(body))
 	if err != nil {

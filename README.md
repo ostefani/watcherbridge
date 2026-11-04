@@ -1,178 +1,227 @@
 # WatcherBridge
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Go Version](https://img.shields.io/badge/go-1.25-blue)
-![Status: early development](https://img.shields.io/badge/status-early%20development-orange)
-![Developed with Muse Spark](https://img.shields.io/badge/developed%20with-Muse%20Spark-0467DF)
-![Model is configurable](https://img.shields.io/badge/model-configurable-lightgrey)
+![Go](https://img.shields.io/badge/Go-1.26-blue)
 ![Redaction on by default](https://img.shields.io/badge/redaction-on%20by%20default-brightgreen)
 ![Built for a hackathon](https://img.shields.io/badge/built%20for-hackathon-blueviolet)
-![Visitors](https://visitor-badge.laobi.icu/badge?page_id=ostefani.subnetlense)
 
-An open-source bridge that receives network watch events via webhooks and turns them into short, prioritized briefings.
+**Turn network-change reports into prioritized explanations and a local review inbox.**
 
-## The problem
+WatcherBridge receives signed webhooks from SubnetLens Pro, preserves the original reports, and turns related changes into concise briefings: what changed, why it matters, how urgent it is, and one recommended check. A built-in dashboard combines those explanations with retained evidence, reported-host history, and your own review decisions.
 
-SubnetLens Pro is the proprietary companion to the open-source [SubnetLens](https://github.com/ostefani/subnetlens) scanner. It watches a local network and sends an HMAC-signed webhook whenever a host appears, disappears, or changes.
+Run it alongside your existing event viewer or use it on its own. AI explanations are optional; local storage, deterministic priorities, and fallback briefings work without a model API key.
 
-The owner still has to read across the events, connect related changes on the same host, and decide which need attention now. WatcherBridge adds interpretation. It groups related events per host, adds the host's recent history, and asks an AI model for a briefing: what changed, why it matters, how urgent it is, and one check to run. Events continue to the consumers unchanged, and briefings are added alongside them.
+## Why WatcherBridge
+
+- **Spend less time connecting events.** Bounded explanation windows group related reports, adding retained context so you can review a change in one place.
+- **See what needs attention.** The overview separates items that need action, items to review, and routine changes. Coverage and source health appear alongside the verdict.
+- **Understand the priority.** Each briefing separates the deterministic baseline, any model suggestion, and the final priority. AI can raise urgency by one level, up to high; only deterministic rules produce critical.
+- **Keep control of review.** Mark a change expected or not expected, snooze it, add notes and labels, or undo a decision. These actions stay local and preserve the original scanner reports.
+- **Keep history close.** Events, briefings, reported context, and pseudonym mappings live in a local SQLite database with configurable retention.
+- **Continue when AI is unavailable.** Provider errors, rejected responses, and redaction blocks produce clearly marked deterministic fallback briefings. Model work runs outside webhook handling.
+- **Fit an existing workflow.** Use the embedded web viewer, query JSON APIs, check status from the CLI, or publish briefing annotations to ScanRelay.
 
 ## How it works
 
-WatcherBridge is designed to work with SubnetLens Pro's watch mode. WatcherBridge receives those webhooks, groups related events per host, and sends a small redacted bundle to an AI model. It returns a schema-validated briefing: what changed, why it matters, how urgent it is, and one check to run. It ships with its own viewer, so it works on its own, and it can optionally publish briefings to ScanRelay.
+```text
+SubnetLens Pro
+  signed host.appeared / host.changed / host.disappeared reports
+        |
+        v
+Authenticate -> Store original bytes -> Deduplicate -> Group related reports
+                                                          |
+                                                          v
+                                                Deterministic priority
+                                                          |
+                                                          v
+                                          Redacted AI explanation or fallback
+                                                          |
+                                                          v
+                                                Durable linked briefing
+                                                          |
+                              +---------------------------+------------------+
+                              v                           v                  v
+                        Local web viewer             JSON API / CLI    ScanRelay annotations
+                                                                         (optional)
+```
+
+SubnetLens Pro owns discovery, device and OS evaluation, host association, and appearance/change/disappearance detection. WatcherBridge explains what the scanner reported and retains its provenance. It does not scan your network, re-identify devices, or infer that a host disappeared because reports stopped arriving.
+
+## Explore and review
+
+### Overview and briefing detail
+
+The Home screen shows a prioritized attention list, a digest of reported changes, and a quiet, review, or act verdict for the selected time window. Open a briefing to inspect its summary, priority reasoning, reported evidence, retained context, recommended check, and provenance.
+
+Live updates use Server-Sent Events, with bounded replay and resynchronization after gaps. Reported-host pages show scanner-supplied attributes and paged retained history, distinguishing device references, address context, unresolved events, and legacy associations. Matching IP addresses or hostnames do not merge profiles.
+
+The viewer supports keyboard navigation, dark mode, and reduced motion. The Health screen exposes source progress, delivery gaps, provider outcomes, redaction blocks, queues, annotation delivery, and retention activity.
+
+### Local decisions and review rules
+
+Expected, not-expected, snooze, note, and label decisions help organize the inbox without changing scanner severity or identity. Decisions are recorded as an audit trail; undo adds a superseding record.
+
+For sources with a supported stable identity contract, repeated expected decisions can produce exact review-rule proposals through the local API. Approved rules match the source, identity namespace and revision, reported reference, and change details. They can make matching non-critical changes routine; critical remains protected. Address-only and unresolved reports remain available for manual review.
+
+### Optional retained-evidence investigation
+
+Enable the investigator with `-agent-enabled`. It can consult five fixed, read-only tools over retained profiles, history, similar reported changes, reported services, and context comparisons. The default limits are four tool turns plus a final answer within a 90-second run budget. The detail view exposes the tool trace and validated evidence references.
+
+Investigation uses existing local evidence. It has no scanner, shell, arbitrary SQL, file, or network tool. Suggested explanations and model confidence are advisory; they do not establish device identity.
+
+### Incident bundles
+
+When the source supplies qualified stable references, WatcherBridge can present bursts of scanner-reported appearances or disappearances as one expandable incident. By default, formation requires three distinct qualified references from the same source and target within five minutes. Without qualifying identity metadata, reports remain individual items.
+
+Member briefings retain their priorities and evidence. An incident's priority is at least the highest member priority, with a minimum of medium for disappearance bursts. Incident review lets you choose whether a decision also applies to members. Incidents and local decisions stay out of ScanRelay annotations.
+
+An include-members decision applies atomically to at most 500 members; a larger request is rejected without a partial decision. New members do not inherit an earlier acknowledgement, and undoing an incident decision does not undo member decisions. For previously committed larger actions, the API returns continuation cursors for the original member-decision snapshot through `GET /api/decisions/{parent_decision_id}/members?after={cursor}&limit=200` (maximum limit 500).
+
+**Forthcoming:** an optional bounded AI summary model for closed incidents, adding an evidence-linked explanation over the fixed member set while preserving the deterministic priority floor.
+
+## Privacy and reliability
+
+Redaction is enabled by default. Provider-bound context replaces identifying values—including IP and MAC addresses, hostnames, subnets, and upstream references—with local tokens. Leak scanning blocks a call when it detects remaining sensitive values or cannot complete safely. The mapping stays local, where accepted text is restored for display.
+
+The model receives bounded structured context rather than a raw scan dump. Responses pass strict field, token, size, and evidence-reference validation, with bounded repair and deterministic fallback. Schema validation checks structure and references; explanations still require operator judgment.
+
+Webhook admission verifies HMAC signatures, freshness, and envelope consistency before storing accepted reports. SQLite provides durable event and briefing storage; recovery resumes interrupted work. Retention removes eligible history in bounded batches while protecting referenced and pending work.
+
+The listener is restricted to loopback. The browser-facing API also checks Host and same-origin writes. One bridge instance serves one configured scanner source; `-source-id` binds that deployment's reported references to its database.
+
+## Delivery modes
+
+**Tap mode (default, preferred):** configure the sender to deliver separately to WatcherBridge and any existing consumer.
+
+```text
+                 +--> WatcherBridge --> local viewer / API / optional annotations
+SubnetLens Pro --+
+                 +--> ScanRelay (optional, independent event delivery)
+```
+
+WatcherBridge acknowledges after local persistence; briefing generation happens asynchronously. A bridge outage does not interrupt the sender's separate delivery to ScanRelay. Tap requires a sender configuration that supports delivery to multiple endpoints.
+
+**Proxy mode:** send events through WatcherBridge when the sender uses a single destination.
+
+```text
+SubnetLens Pro --> WatcherBridge --> ScanRelay (original signed event bytes)
+                       |
+                       +--> local viewer / API / briefing annotations
+```
+
+The bridge stores the event, then forwards the original body and signature headers without rewriting them. There is no retry loop inside the request. Sender redelivery and a bounded startup recovery sweep can retry eligible unforwarded events while their signatures remain fresh; expired deliveries are recorded as undeliverable. A bridge outage interrupts this forwarding path.
+
+ScanRelay works independently of WatcherBridge, and WatcherBridge's viewer works without ScanRelay. Briefing annotations are separate records linked to original event IDs.
+
+## Quick start
+
+### Build
+
+Requirements: **Go 1.26 or newer** and a **C compiler** for the SQLite driver (Xcode Command Line Tools on macOS or GCC on Linux). The production viewer assets are embedded and committed; running the bridge does not require Node.js.
+
+```sh
+git clone https://github.com/ostefani/WatcherBridge.git
+cd WatcherBridge
+CGO_ENABLED=1 go build -o watcherbridge ./cmd/watcherbridge
+```
+
+### Start locally
+
+Create an owner-only secret file containing a randomly generated webhook secret of at least 32 bytes. Configure the same secret in SubnetLens Pro. Use an owner-only data directory for the database.
+
+```sh
+mkdir -m 700 watcherbridge-data
+openssl rand -hex 32 > watcherbridge-data/webhook.secret
+chmod 600 watcherbridge-data/webhook.secret
+
+./watcherbridge \
+  -secret-file ./watcherbridge-data/webhook.secret \
+  -db ./watcherbridge-data/watcherbridge.db \
+  -scanrelay-url=
+```
+
+Point SubnetLens Pro's signed webhook delivery at `http://127.0.0.1:8081/webhook`, then open [the local viewer](http://127.0.0.1:8081/). The sender must be able to reach the bridge's loopback listener. SubnetLens Pro is a separate proprietary application and is not included here.
+
+The default `fake` provider makes no model calls and produces marked fallback briefings. This is enough to use the ingestion, history, dashboard, and review workflow without provider credentials. Fallback activity is visible in Health and can mark coverage degraded.
+
+### Enable AI explanations
+
+The included live adapter targets the Meta Model API; the model ID and full endpoint URL are configurable. Use the endpoint and model ID provided for your account and store its API key in an owner-only file.
+
+```sh
+./watcherbridge \
+  -secret-file ./watcherbridge-data/webhook.secret \
+  -db ./watcherbridge-data/watcherbridge.db \
+  -scanrelay-url= \
+  -model-provider meta \
+  -model-id '<your-model-id>' \
+  -model-base-url '<your-https-responses-endpoint>' \
+  -model-key-file /absolute/path/to/model-api-key
+```
+
+Stop the previous bridge process before restarting with this configuration. Keep the default redaction enabled when using an external provider. Add `-agent-enabled` to opt into retained-evidence investigation.
+
+### Connect ScanRelay
+
+For optional annotations in tap mode, set `-scanrelay-url http://127.0.0.1:8080` and keep the sender's direct ScanRelay delivery. For forwarding, also set `-mode proxy` and point the sender at the bridge. If ScanRelay requires authentication, use `FORWARD_BEARER_TOKEN` or `FORWARD_API_KEY`.
+
+### Check status
+
+```sh
+./watcherbridge status
+./watcherbridge status --window 24h --json
+```
+
+The CLI reads the running bridge's overview API. Exit codes are `0` for quiet, `1` for review, `2` for act, and `3` when status cannot be obtained. A quiet verdict describes the retained reports and your review state; it does not certify network security or host availability. Scanner liveness remains unknown without supported heartbeats; stale heartbeats from a previously reporting source are shown as blind coverage.
+
+## Configuration
+
+Run `./watcherbridge -h` for all startup flags, or `./watcherbridge status -h` for CLI options. Common settings:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `-bind` | `127.0.0.1:8081` | Loopback listener for webhooks, viewer, and API |
+| `-mode` | `tap` | Independent receipt or proxy forwarding |
+| `-source-id` | `default` | Durable scanner deployment scope; also accepts `SOURCE_ID` |
+| `-db` | `watcherbridge.db` | Local SQLite database path |
+| `-secret-file` | Unset | Owner-only webhook secret file; alternatively `WEBHOOK_SECRET` |
+| `-scanrelay-url` | `http://127.0.0.1:8080` | Optional integration; pass an empty value to disable |
+| `-model-provider` | `fake` | `fake` for local fallback, `meta` for AI explanations |
+| `-model-id` / `-model-base-url` | Test placeholders | Set both for a live provider |
+| `-model-key-file` | Unset | Owner-only model key file; alternatively `MODEL_API_KEY` |
+| `-redaction` | `true` | Tokenize and leak-scan provider context |
+| `-agent-enabled` | `false` | Enable bounded retained-evidence investigation |
+| `-group-quiet-window` / `-group-max-window` | `45s` / `2m` | Explanation grouping windows |
+| `-overview-window` | `24h` | Default review window, maximum `168h` |
+| `-briefing-retention` / `-subject-retention` | `720h` / `2160h` | Briefing history and reported-subject retention |
+
+Configure secrets through a file or the supported environment variables, using one mechanism per secret. Keep the source ID stable for the lifetime of its database. Review rules and counted incident bundles require a separately registered, supported upstream identity capability; a nonempty host ID alone does not enable them.
 
 ## Built with
 
-| Part | Choice |
+| Component | Implementation |
 |---|---|
-| Model | Developed against Muse Spark. The model is configurable |
-| Model access | [Meta Model API](https://dev.meta.ai) (Standard tier) |
-| Input | HMAC-signed webhooks from SubnetLens Pro watch mode |
-| Output validation | JSON Schema |
-| Storage | Local event log (optionally enriched with JSON scan reports) |
-| Language and runtime | To be decided |
+| Service and CLI | Go, standard-library HTTP server |
+| Persistence | SQLite in WAL mode through `mattn/go-sqlite3` |
+| Web viewer | Svelte 5 and Vite; embedded production assets |
+| Live updates | Server-Sent Events with bounded replay |
+| AI integration | Meta Model API adapter, configurable endpoint and model |
+| Offline operation | Deterministic baseline and fallback briefings |
 
-> **Status: early development.** Built for a hackathon. Sections marked *(planned)* are not implemented yet.
+To modify the viewer, use the pinned Node.js version in [ui/.nvmrc](ui/.nvmrc), then run `make ui-check`. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution conventions.
 
-> **Design note:** Details such as schemas, configuration names, and internal structure may change as development goes on. The core guarantees will not change: the bridge and ScanRelay stay independent, redaction is on by default, and the model only summarizes data that Pro has already computed.
+## Hackathon disclosure
 
-## Hackathon disclosure: what is new and what is not
+WatcherBridge was built during the hackathon. These companion projects predate the submission, live outside this repository, and connect through event and annotation interfaces:
 
-Everything in this repository was built during the hackathon. The projects below are separate, pre-existing, and not part of this submission. WatcherBridge talks to them only through documented interfaces, and none of their code is copied here.
+| Project | Role | Included here? |
+|---|---|---|
+| [SubnetLens](https://github.com/ostefani/subnetlens) | Open-source network scanner | No |
+| SubnetLens Pro | Proprietary watch mode, scanner evaluation, and signed webhook sender | No |
+| ScanRelay | Proprietary event viewer and optional annotation consumer | No |
+| **WatcherBridge** | **Event bridge, briefings, local review, and embedded viewer** | **Yes** |
 
-| Project | Status | Role | In this repo? |
-|---|---|---|---|
-| [SubnetLens](https://github.com/ostefani/subnetlens) | Existing, open source | Network scanner | No |
-| SubnetLens Pro | Existing, proprietary | Watch mode, device and OS evaluation, webhook sender | No (interface only) |
-| ScanRelay | Existing, proprietary | Viewer for Pro's events. Works with Pro on its own | No (optional integration only) |
-| **WatcherBridge** | **Built during the hackathon** | Verification, grouping, redaction, AI briefing, built-in viewer | **Yes, all of it** |
-
-The first commit marks the start of hackathon work. Test fixtures are synthetic, so no real network data or proprietary code is included.
-
-## Independence
-
-WatcherBridge and ScanRelay are independent of each other.
-
-- **ScanRelay does not need WatcherBridge.** It keeps working with Pro exactly as before.
-- **WatcherBridge does not need ScanRelay.** Its built-in viewer shows each original event with its briefing. ScanRelay support is an optional output.
-- In tap mode, if the bridge stops, you lose briefings only. See delivery modes below for proxy mode.
-
-## Delivery modes *(planned)*
-
-```
-TAP MODE (preferred): Pro sends each event to both
-
-                 +--> ScanRelay (optional, works without the bridge)
-SubnetLens Pro --+
- (watch mode)    +--> WatcherBridge --> outputs
-
-
-PROXY MODE: Pro sends to one URL, the bridge forwards unchanged
-
-SubnetLens Pro --> WatcherBridge --> ScanRelay (events forwarded unchanged)
- (watch mode)           |
-                        +--> outputs
-```
-
-- **Tap mode (preferred).** There is no coupling between the bridge and ScanRelay. If the bridge fails, you lose only briefings. It needs a sender that can deliver each event to more than one endpoint.
-- **Proxy mode.** Use it if Pro can only send to one endpoint. The bridge forwards the raw request body and signature header untouched, so ScanRelay can keep verifying Pro's original HMAC. By default there are no retries or buffering, so ScanRelay's delivery semantics don't change. If the bridge is down, events do not reach ScanRelay.
-
-In both modes, original events reach ScanRelay unchanged. Briefings are separate records linked to the original events by ID.
-
-## Briefing example *(proposed format)*
-
-```json
-{
-  "event_ids": ["evt-001", "evt-002"],
-  "host": "host-a1",
-  "what_changed": "New listening service appeared on an existing device.",
-  "context": "Consistent with the device type Pro evaluated; first change in the recent history.",
-  "priority": "medium",
-  "priority_reason": "A new service on a stable host is unusual but not alarming.",
-  "recommended_check": "Confirm the service was installed intentionally."
-}
-```
-
-The values above are illustrative sample data.
-
-## What the model does and does not do
-
-- It **synthesizes** data that Pro has already computed: the change, Pro's device and OS evaluation with its evidence, and the host's recent history.
-- It does **not** re-identify devices.
-- It does **not** override or second-guess Pro's evaluation.
-- It never sees real addresses unless you turn redaction off.
-
-## Privacy
-
-- Redaction is **on by default**. IP and MAC addresses and other identifying strings are replaced with local pseudonyms before anything leaves your machine.
-- The pseudonym map and the event log stay local.
-- Only a small structured bundle is sent to the model, not raw scan output.
-- Turning redaction off requires an explicit setting.
-
-## Requirements
-
-- SubnetLens Pro with watch mode and webhooks enabled (proprietary, not included)
-- An API key for the configured model provider (developed against the Meta Model API)
-- A webhook shared secret, the same one configured on the sender
-- ScanRelay is **not** required
-
-## Quick start *(planned)*
-
-```bash
-# 1. Clone the repository
-git clone https://github.com/ostefani/WatcherBridge
-cd WatcherBridge
-
-# 2. Configure (setting names are proposals and may change)
-export MODEL_API_KEY=...
-export WEBHOOK_SECRET=...
-
-# 3. Run the bridge (exact command to be filled in once implemented)
-
-# 4. Point SubnetLens Pro's webhook at the bridge
-# 5. Open the built-in viewer
-
-# Test
-go test -v ./internal/store/...
-```
-
-
-## Roadmap
-
-- [ ] Webhook receiver with HMAC verification and immediate acknowledgement
-- [ ] Local event log
-- [ ] Per-host grouping and structured diff
-- [ ] Redaction with local pseudonym map
-- [ ] Configurable model client (first target: Muse Spark via the Meta Model API)
-- [ ] Briefing schema validation and fallback
-- [ ] Address restoration
-- [ ] Built-in viewer (events and briefings side by side)
-- [ ] JSON / CLI output
-- [ ] Tap mode and proxy mode
-- [ ] Optional ScanRelay adapter
-- [ ] Tests with synthetic fixtures
-
-## Limitations
-
-- Briefings are advisory. They do not replace your own review.
-- Model output can be wrong. Schema validation checks the shape of a response, not whether its content is true.
-- Quality and structured-output support vary between models.
-- In proxy mode, the bridge becomes a single point of failure for event delivery to ScanRelay.
-
-### Incident review limits
-
-Incident membership is retained independently of the bounded detail page.
-An “include members” decision applies atomically to at most 500 members.
-Larger actions return HTTP 413 without recording any part of the decision;
-review the member briefing pages individually instead. Incident-only review
-remains available. New members do not inherit earlier acknowledgements.
-
-Retries of previously committed larger fan-outs still return success, with at
-most 500 generated decisions and a `members_next` cursor. Continue the original
-snapshot with `GET /api/decisions/{parent_decision_id}/members?after={cursor}&limit=200`
-(maximum limit 500). Each page returns `members` and, when more remain, `next`.
-Undo likewise supplies `generated_next` when its generated-decision IDs need
-continuation through this endpoint; undo never cascades to member decisions.
+The companion projects' code is not copied into this submission. Test fixtures use synthetic data.
 
 ## License
 

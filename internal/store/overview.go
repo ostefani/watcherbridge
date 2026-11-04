@@ -75,6 +75,7 @@ var purgeRunColumns = []struct {
 	{"incident_pending_deleted", "incident_pending"},
 	{"incident_pending_refs_deleted", "incident_pending_refs"},
 	{"incident_refs_deleted", "incident_references"},
+	{"summaries_deleted", "incident_summaries"},
 }
 
 // scanPurgeRun reads one purge_runs row; ok is false on no match.

@@ -177,8 +177,8 @@ func TestIncidentReferenceUpgradeAndPurgeBudget(t *testing.T) {
 	defer func() { s.Close() }()
 	base := time.Now().UTC().Truncate(time.Second)
 	_, id := regressionIncident(t, s, base)
-	for _, stmt := range []string{`DROP TABLE incident_pending_refs`, `DROP TABLE incident_pending`, `DROP TABLE incident_references`, `ALTER TABLE incidents DROP COLUMN identity_namespace`, `ALTER TABLE incident_progress RENAME COLUMN last_briefing_seq TO last_briefing_rowid`,
-		`ALTER TABLE incident_progress DROP COLUMN pending_after`, `ALTER TABLE incident_progress DROP COLUMN pin_version`, `ALTER TABLE incident_progress DROP COLUMN refs_cursor`, `ALTER TABLE incident_progress DROP COLUMN refs_through`, `ALTER TABLE purge_runs DROP COLUMN incident_pending_deleted`, `ALTER TABLE purge_runs DROP COLUMN incident_pending_refs_deleted`, `ALTER TABLE purge_runs DROP COLUMN incident_refs_deleted`, `PRAGMA user_version=26`} {
+	for _, stmt := range []string{`DROP TABLE incident_pending_refs`, `DROP TABLE incident_pending`, `DROP TABLE incident_references`, `DROP TABLE IF EXISTS incident_summaries`, `ALTER TABLE incidents DROP COLUMN identity_namespace`, `ALTER TABLE incident_progress RENAME COLUMN last_briefing_seq TO last_briefing_rowid`,
+		`ALTER TABLE incident_progress DROP COLUMN pending_after`, `ALTER TABLE incident_progress DROP COLUMN pin_version`, `ALTER TABLE incident_progress DROP COLUMN refs_cursor`, `ALTER TABLE incident_progress DROP COLUMN refs_through`, `ALTER TABLE purge_runs DROP COLUMN incident_pending_deleted`, `ALTER TABLE purge_runs DROP COLUMN incident_pending_refs_deleted`, `ALTER TABLE purge_runs DROP COLUMN incident_refs_deleted`, `ALTER TABLE purge_runs DROP COLUMN summaries_deleted`, `PRAGMA user_version=26`} {
 		if _, err := s.db.Exec(stmt); err != nil {
 			t.Fatal(err)
 		}

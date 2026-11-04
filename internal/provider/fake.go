@@ -41,6 +41,17 @@ type FakeAdapter struct {
 	// transcript: tests parse the bundle out of transcript[1] and
 	// build token-echoing answers without hardcoding token numbers.
 	TurnHandle func(transcript []TurnMessage) (string, error)
+	// SummarySteps scripts the Summarizer path: one FakeStep per
+	// Summarize call, JSON as the summary object. RepairSummary calls
+	// consume SummaryRepairs in order; extra calls replay the last
+	// step, like Brief. SummaryHandle, when non-nil, answers
+	// dynamically instead of the script.
+	SummarySteps    []FakeStep
+	SummaryRepairs  []FakeStep
+	Summaries       int
+	SummaryRepairCt int
+	ReceivedSummary [][]byte
+	SummaryHandle   func(repair bool, payload []byte, valid map[string]struct{}) (RawSummary, error)
 }
 
 // NewFake returns a FakeAdapter playing script in order; extra calls replay
@@ -98,6 +109,59 @@ func (f *FakeAdapter) Turn(ctx context.Context, transcript []TurnMessage) (TurnR
 		return TurnResult{}, step.Err
 	}
 	return TurnResult{Text: string(step.JSON), Usage: step.Usage}, nil
+}
+
+// Summarize implements Summarizer for incident-summary tests.
+func (f *FakeAdapter) Summarize(ctx context.Context, snapshot []byte, valid map[string]struct{}) (RawSummary, error) {
+	return f.nextSummary(ctx, false, snapshot, valid)
+}
+
+// RepairSummary implements Summarizer for incident-summary tests.
+func (f *FakeAdapter) RepairSummary(ctx context.Context, correction string, valid map[string]struct{}) (RawSummary, error) {
+	return f.nextSummary(ctx, true, []byte(correction), valid)
+}
+
+func (f *FakeAdapter) nextSummary(ctx context.Context, repair bool, payload []byte, valid map[string]struct{}) (RawSummary, error) {
+	f.mu.Lock()
+	var step FakeStep
+	if repair {
+		if len(f.SummaryRepairs) > 0 {
+			step = f.SummaryRepairs[0]
+			if len(f.SummaryRepairs) > 1 {
+				f.SummaryRepairs = f.SummaryRepairs[1:]
+			}
+		} else if len(f.SummarySteps) > 0 {
+			step = f.SummarySteps[len(f.SummarySteps)-1]
+		}
+		f.SummaryRepairCt++
+	} else {
+		if len(f.SummarySteps) > 0 {
+			step = f.SummarySteps[0]
+			if len(f.SummarySteps) > 1 {
+				f.SummarySteps = f.SummarySteps[1:]
+			}
+		}
+		f.Summaries++
+	}
+	f.ReceivedSummary = append(f.ReceivedSummary, append([]byte(nil), payload...))
+	if dl, ok := ctx.Deadline(); ok {
+		f.Deadlines = append(f.Deadlines, dl)
+	} else {
+		f.Deadlines = append(f.Deadlines, time.Time{})
+	}
+	handle := f.SummaryHandle
+	f.mu.Unlock()
+	if handle != nil {
+		return handle(repair, payload, valid)
+	}
+	if step.Hang {
+		<-ctx.Done()
+		return RawSummary{}, ctx.Err()
+	}
+	if step.Err != nil {
+		return RawSummary{}, step.Err
+	}
+	return RawSummary{JSON: append([]byte(nil), step.JSON...), Usage: step.Usage}, nil
 }
 
 func (f *FakeAdapter) next(ctx context.Context, repair bool, payload []byte, valid map[string]struct{}) (RawBriefing, error) {

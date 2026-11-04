@@ -1,0 +1,396 @@
+package store
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"time"
+)
+
+// Closed-incident summaries (Plan incident-summary addition,
+// Designv9 §7). A summary is generated once after an incident closes,
+// from its fixed membership, using briefing.Resolve. The deterministic
+// incident stays usable throughout; the summary never changes
+// membership, reopens incidents, modifies decisions, or publishes
+// scanner annotations.
+//
+// Queue: one row per closed incident; pending+running rows are the
+// outstanding queue capped at 100. Enabling applies to subsequent
+// closures only: close paths enqueue, and history is never backfilled
+// automatically. When capacity is exhausted the close records
+// skipped_overload and keeps deterministic presentation.
+//
+// Claim: running rows carry an opaque claim token and a lease expiry.
+// Completions commit only against the matching claim and snapshot;
+// the first committed terminal outcome wins and later/stale
+// completions are rejected.
+const (
+	// maxSummaryQueue caps outstanding summary jobs. The close that
+	// would exceed it records skipped_overload instead of blocking
+	// correlation, ingestion or briefing work.
+	maxSummaryQueue = 100
+	// summaryLease bounds one claimed run before another worker may
+	// reclaim it. It sits under the 30s provider run deadline
+	// sharing: a crashed worker's lease lapses and the next poll
+	// reclaims the job for a conservative fallback.
+	summaryLease = 60 * time.Second
+	// maxSummaryMembers bounds the evidence snapshot: at most 20
+	// member briefings, selected by a documented deterministic policy
+	// (see SummaryMembers).
+	maxSummaryMembers = 20
+)
+
+// IncidentSummary is one durable summary job and its outcome. Floor,
+// Suggestion, FinalPriority and Clamped record the resolver inputs
+// and outcome separately; the incidents row keeps the deterministic
+// floor and is never rewritten from a model answer. Suggestion is nil
+// when the model abstains. Usage rides only when the adapter supplies
+// it; nil reads as unknown, never as a free call. SnapshotJSON is the
+// exact provider-bound input; AliasMapJSON the opaque citation
+// aliases issued for that snapshot; CitationsJSON the validated
+// returned citations.
+type IncidentSummary struct {
+	IncidentID    string
+	Status        string // pending|running|model|fallback|skipped
+	Claim         string
+	LeaseExpires  time.Time
+	Attempts      int
+	Floor         string
+	Suggestion    *string
+	FinalPriority string
+	Clamped       bool
+	Summary       string
+	Hypothesis    string
+	Confidence    string
+	Reason        string
+	Citations     []SummaryCitation
+	SnapshotJSON  string
+	AliasMap      map[string]string
+	Sampled       int
+	Omitted       int
+	InputTokens   *int64
+	OutputTokens  *int64
+	CostMicros    *int64
+	Error         string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+// SummaryCitation is one validated returned citation: the opaque
+// member alias issued for the snapshot. The alias maps to a member
+// briefing ID in AliasMap; raw briefing or event IDs never cross.
+type SummaryCitation struct {
+	Member string `json:"member"`
+}
+
+func scanIncidentSummary(row interface {
+	Scan(dest ...any) error
+}, out *IncidentSummary) error {
+	var suggestion, confidence sql.NullString
+	var inputTokens, outputTokens, costMicros sql.NullInt64
+	var lease int64
+	var created, updated int64
+	var citations, snapshot, aliasMap string
+	if err := row.Scan(&out.IncidentID, &out.Status, &out.Claim, &lease, &out.Attempts,
+		&out.Floor, &suggestion, &out.FinalPriority, &out.Clamped,
+		&out.Summary, &out.Hypothesis, &confidence, &out.Reason,
+		&citations, &snapshot, &aliasMap, &out.Sampled, &out.Omitted,
+		&inputTokens, &outputTokens, &costMicros, &out.Error, &created, &updated); err != nil {
+		return err
+	}
+	if suggestion.Valid {
+		out.Suggestion = &suggestion.String
+	}
+	out.Confidence = confidence.String
+	if citations != "" && citations != "[]" {
+		var cits []SummaryCitation
+		if err := json.Unmarshal([]byte(citations), &cits); err != nil {
+			return err
+		}
+		out.Citations = cits
+	}
+	out.SnapshotJSON = snapshot
+	out.AliasMap = map[string]string{}
+	if aliasMap != "" && aliasMap != "{}" {
+		if err := json.Unmarshal([]byte(aliasMap), &out.AliasMap); err != nil {
+			return err
+		}
+	}
+	if inputTokens.Valid {
+		out.InputTokens = &inputTokens.Int64
+	}
+	if outputTokens.Valid {
+		out.OutputTokens = &outputTokens.Int64
+	}
+	if costMicros.Valid {
+		out.CostMicros = &costMicros.Int64
+	}
+	out.LeaseExpires = fromNanos(lease)
+	out.CreatedAt, out.UpdatedAt = fromNanos(created), fromNanos(updated)
+	return nil
+}
+
+func newSummaryClaim() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// enqueueIncidentSummary records summary eligibility atomically with
+// incident closure (same transaction). When the outstanding queue
+// (pending+running) is at capacity the close records skipped_overload
+// and keeps deterministic presentation; correlation never blocks.
+func enqueueIncidentSummary(tx *sql.Tx, incidentID, floor string, now time.Time) error {
+	var outstanding int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM incident_summaries WHERE status IN ('pending','running')`).Scan(&outstanding); err != nil {
+		return err
+	}
+	if outstanding >= maxSummaryQueue {
+		_, err := tx.Exec(`INSERT OR IGNORE INTO incident_summaries
+			(incident_id, status, floor, final_priority, error, created_at, updated_at)
+			VALUES (?, 'skipped', ?, ?, 'skipped_overload', ?, ?)`,
+			incidentID, floor, floor, nanos(now), nanos(now))
+		return err
+	}
+	_, err := tx.Exec(`INSERT OR IGNORE INTO incident_summaries
+		(incident_id, status, floor, final_priority, created_at, updated_at)
+		VALUES (?, 'pending', ?, ?, ?, ?)`,
+		incidentID, floor, floor, nanos(now), nanos(now))
+	return err
+}
+
+// SummaryOutstanding counts pending+running jobs. Bounded single-row
+// read for the worker and tests.
+func (s *Store) SummaryOutstanding(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM incident_summaries WHERE status IN ('pending','running')`).Scan(&n)
+	return n, err
+}
+
+// GetIncidentSummary reads one incident's summary row, or sql.ErrNoRows.
+func (s *Store) GetIncidentSummary(ctx context.Context, incidentID string) (IncidentSummary, error) {
+	var out IncidentSummary
+	row := s.db.QueryRowContext(ctx, `SELECT incident_id, status, claim, lease_expires, attempts,
+		floor, suggestion, final_priority, clamped, summary, hypothesis, confidence, reason,
+		citations_json, snapshot_json, alias_map_json, sampled, omitted,
+		input_tokens, output_tokens, cost_micros, error, created_at, updated_at
+		FROM incident_summaries WHERE incident_id = ?`, incidentID)
+	if err := scanIncidentSummary(row, &out); err != nil {
+		return IncidentSummary{}, err
+	}
+	return out, nil
+}
+
+// ClaimIncidentSummary atomically claims the oldest pending job, or
+// reclaims an expired running lease. It reserves the attempt durably
+// (attempts+1, fresh claim+lease, snapshot cleared for the new run)
+// before any provider work, so a crash consumes the reservation and
+// recovers conservatively to deterministic fallback rather than
+// repeating an uncertain external call. ok is false when no job is
+// claimable.
+func (s *Store) ClaimIncidentSummary(ctx context.Context, now time.Time) (IncidentSummary, string, bool, error) {
+	var out IncidentSummary
+	var claim string
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		var id, floor string
+		err := tx.QueryRow(`SELECT incident_id, floor FROM incident_summaries
+			WHERE status = 'pending' OR (status = 'running' AND lease_expires <= ?)
+			ORDER BY updated_at ASC, incident_id ASC LIMIT 1`, nanos(now)).Scan(&id, &floor)
+		if err == sql.ErrNoRows {
+			return sql.ErrNoRows
+		}
+		if err != nil {
+			return err
+		}
+		c, err := newSummaryClaim()
+		if err != nil {
+			return err
+		}
+		claim = c
+		res, err := tx.Exec(`UPDATE incident_summaries SET status = 'running', claim = ?,
+			lease_expires = ?, attempts = attempts + 1, snapshot_json = '', alias_map_json = '{}',
+			updated_at = ? WHERE incident_id = ? AND (status = 'pending' OR (status = 'running' AND lease_expires <= ?))`,
+			claim, nanos(now.Add(summaryLease)), nanos(now), id, nanos(now))
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return sql.ErrNoRows
+		}
+		row := tx.QueryRow(`SELECT incident_id, status, claim, lease_expires, attempts,
+			floor, suggestion, final_priority, clamped, summary, hypothesis, confidence, reason,
+			citations_json, snapshot_json, alias_map_json, sampled, omitted,
+			input_tokens, output_tokens, cost_micros, error, created_at, updated_at
+			FROM incident_summaries WHERE incident_id = ?`, id)
+		return scanIncidentSummary(row, &out)
+	})
+	if err == sql.ErrNoRows {
+		return IncidentSummary{}, "", false, nil
+	}
+	if err != nil {
+		return IncidentSummary{}, "", false, err
+	}
+	return out, claim, true, nil
+}
+
+// ReserveSummarySnapshot stores the exact provider-bound snapshot and
+// alias map against the matching claim while still running. A crash
+// after this point leaves the snapshot durable, so validation can
+// reproduce after restart.
+func (s *Store) ReserveSummarySnapshot(ctx context.Context, incidentID, claim, snapshotJSON, aliasMapJSON string, sampled, omitted int, now time.Time) error {
+	return s.write(ctx, func(tx *sql.Tx) error {
+		res, err := tx.Exec(`UPDATE incident_summaries SET snapshot_json = ?, alias_map_json = ?,
+			sampled = ?, omitted = ?, updated_at = ?
+			WHERE incident_id = ? AND claim = ? AND status = 'running'`,
+			snapshotJSON, aliasMapJSON, sampled, omitted, nanos(now), incidentID, claim)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return fmt.Errorf("summary %s is not running under this claim", incidentID)
+		}
+		return nil
+	})
+}
+
+// CompleteIncidentSummary commits an accepted outcome only against the
+// matching claim and snapshot. First committed terminal outcome wins:
+// rows already terminal are left untouched and the late completion
+// reports committed=false.
+func (s *Store) CompleteIncidentSummary(ctx context.Context, incidentID, claim, snapshotJSON string, outcome IncidentSummary, now time.Time) (bool, error) {
+	var committed bool
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		var status, snapshot string
+		if err := tx.QueryRow(`SELECT status, snapshot_json FROM incident_summaries WHERE incident_id = ?`,
+			incidentID).Scan(&status, &snapshot); err != nil {
+			return err
+		}
+		if status != "running" {
+			committed = false
+			return nil
+		}
+		var claimOK string
+		if err := tx.QueryRow(`SELECT claim FROM incident_summaries WHERE incident_id = ? AND claim = ?`,
+			incidentID, claim).Scan(&claimOK); err == sql.ErrNoRows {
+			committed = false
+			return nil
+		} else if err != nil {
+			return err
+		}
+		if snapshot != snapshotJSON {
+			committed = false
+			return nil
+		}
+		citations, err := json.Marshal(outcome.Citations)
+		if err != nil {
+			return err
+		}
+		var suggestion any
+		if outcome.Suggestion != nil {
+			suggestion = *outcome.Suggestion
+		}
+		var in, out, cost any
+		if outcome.InputTokens != nil {
+			in = *outcome.InputTokens
+		}
+		if outcome.OutputTokens != nil {
+			out = *outcome.OutputTokens
+		}
+		if outcome.CostMicros != nil {
+			cost = *outcome.CostMicros
+		}
+		res, err := tx.Exec(`UPDATE incident_summaries SET status = ?, suggestion = ?,
+			final_priority = ?, clamped = ?, summary = ?, hypothesis = ?, confidence = ?,
+			reason = ?, citations_json = ?, input_tokens = ?, output_tokens = ?,
+			cost_micros = ?, error = ?, claim = '', lease_expires = 0, updated_at = ?
+			WHERE incident_id = ? AND claim = ? AND status = 'running'`,
+			outcome.Status, suggestion, outcome.FinalPriority, outcome.Clamped,
+			outcome.Summary, outcome.Hypothesis, outcome.Confidence, outcome.Reason,
+			string(citations), in, out, cost, outcome.Error, nanos(now), incidentID, claim)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		committed = n == 1
+		return nil
+	})
+	return committed, err
+}
+
+// SummaryMember is one briefings row behind the deterministic snapshot
+// selection: priority, kind and bounded display text.
+type SummaryMember struct {
+	BriefingID string
+	Priority   string
+	Kind       string
+	CreatedAt  time.Time
+	What       string
+	Context    string
+	Check      string
+}
+
+// SummaryMembers selects at most maxSummaryMembers member briefings by
+// a documented deterministic policy: priority rank descending, then
+// oldest first, then briefing ID. The first row establishes the
+// incident's priority floor, so the floor member is always sampled.
+// Every text field is capped (512 runes) before serialization; the
+// snapshot layer enforces the 32 KiB provider-bound budget over the
+// capped selection and states sampled/omitted counts explicitly.
+func (s *Store) SummaryMembers(ctx context.Context, incidentID string, limit int) ([]SummaryMember, int, error) {
+	if limit <= 0 || limit > maxSummaryMembers {
+		limit = maxSummaryMembers
+	}
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM incident_members WHERE incident_id = ?`,
+		incidentID).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT b.briefing_id, b.priority, b.kind, b.created_at,
+		b.what_changed, b.context, b.recommended_check
+		FROM incident_members m JOIN briefings b ON b.briefing_id = m.briefing_id
+		WHERE m.incident_id = ?
+		ORDER BY CASE b.priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END DESC,
+			m.member_created_at ASC, m.briefing_id ASC LIMIT ?`, incidentID, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []SummaryMember
+	for rows.Next() {
+		var m SummaryMember
+		var created int64
+		if err := rows.Scan(&m.BriefingID, &m.Priority, &m.Kind, &created, &m.What, &m.Context, &m.Check); err != nil {
+			return nil, 0, err
+		}
+		m.CreatedAt = fromNanos(created)
+		m.What = capSummaryRunes(m.What, 512)
+		m.Context = capSummaryRunes(m.Context, 512)
+		m.Check = capSummaryRunes(m.Check, 512)
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	omitted := total - len(out)
+	if omitted < 0 {
+		omitted = 0
+	}
+	return out, omitted, nil
+}
+
+// MaxSummaryMembersForSnapshot exposes the bounded evidence snapshot
+// size to the summary builder without exporting the queue internals.
+func MaxSummaryMembersForSnapshot() int { return maxSummaryMembers }
+
+func capSummaryRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
+}

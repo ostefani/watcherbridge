@@ -166,6 +166,7 @@ type PurgeReport struct {
 	IncidentPending     int64
 	IncidentPendingRefs int64
 	IncidentRefs        int64
+	Summaries           int64 // closed-incident summary rows; children drained before incidents
 	Bookkeeping         int64 // purge_state upserts sharing the row budget
 }
 
@@ -191,13 +192,14 @@ func (r *PurgeReport) add(o PurgeReport) {
 	r.IncidentPending += o.IncidentPending
 	r.IncidentPendingRefs += o.IncidentPendingRefs
 	r.IncidentRefs += o.IncidentRefs
+	r.Summaries += o.Summaries
 	r.Bookkeeping += o.Bookkeeping
 }
 
 func (r PurgeReport) total() int64 {
 	return r.BriefingLinks + r.Briefings + r.Traces + r.Groups + r.GroupLinks + r.GroupEvents + r.Ports +
 		r.Observations + r.Progress + r.RawEvents + r.Subjects + r.Sources + r.Pseudonyms + r.Decisions + r.Rules + r.Heartbeats +
-		r.Incidents + r.IncidentMembers + r.IncidentPending + r.IncidentPendingRefs + r.IncidentRefs
+		r.Incidents + r.IncidentMembers + r.IncidentPending + r.IncidentPendingRefs + r.IncidentRefs + r.Summaries
 }
 
 // purgeStages selects which table families one batch transaction covers.
@@ -375,6 +377,8 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				report.IncidentPendingRefs += n
 			case "incident_references":
 				report.IncidentRefs += n
+			case "incident_summaries":
+				report.Summaries += n
 			}
 			return nil
 		}
@@ -410,10 +414,23 @@ func (s *Store) purgeBatch(ctx context.Context, now time.Time, plan purgePlan) (
 				(SELECT i.incident_id FROM incidents i WHERE i.status = 'closed' AND i.closed_at < ? AND NOT EXISTS(SELECT 1 FROM operator_decisions d WHERE d.subject_kind='incident' AND d.subject_id=i.incident_id AND d.created_at>=?)) ORDER BY rowid LIMIT ?)`, limit, plan.incidentCut, plan.decisionCut, limit); err != nil {
 				return err
 			}
+			// Summaries are children of incidents: they drain under the
+			// same decision pin once members and references are gone,
+			// explicitly before the incident parent so cascades stay
+			// empty and RowsAffected stays exact. Retained summaries
+			// keep their snapshot/alias/citation audit and their
+			// restoration mappings until the incident itself drains.
+			limit = deleteLimit()
+			if err := take("incident_summaries", plan.incidentCut, `DELETE FROM incident_summaries WHERE rowid IN (SELECT rowid FROM incident_summaries WHERE incident_id IN
+				(SELECT i.incident_id FROM incidents i WHERE i.status = 'closed' AND i.closed_at < ? AND NOT EXISTS(SELECT 1 FROM operator_decisions d WHERE d.subject_kind='incident' AND d.subject_id=i.incident_id AND d.created_at>=?))
+				AND NOT EXISTS (SELECT 1 FROM incident_members WHERE incident_members.incident_id = incident_summaries.incident_id)
+				AND NOT EXISTS (SELECT 1 FROM incident_references WHERE incident_references.incident_id = incident_summaries.incident_id) ORDER BY rowid LIMIT ?)`, limit, plan.incidentCut, plan.decisionCut, limit); err != nil {
+				return err
+			}
 			limit = deleteLimit()
 			if err := take("incidents", plan.incidentCut, `DELETE FROM incidents WHERE rowid IN (SELECT rowid FROM incidents WHERE status = 'closed' AND closed_at < ?
 				AND NOT EXISTS(SELECT 1 FROM operator_decisions d WHERE d.subject_kind='incident' AND d.subject_id=incidents.incident_id AND d.created_at>=?)
-				AND NOT EXISTS (SELECT 1 FROM incident_members WHERE incident_members.incident_id = incidents.incident_id) AND NOT EXISTS(SELECT 1 FROM incident_references WHERE incident_references.incident_id=incidents.incident_id) ORDER BY closed_at, rowid LIMIT ?)`, limit, plan.incidentCut, plan.decisionCut, limit); err != nil {
+				AND NOT EXISTS (SELECT 1 FROM incident_members WHERE incident_members.incident_id = incidents.incident_id) AND NOT EXISTS(SELECT 1 FROM incident_references WHERE incident_references.incident_id=incidents.incident_id) AND NOT EXISTS (SELECT 1 FROM incident_summaries WHERE incident_summaries.incident_id = incidents.incident_id) ORDER BY closed_at, rowid LIMIT ?)`, limit, plan.incidentCut, plan.decisionCut, limit); err != nil {
 				return err
 			}
 			// A briefing a retained decision still references cannot
@@ -718,6 +735,13 @@ func (s *Store) refillProtectedTokensPaged(ctx context.Context, briefingCut, dec
 			return 0, 0, err
 		}
 		if current <= fence && decCurrent <= decFence {
+			// Retained summaries carry tokenized snapshots and restored
+			// display text: their mappings retire with the incident,
+			// never before. The summary scan is bounded per page and
+			// runs once per successful briefing discovery.
+			if err := s.protectSummaryTokens(ctx, scanPage, writePage); err != nil {
+				return 0, 0, err
+			}
 			return fence, decFence, nil
 		}
 		if decCurrent > decFence {
@@ -798,6 +822,54 @@ func (s *Store) refillProtectedTokensThrough(ctx context.Context, briefingCut, d
 		if scanned < int64(scanPage) {
 			return nil
 		}
+	}
+}
+
+// protectSummaryTokens scans retained incident summaries (open incidents
+// plus closed ones) for token references so their restoration mappings
+// survive until the incident itself drains. Paged by incident_id; every
+// page commits in its own bounded writer transaction.
+func (s *Store) protectSummaryTokens(ctx context.Context, scanPage, writePage int) error {
+	after := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT incident_id, COALESCE(snapshot_json, ''), COALESCE(summary, ''), COALESCE(hypothesis, '') FROM incident_summaries
+			WHERE incident_id > ? ORDER BY incident_id ASC LIMIT ?`, after, scanPage)
+		if err != nil {
+			return err
+		}
+		seen := map[string]struct{}{}
+		var tokens []string
+		count := 0
+		last := after
+		for rows.Next() {
+			var id, snapshot, summary, hypothesis string
+			if err := rows.Scan(&id, &snapshot, &summary, &hypothesis); err != nil {
+				rows.Close()
+				return err
+			}
+			tokens = appendProtectedTokens(seen, tokens, snapshot)
+			tokens = appendProtectedTokens(seen, tokens, summary)
+			tokens = appendProtectedTokens(seen, tokens, hypothesis)
+			last = id
+			count++
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		if len(tokens) > 0 {
+			if err := s.storeProtectedTokensPaged(ctx, tokens, writePage); err != nil {
+				return err
+			}
+		}
+		if count < scanPage {
+			return nil
+		}
+		after = last
 	}
 }
 
@@ -903,13 +975,14 @@ func addPurgeRunCounts(tx *sql.Tx, runID int64, report PurgeReport) error {
 		incident_pending_deleted=incident_pending_deleted+?,
 		incident_pending_refs_deleted=incident_pending_refs_deleted+?,
 		incident_refs_deleted=incident_refs_deleted+?,
+		summaries_deleted = summaries_deleted + ?,
 		bookkeeping_writes = bookkeeping_writes + ?
 		WHERE run_id = ?`,
 		report.BriefingLinks, report.Briefings, report.Traces, report.Groups, report.GroupLinks,
 		report.GroupEvents,
 		report.Ports, report.Observations, report.Progress, report.RawEvents,
 		report.Subjects, report.Sources, report.Pseudonyms, report.Decisions, report.Rules, report.Heartbeats,
-		report.Incidents, report.IncidentMembers, report.IncidentPending, report.IncidentPendingRefs, report.IncidentRefs, report.Bookkeeping,
+		report.Incidents, report.IncidentMembers, report.IncidentPending, report.IncidentPendingRefs, report.IncidentRefs, report.Summaries, report.Bookkeeping,
 		runID)
 	return err
 }

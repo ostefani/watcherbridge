@@ -24,9 +24,11 @@ func dropIncidentSchema(t *testing.T, db *sql.DB) {
 		`DROP TABLE IF EXISTS incident_pending`,
 		`DROP TABLE IF EXISTS incident_references`,
 		`DROP TABLE IF EXISTS incident_members`,
+		`DROP TABLE IF EXISTS incident_summaries`,
 		`DROP TABLE IF EXISTS incidents`,
 		`DROP TABLE IF EXISTS incident_progress`,
 		`DROP INDEX IF EXISTS incidents_status_closed`,
+		`DROP INDEX IF EXISTS incident_summaries_status`,
 		`DROP INDEX IF EXISTS decisions_generated`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
@@ -35,7 +37,7 @@ func dropIncidentSchema(t *testing.T, db *sql.DB) {
 	}
 	dropColumnIfExists(t, db, "purge_runs", "incidents_deleted")
 	dropColumnIfExists(t, db, "purge_runs", "incident_members_deleted")
-	for _, col := range []string{"incident_pending_deleted", "incident_pending_refs_deleted", "incident_refs_deleted"} {
+	for _, col := range []string{"incident_pending_deleted", "incident_pending_refs_deleted", "incident_refs_deleted", "summaries_deleted"} {
 		dropColumnIfExists(t, db, "purge_runs", col)
 	}
 }

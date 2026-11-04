@@ -173,6 +173,10 @@ func TestIncidentAlternativeWindowProgressSurvivesUpgradeAndRestart(t *testing.T
 	if _, err = s.db.Exec(`ALTER TABLE incident_pending DROP COLUMN formation_before`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = s.db.Exec(`DROP TABLE IF EXISTS incident_summaries`); err != nil {
+		t.Fatal(err)
+	}
+	dropColumnIfExists(t, s.db, "purge_runs", "summaries_deleted")
 	if _, err = s.db.Exec(`PRAGMA user_version=27`); err != nil {
 		t.Fatal(err)
 	}

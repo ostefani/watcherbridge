@@ -203,6 +203,12 @@ type Config struct {
 	IncidentQuiet     time.Duration
 	IncidentMinRefs   int
 	IncidentRetention time.Duration
+	// Optional AI summary of a closed incident (Plan incident-summary
+	// addition, Designv9 §7): default off, generated once after close
+	// from fixed membership using briefing.Resolve. Enabling applies
+	// to subsequent closures only; historical incidents are never
+	// backfilled automatically.
+	IncidentSummaryEnabled bool
 
 	GrouperTick          time.Duration
 	OverviewWindow       time.Duration // default overview window; window <= max <= briefing retention
@@ -277,21 +283,22 @@ func Default() Config {
 		GroupMaxWindow:   120 * time.Second,
 		GroupMaxEvents:   10,
 
-		BriefingRetention:   30 * 24 * time.Hour,
-		SubjectRetention:    90 * 24 * time.Hour,
-		PurgeInterval:       6 * time.Hour,
-		SnoozeDefault:       24 * time.Hour,
-		DecisionRetention:   180 * 24 * time.Hour,
-		RuleProposeAfter:    3,
-		RuleDefaultTTL:      90 * 24 * time.Hour,
-		RulePurgeAfter:      180 * 24 * time.Hour,
-		HeartbeatStaleAfter: 10 * time.Minute,
-		HeartbeatRetention:  7 * 24 * time.Hour,
-		IncidentTick:        30 * time.Second,
-		IncidentWindow:      5 * time.Minute,
-		IncidentQuiet:       120 * time.Second,
-		IncidentMinRefs:     3,
-		IncidentRetention:   90 * 24 * time.Hour,
+		BriefingRetention:      30 * 24 * time.Hour,
+		SubjectRetention:       90 * 24 * time.Hour,
+		PurgeInterval:          6 * time.Hour,
+		SnoozeDefault:          24 * time.Hour,
+		DecisionRetention:      180 * 24 * time.Hour,
+		RuleProposeAfter:       3,
+		RuleDefaultTTL:         90 * 24 * time.Hour,
+		RulePurgeAfter:         180 * 24 * time.Hour,
+		HeartbeatStaleAfter:    10 * time.Minute,
+		HeartbeatRetention:     7 * 24 * time.Hour,
+		IncidentTick:           30 * time.Second,
+		IncidentWindow:         5 * time.Minute,
+		IncidentQuiet:          120 * time.Second,
+		IncidentMinRefs:        3,
+		IncidentRetention:      90 * 24 * time.Hour,
+		IncidentSummaryEnabled: false,
 
 		GrouperTick:          1 * time.Second,
 		OverviewWindow:       24 * time.Hour,
@@ -679,6 +686,15 @@ func (c Config) Validate() error {
 	}
 	if c.IncidentRetention > c.SubjectRetention {
 		return fmt.Errorf("incident retention %v must not exceed subject retention %v", c.IncidentRetention, c.SubjectRetention)
+	}
+	// Incident summaries reuse the existing provider transport, endpoint
+	// security, cancellation, response limits and accounting: no separate
+	// spending policy is introduced by enabling them. The startup wiring
+	// additionally asserts the configured provider exposes the explicit
+	// incident-summary capability; config validation keeps the shared
+	// provider budgets intact here.
+	if c.IncidentSummaryEnabled && c.ProviderTimeout <= 0 {
+		return fmt.Errorf("incident summaries require a positive provider timeout")
 	}
 	if c.RuleProposeAfter < 1 {
 		return fmt.Errorf("rule propose-after %d must be at least 1", c.RuleProposeAfter)

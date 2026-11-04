@@ -18,6 +18,7 @@ import (
 	"github.com/ostefani/watcherbridge/internal/config"
 	"github.com/ostefani/watcherbridge/internal/forwarder"
 	"github.com/ostefani/watcherbridge/internal/health"
+	"github.com/ostefani/watcherbridge/internal/incidentsummary"
 	"github.com/ostefani/watcherbridge/internal/provider"
 	"github.com/ostefani/watcherbridge/internal/redactor"
 	"github.com/ostefani/watcherbridge/internal/server"
@@ -63,6 +64,7 @@ func main() {
 	incidentQuiet := fs.Duration("incident-quiet", def.IncidentQuiet, "incident quiet close (min one tick)")
 	incidentMinRefs := fs.Int("incident-min-refs", def.IncidentMinRefs, "distinct qualified references per incident (min 2)")
 	incidentRet := fs.Duration("incident-retention", def.IncidentRetention, "retained closed incidents (min 24h, max subject retention)")
+	incidentSummary := fs.Bool("incident-summary-enabled", def.IncidentSummaryEnabled, "generate one AI summary after each incident closes (opt-in)")
 	tick := fs.Duration("grouper-tick", def.GrouperTick, "worker tick")
 	lease := fs.Duration("processing-lease", def.ProcessingLease, "stale processing lease")
 	agentTimeout := fs.Duration("agent-timeout", def.AgentTimeout, "bounded investigator loop run budget")
@@ -107,6 +109,11 @@ func main() {
 	cfg.IncidentQuiet = *incidentQuiet
 	cfg.IncidentMinRefs = *incidentMinRefs
 	cfg.IncidentRetention = *incidentRet
+	if *incidentSummary {
+		cfg.IncidentSummaryEnabled = true
+	} else if os.Getenv("INCIDENT_SUMMARY_ENABLED") == "true" {
+		cfg.IncidentSummaryEnabled = true
+	}
 	cfg.GrouperTick = *tick
 	cfg.OverviewWindow = *overviewWindow
 	cfg.OverviewMaxWindow = *overviewMax
@@ -243,11 +250,41 @@ func main() {
 	// triggers an overview refresh for the attention cut.
 	incidentSettings := store.IncidentSettings{
 		Window: cfg.IncidentWindow, Quiet: cfg.IncidentQuiet, MinRefs: cfg.IncidentMinRefs,
+		SummaryEnabled: cfg.IncidentSummaryEnabled,
 	}
 	incidentDone := make(chan error, 1)
 	go func() {
 		incidentDone <- runIncidentLoop(ctx, st, hub, ov, cfg.IncidentTick, incidentSettings)
 	}()
+
+	// The closed-incident summary worker sits beside them on the same
+	// terms: one worker, one durable queue capped at 100 outstanding
+	// jobs, no blocking of correlation, ingestion or briefing work.
+	// Enabling applies to subsequent closures only. Completion reuses
+	// incident SSE invalidation and reconnect/resync behavior (one
+	// incident event plus an overview refresh) without changing
+	// membership, reopening incidents, modifying decisions or
+	// publishing scanner annotations.
+	summaryDone := make(chan error, 1)
+	if cfg.IncidentSummaryEnabled {
+		summarizer, ok := prov.(provider.Summarizer)
+		if !ok {
+			log.Fatalf("incident summaries require a provider with explicit summary capability")
+		}
+		onSummary := func(incidentID string) {
+			hub.Broadcast("incident", viewer.IncidentEventOf(store.IncidentReport{Changed: []string{incidentID}}))
+			ov.Trigger()
+		}
+		go func() {
+			summaryDone <- incidentsummary.Run(ctx, incidentsummary.Deps{
+				Store: st, Provider: summarizer,
+				Redaction: redactor.Policy{Enabled: cfg.Redaction, MaxFieldChars: cfg.MaxFieldChars},
+				Now:       time.Now, Health: opHealth, OnComplete: onSummary,
+			})
+		}()
+	} else {
+		close(summaryDone)
+	}
 
 	workerDone := make(chan error, 1)
 	go func() {
@@ -299,6 +336,9 @@ func main() {
 	}
 	if err := <-incidentDone; err != nil {
 		log.Printf("incident loop: %v", err)
+	}
+	if err := <-summaryDone; err != nil {
+		log.Printf("summary loop: %v", err)
 	}
 	<-overviewDone
 	log.Print("watcherbridge: stopped")
