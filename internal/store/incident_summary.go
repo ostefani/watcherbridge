@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Closed-incident summaries (Plan incident-summary addition,
@@ -24,9 +26,9 @@ import (
 // skipped_overload and keeps deterministic presentation.
 //
 // Claim: running rows carry an opaque claim token and a lease expiry.
-// Completions commit only against the matching claim and snapshot;
-// the first committed terminal outcome wins and later/stale
-// completions are rejected.
+// Send reservations and received usage are durable independently of
+// completion. The first terminal outcome committed by the matching
+// claim and snapshot wins.
 const (
 	// maxSummaryQueue caps outstanding summary jobs. The close that
 	// would exceed it records skipped_overload instead of blocking
@@ -58,6 +60,7 @@ type IncidentSummary struct {
 	Claim         string
 	LeaseExpires  time.Time
 	Attempts      int
+	SendsReserved int
 	Floor         string
 	Suggestion    *string
 	FinalPriority string
@@ -94,7 +97,7 @@ func scanIncidentSummary(row interface {
 	var lease int64
 	var created, updated int64
 	var citations, snapshot, aliasMap string
-	if err := row.Scan(&out.IncidentID, &out.Status, &out.Claim, &lease, &out.Attempts,
+	if err := row.Scan(&out.IncidentID, &out.Status, &out.Claim, &lease, &out.Attempts, &out.SendsReserved,
 		&out.Floor, &suggestion, &out.FinalPriority, &out.Clamped,
 		&out.Summary, &out.Hypothesis, &confidence, &out.Reason,
 		&citations, &snapshot, &aliasMap, &out.Sampled, &out.Omitted,
@@ -175,7 +178,7 @@ func (s *Store) SummaryOutstanding(ctx context.Context) (int, error) {
 // GetIncidentSummary reads one incident's summary row, or sql.ErrNoRows.
 func (s *Store) GetIncidentSummary(ctx context.Context, incidentID string) (IncidentSummary, error) {
 	var out IncidentSummary
-	row := s.db.QueryRowContext(ctx, `SELECT incident_id, status, claim, lease_expires, attempts,
+	row := s.db.QueryRowContext(ctx, `SELECT incident_id, status, claim, lease_expires, attempts, sends_reserved,
 		floor, suggestion, final_priority, clamped, summary, hypothesis, confidence, reason,
 		citations_json, snapshot_json, alias_map_json, sampled, omitted,
 		input_tokens, output_tokens, cost_micros, error, created_at, updated_at
@@ -187,12 +190,10 @@ func (s *Store) GetIncidentSummary(ctx context.Context, incidentID string) (Inci
 }
 
 // ClaimIncidentSummary atomically claims the oldest pending job, or
-// reclaims an expired running lease. It reserves the attempt durably
-// (attempts+1, fresh claim+lease, snapshot cleared for the new run)
-// before any provider work, so a crash consumes the reservation and
-// recovers conservatively to deterministic fallback rather than
-// repeating an uncertain external call. ok is false when no job is
-// claimable.
+// reclaims an expired running lease. It preserves the exact snapshot,
+// send reservations and received usage across claims. The worker uses
+// any prior send reservation to settle uncertain dispatched work to
+// deterministic fallback instead of repeating an external call.
 func (s *Store) ClaimIncidentSummary(ctx context.Context, now time.Time) (IncidentSummary, string, bool, error) {
 	var out IncidentSummary
 	var claim string
@@ -213,7 +214,7 @@ func (s *Store) ClaimIncidentSummary(ctx context.Context, now time.Time) (Incide
 		}
 		claim = c
 		res, err := tx.Exec(`UPDATE incident_summaries SET status = 'running', claim = ?,
-			lease_expires = ?, attempts = attempts + 1, snapshot_json = '', alias_map_json = '{}',
+			lease_expires = ?, attempts = attempts + 1,
 			updated_at = ? WHERE incident_id = ? AND (status = 'pending' OR (status = 'running' AND lease_expires <= ?))`,
 			claim, nanos(now.Add(summaryLease)), nanos(now), id, nanos(now))
 		if err != nil {
@@ -222,7 +223,7 @@ func (s *Store) ClaimIncidentSummary(ctx context.Context, now time.Time) (Incide
 		if n, _ := res.RowsAffected(); n != 1 {
 			return sql.ErrNoRows
 		}
-		row := tx.QueryRow(`SELECT incident_id, status, claim, lease_expires, attempts,
+		row := tx.QueryRow(`SELECT incident_id, status, claim, lease_expires, attempts, sends_reserved,
 			floor, suggestion, final_priority, clamped, summary, hypothesis, confidence, reason,
 			citations_json, snapshot_json, alias_map_json, sampled, omitted,
 			input_tokens, output_tokens, cost_micros, error, created_at, updated_at
@@ -236,6 +237,34 @@ func (s *Store) ClaimIncidentSummary(ctx context.Context, now time.Time) (Incide
 		return IncidentSummary{}, "", false, err
 	}
 	return out, claim, true, nil
+}
+
+// ReserveSummarySend durably consumes one of the incident's two provider
+// sends before dispatch. It is guarded by the active claim.
+func (s *Store) ReserveSummarySend(ctx context.Context, incidentID, claim string, now time.Time) (bool, error) {
+	var reserved bool
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		res, err := tx.Exec(`UPDATE incident_summaries SET sends_reserved=sends_reserved+1, updated_at=?
+			WHERE incident_id=? AND claim=? AND status='running' AND sends_reserved<2`, nanos(now), incidentID, claim)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		reserved = n == 1
+		return err
+	})
+	return reserved, err
+}
+
+// RecordSummaryUsage persists accounting independently of terminal completion.
+func (s *Store) RecordSummaryUsage(ctx context.Context, incidentID, claim string, input, output int64, hasUsage bool, now time.Time) error {
+	if !hasUsage {
+		return nil
+	}
+	return s.write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE incident_summaries SET input_tokens=COALESCE(input_tokens,0)+?, output_tokens=COALESCE(output_tokens,0)+?, updated_at=? WHERE incident_id=? AND claim=? AND status='running'`, input, output, nanos(now), incidentID, claim)
+		return err
+	})
 }
 
 // ReserveSummarySnapshot stores the exact provider-bound snapshot and
@@ -306,12 +335,11 @@ func (s *Store) CompleteIncidentSummary(ctx context.Context, incidentID, claim, 
 		}
 		res, err := tx.Exec(`UPDATE incident_summaries SET status = ?, suggestion = ?,
 			final_priority = ?, clamped = ?, summary = ?, hypothesis = ?, confidence = ?,
-			reason = ?, citations_json = ?, input_tokens = ?, output_tokens = ?,
-			cost_micros = ?, error = ?, claim = '', lease_expires = 0, updated_at = ?
+			reason = ?, citations_json = ?, cost_micros = ?, input_tokens = COALESCE(?, input_tokens), output_tokens = COALESCE(?, output_tokens), error = ?, claim = '', lease_expires = 0, updated_at = ?
 			WHERE incident_id = ? AND claim = ? AND status = 'running'`,
 			outcome.Status, suggestion, outcome.FinalPriority, outcome.Clamped,
 			outcome.Summary, outcome.Hypothesis, outcome.Confidence, outcome.Reason,
-			string(citations), in, out, cost, outcome.Error, nanos(now), incidentID, claim)
+			string(citations), cost, in, out, outcome.Error, nanos(now), incidentID, claim)
 		if err != nil {
 			return err
 		}
@@ -332,6 +360,7 @@ type SummaryMember struct {
 	What       string
 	Context    string
 	Check      string
+	Seeds      []string
 }
 
 // SummaryMembers selects at most maxSummaryMembers member briefings by
@@ -346,16 +375,15 @@ func (s *Store) SummaryMembers(ctx context.Context, incidentID string, limit int
 		limit = maxSummaryMembers
 	}
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM incident_members WHERE incident_id = ?`,
+	if err := s.db.QueryRowContext(ctx, `SELECT member_count FROM incidents WHERE incident_id = ?`,
 		incidentID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT b.briefing_id, b.priority, b.kind, b.created_at,
-		b.what_changed, b.context, b.recommended_check
+		b.what_changed, b.context, b.recommended_check, m.refs_json
 		FROM incident_members m JOIN briefings b ON b.briefing_id = m.briefing_id
 		WHERE m.incident_id = ?
-		ORDER BY CASE b.priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END DESC,
-			m.member_created_at ASC, m.briefing_id ASC LIMIT ?`, incidentID, limit)
+		ORDER BY m.priority_rank DESC, m.member_created_at ASC, m.briefing_id ASC LIMIT ?`, incidentID, limit)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -364,8 +392,52 @@ func (s *Store) SummaryMembers(ctx context.Context, incidentID string, limit int
 	for rows.Next() {
 		var m SummaryMember
 		var created int64
-		if err := rows.Scan(&m.BriefingID, &m.Priority, &m.Kind, &created, &m.What, &m.Context, &m.Check); err != nil {
+		var refs string
+		if err := rows.Scan(&m.BriefingID, &m.Priority, &m.Kind, &created, &m.What, &m.Context, &m.Check, &refs); err != nil {
 			return nil, 0, err
+		}
+		var parsed []MemberRef
+		if json.Unmarshal([]byte(refs), &parsed) != nil {
+			return nil, 0, fmt.Errorf("invalid incident member references")
+		}
+		for _, ref := range parsed {
+			m.Seeds = append(m.Seeds, ref.Reference)
+		}
+		seedRows, err := s.db.QueryContext(ctx, `SELECT o.attributes_json FROM briefing_subjects bs
+			JOIN reported_observations o ON o.profile_id=bs.profile_id
+			WHERE bs.briefing_id=? ORDER BY o.reported_at DESC, o.observation_id DESC LIMIT 201`, m.BriefingID)
+		if err != nil {
+			return nil, 0, err
+		}
+		observationCount := 0
+		for seedRows.Next() {
+			observationCount++
+			if observationCount > 200 {
+				seedRows.Close()
+				return nil, 0, fmt.Errorf("retained summary observation metadata exceeds redaction bounds")
+			}
+			var attrs string
+			if err := seedRows.Scan(&attrs); err != nil {
+				seedRows.Close()
+				return nil, 0, err
+			}
+			var values any
+			if json.Unmarshal([]byte(attrs), &values) != nil {
+				seedRows.Close()
+				return nil, 0, fmt.Errorf("invalid retained summary metadata")
+			}
+			if err := collectSummarySeeds(values, "", &m.Seeds); err != nil {
+				seedRows.Close()
+				return nil, 0, err
+			}
+		}
+		if err := seedRows.Err(); err != nil {
+			seedRows.Close()
+			return nil, 0, err
+		}
+		seedRows.Close()
+		if len(m.Seeds) > 200 {
+			m.Seeds = m.Seeds[:200]
 		}
 		m.CreatedAt = fromNanos(created)
 		m.What = capSummaryRunes(m.What, 512)
@@ -381,6 +453,37 @@ func (s *Store) SummaryMembers(ctx context.Context, incidentID string, limit int
 		omitted = 0
 	}
 	return out, omitted, nil
+}
+
+func collectSummarySeeds(v any, key string, out *[]string) error {
+	if len(*out) >= 200 {
+		return fmt.Errorf("retained summary metadata exceeds redaction seed bound")
+	}
+	switch x := v.(type) {
+	case map[string]any:
+		for k, value := range x {
+			if err := collectSummarySeeds(value, strings.ToLower(k), out); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, value := range x {
+			if err := collectSummarySeeds(value, key, out); err != nil {
+				return err
+			}
+		}
+	case string:
+		switch key {
+		case "hostname", "name", "description", "device_type", "vendor", "identity_aliases", "aliases", "reported_id", "reference", "identity":
+			if x != "" {
+				if utf8.RuneCountInString(x) > 256 {
+					return fmt.Errorf("retained summary identifier exceeds redaction bound")
+				}
+				*out = append(*out, x)
+			}
+		}
+	}
+	return nil
 }
 
 // MaxSummaryMembersForSnapshot exposes the bounded evidence snapshot

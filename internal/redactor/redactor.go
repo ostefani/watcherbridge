@@ -69,6 +69,9 @@ type BundleInput struct {
 	Target   string
 	Baseline string
 	Events   []InputEvent
+	// SeedValues are retained identity spellings discovered outside the
+	// summarized prose. They are tokenized wherever they recur in leaves.
+	SeedValues []string
 }
 
 var (
@@ -692,6 +695,11 @@ func BuildBundle(ctx context.Context, st *store.Store, in BundleInput, pol Polic
 	for _, v := range decoded {
 		walkLeaves(v, "", b.discoverString)
 		b.discoverKeys(v)
+	}
+	for _, value := range in.SeedValues {
+		if value != "" {
+			b.addPending(catHost, strings.ToLower(value), value)
+		}
 	}
 	// Anchor and target seed the map typed: the anchor carries the host
 	// identity by construction ("mac:…", "host:…", "ip:…", or a scoped

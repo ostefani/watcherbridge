@@ -370,8 +370,8 @@ func TestSummaryGatesVerification(t *testing.T) {
 	if err != nil || committed {
 		t.Fatalf("stale claim committed: %v %v", committed, err)
 	}
-	// The reclaim cleared the snapshot identity, so the fresh claim
-	// re-reserves it before completing, exactly as the worker does.
+	// The reclaimed claim retains the snapshot identity; reserving the
+	// same value remains safe for a non-dispatched test setup.
 	if err := s.ReserveSummarySnapshot(ctx, bigID, claim2, string(raw), `{"M1":"x"}`, 20, 5, now); err != nil {
 		t.Fatal(err)
 	}

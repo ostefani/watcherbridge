@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS raw_received ON raw_events(received_at);
 CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadline_at);
 `
 
-const supportedSchemaVersion = 30
+const supportedSchemaVersion = 31
 
 // validateSchemaLineage is read-only so callers can reject unsupported
 // databases before the writable connection switches journal mode.
@@ -177,11 +177,60 @@ func migrate(db *sql.DB) error {
 			err = applyMigration(db, 29, migrateV29)
 		case 29:
 			err = applyMigration(db, 30, migrateV30)
+		case 30:
+			err = applyMigration(db, 31, migrateV31)
 		}
 		if err != nil {
 			return err
 		}
 		version++
+	}
+	return nil
+}
+
+// migrateV31 persists per-member priority ordering and independent
+// provider-send/accounting reservations for incident summaries.
+func migrateV31(tx *sql.Tx) error {
+	var memberRank, sends bool
+	for _, table := range []struct {
+		name   string
+		column string
+		target *bool
+	}{{"incident_members", "priority_rank", &memberRank}, {"incident_summaries", "sends_reserved", &sends}} {
+		rows, err := tx.Query(`PRAGMA table_info(` + table.name + `)`)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var cid, notnull, pk int
+			var name, typ string
+			var def any
+			if err := rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
+				rows.Close()
+				return err
+			}
+			if name == table.column {
+				*table.target = true
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+	}
+	stmts := []string{}
+	if !memberRank {
+		stmts = append(stmts, `ALTER TABLE incident_members ADD COLUMN priority_rank INTEGER NOT NULL DEFAULT 0`)
+	}
+	stmts = append(stmts, `UPDATE incident_members SET priority_rank = COALESCE((SELECT CASE b.priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END FROM briefings b WHERE b.briefing_id = incident_members.briefing_id), 0)`, `CREATE INDEX IF NOT EXISTS incident_members_summary_order ON incident_members(incident_id, priority_rank DESC, member_created_at ASC, briefing_id ASC)`)
+	if !sends {
+		stmts = append(stmts, `ALTER TABLE incident_summaries ADD COLUMN sends_reserved INTEGER NOT NULL DEFAULT 0`)
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
 	}
 	return nil
 }
