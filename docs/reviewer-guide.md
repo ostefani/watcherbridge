@@ -2,9 +2,15 @@
 
 This page is for hackathon reviewers and testers. It covers building the
 bridge and sending it either synthetic data or SubnetLens Pro reports.
-The synthetic route is the default recommendation: it needs no Pro binary
-and performs no network scan. Operational details live in
-[README.md](../README.md).
+Start with the synthetic demo: it needs no scanner or AI credentials and
+performs no network scan. For the optional scanner demo, download SubnetLens
+Pro and the reviewer license from the
+[reviewer-preview-1 release](https://github.com/ostefani/watcherbridge/releases/tag/review).
+**These Pro binaries are unsigned.** SubnetLens Pro is proprietary; its
+source code is not part of this submission. macOS, Windows, or endpoint security
+software may warn or block them. You do not need to override those
+protections: use the synthetic-webhook instructions below instead.
+
 
 ## 1. Prerequisites
 
@@ -15,12 +21,9 @@ and performs no network scan. Operational details live in
 - Bridge and event sender must run on the **same machine**: the bridge
   listens on loopback only (`127.0.0.1:8081` by default).
 - The optional SubnetLens Pro binaries and reviewer license are in the
-  [reviewer-preview-1 release](https://github.com/ostefani/watcherbridge/releases/tag/reviewer-preview-1).
+  [reviewer-preview-1 release](https://github.com/ostefani/watcherbridge/releases/tag/review).
   Choose Windows amd64, macOS arm64 (Apple silicon), macOS amd64 (Intel),
   or Linux amd64 as appropriate, and download `reviewer-license.zip`.
-- The Pro binaries are unsigned. macOS, Windows, or endpoint security
-  software may warn or block them. You do not need to override those
-  protections: use the synthetic-webhook instructions below instead.
 
 ## 2. Build and start the bridge
 
@@ -40,11 +43,16 @@ chmod 600 demo-data/webhook.secret
   -db ./demo-data/demo.db -scanrelay-url=
 ```
 
-Windows PowerShell, from the repository root (with Go 1.26+ and
+Windows PowerShell (with Go 1.26+ and
 MinGW-w64 GCC installed and available on `PATH`):
 
 ```powershell
+git clone https://github.com/ostefani/WatcherBridge.git
+Set-Location WatcherBridge
 New-Item -ItemType Directory -Force .\demo-data | Out-Null
+$reviewerIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+icacls .\demo-data /inheritance:r /grant:r "${reviewerIdentity}:(OI)(CI)F"
+if ($LASTEXITCODE -ne 0) { throw 'Could not restrict demo-data permissions' }
 $bytes = New-Object byte[] 32
 $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
 $rng.GetBytes($bytes)
@@ -57,15 +65,18 @@ $env:WEBHOOK_SECRET = $secret
 .\watcherbridge.exe -db .\demo-data\demo.db -scanrelay-url=
 ```
 
-Keep the bridge running. In another PowerShell window the mock sender
-reads the secret file directly; use the separate Pro config steps below
-when running the scanner.
+Run only the block for your platform. If you already cloned the repository,
+start in its root and skip the clone and directory-change commands. Use a
+new `demo-data` directory for the initial setup; do not regenerate its
+secret while a bridge or sender is using it. On Windows the directory ACL
+restricts the demo files to your account; the bridge reads its webhook
+secret from the process environment because its secret-file permission
+check uses Unix mode bits.
 
 This runs in tap mode, standalone with no relay dependency
-(`-scanrelay-url=` disables the optional relay integration). Open
-`http://127.0.0.1:8081/`. Without a model key everything works with
-clearly marked deterministic fallback briefings, so AI credentials are
-optional for a first pass.
+(`-scanrelay-url=` disables the optional relay integration). Without a
+model key the demo uses clearly marked deterministic fallback briefings,
+so AI credentials are optional for a first pass.
 
 WatcherBridge works alongside any existing relay or event consumer: in
 tap mode the sender delivers to the bridge and to the consumer
@@ -75,7 +86,7 @@ sender's reports.
 
 Leave the bridge running in this terminal. Open `http://127.0.0.1:8081/`
 in a browser on the same machine, then use one of the two sender options
-below in another terminal.
+below in another terminal, also in the repository root.
 
 ## 3. Sending data
 
@@ -100,26 +111,36 @@ py .\docs\reviewer-mock.py .\demo-data\webhook.secret
 
 The command should print `Synthetic event accepted: 202`. Each run uses
 a new event ID. Allow the 45-second grouping quiet window for the
-briefing to appear.
+briefing to appear, plus processing time. This fixture has a medium
+baseline, so it also qualifies for investigation when enabled in section 5.
 
 ### With SubnetLens Pro
 
-Download the matching Pro archive and `reviewer-license.zip` from the
-release linked above. Extract them into a `pro/` directory under the
+**Download:** [SubnetLens Pro binaries and reviewer license — reviewer-preview-1](https://github.com/ostefani/watcherbridge/releases/tag/reviewer-preview-1).
+
+**The Pro executables are not code-signed.** macOS Gatekeeper, Windows
+SmartScreen, or endpoint security may warn or block launch. If you cannot
+run the binary under your machine's security policy, use the synthetic
+demo above.
+
+Download the archive matching your OS and architecture, plus
+`reviewer-license.zip`. Extract them into a `pro/` directory under the
 WatcherBridge repository root so these files are available:
 `pro/subnetlens-pro` (or `pro/subnetlens-pro.exe`) and
 `pro/reviewer.license`. Pass the license path explicitly for both
 verification and watch mode; the default license filename is
-`subnetlens.license`, not `reviewer.license`. On Linux, make the binary
-executable with `chmod +x pro/subnetlens-pro`. On macOS, right-click the
-unsigned binary and choose **Open** if Gatekeeper blocks the first launch.
+`subnetlens.license`, not `reviewer.license`. On macOS/Linux, make the binary
+executable with `chmod +x pro/subnetlens-pro`.
 Use your own subnet or one you are authorized to scan. The synthetic
 route above needs none of these binaries and performs no scan.
 
 From the repository root, create a locked-down Pro webhook config that
 uses the same bridge secret:
 
+macOS/Linux:
+
 ```sh
+umask 077
 cat > demo-data/bridge.yaml <<EOF
 webhook_secret: $(cat demo-data/webhook.secret)
 endpoints:
@@ -127,6 +148,19 @@ endpoints:
     timeout: 10s
 EOF
 chmod 600 demo-data/bridge.yaml
+```
+
+Windows PowerShell (the `demo-data` ACL was set in section 2):
+
+```powershell
+$webhookSecret = (Get-Content -Raw .\demo-data\webhook.secret).Trim()
+@"
+webhook_secret: $webhookSecret
+endpoints:
+  - url: http://127.0.0.1:8081/webhook
+    timeout: 10s
+"@ | Set-Content -Path .\demo-data\bridge.yaml -Encoding ascii
+Remove-Variable webhookSecret
 ```
 
 Do not start a second bridge; keep the one from section 2 running. From
@@ -147,7 +181,8 @@ For Windows PowerShell, run:
   -watch-webhook-config (Resolve-Path .\demo-data\bridge.yaml).Path -license .\pro\reviewer.license
 ```
 
-Replace the example subnet. Watch interval and scan duration add to the
+Replace `192.168.1.0/24` with a subnet you are authorized to scan before
+running watch mode. Watch interval and scan duration add to the
 bridge's 45-second grouping window, so results may take longer than 45
 seconds after network activity.
 
@@ -174,15 +209,21 @@ The JSON body must echo the same `event_id`/`event_key`/`event_type`
   "identity_confidence":"high","alive":true}}
 ```
 
-The included `docs/reviewer-mock.py` sender constructs this envelope,
-generates a fresh timestamp and event ID, signs the exact request body,
+The included `docs/reviewer-mock.py` sender constructs the same envelope
+shape with synthetic host values, generates a fresh timestamp and event
+ID, signs the exact request body,
 and posts to loopback. Use that command for the reviewer demo; it avoids
 copying a stale timestamp or reusing an event ID.
 
-Status meanings: `202` stored; `401` bad signature or unknown secret;
-`400` unknown event type, split envelope, or stale timestamp (check clock
-skew). A briefing appears in the viewer after the grouping window
-(~45 seconds by default).
+Status meanings: `202` accepted (including an already accepted duplicate);
+`401` invalid signature or stale timestamp (check the shared secret and
+clock skew); `400` malformed request, unknown event type, or split
+envelope; `503` temporary admission failure, with retry guidance. In proxy
+mode, `502` means downstream forwarding failed; the event remains stored
+locally.
+Host-event briefings appear after the grouping window (~45 seconds by
+default) plus processing time. Heartbeats update source health and do not
+produce briefings; they use a separate [H1 payload contract](heartbeat-h1.md).
 
 ## 4. Suggested demo tour
 
@@ -191,23 +232,86 @@ skew). A briefing appears in the viewer after the grouping window
 2. Review actions: mark a briefing expected, snooze it, add a note. All
    stay local; the original scanner report is never modified.
 3. Health screen: ingest outcomes, delivery gaps, retention activity.
-4. Reset any time: stop the bridge, `rm -f demo-data/demo.db*`, restart.
+4. For a fresh demo, stop the bridge with Ctrl+C and restart using a new
+   database filename, such as `-db ./demo-data/demo-2.db`. Keep the same
+   secret and send another event. The previous database remains available.
 
 ## 5. Enabling AI explanations (optional)
+
+Stop the bridge with Ctrl+C and wait for it to exit before restarting.
+Choose the command for your platform and replace the model ID and full
+HTTPS Responses endpoint with values supplied for your account. These
+examples explicitly enable retained-evidence investigation.
+
+macOS/Linux: put the API key in a private file such as
+`demo-data/model-api-key`, set `chmod 600 demo-data/model-api-key`, and run:
 
 ```sh
 ./watcherbridge -secret-file ./demo-data/webhook.secret \
   -db ./demo-data/demo.db -scanrelay-url= \
   -model-provider meta -model-id '<your-model-id>' \
   -model-base-url '<your-https-responses-endpoint>' \
-  -model-key-file /absolute/path/to/model-api-key
+  -model-key-file ./demo-data/model-api-key \
+  -agent-enabled
 ```
 
-Add `-agent-enabled` to opt into the retained-evidence investigator
-(five fixed read-only tools, 90-second run budget). On slow networks,
-provider calls may need larger budgets, e.g. `-provider-timeout 3m
--agent-timeout 8m -processing-lease 17m`; without them, slow calls
-surface as marked fallback briefings instead of errors.
+Windows PowerShell: read the webhook secret from the existing file and
+enter the model key at the hidden prompt. Use environment credentials
+instead of `-secret-file` or `-model-key-file` on Windows:
+
+```powershell
+$env:WEBHOOK_SECRET = (Get-Content -Raw .\demo-data\webhook.secret).Trim()
+$modelKeyInput = Read-Host 'Model API key' -AsSecureString
+$env:MODEL_API_KEY = [System.Net.NetworkCredential]::new('', $modelKeyInput).Password
+Remove-Variable modelKeyInput
+.\watcherbridge.exe -db .\demo-data\demo.db -scanrelay-url= `
+  -model-provider meta -model-id '<your-model-id>' `
+  -model-base-url '<your-https-responses-endpoint>' `
+  -agent-enabled
+```
+
+Keep redaction enabled. Send a **new** synthetic event using section 3;
+existing fallback briefings are not regenerated on restart. The investigator
+is selected for medium-or-higher baselines by default; low-priority groups
+use the single-call path. It has five fixed read-only tools, at most four
+tool turns plus a final answer, and a default total run budget of 90 seconds.
+Tools read retained evidence; they do not scan or access the network.
+The model chooses whether to use tools, so a valid answer may have no tool
+trace. Check the briefing source and Health for the actual outcome.
+
+### Longer provider budgets
+
+If provider latency exhausts the defaults, stop the bridge and use this
+complete macOS/Linux command (with the same account-specific values):
+
+```sh
+./watcherbridge -secret-file ./demo-data/webhook.secret \
+  -db ./demo-data/demo.db -scanrelay-url= \
+  -model-provider meta -model-id '<your-model-id>' \
+  -model-base-url '<your-https-responses-endpoint>' \
+  -model-key-file ./demo-data/model-api-key \
+  -agent-enabled -provider-timeout 3m \
+  -agent-timeout 8m -processing-lease 17m
+```
+
+Windows PowerShell, after setting the two environment credentials above:
+
+```powershell
+.\watcherbridge.exe -db .\demo-data\demo.db -scanrelay-url= `
+  -model-provider meta -model-id '<your-model-id>' `
+  -model-base-url '<your-https-responses-endpoint>' `
+  -agent-enabled -provider-timeout 3m `
+  -agent-timeout 8m -processing-lease 17m
+```
+
+This changes the total investigator budget to **8 minutes**; `3m` is the
+provider attempt-and-repair cap, and individual investigator turns also
+share the remaining run time. The `17m` lease exceeds twice the run budget
+plus the required 30-second margin. These values pass startup validation;
+they do not guarantee a provider response. Timeouts, provider failures, or
+rejected output produce marked deterministic fallback briefings while
+preserving accepted reports. Allow the grouping window plus model time
+before expecting a result.
 
 ## 6. Notes for the thorough
 

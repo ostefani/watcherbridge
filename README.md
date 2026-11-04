@@ -13,7 +13,7 @@ The bridge runs locally with an embedded dashboard, SQLite storage, and optional
 
 ## What it does
 
-- **Prioritizes changes.** Deterministic rules set the priority floor. AI may raise it by one level, up to high; only rules produce critical.
+- **Shows what needs attention.** Each briefing shows a priority derived from deterministic rules over the reported changes, with the reasoning behind it. AI may raise that priority by one level, up to high; only rules produce critical.
 - **Explains with evidence.** Briefings link to original reports and retained host context. An optional investigator uses bounded, read-only tools over local history.
 - **Supports review.** Mark changes expected or unexpected, snooze items, and add notes or labels. Review decisions stay local.
 - **Protects provider context.** Redaction is enabled by default, and a final leak scan blocks unsafe provider requests. Model failures produce marked deterministic fallbacks.
@@ -27,7 +27,9 @@ Signed reports → Verify & store → Group → Prioritize → Explain or fallba
 
 ## Quick start
 
-Requires **Go 1.26+** and a **C compiler** for SQLite. The viewer is embedded; Node.js is needed only for frontend development. These commands use a macOS/Linux shell; see the [reviewer guide](docs/reviewer-guide.md) for Windows instructions.
+Requires **Go 1.26+** and a **C compiler** for SQLite. The viewer is embedded; Node.js is needed only for frontend development. The examples below use a POSIX shell.
+
+The [reviewer guide](docs/reviewer-guide.md) covers setup and demos on macOS, Linux, and Windows, including optional scanner integration.
 
 ```sh
 git clone https://github.com/ostefani/WatcherBridge.git
@@ -61,10 +63,11 @@ The live adapter uses the Meta Model API with a configurable model ID and endpoi
   -db ./demo-data/demo.db -scanrelay-url= \
   -model-provider meta -model-id '<your-model-id>' \
   -model-base-url '<your-https-responses-endpoint>' \
-  -model-key-file /absolute/path/to/model-api-key
+  -model-key-file /absolute/path/to/model-api-key \
+  -agent-enabled
 ```
 
-Keep redaction enabled for external providers. Add `-agent-enabled` for retained-evidence investigation. AI explanations are advisory; the bridge remains usable without a model key.
+This example enables retained-evidence investigation. Keep redaction enabled for external providers. AI explanations are advisory; the bridge remains usable without a model key.
 
 ## Operation and development
 
@@ -73,7 +76,7 @@ Keep redaction enabled for external providers. Add `-agent-enabled` for retained
 - Tap mode receives events independently of other consumers. Proxy mode (`-mode proxy`) forwards original signed bytes to the configured relay. `-scanrelay-url=` disables relay integration.
 - Built with Go, SQLite in WAL mode, Svelte 5, Vite, and Server-Sent Events. Use the Node.js version in [ui/.nvmrc](ui/.nvmrc) and `make ui-check` for viewer changes.
 
-See the [reviewer guide](docs/reviewer-guide.md) for the demo walkthrough and optional scanner setup, and [CONTRIBUTING.md](CONTRIBUTING.md) for engineering conventions.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for engineering conventions.
 
 ## Submission scope
 
