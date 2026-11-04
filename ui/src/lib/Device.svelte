@@ -213,18 +213,3 @@
     </section>
   </article>
 {/if}
-
-<style>
-  dl {
-    display: grid;
-    grid-template-columns: auto 1fr;
-    gap: 0.25rem 1rem;
-  }
-  dt {
-    font-weight: 600;
-  }
-  dd {
-    margin: 0;
-    overflow-wrap: anywhere;
-  }
-</style>

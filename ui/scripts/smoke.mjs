@@ -56,6 +56,9 @@ const { default: Health } = await import(pathToFileURL(join(out, 'Health.js')).h
 // eslint-disable-next-line no-unsanitized/method
 const { default: Incident } = await import(pathToFileURL(join(out, 'Incident.js')).href);
 
+// eslint-disable-next-line no-unsanitized/method
+const { default: AttentionList } = await import(pathToFileURL(join(out, 'AttentionList.js')).href);
+
 const zeroDigest = {
   weak_appearance: 0,
   weak_disappearance: 0,
@@ -401,8 +404,8 @@ const cases = [
     name: 'health with purge failure',
     props: { stream: 'live', initial: healthFixture },
     expect: [
-      'Coverage: degraded',
-      'Stuck groups awaiting operator: 1',
+      'data-state="degraded"',
+      'Awaiting operator</dt><dd>1',
       'Latest purge run failed',
       'disk I/O',
       'Latest fully successful purge',
@@ -456,7 +459,7 @@ const cases = [
       }),
       loadError: null
     },
-    expect: ['1 things to review', 'brf-grp-1', 'Priority: medium']
+    expect: ['1 things to review', 'brf-grp-1', 'data-priority="medium"']
   },
   {
     name: 'act with degraded coverage',
@@ -485,7 +488,7 @@ const cases = [
     },
     expect: [
       '1 need a check now',
-      'port_closed',
+      'Ports closed',
       'expected 1',
       'fallback ratio high',
       'Coverage is degraded',
@@ -555,7 +558,7 @@ const cases = [
       }),
       loadError: null
     },
-    expect: ['1 things to review', 'inc-11-22', '#/incidents/inc-11-22', 'Show members']
+    expect: ['1 things to review', 'inc-11-22', 'class="attention-row"', 'Show members']
   },
   {
     name: 'stale error keeps overview',
@@ -566,6 +569,13 @@ const cases = [
 ];
 
 let failed = 0;
+cases.push(
+  { component: AttentionList, name: 'standalone review navigation', props: { items: [attentionItem] }, expect: ['href="#/briefing/brf-grp-1"', 'Ports closed'] },
+  { component: AttentionList, name: 'standalone incident navigation', props: { items: [{ ...attentionItem, id: 'inc-11-22', kind: 'incident' }] }, expect: ['href="#/incidents/inc-11-22"', 'Show members'] },
+  { component: AttentionList, name: 'selected review button', props: { items: [attentionItem], selectedId: attentionItem.id, onselect: () => {} }, expect: ['<button', 'aria-current="true"', 'data-row'], absent: ['href="#/briefing/'] },
+  { component: Detail, name: 'embedded briefing keeps evidence and decisions', props: { id: 'brf-grp-1', initial: detailFixture, embedded: true }, expect: ['Reported evidence', 'Record decision', 'Recommended check'], absent: ['Back to Home', '<img'] }
+);
+
 for (const c of cases) {
   const { body } = render(c.component ?? Home, { props: c.props });
   // Strip SSR hydration markers, which split copy across expressions.

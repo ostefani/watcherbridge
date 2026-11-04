@@ -157,14 +157,18 @@
   });
 </script>
 
-<main>
-  <h1>WatcherBridge</h1>
+<a class="skip-link" href="#content" onclick={(event) => { event.preventDefault(); document.getElementById('content')?.focus(); }}>Skip to content</a>
+<div class="app-shell">
+<header class="app-header">
+  <a class="brand" href="#/" aria-label="WatcherBridge Home"><span class="brand-mark" aria-hidden="true">W</span>WatcherBridge</a>
   <nav aria-label="Views">
     <a href="#/" aria-current={route.name === 'home' ? 'page' : undefined}>Home</a>
     <a href="#/devices" aria-current={route.name === 'devices' || route.name === 'device' ? 'page' : undefined}>Reported hosts</a>
     <a href="#/health" aria-current={route.name === 'health' ? 'page' : undefined}>Health</a>
     <button type="button" onclick={() => (showHelp = !showHelp)} aria-expanded={showHelp}>Shortcuts</button>
   </nav>
+  <ConnectionStatus state={stream} />
+</header>
   {#if showHelp}
     <section aria-label="Keyboard shortcuts">
       <h2>Keyboard shortcuts</h2>
@@ -178,7 +182,8 @@
       <p>Shortcuts stay silent while typing. Briefing keys preset the composer; nothing submits on its own.</p>
     </section>
   {/if}
-  <ConnectionStatus state={stream} />
+  <main id="content" tabindex="-1">
+  <h1 class="sr-only">{({ home: 'Review overview', devices: 'Reported hosts', device: 'Reported host detail', briefing: 'Briefing', incident: 'Incident', health: 'Health' })[route.name]}</h1>
   {#key routeKey}
     {#if route.name === 'home'}
       <Home {overview} {loadError} />
@@ -195,54 +200,114 @@
     {/if}
   {/key}
 </main>
+<footer class="app-footer"><span>WatcherBridge · Local review workspace</span><span>Scanner reports are evidence, not a live inventory.</span></footer>
+</div>
 
 <style>
-  main {
-    font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
-    max-width: 48rem;
-    margin: 0 auto;
-    padding: 0 1rem 2rem;
-    line-height: 1.5;
-    color: #1a1a1a;
-    background: #fff;
+  .app-header {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px 28px;
+    padding: 12px 28px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
   }
-  h1 {
-    font-size: 1.5rem;
-    font-weight: 650;
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--text);
+    font-size: 18px;
+    font-weight: 700;
+    text-decoration: none;
+    letter-spacing: -0.5px;
+  }
+  .brand-mark {
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    background: var(--text);
+    color: var(--surface);
+    font-size: 17px;
   }
   nav {
     display: flex;
-    gap: 1rem;
-    margin-bottom: 1rem;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  nav a, nav button {
+    display: inline-flex;
+    align-items: center;
+    padding: 8px 14px;
+    min-height: 44px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    text-decoration: none;
+    color: var(--muted);
   }
   nav a[aria-current='page'] {
-    font-weight: 700;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 650;
   }
-  :global(a:focus-visible, button:focus-visible, summary:focus-visible) {
-    outline: 2px solid #1a1a1a;
-    outline-offset: 2px;
+  main {
+    max-width: 1500px;
+    margin: 0 auto;
+    padding: 28px;
+    min-height: calc(100dvh - 160px);
   }
-  kbd {
-    border: 1px solid #999;
-    padding: 0 0.3rem;
-    font-size: 0.85rem;
+  main:focus {
+    outline: none;
   }
-  @media (prefers-color-scheme: dark) {
+  .app-footer {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 16px 28px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .skip-link {
+    position: fixed;
+    left: 16px;
+    top: -100px;
+    z-index: 10;
+    padding: 12px;
+    background: var(--surface);
+  }
+  .skip-link:focus {
+    top: 12px;
+  }
+  section[aria-label='Keyboard shortcuts'] {
+    margin: 16px 28px;
+    padding: 20px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+  }
+  @media (max-width: 640px) {
+    .app-header {
+      padding: 12px 16px;
+      gap: 10px;
+    }
+    nav {
+      order: 3;
+      width: 100%;
+    }
+    nav a, nav button {
+      padding: 8px 10px;
+    }
     main {
-      color: #e8e8e8;
-      background: #111;
+      padding: 16px;
     }
-    :global(a) {
-      color: #8ab4f8;
-    }
-    :global(a:focus-visible, button:focus-visible, summary:focus-visible) {
-      outline-color: #e8e8e8;
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    :global(*) {
-      transition: none;
-      animation: none;
+    .app-footer {
+      padding: 16px;
     }
   }
 </style>

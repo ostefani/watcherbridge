@@ -149,12 +149,3 @@
     reload={load}
   />
 {/if}
-
-<style>
-  .pill {
-    border: 1px solid #999;
-    padding: 0 0.4rem;
-    font-size: 0.8rem;
-    margin-right: 0.4rem;
-  }
-</style>

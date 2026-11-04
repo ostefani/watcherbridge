@@ -36,23 +36,3 @@
     </ul>
   {/if}
 </section>
-
-<style>
-  .sources {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-  }
-  .sources > li {
-    border: 1px solid #ccc;
-    padding: 0.5rem 0.75rem;
-    margin-bottom: 0.5rem;
-    font-size: 0.9rem;
-  }
-  .pill {
-    border: 1px solid #999;
-    padding: 0 0.4rem;
-    font-size: 0.8rem;
-    margin-left: 0.4rem;
-  }
-</style>

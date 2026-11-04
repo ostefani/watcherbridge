@@ -1,4 +1,5 @@
 <script>
+  import { changeLabel } from './format.js';
   import { onDestroy, onMount } from 'svelte';
   import { fetchIncident } from '../api.js';
 
@@ -8,7 +9,7 @@
   // Incident rows expand inline to their member briefings; the member
   // list is cached until an update/reconnect/resync invalidates it, and a
   // fetch failure surfaces on the row, never as navigation.
-  let { items = [] } = $props();
+  let { items = [], selectedId = null, onselect = null } = $props();
 
   let expanded = $state(/** @type {Record<string, boolean>} */ ({}));
   let memberCache = $state(/** @type {Record<string, import('../wire.js').IncidentMember[]>} */ ({}));
@@ -76,26 +77,21 @@
     <ol class="attention" data-rows>
       {#each items as item (item.id)}
         <li data-status={item.status}>
-          {#if item.kind === 'briefing'}
-            <a data-row href={`#/briefing/${item.id}`}>
-              <span class="pill">Priority: {item.priority}</span>
-              <span class="pill">Status: {item.status}</span>
-              <span class="kind">{item.change_kind}</span>
-              <code>{item.id}</code>
-              <time datetime={item.created_at} title={item.created_at}
-                >{new Date(item.created_at).toLocaleString()}</time
-              >
-            </a>
-          {:else if item.kind === 'incident'}
-            <a data-row href={`#/incidents/${item.id}`}>
-              <span class="pill">Priority: {item.priority}</span>
-              <span class="pill">Status: {item.status}</span>
-              <span class="kind">{item.change_kind}</span>
-              <code>{item.id}</code>
-              <time datetime={item.created_at} title={item.created_at}
-                >{new Date(item.created_at).toLocaleString()}</time
-              >
-            </a>
+          {#snippet row()}
+            <span class="pill priority" data-priority={item.priority} aria-label={`Priority: ${item.priority}`}>{item.priority}</span>
+            <span class="row-main"><strong>{item.kind === 'incident' ? 'Incident · ' : ''}{changeLabel(item.change_kind)}</strong><code>{item.id}</code></span>
+            <span class="row-meta"><span class="pill">{item.status}</span><time datetime={item.created_at} title={item.created_at}>{new Date(item.created_at).toLocaleString()}</time></span>
+          {/snippet}
+          {#if item.kind === 'briefing' || item.kind === 'incident'}
+            {#if onselect}
+              <button class="attention-row" type="button" data-row aria-current={selectedId === item.id ? 'true' : undefined} onclick={() => onselect(item)}>{@render row()}</button>
+            {:else}
+              <a class="attention-row" data-row href={item.kind === 'briefing' ? `#/briefing/${item.id}` : `#/incidents/${item.id}`}>{@render row()}</a>
+            {/if}
+          {:else}
+            <div class="attention-row">{@render row()}</div>
+          {/if}
+          {#if item.kind === 'incident'}
             <button
               type="button"
               aria-expanded={expanded[item.id] ?? false}
@@ -117,42 +113,9 @@
                 {/each}
               </ol>
             {/if}
-          {:else}
-            <span class="pill">Priority: {item.priority}</span>
-            <span class="pill">Status: {item.status}</span>
-            <span class="kind">{item.change_kind}</span>
-            <code>{item.id}</code>
-            <time datetime={item.created_at} title={item.created_at}
-              >{new Date(item.created_at).toLocaleString()}</time
-            >
           {/if}
         </li>
       {/each}
     </ol>
   {/if}
 </section>
-
-<style>
-  .attention {
-    list-style: decimal;
-    margin: 0;
-    padding-left: 1.5rem;
-  }
-  .attention li {
-    margin-bottom: 0.5rem;
-    font-size: 0.9rem;
-  }
-  .pill {
-    border: 1px solid #999;
-    padding: 0 0.4rem;
-    font-size: 0.8rem;
-    margin-right: 0.4rem;
-  }
-  .kind {
-    margin-right: 0.4rem;
-  }
-  code {
-    font-size: 0.8rem;
-    margin-right: 0.4rem;
-  }
-</style>

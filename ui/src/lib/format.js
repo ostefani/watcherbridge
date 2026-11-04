@@ -54,3 +54,16 @@ export function classLabel(cls) {
       return 'Unknown class';
   }
 }
+
+/** Human-readable reported-change names; unknown values remain inert text. */
+export function changeLabel(kind) {
+  return ({ weak_appearance: 'Weak sightings', weak_disappearance: 'Weak disappearances',
+    port_closed: 'Ports closed', hostname_change: 'Hostname changes',
+    os_refinement: 'OS refinements', other: 'Other changes' })[kind] ?? kind;
+}
+
+/** Format the server's duration without changing the selected window. */
+export function windowLabel(value) {
+  const match = /^(\d+)h0m0s$/.exec(value);
+  return match ? `${match[1]} hours` : value;
+}

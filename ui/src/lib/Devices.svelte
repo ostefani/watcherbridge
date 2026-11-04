@@ -105,7 +105,7 @@
 
 <section aria-label="Reported hosts">
   <h2>Reported hosts</h2>
-  <p>Scanner-reported subjects. Classes distinguish device references, address context, unresolved events and legacy profiles.</p>
+  <p class="section-note">Scanner-reported subjects. Classes distinguish device references, address context, unresolved events and legacy profiles.</p>
   {#if loading && devices.length === 0}
     <p role="status">Loading reported hosts…</p>
   {:else if error !== null && devices.length === 0}
@@ -118,12 +118,15 @@
     {#if devices.length === 0}
       <p>No reported subjects retained.</p>
     {:else}
-      <ul data-rows>
+      <ul class="host-list" data-rows>
         {#each devices as dev (dev.profile_id)}
           {@const last = displayTime(dev.last_report_at)}
           <li>
             <a data-row href={`#/devices/${dev.profile_id}`}>
-              {dev.profile_id} — {classLabel(dev.class)}, last report {last.local}
+              <span class="host-icon" aria-hidden="true">▣</span>
+              <span class="row-main"><strong>{dev.operator_label || dev.reported_id || 'Unlabelled subject'}</strong><code>{dev.profile_id}</code><span>{classLabel(dev.class)}</span></span>
+              <span class="row-meta">Last report<time datetime={dev.last_report_at} title={last.utc}>{last.local}</time></span>
+              <span aria-hidden="true">→</span>
             </a>
           </li>
         {/each}

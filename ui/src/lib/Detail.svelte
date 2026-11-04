@@ -3,7 +3,7 @@
   import { fetchBriefing } from '../api.js';
   import { createFetchGuard } from './freshness.js';
   import { typingTarget } from './roving.js';
-  import { displayTime, sourceLabel } from './format.js';
+  import { displayTime, sourceLabel, changeLabel } from './format.js';
   import DecisionPanel from './DecisionPanel.svelte';
 
   // Briefing detail (Planv4 Step 24 order): Summary -> Why this
@@ -14,7 +14,7 @@
   // initial carries a server snapshot for prerender/tests: when set
   // the screen renders it without fetching, exactly as a completion
   // would. Production mounts omit it and fetch.
-  let { id, initial = null } = $props();
+  let { id, initial = null, embedded = false } = $props();
 
   const guard = createFetchGuard();
   onDestroy(() => guard.invalidate());
@@ -107,11 +107,11 @@
   <p role="status">Loading briefing…</p>
 {:else}
   <article aria-label="Briefing shown">
-    <p><a href="#/">Back to Home</a></p>
+    {#if !embedded}<p><a href="#/">← Back to Home</a></p>{/if}
 
     <section aria-label="Summary">
       <h2>{shown.priority}: {shown.what_changed}</h2>
-      <p>Reported change: {shown.kind}. Reported by {shown.host}.</p>
+      <p>Reported change: {changeLabel(shown.kind)}. Reported by {shown.host}.</p>
     </section>
 
     <section aria-label="Why this priority">
@@ -280,33 +280,3 @@
     </section>
   </article>
 {/if}
-
-<style>
-  .stepper {
-    list-style: none;
-    padding-left: 0;
-  }
-  .stepper li {
-    padding: 0.25rem 0;
-  }
-  dl {
-    display: grid;
-    grid-template-columns: auto 1fr;
-    gap: 0.25rem 1rem;
-  }
-  dt {
-    font-weight: 600;
-  }
-  dd {
-    margin: 0;
-    overflow-wrap: anywhere;
-  }
-  details {
-    border: 1px solid #ccc;
-    padding: 0.5rem 0.75rem;
-    margin-bottom: 0.5rem;
-  }
-  summary {
-    cursor: pointer;
-  }
-</style>

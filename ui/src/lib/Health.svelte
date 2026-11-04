@@ -74,21 +74,22 @@
 
 <section aria-label="Health">
   <h2>Health</h2>
+  <p class="section-note">Source coverage, processing, and retention. Liveness describes the source, not host presence.</p>
   {#if error !== null && shown === null}
-    <p role="alert">The bridge did not return shown ({error}).</p>
+    <p role="alert">The bridge did not return health ({error}).</p>
     <button type="button" onclick={load}>Retry</button>
   {:else if shown === null}
-    <p role="status">Loading shown…</p>
+    <p role="status">Loading health…</p>
   {:else}
     <section aria-label="Summary">
       <h3>Summary</h3>
-      <ul>
-        <li>Coverage: {shown.coverage}</li>
-        <li>Fallback briefings (1h): {shown.fallback_1h.used} of {shown.fallback_1h.total}</li>
-        <li>Stuck groups awaiting operator: {shown.parked_groups}</li>
-        <li>Forward errors (1h): {shown.forward_errors_1h}</li>
-        <li>Ingest queue: {shown.queue_depth} of {shown.queue_cap}</li>
-      </ul>
+      <dl class="health-metrics">
+        <div><dt>Coverage</dt><dd><span class="pill" data-state={shown.coverage}>{shown.coverage}</span></dd></div>
+        <div><dt>Fallback briefings · 1h</dt><dd>{shown.fallback_1h.used} <small>of {shown.fallback_1h.total}</small></dd></div>
+        <div><dt>Awaiting operator</dt><dd>{shown.parked_groups}</dd></div>
+        <div><dt>Forward errors · 1h</dt><dd>{shown.forward_errors_1h}</dd></div>
+        <div><dt>Ingest queue</dt><dd>{shown.queue_depth} <small>of {shown.queue_cap}</small></dd></div>
+      </dl>
       {#if (shown.coverage_reasons ?? []).length > 0}
         <ul>
           {#each shown.coverage_reasons as reason (reason)}
@@ -222,26 +223,3 @@
     {/if}
   {/if}
 </section>
-
-<style>
-  dl {
-    display: grid;
-    grid-template-columns: auto 1fr;
-    gap: 0.25rem 1rem;
-  }
-  dt {
-    font-weight: 600;
-  }
-  dd {
-    margin: 0;
-    overflow-wrap: anywhere;
-  }
-  details {
-    border: 1px solid #ccc;
-    padding: 0.5rem 0.75rem;
-    margin-bottom: 0.5rem;
-  }
-  summary {
-    cursor: pointer;
-  }
-</style>
