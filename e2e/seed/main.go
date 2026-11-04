@@ -332,6 +332,7 @@ func downgradeToV13(path string) {
 		`DROP TABLE IF EXISTS incident_pending_refs`,
 		`DROP TABLE IF EXISTS incident_pending`,
 		`DROP TABLE IF EXISTS incident_references`,
+		`DROP TABLE IF EXISTS incident_summaries`,
 		`DROP TABLE IF EXISTS incident_members`,
 		`DROP TABLE IF EXISTS incidents`,
 		`DROP TABLE IF EXISTS incident_progress`,

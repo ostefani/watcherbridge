@@ -585,7 +585,7 @@ RAW0="$(db_count mig.db raw_events)"
 BRF0="$(db_count mig.db briefings)"
 T0="$(date +%s)"
 start_bridge tap mig.db
-[ "$(db_version mig.db)" = 29 ] || fail "migration did not reach v29"
+[ "$(db_version mig.db)" = 31 ] || fail "migration did not reach v31"
 python3 "$ROOT/e2e/snapshot.py" verify "$DATA/mig.db" "$DATA/mig-before.json" || fail "migration preservation"
 [ "$(db_count mig.db raw_events)" = "$RAW0" ] || fail "migration lost raw events"
 [ "$(db_count mig.db briefings)" = "$BRF0" ] || fail "migration lost briefings"
@@ -603,13 +603,13 @@ BRIDGE_PID=$!
 MIG_HIT=0
 for _ in $(seq 1 100); do
   version="$(db_version migk.db 2>/dev/null || echo 0)"
-  if kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$version" -gt 13 ] && [ "$version" -lt 29 ]; then MIG_HIT=1; break; fi
+  if kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$version" -gt 13 ] && [ "$version" -lt 31 ]; then MIG_HIT=1; break; fi
   sleep 0.01
 done
 [ "$MIG_HIT" = 1 ] || pending "MIGK intermediate migration version not observed while bridge ran; interruption unproved"
 kill9_bridge
 start_bridge tap migk.db
-[ "$(db_version migk.db)" = 29 ] || fail "recovery did not reach v29"
+[ "$(db_version migk.db)" = 31 ] || fail "recovery did not reach v31"
 python3 "$ROOT/e2e/snapshot.py" verify "$DATA/migk.db" "$DATA/migk-before.json" || fail "migration restart preservation"
 [ "$(db_count migk.db raw_events)" = 60 ] || fail "recovery lost raw events"
 stop_bridge
