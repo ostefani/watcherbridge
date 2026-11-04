@@ -211,9 +211,23 @@ func BuildSnapshot(ctx context.Context, st *store.Store, incident store.Incident
 		}
 		events = append(events, redactor.InputEvent{EventID: alias, Payload: payload})
 	}
+	retainedSeeds := []string{incident.SourceScope}
+	seedSet := map[string]struct{}{}
+	for _, member := range members {
+		for _, seed := range member.Seeds {
+			if _, ok := seedSet[seed]; ok {
+				continue
+			}
+			seedSet[seed] = struct{}{}
+			retainedSeeds = append(retainedSeeds, seed)
+			if len(retainedSeeds) > 200 {
+				return nil, nil, nil, nil, 0, 0, "summary identity metadata exceeds redaction bounds; no model summary"
+			}
+		}
+	}
 	bundle, issued, display, err := redactor.BuildBundle(ctx, st, redactor.BundleInput{
 		GroupID: incident.IncidentID, Anchor: incident.Target, Target: incident.Target,
-		Baseline: incident.Floor, Events: events,
+		Baseline: incident.Floor, Events: events, SeedValues: retainedSeeds,
 	}, pol)
 	if err != nil {
 		return nil, nil, nil, nil, 0, 0, "summary redaction failed; no model summary"

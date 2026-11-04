@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -105,6 +106,70 @@ func TestIncidentSummaryQueue(t *testing.T) {
 	}
 	if over.Status != "skipped" || over.Error != "skipped_overload" {
 		t.Fatalf("over row = %+v", over)
+	}
+}
+
+func TestIncidentSummarySendReservationsSurviveLeaseRecovery(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	if _, err := s.db.Exec(`INSERT INTO incidents (incident_id, kind, source_scope, target, status, floor, identity_revision, identity_namespace, qualified_refs, member_count, window_start, last_member_at, opened_at, closed_at, updated_at) VALUES ('inc-send', 'burst_appearance', 'scope', 'target', 'closed', 'low', 'r1', 'ns', 3, 3, ?, ?, ?, ?, ?)`, now.UnixNano(), now.UnixNano(), now.UnixNano(), now.UnixNano(), now.UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.write(ctx, func(tx *sql.Tx) error { return enqueueIncidentSummary(tx, "inc-send", "low", now) }); err != nil {
+		t.Fatal(err)
+	}
+	job, claim, ok, err := s.ClaimIncidentSummary(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("claim: %+v %v %v", job, ok, err)
+	}
+	if err := s.ReserveSummarySnapshot(ctx, job.IncidentID, claim, `{"safe":true}`, `{}`, 1, 0, now); err != nil {
+		t.Fatal(err)
+	}
+	if reserved, err := s.ReserveSummarySend(ctx, job.IncidentID, claim, now); err != nil || !reserved {
+		t.Fatalf("first send reservation: %v %v", reserved, err)
+	}
+	if err := s.RecordSummaryUsage(ctx, job.IncidentID, claim, 23, 7, true, now); err != nil {
+		t.Fatal(err)
+	}
+	recovered, claim2, ok, err := s.ClaimIncidentSummary(ctx, now.Add(summaryLease+time.Second))
+	if err != nil || !ok || recovered.SendsReserved != 1 || recovered.SnapshotJSON != `{"safe":true}` || recovered.InputTokens == nil || *recovered.InputTokens != 23 {
+		t.Fatalf("recovered state: %+v ok=%v err=%v", recovered, ok, err)
+	}
+	if reserved, err := s.ReserveSummarySend(ctx, job.IncidentID, claim2, now); err != nil || !reserved {
+		t.Fatalf("repair reservation: %v %v", reserved, err)
+	}
+	if reserved, err := s.ReserveSummarySend(ctx, job.IncidentID, claim2, now); err != nil || reserved {
+		t.Fatalf("third send reservation: %v %v", reserved, err)
+	}
+}
+
+func TestSummaryMemberSelectionUsesBoundedOrderIndex(t *testing.T) {
+	s := openTestStore(t)
+	rows, err := s.db.Query(`EXPLAIN QUERY PLAN SELECT b.briefing_id, b.priority, b.kind, b.created_at,
+		b.what_changed, b.context, b.recommended_check, m.refs_json
+		FROM incident_members m JOIN briefings b ON b.briefing_id=m.briefing_id
+		WHERE m.incident_id='inc-plan' ORDER BY m.priority_rank DESC, m.member_created_at ASC, m.briefing_id ASC LIMIT 20`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(detail)
+		plan.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	text := plan.String()
+	if !strings.Contains(text, "incident_members_summary_order") || strings.Contains(text, "USE TEMP B-TREE") {
+		t.Fatalf("summary member query plan is not index ordered: %s", text)
 	}
 }
 

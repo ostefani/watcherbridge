@@ -205,6 +205,7 @@
  * @property {boolean} truncated member section cut at the serving bound
  * @property {Decision[]} decisions newest-first audit trail
  * @property {EffectiveReview} [effective_review] absent without live review
+ * @property {{status: string, floor: string, suggestion: string|null, final_priority: string, clamped: boolean, summary?: string, hypothesis?: string, confidence?: string, reason?: string, citations: Array<{member: string, briefing_id: string}>, sampled: number, omitted: number, error?: string, updated_at: string}} [summary] local incident explanation and resolved priority
  */
 
 export {};

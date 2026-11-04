@@ -84,20 +84,25 @@ type incidentMemberWire struct {
 // the coverage limits explicitly. A summary may arrive after close;
 // UpdatedAt marks that timing.
 type summaryWire struct {
-	Status        string   `json:"status"`
-	Floor         string   `json:"floor"`
-	Suggestion    *string  `json:"suggestion,omitempty"`
-	FinalPriority string   `json:"final_priority"`
-	Clamped       bool     `json:"clamped"`
-	Summary       string   `json:"summary,omitempty"`
-	Hypothesis    string   `json:"hypothesis,omitempty"`
-	Confidence    string   `json:"confidence,omitempty"`
-	Reason        string   `json:"reason,omitempty"`
-	Citations     []string `json:"citations"`
-	Sampled       int      `json:"sampled"`
-	Omitted       int      `json:"omitted"`
-	Error         string   `json:"error,omitempty"`
-	UpdatedAt     string   `json:"updated_at"`
+	Status        string                `json:"status"`
+	Floor         string                `json:"floor"`
+	Suggestion    *string               `json:"suggestion,omitempty"`
+	FinalPriority string                `json:"final_priority"`
+	Clamped       bool                  `json:"clamped"`
+	Summary       string                `json:"summary,omitempty"`
+	Hypothesis    string                `json:"hypothesis,omitempty"`
+	Confidence    string                `json:"confidence,omitempty"`
+	Reason        string                `json:"reason,omitempty"`
+	Citations     []summaryCitationWire `json:"citations"`
+	Sampled       int                   `json:"sampled"`
+	Omitted       int                   `json:"omitted"`
+	Error         string                `json:"error,omitempty"`
+	UpdatedAt     string                `json:"updated_at"`
+}
+
+type summaryCitationWire struct {
+	Member   string `json:"member"`
+	Briefing string `json:"briefing_id"`
 }
 
 // incidentDetailWire is one incident with its bounded member
@@ -252,11 +257,11 @@ func (v *Viewer) handleIncident(w http.ResponseWriter, r *http.Request) {
 			FinalPriority: sum.FinalPriority, Clamped: sum.Clamped,
 			Summary: sum.Summary, Hypothesis: sum.Hypothesis,
 			Confidence: sum.Confidence, Reason: sum.Reason,
-			Citations: []string{}, Sampled: sum.Sampled, Omitted: sum.Omitted,
+			Citations: []summaryCitationWire{}, Sampled: sum.Sampled, Omitted: sum.Omitted,
 			Error: sum.Error, UpdatedAt: sum.UpdatedAt.UTC().Format(time.RFC3339),
 		}
 		for _, c := range sum.Citations {
-			sw.Citations = append(sw.Citations, c.Member)
+			sw.Citations = append(sw.Citations, summaryCitationWire{Member: c.Member, Briefing: sum.AliasMap[c.Member]})
 		}
 		wire.Summary = sw
 	} else if !errors.Is(err, sql.ErrNoRows) {

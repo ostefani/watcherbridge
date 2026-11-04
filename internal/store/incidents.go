@@ -863,8 +863,8 @@ func appendIncidentMembers(tx *sql.Tx, in *Incident, members []classifiedBriefin
 			return 0, err
 		}
 		res, err := tx.Exec(`INSERT OR IGNORE INTO incident_members
-			(incident_id, briefing_id, member_created_at, refs_json)
-			VALUES (?, ?, ?, ?)`, in.IncidentID, m.briefingID, nanos(m.createdAt), refsJSON)
+			(incident_id, briefing_id, member_created_at, refs_json, priority_rank)
+			SELECT ?, ?, ?, ?, CASE b.priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END FROM briefings b WHERE b.briefing_id=?`, in.IncidentID, m.briefingID, nanos(m.createdAt), refsJSON, m.briefingID)
 		if err != nil {
 			return 0, err
 		}
@@ -989,8 +989,8 @@ func formIncident(tx *sql.Tx, s *Store, members []classifiedBriefing, settings I
 			return "", err
 		}
 		res, err := tx.Exec(`INSERT OR IGNORE INTO incident_members
-			(incident_id, briefing_id, member_created_at, refs_json)
-			VALUES (?, ?, ?, ?)`, incidentID, m.briefingID, nanos(m.createdAt), refsJSON)
+			(incident_id, briefing_id, member_created_at, refs_json, priority_rank)
+			SELECT ?, ?, ?, ?, CASE b.priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END FROM briefings b WHERE b.briefing_id=?`, incidentID, m.briefingID, nanos(m.createdAt), refsJSON, m.briefingID)
 		if err != nil {
 			return "", err
 		}

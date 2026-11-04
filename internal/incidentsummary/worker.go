@@ -100,6 +100,18 @@ func runOne(ctx context.Context, d Deps) (bool, error) {
 	if ctx.Err() != nil {
 		return false, nil
 	}
+	if job.SendsReserved > 0 {
+		// A dispatched send may have consumed allowance even if its
+		// response was lost. Never repeat it after lease recovery.
+		outcome := store.IncidentSummary{Status: "fallback", FinalPriority: job.Floor,
+			InputTokens: job.InputTokens, OutputTokens: job.OutputTokens,
+			Error: "summary interrupted after provider dispatch; deterministic presentation retained"}
+		if _, err := d.Store.CompleteIncidentSummary(ctx, job.IncidentID, claim, job.SnapshotJSON, outcome, nowOf(d)); err != nil {
+			return false, err
+		}
+		completed(d, job.IncidentID)
+		return true, nil
+	}
 	incident, err := d.Store.GetIncident(ctx, job.IncidentID)
 	if err != nil {
 		// Incident purged under a retained summary row: keep the
@@ -157,6 +169,13 @@ func runOne(ctx context.Context, d Deps) (bool, error) {
 	}
 	runCtx, cancel := context.WithTimeout(ctx, runDeadline)
 	defer cancel()
+	reserved, err := d.Store.ReserveSummarySend(ctx, job.IncidentID, claim, nowOf(d))
+	if err != nil {
+		return false, err
+	}
+	if !reserved {
+		return false, nil
+	}
 	if d.Health != nil {
 		d.Health.AddProviderCall()
 	}
@@ -176,11 +195,21 @@ func runOne(ctx context.Context, d Deps) (bool, error) {
 		return true, nil
 	}
 	usage := answer.Usage
+	if err := d.Store.RecordSummaryUsage(ctx, job.IncidentID, claim, usage.InputTokens, usage.OutputTokens, usage.HasUsage, nowOf(d)); err != nil {
+		return false, err
+	}
 	if d.Health != nil {
 		d.Health.AddUsage(usage)
 	}
 	accepted, correction, ok := acceptSummary(answer.JSON, aliasMap, issued, display, d.Redaction.Enabled, floorLevel)
 	if !ok {
+		reserved, rerr := d.Store.ReserveSummarySend(ctx, job.IncidentID, claim, nowOf(d))
+		if rerr != nil {
+			return false, rerr
+		}
+		if !reserved {
+			return false, nil
+		}
 		if d.Health != nil {
 			d.Health.AddProviderCall()
 		}
@@ -202,6 +231,9 @@ func runOne(ctx context.Context, d Deps) (bool, error) {
 			return true, nil
 		}
 		usage = usage.Add(repair.Usage)
+		if err := d.Store.RecordSummaryUsage(ctx, job.IncidentID, claim, repair.Usage.InputTokens, repair.Usage.OutputTokens, repair.Usage.HasUsage, nowOf(d)); err != nil {
+			return false, err
+		}
 		if d.Health != nil {
 			d.Health.AddUsage(repair.Usage)
 		}

@@ -25,6 +25,24 @@ func testStore(t *testing.T) *store.Store {
 
 func testPolicy() Policy { return Policy{Enabled: true, MaxFieldChars: 256} }
 
+func TestBuildBundleRedactsRetainedMetadataSeedsInProse(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	events := []InputEvent{{EventID: "M1", Payload: []byte(`{"context":"printer-secret.office private-sensor opaque-device-a"}`)}}
+	bundle, issued, _, err := BuildBundle(ctx, s, BundleInput{GroupID: "incident", Anchor: "target", Target: "target", Events: events, SeedValues: []string{"printer-secret.office", "private-sensor", "opaque-device-a"}}, testPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{"printer-secret.office", "private-sensor", "opaque-device-a"} {
+		if strings.Contains(string(bundle.EventsJSON), raw) {
+			t.Fatalf("provider copy retained %q: %s", raw, bundle.EventsJSON)
+		}
+	}
+	if len(issued) < 3 {
+		t.Fatalf("seed tokens missing: %v", issued)
+	}
+}
+
 func payload(t *testing.T, host string, extra string) []byte {
 	t.Helper()
 	return []byte(`{"event_id":"e1","event_key":"k","event_type":"host.changed","host":` + host + extra + `}`)
