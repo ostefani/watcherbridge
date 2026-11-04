@@ -1,10 +1,13 @@
 package briefing
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -263,6 +266,81 @@ func TestAgentRepairRecoversInvalidTurn(t *testing.T) {
 	}
 	if b := briefed(t, s, gid); b.Source != "agent" || b.FallbackUsed {
 		t.Fatalf("repaired final must store a model briefing: %+v", b)
+	}
+}
+
+func TestAgentRepairFinalKeepsToolEvidence(t *testing.T) {
+	for _, reservedFinal := range []bool{false, true} {
+		t.Run(strconv.FormatBool(reservedFinal), func(t *testing.T) {
+			s := openWorkerStore(t)
+			gid := hostChangedGroup(t, s)
+			fake := provider.NewFake()
+			fake.TurnHandle = func(tr []provider.TurnMessage) (string, error) {
+				switch fake.TurnCalls {
+				case 1:
+					return `{"tool":"get_reported_profile","arguments":{"host":"IP_1"}}`, nil
+				case 2:
+					var invalid map[string]any
+					if err := json.Unmarshal([]byte(finalFromTranscript(t, tr, nil)), &invalid); err != nil {
+						t.Fatal(err)
+					}
+					delete(invalid, "confidence")
+					return string(mustMarshal(invalid)), nil
+				}
+				prompt := tr[len(tr)-1].Text
+				if !strings.Contains(prompt, `{"tool_step":`) || strings.Contains(prompt, "there are no tool steps") {
+					t.Fatalf("agent repair must allow executed tool citations: %s", prompt)
+				}
+				if reservedFinal && !strings.Contains(prompt, "no further tool calls are allowed") {
+					t.Fatal("reserved final repair must require a final briefing")
+				}
+				var valid map[string]any
+				if err := json.Unmarshal([]byte(finalFromTranscript(t, tr, nil)), &valid); err != nil {
+					t.Fatal(err)
+				}
+				valid["evidence_refs"] = []any{map[string]any{"tool_step": 0}}
+				return string(mustMarshal(valid)), nil
+			}
+			d := agentTestDeps(t, s, fake)
+			if reservedFinal {
+				d.AgentMaxSteps = 1
+			}
+			if !briefOne(t.Context(), d, gid) {
+				t.Fatal("repaired run must progress")
+			}
+			if b := briefed(t, s, gid); b.Source != "agent" || b.FallbackUsed || fake.TurnCalls != 3 {
+				t.Fatalf("tool, invalid final and repaired final must succeed: %+v; calls=%d", b, fake.TurnCalls)
+			}
+		})
+	}
+}
+
+func TestAgentInvalidRepairLogsClassificationOnly(t *testing.T) {
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	s := openWorkerStore(t)
+	gid := hostChangedGroup(t, s)
+	fake := provider.NewFake()
+	const sensitive = "private-model-content"
+	fake.Turns = []provider.FakeStep{{JSON: []byte(`{"` + sensitive + `":1}`)}}
+	if !briefOne(t.Context(), agentTestDeps(t, s, fake), gid) {
+		t.Fatal("invalid run must progress to fallback")
+	}
+	for _, want := range []string{
+		"agent output rejected (turn is neither a tool call nor a final briefing)",
+		"agent turn invalid after repair (turn is neither a tool call nor a final briefing)",
+	} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("missing safe classification %q in %s", want, logs.String())
+		}
+	}
+	if strings.Contains(logs.String(), sensitive) {
+		t.Fatal("logs must not contain rejected model content")
+	}
+	if b := briefed(t, s, gid); !b.FallbackUsed || fake.TurnCalls != 2 {
+		t.Fatal("invalid repair must retain the single-repair fallback")
 	}
 }
 

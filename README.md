@@ -54,6 +54,22 @@ The sender should print `Synthetic event accepted: 202`. Allow about 45 seconds 
 
 For integration, configure a sender on the same machine to post to `http://127.0.0.1:8081/webhook` using the shared secret and the [signed webhook contract](docs/reviewer-guide.md#without-pro-the-webhook-contract). Compatible senders must implement that event schema and signature format.
 
+## AI explanations
+
+The live adapter uses the Meta Model API with a configurable model ID and endpoint. Store your API key in an owner-only file, stop the running bridge, and restart it with:
+
+```sh
+./watcherbridge -secret-file ./demo-data/webhook.secret \
+  -db ./demo-data/demo.db -scanrelay-url= \
+  -model-provider meta -model-id '<your-model-id>' \
+  -model-base-url '<your-https-responses-endpoint>' \
+  -model-key-file /absolute/path/to/model-api-key \
+  -agent-enabled
+```
+
+This example enables retained-evidence investigation. Without `-agent-enabled`, eligible groups use a single model request, with at most one repair. With the flag, groups whose deterministic baseline is medium or higher (by default) can use up to four read-only local evidence tools before a final answer, plus at most one repair across the run. Low-baseline groups still use the single-request path. The investigator can provide retained history and reported-service context, with its executed tools shown in the briefing trace; it may take longer and use more model tokens. It never scans the network or changes the deterministic priority floor. Failed investigation produces a deterministic fallback briefing.
+
+Keep redaction enabled for external providers. AI explanations are advisory; the bridge remains usable without a model key.
 
 ## Operation and development
 

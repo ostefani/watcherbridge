@@ -103,6 +103,65 @@ func TestMetaNoTextOutputFails(t *testing.T) {
 	}
 }
 
+func TestMetaTurnRequestsJSONOutput(t *testing.T) {
+	stub := &stubTripper{}
+	stub.respond = func(*http.Request) (*http.Response, error) {
+		var request struct {
+			Text struct {
+				Format struct {
+					Type string `json:"type"`
+				} `json:"format"`
+			} `json:"text"`
+		}
+		if err := json.Unmarshal(stub.bodies[len(stub.bodies)-1], &request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Text.Format.Type != "json_object" {
+			t.Fatal("agent turns must request JSON generation, including repairs")
+		}
+		return okResponse(`{"output":[{"type":"message","content":[{"type":"output_text","text":"{}"}]}]}`), nil
+	}
+	a := testAdapter(t, stub, 64<<10)
+	tr := []TurnMessage{{Role: "system", Text: "Reply with one JSON object."}, {Role: "user", Text: "bundle"}}
+	for range 2 {
+		res, err := a.Turn(t.Context(), tr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr = append(tr, TurnMessage{Role: "assistant", Text: res.Text}, TurnMessage{Role: "user", Text: "Correct the JSON fields."})
+	}
+}
+
+func TestMetaExtractsCompleteAnswerText(t *testing.T) {
+	const body = `{"status":"completed","output":[
+		{"type":"reasoning","content":[{"type":"output_text","text":"ignore reasoning"}]},
+		{"type":"message","phase":"commentary","content":[{"type":"output_text","text":"Checking evidence."}]},
+		{"type":"message","content":[{"type":"other","text":"ignore other content"},{"type":"output_text","text":"{\"event_ids\":"},{"type":"output_text","text":"[\"e1\"]}"}]}
+	],"usage":{"input_tokens":10,"output_tokens":5}}`
+	stub := &stubTripper{respond: func(*http.Request) (*http.Response, error) { return okResponse(body), nil }}
+	res, err := testAdapter(t, stub, 64<<10).Turn(t.Context(), []TurnMessage{{Role: "user", Text: "JSON"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Text != `{"event_ids":["e1"]}` || !res.Usage.HasUsage || res.Usage.OutputTokens != 5 {
+		t.Fatalf("must extract all final output_text parts with usage: %+v", res)
+	}
+}
+
+func TestMetaRejectsUnfinishedOrNonAnswerOutput(t *testing.T) {
+	for _, body := range []string{
+		`{"status":"incomplete","output":[{"type":"message","content":[{"type":"output_text","text":"{\"partial\":"}]}]}`,
+		`{"status":"failed","output":[{"type":"message","content":[{"type":"output_text","text":"{}"}]}]}`,
+		`{"output":[{"type":"message","phase":"commentary","content":[{"type":"output_text","text":"Checking."}]}]}`,
+		`{"output":[{"type":"reasoning","content":[{"type":"output_text","text":"not an answer"}]}]}`,
+	} {
+		stub := &stubTripper{respond: func(*http.Request) (*http.Response, error) { return okResponse(body), nil }}
+		if _, err := testAdapter(t, stub, 64<<10).Turn(t.Context(), nil); err == nil {
+			t.Fatal("unfinished or non-answer output must fail at the adapter boundary")
+		}
+	}
+}
+
 func TestMetaRefusesRedirect(t *testing.T) {
 	stub := &stubTripper{respond: func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 302, Header: http.Header{"Location": []string{"https://evil.example/x"}}, Body: io.NopCloser(strings.NewReader(""))}, nil
@@ -297,6 +356,66 @@ func TestMetaTurnSendsFullTranscript(t *testing.T) {
 		if !bytes.Contains(stub.bodies[0], []byte(want)) {
 			t.Fatalf("turn body missing %s in %s", want, stub.bodies[0])
 		}
+	}
+}
+
+// Enforce the endpoint's role/content contract on every POST, including
+// continuations. An initial turn has no assistant history and would hide
+// input_text incorrectly used for a replayed assistant answer.
+func TestMetaTurnReplayContentTypes(t *testing.T) {
+	for _, continuation := range []TurnMessage{
+		{Role: "user", Text: "That turn was rejected. Reply with corrected JSON."},
+		{Role: "tool", Text: `{"result":{"report_count":2}}`},
+	} {
+		t.Run(continuation.Role, func(t *testing.T) {
+			const answer = `{"tool":"get_reported_profile","arguments":{"host":"HOST_1"}}`
+			stub := &stubTripper{}
+			stub.respond = func(*http.Request) (*http.Response, error) {
+				var body responsesRequest
+				if err := json.Unmarshal(stub.bodies[len(stub.bodies)-1], &body); err != nil {
+					t.Fatal(err)
+				}
+				for _, msg := range body.Input {
+					want := "input_text"
+					if msg.Role == "assistant" {
+						want = "output_text"
+					}
+					for _, part := range msg.Content {
+						if part.Type != want {
+							return &http.Response{StatusCode: http.StatusBadRequest, Header: make(http.Header),
+								Body: io.NopCloser(strings.NewReader(`{"error":"invalid content type for role"}`))}, nil
+						}
+					}
+				}
+				return okResponse(`{"output":[{"type":"message","content":[{"type":"output_text","text":` + strconv.Quote(answer) + `}]}]}`), nil
+			}
+			a := testAdapter(t, stub, 64<<10)
+			tr := []TurnMessage{{Role: "system", Text: "instructions"}, {Role: "user", Text: `{"host":"HOST_1"}`}}
+			first, err := a.Turn(t.Context(), tr)
+			if err != nil {
+				t.Fatalf("initial turn: %v", err)
+			}
+			tr = append(tr, TurnMessage{Role: "assistant", Text: first.Text}, continuation)
+			if _, err := a.Turn(t.Context(), tr); err != nil {
+				t.Fatalf("continuation must accept replayed assistant output: %v", err)
+			}
+			var replay responsesRequest
+			if err := json.Unmarshal(stub.bodies[1], &replay); err != nil {
+				t.Fatal(err)
+			}
+			if len(stub.requests) != 2 || len(replay.Input) != len(tr) {
+				t.Fatal("continuation must resend the full transcript in one POST")
+			}
+			for i, msg := range tr {
+				want := msg.Text
+				if msg.Role == "tool" {
+					want = "Tool result: " + want
+				}
+				if len(replay.Input[i].Content) != 1 || replay.Input[i].Content[0].Text != want {
+					t.Fatalf("message %d text changed during replay", i)
+				}
+			}
+		})
 	}
 }
 

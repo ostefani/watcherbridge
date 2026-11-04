@@ -112,12 +112,22 @@ type responsesMessage struct {
 	Content []responsesContent `json:"content"`
 }
 
-// responsesRequest is the Meta Responses API wire body, verified against
-// the live endpoint: model, one user message, no streaming.
+// responsesTextConfig selects provider-side JSON generation. Local
+// validation still owns the action schema, token scope and evidence refs.
+type responsesTextConfig struct {
+	Format responsesTextFormat `json:"format"`
+}
+
+type responsesTextFormat struct {
+	Type string `json:"type"`
+}
+
+// responsesRequest is the Meta Responses API wire body.
 type responsesRequest struct {
-	Model  string             `json:"model"`
-	Input  []responsesMessage `json:"input"`
-	Stream bool               `json:"stream"`
+	Model  string               `json:"model"`
+	Input  []responsesMessage   `json:"input"`
+	Stream bool                 `json:"stream"`
+	Text   *responsesTextConfig `json:"text,omitempty"`
 }
 
 // briefingFieldContract is the output contract shared by the bundle and
@@ -168,13 +178,20 @@ func MarshalTurnRequest(model string, transcript []TurnMessage) ([]byte, error) 
 	in := make([]responsesMessage, 0, len(transcript))
 	for _, m := range transcript {
 		text := m.Text
+		contentType := "input_text"
+		if m.Role == "assistant" {
+			// Responses replays prior model answers as output, including
+			// rejected answers carried into a repair turn.
+			contentType = "output_text"
+		}
 		if m.Role == "tool" {
 			text = "Tool result: " + text
 		}
 		in = append(in, responsesMessage{
 			Role:    turnRole(m.Role),
-			Content: []responsesContent{{Type: "input_text", Text: text}},
+			Content: []responsesContent{{Type: contentType, Text: text}},
 		})
 	}
-	return json.Marshal(responsesRequest{Model: model, Input: in, Stream: false})
+	return json.Marshal(responsesRequest{Model: model, Input: in, Stream: false,
+		Text: &responsesTextConfig{Format: responsesTextFormat{Type: "json_object"}}})
 }
