@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Go](https://img.shields.io/badge/Go-1.26-blue)
 ![Muse AI](https://img.shields.io/badge/AI-Muse-0866FF)
-![Local first](https://img.shields.io/badge/local-first-brightgreen)
+![Visitors](https://visitor-badge.laobi.icu/badge?page_id=ostefani.watcherbridge)
 
 **Turn network changes into clear explanations and a focused review inbox.**
 
