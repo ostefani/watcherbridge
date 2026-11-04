@@ -15,6 +15,15 @@
   // Keep only the routing identity; Detail/Incident own the current evidence.
   let { overview = null, loadError = null, selected = $bindable(null) } = $props();
   const selectedId = $derived(selected?.id ?? null);
+  let reviewTitles = $state({});
+
+  function rememberTitle(id, title) {
+    if (reviewTitles[id] === title) {
+      return;
+    }
+    // A small session cache: no additional fetches or persisted data.
+    reviewTitles = Object.fromEntries([...Object.entries(reviewTitles), [id, title]].slice(-32));
+  }
 
   function selectReview(item) {
     selected = { id: item.id, kind: item.kind };
@@ -60,7 +69,7 @@
   />
   <div class="review-workspace" data-empty={overview.attention.length === 0 && selected === null}>
     <div class="review-list" id="review-list" tabindex="-1">
-      <AttentionList items={overview.attention} {selectedId} onselect={selectReview} />
+      <AttentionList items={overview.attention} {selectedId} titles={reviewTitles} onselect={selectReview} />
       {#if selected}<p><a href="#selected-review" onclick={(event) => { event.preventDefault(); document.getElementById('selected-review')?.focus(); }}>Jump to selected review ↓</a></p>{/if}
       <DigestBar digest={overview.digest} explained={overview.explained ?? {}} />
       <SourceCoverage sources={overview.sources} />
@@ -75,7 +84,7 @@
           <button type="button" onclick={closeReview}>Close review</button>
         </div>
         {#key selected.id}
-          {#if selected.kind === 'briefing'}<Detail id={selected.id} embedded />{:else}<Incident id={selected.id} />{/if}
+          {#if selected.kind === 'briefing'}<Detail id={selected.id} embedded ontitle={rememberTitle} />{:else}<Incident id={selected.id} />{/if}
         {/key}
       {:else}
         <div class="empty-detail"><span class="empty-mark" aria-hidden="true">↖</span><h2>Select a review</h2><p>Choose an item in Needs attention to read its evidence and recommended check, and record your decision.</p><p>New reports update the list automatically.</p></div>

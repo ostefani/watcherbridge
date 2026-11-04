@@ -1,5 +1,5 @@
 <script>
-  import { changeLabel } from './format.js';
+  import { changeLabel, reviewTitle } from './format.js';
   import { onDestroy, onMount } from 'svelte';
   import { fetchIncident } from '../api.js';
 
@@ -9,7 +9,7 @@
   // Incident rows expand inline to their member briefings; the member
   // list is cached until an update/reconnect/resync invalidates it, and a
   // fetch failure surfaces on the row, never as navigation.
-  let { items = [], selectedId = null, onselect = null } = $props();
+  let { items = [], selectedId = null, titles = {}, onselect = null } = $props();
 
   let expanded = $state(/** @type {Record<string, boolean>} */ ({}));
   let memberCache = $state(/** @type {Record<string, import('../wire.js').IncidentMember[]>} */ ({}));
@@ -79,7 +79,7 @@
         <li data-status={item.status}>
           {#snippet row()}
             <span class="pill priority" data-priority={item.priority} aria-label={`Priority: ${item.priority}`}>{item.priority}</span>
-            <span class="row-main"><strong>{item.kind === 'incident' ? 'Incident · ' : ''}{changeLabel(item.change_kind)}</strong><code>{item.id}</code></span>
+            <span class="row-main"><strong>{item.kind === 'incident' ? 'Incident · ' : ''}{item.kind === 'briefing' ? (titles[item.id] ?? reviewTitle(item.change_kind)) : changeLabel(item.change_kind)}</strong><code>{item.id}</code></span>
             <span class="row-meta"><span class="pill">{item.status}</span><time datetime={item.created_at} title={item.created_at}>{new Date(item.created_at).toLocaleString()}</time></span>
           {/snippet}
           {#if item.kind === 'briefing' || item.kind === 'incident'}

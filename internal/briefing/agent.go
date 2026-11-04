@@ -22,6 +22,7 @@ import (
 )
 
 const (
+	finalTurnInstruction = "Tool budget exhausted. Return exactly one complete final briefing JSON object using the available evidence; no further tool calls are allowed. Keep unavailable facts unknown and cite only real event IDs or already executed tool steps."
 	// maxToolResultBytes caps one serialized tool result (Designv9 §6.2:
 	// results <=4 KiB). Truncation and omission are marked in the
 	// envelope flags, never silent — and never a cut inside the JSON,
@@ -271,6 +272,12 @@ func (l *agentLoop) toolTurn(k int) (done bool) {
 // tool call here is invalid — the tools are spent — and any rejection
 // spends the run's one repair (when still unused) before falling back.
 func (l *agentLoop) finalTurn() bool {
+	// Announce the transition before sending: the initial instructions
+	// permit tools, but this reserved turn can only produce a briefing.
+	if over := l.appendUser(finalTurnInstruction); over != "" {
+		l.fallback = over
+		return l.finish()
+	}
 	slice, ok := turnSlice(l.runCtx(), l.provider, l.steps, l.steps+1)
 	if !ok {
 		l.fallback = "agent turn budget exhausted; briefing from deterministic baseline only"
@@ -318,7 +325,7 @@ func (l *agentLoop) repairFlow(turnCtx context.Context, correction string, allow
 	log.Printf("briefing: group %s agent output rejected (%s)", l.taken.GroupID, correction)
 	prompt := repairPromptForTurn(correction)
 	if !allowTool {
-		prompt += " This is the final turn: return the complete final briefing only; no further tool calls are allowed."
+		prompt += " " + finalTurnInstruction
 	}
 	rep, failReason, ok := l.repairAsk(turnCtx, prompt)
 	if !ok {

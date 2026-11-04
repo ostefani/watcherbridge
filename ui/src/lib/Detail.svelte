@@ -1,9 +1,9 @@
 <script>
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import { fetchBriefing } from '../api.js';
   import { createFetchGuard } from './freshness.js';
   import { typingTarget } from './roving.js';
-  import { displayTime, sourceLabel, changeLabel } from './format.js';
+  import { displayTime, sourceLabel, reviewTitle } from './format.js';
   import DecisionPanel from './DecisionPanel.svelte';
 
   // Briefing detail (Planv4 Step 24 order): Summary -> Why this
@@ -14,7 +14,7 @@
   // initial carries a server snapshot for prerender/tests: when set
   // the screen renders it without fetching, exactly as a completion
   // would. Production mounts omit it and fetch.
-  let { id, initial = null, embedded = false } = $props();
+  let { id, initial = null, embedded = false, ontitle = null } = $props();
 
   const guard = createFetchGuard();
   onDestroy(() => guard.invalidate());
@@ -31,6 +31,15 @@
   // until (or instead of) the fetch. Reads the prop inside a
   // derived, never as state, so updates stay explicit.
   const shown = $derived(detail ?? initial);
+  const title = $derived(shown === null ? '' : reviewTitle(shown.kind, shown.observations, shown.referenced_events));
+  $effect(() => {
+    if (shown !== null && ontitle) {
+      const briefingId = shown.briefing_id;
+      const heading = title;
+      // Reporting the title must not subscribe this effect to parent state.
+      untrack(() => ontitle(briefingId, heading));
+    }
+  });
 
   async function load() {
     guard.invalidate();
@@ -106,29 +115,41 @@
 {:else if shown === null}
   <p role="status">Loading briefing…</p>
 {:else}
-  <article aria-label="Briefing shown">
+  <article class="briefing" aria-label="Briefing shown">
     {#if !embedded}<p><a href="#/">← Back to Home</a></p>{/if}
 
-    <section aria-label="Summary">
-      <h2>{shown.priority}: {shown.what_changed}</h2>
-      <p>Reported change: {changeLabel(shown.kind)}. Reported by {shown.host}.</p>
+    <section class="briefing-summary" aria-label="Summary">
+      <div class="briefing-heading">
+        <h2>{title}</h2>
+        <span class="pill priority" data-priority={shown.priority} aria-label={`Priority: ${shown.priority}`}>{shown.priority}</span>
+      </div>
+      <p class="briefing-description">{shown.what_changed}</p>
+      <div class="briefing-meta">
+        <span class="pill">{sourceLabel(shown.source)}</span>
+        <span>Reported by <span class="briefing-host">{shown.host}</span></span>
+      </div>
     </section>
 
     <section aria-label="Why this priority">
       <h3>Why this priority</h3>
       <ol class="stepper">
-        <li>Baseline floor: <strong>{shown.baseline}</strong>{shown.baseline_rule ? ` (${shown.baseline_rule})` : ''}</li>
+        <li>Baseline floor <strong>{shown.baseline}</strong></li>
         <li>
-          Model suggestion:
+          Model suggestion
           {#if shown.model_suggestion === null || shown.model_suggestion === undefined}
             <strong>none — baseline stands</strong>
           {:else}
-            <strong>{shown.model_suggestion}</strong>{shown.clamped ? ' (clamped to one step above baseline)' : ''}
+            <strong>{shown.model_suggestion}</strong>
           {/if}
         </li>
-        <li>Final priority: <strong>{shown.priority}</strong></li>
+        <li>Final priority <strong>{shown.priority}</strong></li>
       </ol>
-      <p>Source: {sourceLabel(shown.source)}.</p>
+      {#if shown.baseline_rule || shown.clamped}
+        <p class="section-note priority-note">
+          {#if shown.baseline_rule}<span>Rule: <code>{shown.baseline_rule}</code>.</span>{/if}
+          {#if shown.clamped}<span>Suggestion adjusted to respect the baseline floor and one-step raise limit.</span>{/if}
+        </p>
+      {/if}
       {#if shown.fallback_used}
         <p>Deterministic fallback text: the model path did not produce this briefing.</p>
       {/if}
