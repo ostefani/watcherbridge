@@ -380,6 +380,13 @@ func (b *builder) discoverString(key, s string) {
 	if b.skip[s] {
 		return
 	}
+	if key == "host_id" {
+		// Producer references are opaque, including prefixed values and
+		// references containing a hostname. Redact the complete value.
+		if s != "" {
+			b.addPending(catHost, strings.ToLower(s), s)
+		}
+	}
 	if key == "hostname" || key == "identity_aliases" || key == "aliases" {
 		for _, h := range splitAliases(s) {
 			orig := strings.TrimSpace(h)
@@ -451,6 +458,13 @@ func (b *builder) discoverAnchor(anchor string) {
 	}
 	val = strings.TrimSpace(val)
 	switch kind {
+	case "evt":
+		// Event-local anchors contain an opaque event ID. The same ID
+		// remains literal in envelope reference fields, but the anchor
+		// must not expose a hostname embedded in that ID.
+		if val != "" {
+			b.addPending(catHost, strings.ToLower(val), val)
+		}
 	case "sub", "addr":
 		ns, ref, ok := strings.Cut(val, ":")
 		if !ok {
