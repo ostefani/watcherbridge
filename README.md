@@ -115,9 +115,13 @@ The relay works independently of WatcherBridge, and WatcherBridge's viewer works
 
 ## Quick start
 
+### Hackathon reviewer build
+
+The [reviewer-preview-1 release](https://github.com/ostefani/watcherbridge/releases/tag/reviewer-preview-1) contains SubnetLens Pro binaries for Windows amd64, macOS arm64/amd64, and Linux amd64, plus the reviewer license. The Pro binaries are unsigned and optional: the [reviewer guide](docs/reviewer-guide.md) includes a synthetic-webhook path that needs no Pro binary and performs no network scan. WatcherBridge is built from this repository using the steps below.
+
 ### Build
 
-Requirements: **Go 1.26 or newer** and a **C compiler** for the SQLite driver (Xcode Command Line Tools on macOS or GCC on Linux). The production viewer assets are embedded and committed; running the bridge does not require Node.js.
+Requirements: **Go 1.26 or newer** and a **C compiler** for the SQLite driver (Xcode Command Line Tools on macOS, GCC on Linux, or MinGW-w64 on Windows). The production viewer assets are embedded and committed; running the bridge does not require Node.js.
 
 ```sh
 git clone https://github.com/ostefani/WatcherBridge.git
