@@ -1,0 +1,6 @@
+proxy-1 forwarded=    3512
+proxy-1 forwarded-after-sweep=    3512
+proxy-2 forwarded=    3512
+proxy-2 forwarded-after-sweep=    3512
+proxy-3 forwarded=    3512
+proxy-3 forwarded-after-sweep=    3512

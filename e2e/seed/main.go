@@ -1,9 +1,10 @@
-// Command seed builds synthetic representative databases for Step 31
-// retention, purge, migration and load evidence. Everything is written
+// Command seed builds synthetic diagnostic databases for Step 31
+// retention, purge and migration checks. The default size is not a
+// release-representative capacity workload. Everything is written
 // through production store APIs (never raw SQL, except the explicit
 // schema downgrade), so the database exercises real code paths.
 //
-// Default workload (documented; override with flags): 600 raw events
+// Default diagnostic workload (override with flags): 600 raw events
 // across 300 subjects (mac-qualified, ip-qualified, unqualified),
 // occurred spread over 100 days with a recent tail, payloads varying
 // 0-8 ports, 20 decisions, 10 rules, 50 pseudonyms, 5 heartbeats,
@@ -360,4 +361,11 @@ func downgradeToV13(path string) {
 	// fails on duplicates (mirrors dropHeartbeatSchema).
 	_, _ = raw.Exec(`ALTER TABLE report_sources DROP COLUMN heartbeat_completed_at`)
 	_, _ = raw.Exec(`ALTER TABLE report_sources DROP COLUMN heartbeat_summary`)
+	// The v15 identity migration adds these columns. Rewind their shape as
+	// well as user_version; otherwise this is not a valid v13 fixture.
+	for _, col := range []string{"label_owner", "identity_revision"} {
+		if _, err := raw.Exec(fmt.Sprintf(`ALTER TABLE reported_subjects DROP COLUMN %s`, col)); err != nil {
+			log.Fatal(err)
+		}
+	}
 }

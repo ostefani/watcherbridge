@@ -12,6 +12,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -45,9 +47,11 @@ func main() {
 	bodies := loadFixtures(strings.Split(*fixtures, ","))
 	client := &http.Client{Timeout: 30 * time.Second}
 	type result struct {
-		Tms    int64 `json:"t_ms"`
-		Status int   `json:"status"`
-		LatMs  int64 `json:"lat_ms"`
+		ID     string  `json:"event_id"`
+		SHA256 string  `json:"body_sha256"`
+		Tms    int64   `json:"t_ms"`
+		Status int     `json:"status"`
+		LatMs  float64 `json:"lat_ms"`
 	}
 	outf, err := os.Create(*out)
 	if err != nil {
@@ -55,13 +59,14 @@ func main() {
 	}
 	defer outf.Close()
 	var mu sync.Mutex
-	var sent, ok202, rejected, failed, dropped int64
-	var lats []int64
-	emit := func(status int, lat time.Duration) {
-		rec, _ := json.Marshal(result{Tms: time.Now().UnixMilli(), Status: status, LatMs: lat.Milliseconds()})
+	var sent, ok202, rejected, failed, dropped, offered int64
+	var lats []float64
+	emit := func(id, body string, status int, lat time.Duration) {
+		sum := sha256.Sum256([]byte(body))
+		rec, _ := json.Marshal(result{ID: id, SHA256: hex.EncodeToString(sum[:]), Tms: time.Now().UnixMilli(), Status: status, LatMs: float64(lat.Microseconds()) / 1000})
 		mu.Lock()
 		fmt.Fprintln(outf, string(rec))
-		lats = append(lats, lat.Milliseconds())
+		lats = append(lats, float64(lat.Microseconds())/1000)
 		mu.Unlock()
 		atomic.AddInt64(&sent, 1)
 		switch {
@@ -105,13 +110,14 @@ func main() {
 		id, key, typ, body := job(i)
 		status, lat, err := sig.Post(client, *url, *secret, id, key, typ, sig.Timestamp(), body)
 		if err != nil {
-			emit(-1, lat)
+			emit(id, body, -1, lat)
 			return
 		}
-		emit(status, lat)
+		emit(id, body, status, lat)
 	}
 	switch *mode {
 	case "burst":
+		offered = int64(*n)
 		var wg sync.WaitGroup
 		slots := make(chan int, *n)
 		for i := 0; i < *n; i++ {
@@ -146,12 +152,13 @@ func main() {
 		i := 0
 		for time.Now().Before(deadline) {
 			<-tick.C
+			offered++
 			select {
 			case slots <- i:
-				i++
 			default:
 				atomic.AddInt64(&dropped, 1) // pool saturated: count it, never slow the clock
 			}
+			i++
 		}
 		close(slots)
 		wg.Wait()
@@ -159,7 +166,7 @@ func main() {
 		log.Fatalf("unknown mode %q", *mode)
 	}
 	sort.Slice(lats, func(a, b int) bool { return lats[a] < lats[b] })
-	perc := func(p float64) int64 {
+	perc := func(p float64) float64 {
 		if len(lats) == 0 {
 			return -1
 		}
@@ -167,7 +174,7 @@ func main() {
 		return lats[k]
 	}
 	summary, _ := json.Marshal(map[string]any{
-		"sent": sent, "accepted_202": ok202, "rejected_4xx": rejected,
+		"offered": offered, "sent": sent, "accepted_202": ok202, "rejected_4xx": rejected,
 		"failed": failed, "dropped_unsent": atomic.LoadInt64(&dropped),
 		"lat_ms_p50": perc(0.50), "lat_ms_p99": perc(0.99), "lat_ms_max": perc(1.0),
 	})

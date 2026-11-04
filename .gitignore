@@ -43,6 +43,9 @@ ui/.smoke-tmp/
 # --- E2E harness output (rebuilt/preserved per run, never committed) ---
 .e2e-bin/
 .e2e-last-failure/
+.e2e-failures/
+.e2e-pending.txt
+e2e/results/
 
 # --- Editors and IDEs ---
 .idea/

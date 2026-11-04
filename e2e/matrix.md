@@ -1,6 +1,8 @@
 # Step 31 E2E scenario matrix
 
-Baseline: commit `adb8a96`, clean tree. Bridge scope defaults to
+Original harness baseline: commit `adb8a96`. Step 31 executions in this
+document use baseline commit `385fcb6` plus uncommitted corrections; the
+working tree is not clean. Bridge scope defaults to
 `default` (no `-source-id` passed); capability registration (if any)
 is seeded with `e2e/register` before bridge start — never through a
 second process while the bridge owns the database, never from payloads.
@@ -11,6 +13,28 @@ Conventions: `send_event` rewrites the body envelope to the header
 identity before signing; `send_mismatch` sends fixture bytes verbatim
 as an explicit negative. Counts below are unique accepted events
 unless noted; duplicates/reposts are asserted separately.
+
+## Execution status (2026-11-03)
+
+The first full `e2e/run.sh` execution passed A–S and M, but K missed the
+processing window, KP2 missed the active purge window, and the then-invalid
+v13 fixture stopped at MIG. The fixture was corrected and the migration-only
+tail passed MIG and NEGMIG; MIGK still missed an intermediate migration
+version. A final `E2E_SKIP_LONG=1` run on 2026-11-04 passed A–S and the
+migration tail on the current store code. K and MIGK still missed their crash
+targets; M/KP2 were intentionally skipped in that run. These missed or skipped
+targets remain pending, not passes. The fast-run bundle is archived under
+`docs/evidence/e2e-20261104T161745Z.tar.gz`.
+The separate final-tree `E2E_RETENTION_ONLY=1` run passed M's diagnostic
+assertions; KP2 did not observe a running purge and remains pending. Its
+bundle is `docs/evidence/e2e-retention-20261104T162400Z.tar.gz`.
+The separate `E2E_MATRIX_ONLY=1 E2E_SKIP_LONG=1 E2E_SKIP_MIG=1` run
+executed all 16 mode/relay/registration/H1 combinations; `matrix.tsv` in
+`docs/evidence/e2e-matrix-20261104T163524Z.tar.gz` records each response,
+stored event, briefing, heartbeat and projection class. The provided-ID
+fixture remained event-local even with synthetic registration because it
+does not carry a verified I1 namespace/lifetime contract. G2 separately
+exercises exact MAC-reference incidents under synthetic registration.
 
 ## Baseline (e2e/run.sh, must stay green)
 

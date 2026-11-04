@@ -4,6 +4,11 @@
 #
 # Runs UNSANDBOXED: it binds loopback ports and controls processes.
 # Usage: ./e2e/run.sh   (from anywhere; exits non-zero on first failure)
+# E2E_SKIP_LONG=1 skips M/KP2 for a fast functional regression; those
+# retention/crash cells remain unrun in that invocation.
+# E2E_MIG_ONLY=1 runs only MIG/MIGK/NEGMIG.
+# E2E_RETENTION_ONLY=1 runs only M/KP2.
+# E2E_MATRIX_ONLY=1 runs MX plus the migration tail (unless E2E_SKIP_MIG=1).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,6 +19,8 @@ STUB_PORT=18080
 SECRET="e2e-secret-0123456789abcdef0123456789"
 
 BRIDGE_PID=""; STUB_PID=""
+PENDING="$DATA/pending.txt"
+pending() { echo "PENDING: $*" | tee -a "$PENDING" >&2; }
 # Kills are routine here (case teardown, kill -9 test); wait reaps each
 # pid so bash does not narrate our own cleanup kills.
 quiet_kill() { kill -9 "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
@@ -27,15 +34,14 @@ trap cleanup EXIT
 step() { echo "### $*"; }
 fail() {
   echo "E2E FAIL: $*" >&2
-  echo "--- process logs (kept, dir removed on exit):"
+  echo "--- process logs (full bundle preserved):"
   for f in "$DATA"/*.log; do
     [ -f "$f" ] && { echo "--- $f"; tail -20 "$f"; }
   done
-  # Preserve the full failure bundle outside the temp dir so the evidence
-  # survives cleanup; a later failure replaces it.
-  rm -rf "$ROOT/.e2e-last-failure"
-  cp -r "$DATA" "$ROOT/.e2e-last-failure" 2>/dev/null || true
-  echo "E2E evidence preserved at $ROOT/.e2e-last-failure"
+  bundle="$ROOT/.e2e-failures/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  mkdir -p "$ROOT/.e2e-failures"
+  cp -r "$DATA" "$bundle" 2>/dev/null || true
+  echo "E2E evidence preserved at $bundle"
   exit 1
 }
 
@@ -51,7 +57,12 @@ build_all() {
 start_stub() { # [extra stub flags]
   "$BIN/stubrelay" --port "$STUB_PORT" --dir "$DATA/stub" "$@" >"$DATA/stub.log" 2>&1 &
   STUB_PID=$!
-  sleep 0.5 # no GET routes on the stub; a fixed settle beats a fake probe
+  for _ in $(seq 1 100); do
+    kill -0 "$STUB_PID" 2>/dev/null || fail "stub relay exited before readiness"
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$STUB_PORT/" 2>/dev/null || true)" = 404 ] && return 0
+    sleep 0.1
+  done
+  fail "stub relay did not become ready"
 }
 
 stop_stub() { [ -n "$STUB_PID" ] && quiet_kill "$STUB_PID"; STUB_PID=""; }
@@ -63,6 +74,7 @@ start_bridge() { # mode dbname [extra bridge flags]
     -group-quiet-window 4s -grouper-tick 500ms -incident-tick 5s "$@" >"$DATA/bridge-$db.log" 2>&1 &
   BRIDGE_PID=$!
   for _ in $(seq 1 100); do
+    kill -0 "$BRIDGE_PID" 2>/dev/null || fail "bridge exited before readiness ($mode $db)"
     curl -sf -o /dev/null "http://127.0.0.1:$BRIDGE_PORT/" && return 0
     sleep 0.1
   done
@@ -101,7 +113,7 @@ incident_field() { # incident_id field
 }
 
 source_liveness() {
-  curl -s "http://127.0.0.1:$BRIDGE_PORT/api/overview" | python3 -c "import json,sys; print(json.load(sys.stdin)['sources'][0]['liveness'])"
+  curl -s "http://127.0.0.1:$BRIDGE_PORT/api/overview" | python3 -c "import json,sys; sources=json.load(sys.stdin).get('sources') or []; print(sources[0]['liveness'] if sources else '')"
 }
 
 source_has_heartbeat() {
@@ -126,6 +138,10 @@ send_hb() { # scanid (32 lowercase hex): posts a signed H1 heartbeat
 # the HTTP API does not expose.
 db_count() { # db table
   python3 -c "import sqlite3,sys; c=sqlite3.connect('file:$DATA/$1?mode=ro',uri=True); print(c.execute('select count(*) from $2').fetchone()[0])"
+}
+subject_count() { db_count "$1" reported_subjects; }
+group_status_count() { # db status
+  python3 -c "import sqlite3; c=sqlite3.connect('file:$DATA/$1?mode=ro',uri=True); print(c.execute('select count(*) from active_groups where status=?',('$2',)).fetchone()[0])"
 }
 
 db_version() {
@@ -200,6 +216,9 @@ wait_for_ge() { # what want timeout_secs command...: numeric >= for
 step "build"
 build_all
 
+if [ "${E2E_MIG_ONLY:-0}" != 1 ]; then
+if [ "${E2E_RETENTION_ONLY:-0}" != 1 ]; then
+if [ "${E2E_MATRIX_ONLY:-0}" != 1 ]; then
 # --- case A: tap, stub present -------------------------------------------
 step "A: tap + ScanRelay present"
 rm -rf "$DATA/stub"; start_stub
@@ -252,7 +271,7 @@ step "E: kill -9 mid-window, exactly one briefing after restart"
 rm -rf "$DATA/stub"; start_stub
 start_bridge tap e.db
 [ "$(send_event e2e-6 host.changed changed.json)" = 202 ] || fail "restart post"
-sleep 1 # mid-window: group still open
+[ "$(group_status_count e.db open)" = 1 ] || fail "open group not observed before kill"
 kill9_bridge
 start_bridge tap e.db
 wait_for "briefings" 1 30 briefing_count
@@ -371,11 +390,12 @@ start_bridge tap kp.db
 [ "$(send_event e2e-kp1 host.appeared appeared-qualified.json)" = 202 ] || fail "kp post"
 HIT=0
 for _ in $(seq 1 100); do # ~5s at 50ms: close lands, briefing may not have
-  if [ "$(groups_count)" = 0 ] && [ "$(briefing_count)" = 0 ]; then HIT=1; break; fi
+  if [ "$(group_status_count kp.db processing)" -gt 0 ]; then HIT=1; break; fi
   sleep 0.05
 done
-kill9_bridge # HIT=1: closed-unbriefed; HIT=0: already briefed (weaker, still valid)
-echo "kill-mid-processing: HIT=$HIT (1 closed-unbriefed, 0 already briefed)"
+[ "$HIT" = 1 ] || pending "K processing state not observed; crash timing unproved"
+kill9_bridge
+echo "kill-mid-processing: HIT=$HIT"
 start_bridge tap kp.db
 wait_for "briefings" 1 30 briefing_count
 sleep 6 # past another window: recovery must not brief twice
@@ -389,7 +409,8 @@ start_bridge tap ki.db
 [ "$(send_event e2e-k1 host.appeared burst-a1.json)" = 202 ] || fail "k2 post 1"
 [ "$(send_event e2e-k2 host.appeared burst-a2.json)" = 202 ] || fail "k2 post 2"
 [ "$(send_event e2e-k3 host.appeared burst-a3.json)" = 202 ] || fail "k2 post 3"
-sleep 0.5 # before the 5s tick must fire; either way the assert below holds
+[ "$(incidents_count)" = 0 ] || pending "K2 incident already formed before crash"
+[ "$(db_count ki.db raw_events)" = 3 ] || fail "K2 pending events missing before crash"
 kill9_bridge
 start_bridge tap ki.db
 wait_for "briefings" 3 30 briefing_count
@@ -451,7 +472,56 @@ print("sse resume ok:", ids)
 EOF
 stop_bridge
 
+fi # E2E_MATRIX_ONLY skips A–S.
+# --- matrix MX: mode × relay × identity contract × H1 --------------------
+step "MX: complete synthetic capability/mode matrix"
+printf 'cell\tmode\trelay\tidentity\th1\thost_status\traw\tbriefings\theartbeats\tclass\n' >"$DATA/matrix.tsv"
+MX=0
+for mode in tap proxy; do
+  for relay in present absent; do
+    for identity in supported absent; do
+      for h1 in present absent; do
+        MX=$((MX + 1))
+        db="mx-$MX.db"
+        [ "$identity" = supported ] && register_cap "$db" "e2e-mx-ns-$MX" stable-identity-v1
+        if [ "$relay" = present ]; then rm -rf "$DATA/stub"; start_stub; fi
+        start_bridge "$mode" "$db"
+        status="$(send_event "e2e-mx-$MX" host.appeared appeared-provided-e2e.json)"
+        want=202
+        [ "$mode" = proxy ] && [ "$relay" = absent ] && want=502
+        [ "$status" = "$want" ] || fail "MX$MX host status $status, want $want"
+        if [ "$h1" = present ]; then
+          scanid="$(printf '%032x' "$MX")"
+          [ "$(send_hb "$scanid")" = 202 ] || fail "MX$MX heartbeat status"
+          wait_for "MX$MX liveness" reporting 30 source_liveness
+        else
+          wait_for "MX$MX liveness" unknown 30 source_liveness
+        fi
+        wait_for "MX$MX briefing" 1 30 briefing_count
+        [ "$(db_count "$db" raw_events)" = 1 ] || fail "MX$MX raw event count"
+        [ "$(db_count "$db" heartbeats)" = "$([ "$h1" = present ] && echo 1 || echo 0)" ] || fail "MX$MX heartbeat count"
+        wait_for "MX$MX projected subject" 1 30 subject_count "$db"
+        class="$(python3 -c "import sqlite3; c=sqlite3.connect('file:$DATA/$db?mode=ro',uri=True); print(c.execute('select reference_class from reported_subjects').fetchone()[0])")" || fail "MX$MX subject query"
+        want_class=event
+        # The provided fixture carries no I1 namespace/lifetime contract.
+        # Registration alone cannot promote its payload claim to identity.
+        [ "$class" = "$want_class" ] || fail "MX$MX class $class, want $want_class"
+        if [ "$mode" = proxy ] && [ "$relay" = present ]; then
+          [ -f "$DATA/stub/webhook-001.json" ] || fail "MX$MX host not forwarded"
+          [ ! -f "$DATA/stub/webhook-002.json" ] || fail "MX$MX heartbeat forwarded"
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t1\t1\t%s\t%s\n' "$MX" "$mode" "$relay" "$identity" "$h1" "$status" "$([ "$h1" = present ] && echo 1 || echo 0)" "$class" >>"$DATA/matrix.tsv"
+        stop_bridge
+        [ "$relay" = present ] && stop_stub
+      done
+    done
+  done
+done
+[ "$MX" = 16 ] || fail "matrix did not execute all 16 cells"
+
+fi # E2E_RETENTION_ONLY skips the functional cases before M.
 # --- case M: aged db drains bounded, ingest unaffected --------------------
+if [ "${E2E_SKIP_LONG:-0}" != 1 ]; then
 step "M: purge drains in bounded runs, ingest stays 202"
 "$BIN/seed" -db "$DATA/aged.db" -events 600 -subjects 300 -age-days 100
 PSEUDO0="$(token_counter aged.db)"
@@ -491,8 +561,9 @@ for _ in $(seq 1 375); do # ~75s at 200ms: catch a running pass
   if [ "$(purge_running_seen aged2.db)" = yes ]; then PHIT=1; break; fi
   sleep 0.2
 done
-kill9_bridge # PHIT=1: mid-pass; PHIT=0: between passes (drain asserts still hold)
-echo "kill-mid-purge: HIT=$PHIT (1 mid-pass, 0 between passes)"
+[ "$PHIT" = 1 ] || pending "KP2 running purge not observed; mid-purge crash unproved"
+kill9_bridge
+echo "kill-mid-purge: HIT=$PHIT"
 start_bridge tap aged2.db -purge-interval 1m
 wait_for_ge "purge runs" 1 200 purge_completed aged2.db
 case " $(purge_statuses aged2.db) " in
@@ -501,16 +572,21 @@ esac
 [ "$(token_unique aged2.db)" = ok ] || fail "token map unsound after purge kill"
 stop_bridge
 
+fi # The long retention soak can be run separately from functional regressions.
+fi # E2E_MIG_ONLY runs the migration tail without repeating the long scenarios.
+
+if [ "${E2E_RETENTION_ONLY:-0}" != 1 ] && [ "${E2E_SKIP_MIG:-0}" != 1 ]; then
 # --- case MIG: supported lineage migrates with bytes intact ---------------
 step "MIG: v13 lineage migrates, raw bytes and counts preserved"
-"$BIN/seed" -db "$DATA/mig.db" -events 60 -subjects 30 -age-days 100 -downgrade v13
+"$BIN/seed" -db "$DATA/mig.db" -events 60 -subjects 30 -age-days 10 -downgrade v13
 [ "$(db_version mig.db)" = 13 ] || fail "downgrade did not land"
+python3 "$ROOT/e2e/snapshot.py" capture "$DATA/mig.db" "$DATA/mig-before.json"
 RAW0="$(db_count mig.db raw_events)"
 BRF0="$(db_count mig.db briefings)"
 T0="$(date +%s)"
 start_bridge tap mig.db
-wait_for "http" 200 30 api_code
 [ "$(db_version mig.db)" = 29 ] || fail "migration did not reach v29"
+python3 "$ROOT/e2e/snapshot.py" verify "$DATA/mig.db" "$DATA/mig-before.json" || fail "migration preservation"
 [ "$(db_count mig.db raw_events)" = "$RAW0" ] || fail "migration lost raw events"
 [ "$(db_count mig.db briefings)" = "$BRF0" ] || fail "migration lost briefings"
 [ "$(table_exists mig.db incidents)" = yes ] || fail "incident schema missing after migration"
@@ -519,13 +595,22 @@ stop_bridge
 
 # --- case MIGK: kill during first startup, idempotent recovery ------------
 step "MIGK: kill during migrate, restart recovers without loss"
-"$BIN/seed" -db "$DATA/migk.db" -events 60 -subjects 30 -age-days 100 -downgrade v13
-start_bridge tap migk.db
-sleep 0.3 # crash point not provably inside migration; recovery asserts hold either way
+"$BIN/seed" -db "$DATA/migk.db" -events 60 -subjects 30 -age-days 10 -downgrade v13
+python3 "$ROOT/e2e/snapshot.py" capture "$DATA/migk.db" "$DATA/migk-before.json"
+"$BIN/bridge" -bind "127.0.0.1:$BRIDGE_PORT" -mode tap -db "$DATA/migk.db" \
+  -secret "$SECRET" -scanrelay-url "http://127.0.0.1:$STUB_PORT" >"$DATA/bridge-migk.db.log" 2>&1 &
+BRIDGE_PID=$!
+MIG_HIT=0
+for _ in $(seq 1 100); do
+  version="$(db_version migk.db 2>/dev/null || echo 0)"
+  if kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$version" -gt 13 ] && [ "$version" -lt 29 ]; then MIG_HIT=1; break; fi
+  sleep 0.01
+done
+[ "$MIG_HIT" = 1 ] || pending "MIGK intermediate migration version not observed while bridge ran; interruption unproved"
 kill9_bridge
 start_bridge tap migk.db
-wait_for "http" 200 30 api_code
 [ "$(db_version migk.db)" = 29 ] || fail "recovery did not reach v29"
+python3 "$ROOT/e2e/snapshot.py" verify "$DATA/migk.db" "$DATA/migk-before.json" || fail "migration restart preservation"
 [ "$(db_count migk.db raw_events)" = 60 ] || fail "recovery lost raw events"
 stop_bridge
 
@@ -544,5 +629,14 @@ fi
 wait "$NEG_PID" 2>/dev/null || true
 grep -q "newer than supported" "$DATA/neg.log" || fail "refusal reason missing from log"
 [ "$(shasum -a 256 "$DATA/neg.db" | cut -d' ' -f1)" = "$SHA0" ] || fail "refused database was modified"
+fi # E2E_RETENTION_ONLY skips migration cases.
 
-echo "E2E PASS"
+bundle="$ROOT/e2e/results/e2e-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+mkdir -p "$ROOT/e2e/results"
+cp -r "$DATA" "$bundle"
+if [ -s "$PENDING" ]; then
+  cp "$PENDING" "$ROOT/.e2e-pending.txt"
+  echo "E2E FUNCTIONAL CHECKS PASSED; crash targets pending (see $bundle/pending.txt)"
+else
+  echo "E2E FUNCTIONAL CHECKS PASSED; evidence at $bundle"
+fi

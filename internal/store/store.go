@@ -232,6 +232,26 @@ func openStore(path string, opts ...Option) (*Store, error) {
 	} else {
 		return nil, fmt.Errorf("stat database file: %w", err)
 	}
+	// The normal DSN switches SQLite to WAL on its first connection. Refuse
+	// unsupported databases through a read-only connection first, so even
+	// the journal header is not rewritten before the refusal.
+	readURI := &url.URL{Scheme: "file", Path: fileURIPath(path)}
+	readQuery := readURI.Query()
+	readQuery.Set("mode", "ro")
+	readQuery.Set("_busy_timeout", "5000")
+	readURI.RawQuery = readQuery.Encode()
+	preflight, err := sql.Open("sqlite3", readURI.String())
+	if err != nil {
+		return nil, fmt.Errorf("open database for schema check: %w", err)
+	}
+	_, checkErr := validateSchemaLineage(preflight)
+	closeErr := preflight.Close()
+	if checkErr != nil {
+		return nil, fmt.Errorf("check database schema: %w", checkErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close schema check: %w", closeErr)
+	}
 	dsn, err := dsnForPath(path)
 	if err != nil {
 		return nil, err

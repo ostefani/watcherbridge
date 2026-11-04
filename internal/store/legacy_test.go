@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -18,8 +19,8 @@ import (
 // repurposed by any runtime path, and databases newer than the
 // supported schema are refused unchanged rather than opened.
 
-// A newer version must fail before migration dispatch and preserve its
-// user_version. This does not assert byte identity of SQLite's files.
+// A newer version must fail before the WAL-mode connection can change
+// SQLite's file header, and preserve its contents and user_version.
 func TestOpenRefusesNewerVersion(t *testing.T) {
 	for _, version := range []int{supportedSchemaVersion + 1, 99} {
 		path := filepath.Join(t.TempDir(), "bridge.db")
@@ -37,8 +38,19 @@ func TestOpenRefusesNewerVersion(t *testing.T) {
 			t.Fatal(err)
 		}
 		db.Close()
+		before, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "newer than supported") {
 			t.Fatalf("version %d must be refused, got %v", version, err)
+		}
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatalf("refused database version %d changed bytes", version)
 		}
 		db, err = sql.Open("sqlite3", path)
 		if err != nil {
@@ -159,11 +171,22 @@ func TestOpenRefusesArchivedDeviceSchema(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if s, err := Open(path); err == nil {
 		s.Close()
 		t.Fatal("archived schema was admitted")
 	} else if !strings.Contains(err.Error(), "unsupported database schema lineage") {
 		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("archived database changed bytes on refusal")
 	}
 	db, err = sql.Open("sqlite3", path)
 	if err != nil {

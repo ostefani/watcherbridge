@@ -72,37 +72,46 @@ CREATE INDEX IF NOT EXISTS groups_status_deadline ON active_groups(status, deadl
 
 const supportedSchemaVersion = 29
 
-func migrate(db *sql.DB) error {
+// validateSchemaLineage is read-only so callers can reject unsupported
+// databases before the writable connection switches journal mode.
+func validateSchemaLineage(db *sql.DB) (int, error) {
 	var version int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
-		return err
+		return 0, err
 	}
 	if version > supportedSchemaVersion {
-		return fmt.Errorf("database schema version %d is newer than supported %d; upgrade the binary", version, supportedSchemaVersion)
+		return 0, fmt.Errorf("database schema version %d is newer than supported %d; upgrade the binary", version, supportedSchemaVersion)
 	}
-	// The archived device engine used overlapping version numbers. A
-	// version alone must never admit that incompatible schema lineage.
+	// The archived device engine used overlapping version numbers.
 	if version >= 10 {
 		var tables int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
-			AND name IN ('report_sources', 'reported_subjects', 'projection_progress')`).Scan(&tables); err != nil {
-			return err
+            AND name IN ('report_sources', 'reported_subjects', 'projection_progress')`).Scan(&tables); err != nil {
+			return 0, err
 		}
 		if tables != 3 {
-			return fmt.Errorf("unsupported database schema lineage at version %d; archived device databases require a separate upgrade path", version)
+			return 0, fmt.Errorf("unsupported database schema lineage at version %d; archived device databases require a separate upgrade path", version)
 		}
 	}
-	initialVersion := version
 	if version == 0 {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='raw_events'`).Scan(&name)
 		if err == nil {
-			return fmt.Errorf("unversioned legacy database is not supported; delete the database file and restart to recreate it")
+			return 0, fmt.Errorf("unversioned legacy database is not supported; delete the database file and restart to recreate it")
 		}
 		if err != sql.ErrNoRows {
-			return err
+			return 0, err
 		}
 	}
+	return version, nil
+}
+
+func migrate(db *sql.DB) error {
+	version, err := validateSchemaLineage(db)
+	if err != nil {
+		return err
+	}
+	initialVersion := version
 	for version < supportedSchemaVersion {
 		var err error
 		switch version {
