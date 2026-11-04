@@ -54,20 +54,6 @@ The sender should print `Synthetic event accepted: 202`. Allow about 45 seconds 
 
 For integration, configure a sender on the same machine to post to `http://127.0.0.1:8081/webhook` using the shared secret and the [signed webhook contract](docs/reviewer-guide.md#without-pro-the-webhook-contract). Compatible senders must implement that event schema and signature format.
 
-## AI explanations
-
-The live adapter uses the Meta Model API with a configurable model ID and endpoint. Store your API key in an owner-only file, stop the running bridge, and restart it with:
-
-```sh
-./watcherbridge -secret-file ./demo-data/webhook.secret \
-  -db ./demo-data/demo.db -scanrelay-url= \
-  -model-provider meta -model-id '<your-model-id>' \
-  -model-base-url '<your-https-responses-endpoint>' \
-  -model-key-file /absolute/path/to/model-api-key \
-  -agent-enabled
-```
-
-This example enables retained-evidence investigation. Keep redaction enabled for external providers. AI explanations are advisory; the bridge remains usable without a model key.
 
 ## Operation and development
 
