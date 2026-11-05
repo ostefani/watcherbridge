@@ -20,12 +20,15 @@ Biggest obstacle during the hackathon: repeated power and internet outages in th
 The screenshots below use synthetic demonstration data.
 
 **Briefing detail.** Inspect reported identity and priority, open saved scanner evidence, and record an operator decision.
-
-![Briefing detail showing reported host identity, medium priority, and the operator decision sidebar](docs/images/report.png)
-
 **Home overview.** Find reports needing attention and select an item to review its evidence and recommended check.
+<table>
+<tr>
+<td><img src="docs/images/report.png" alt="Briefing detail showing reported host identity, medium priority, and the operator decision sidebar" width="600" /></td>
+<td><img src="docs/images/home.png" alt="Home dashboard showing the review verdict, an item needing attention, and reported-change counts" width="600" /></td>
+</tr>
+</table>
 
-![Home dashboard showing the review verdict, an item needing attention, and reported-change counts](docs/images/home.png)
+
 
 ## What it does
 
