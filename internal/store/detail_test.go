@@ -204,6 +204,9 @@ func TestBriefingReferencedEvents(t *testing.T) {
 		if r.EventType != "host.appeared" {
 			t.Fatalf("referenced = %+v, want recorded types", refs)
 		}
+		if r.OccurredAt.IsZero() || r.ReceivedAt.IsZero() {
+			t.Fatalf("referenced = %+v, want report timing", refs)
+		}
 	}
 }
 
@@ -222,6 +225,11 @@ func TestObservationsForEvents(t *testing.T) {
 	}
 	if obs[0].ViewRole != "host" || len(obs[0].Attributes) == 0 {
 		t.Fatalf("observation = %+v, want snapshot attributes", obs[0])
+	}
+	// The detail read carries the exact persisted association: the
+	// observation's own subject, never a re-matched profile.
+	if obs[0].ProfileID == "" || obs[0].ReferenceClass == "" || obs[0].SourceScope == "" {
+		t.Fatalf("observation = %+v, want exact persisted association", obs[0])
 	}
 
 	// Empty and unknown inputs read nothing; a profile's latest

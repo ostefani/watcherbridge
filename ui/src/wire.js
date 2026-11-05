@@ -113,7 +113,7 @@
  * @property {number} [input_tokens] producing-call accounting only
  * @property {number} [output_tokens] producing-call accounting only
  * @property {number} [cost_usd] producing-call accounting only, absent while unknown
- * @property {Array<{step: number, tool: string, args: string, result: string, status: string, duration_ms: number}>} [traces] executed tool steps, detail fetch only
+ * @property {Array<{step: number, tool: string, args: string, result: string, status: string, duration_ms: number, outcome?: string, summary?: string}>} [traces] executed tool steps, detail fetch only
  * @property {string} context retained reported context, not raw evidence
  * @property {string} recommended_check text only, never an action
  * @property {string} created_at RFC 3339
@@ -121,7 +121,7 @@
  * @property {number} seq
  * @property {{profile_id: string, role: string}[]} profiles persisted links only
  * @property {boolean} [profiles_truncated]
- * @property {{event_id: string, event_type: string}[]} referenced_events index, not evidence
+ * @property {{event_id: string, event_type: string, occurred_at?: string, received_at?: string, target?: string, target_truncated?: boolean}[]} referenced_events index, not evidence
  * @property {boolean} [referenced_truncated]
  * @property {Observation[]} observations retained views for exactly those events
  * @property {boolean} [observations_truncated]
@@ -139,6 +139,9 @@
  * @property {Array<{proto: string, port: number, state: string, service: string}>} [ports] latest evidence only
  * @property {number} ports_total
  * @property {boolean} ports_truncated
+ * @property {string} [profile_id] detail fetch only, exact persisted link
+ * @property {string} [reference_class] detail fetch only
+ * @property {string} [source_scope] detail fetch only
  */
 
 // wire: deviceWire (internal/viewer/viewer.go)
