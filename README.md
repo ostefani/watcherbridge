@@ -11,6 +11,10 @@ WatcherBridge receives signed network-change reports, preserves the original evi
 
 The bridge runs locally with an embedded dashboard, SQLite storage, and optional AI explanations. It interprets reported changes; network discovery and host identification belong to the event source.
 
+## Building notes
+
+Biggest obstacle: repeated power and internet outages in the final days of the build. I worked in short windows when connected, and submitted before the deadline. Wasn't able to update the submission form to add this note there due to the outage too.
+
 ## What it does
 
 - **Shows what needs attention.** Each briefing shows a priority derived from deterministic rules over the reported changes, with the reasoning behind it. AI may raise that priority by one level, up to high; only rules produce critical.
