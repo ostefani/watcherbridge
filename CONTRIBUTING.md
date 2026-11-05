@@ -17,10 +17,24 @@ Design principles that contributions must preserve:
 
 Requirements:
 
-- Go 1.25 or newer.
+- Go 1.26 or newer, matching `go.mod`.
 - A C compiler (Xcode Command Line Tools on macOS, gcc on Linux). The SQLite driver (`mattn/go-sqlite3`) uses cgo, so builds need `CGO_ENABLED=1` (the default when a C compiler is present).
 
-Clone, then from the repository root:
+Build from the repository root:
+
+```sh
+CGO_ENABLED=1 go build -o watcherbridge ./cmd/watcherbridge
+```
+
+The dashboard assets are embedded in the executable. The repository includes
+built assets, so Node.js is needed only when changing the viewer. For UI work,
+use the version pinned in `ui/.nvmrc`, run `make ui-check`, and include the
+regenerated `internal/viewer/web/dist` files with the source changes. Rebuild
+and restart the executable after updating those assets; refreshing the browser
+alone does not update a running binary.
+
+Run the Go checks from the repository root with `CGO_ENABLED=1` and a C
+compiler available:
 
 ```sh
 go test $(go list ./... | grep -v '/node_modules/')
@@ -41,12 +55,26 @@ Formatting is checked over tracked files only:
 test -z "$(gofmt -l $(git ls-files '*.go'))"
 ```
 
-There is no released binary yet; the current code is the persistence and forwarding core (`internal/store`, `internal/forwarder`) with its test suites.
+The application includes signed-report ingestion, retained reported context,
+priority resolution, optional model/investigator explanations, a local review
+dashboard, operator decisions, and status/API surfaces. Network discovery,
+host matching, and live device identity remain the scanner's responsibilities.
+
+For UI changes, also walk the applicable checks in
+[the manual UI checklist](docs/manual-ui-results.md). Record the tested revision
+and actual results; automated render checks do not establish visual or
+interactive correctness. `make ui-drift` verifies that the embedded assets
+match a rebuild once the intended generated changes are committed.
 
 ## Architecture in brief
 
 - `internal/store` — embedded SQLite (WAL mode) behind a single-writer goroutine. It stores raw events with their original bytes, per-host groups with a durable lifecycle (open → closed → processing → done/failed), briefings, and the local pseudonym map. Schema changes are ordered migrations keyed by `PRAGMA user_version`; timestamps are UTC Unix nanoseconds stored as integers.
 - `internal/forwarder` — a per-event gate that prevents duplicate in-flight forwards when the same event is delivered twice.
+- `internal/server` — authenticated report/heartbeat admission and tap/proxy delivery boundaries.
+- `internal/briefing` — deterministic priority rules, bounded model/investigator work, and fallback briefings. `internal/provider` and `internal/redactor` own provider adapters and redacted context handling.
+- `internal/overview` and `internal/incidentsummary` — review overview computation and summaries over retained incident evidence.
+- `internal/viewer` and `ui/` — local APIs, Server-Sent Events, and the Svelte dashboard. Reported facts, model explanations, and operator review state remain distinct.
+- `cmd/watcherbridge` — process setup and the status CLI.
 
 Keep files organized by responsibility inside a package. Create a new package only for a real boundary, as with `internal/forwarder`; don't split packages just to shorten files, and don't split one transaction across independently committed steps.
 

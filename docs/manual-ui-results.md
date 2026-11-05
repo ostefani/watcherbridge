@@ -12,6 +12,11 @@ Unrun items never count as passing.
 
 Release under test: Release 2 candidate, baseline 385fcb6 plus uncommitted Step 31 corrections. Date: 2026-11-03. Walked by: unavailable (human walkthrough pending).
 
+Checklist maintenance, 2026-11-05: the briefing expectations in §§4 and 11
+below reflect the redesigned viewer. The run context above is historical;
+this edit does not record a new walkthrough or change any verdict. For the
+next walkthrough, record its revision, date and reviewer separately.
+
 ## 1. Stream, startup and shutdown
 
 - [ ] Cold start with an empty database shows Home quiet state
@@ -77,27 +82,43 @@ Release under test: Release 2 candidate, baseline 385fcb6 plus uncommitted Step 
 ## 4. Detail, device and health screens
 
 - [ ] From Home attention, follow a briefing link: route is
-  `#/briefing/<id>`, sections run Summary, Why this priority,
-  Referenced events, Reported evidence, Retained reported context,
-  Recommended check, How I checked this, Provenance.
+  `#/briefing/<id>`. Reading order is structured Summary, report-time
+  notice, Recommended check, Why this priority, expandable Scanner
+  snapshot(s), Investigator notes (or Analysis and retained context),
+  and collapsed Technical details with trace/accounting/provenance.
+  Your decision aligns beside the summary on wide full pages and follows
+  the recommended check in embedded/narrow views. Long IDs and IPv6 wrap
+  without horizontal page overflow; keyboard order follows the stacked
+  reading order. Verdict: **Not run**
+- [ ] Summary fields use reported hostname/IP/MAC, report time/range,
+  scan target and analysis source. Previous/current identities stay
+  separate, missing values read as unavailable, and incomplete evidence
+  does not become a single-host summary or complete time range. The notice
+  reads "Reported at the time shown. Network conditions may have changed
+  since this report." Verdict: **Not run**
+- [ ] Why this priority shows the final priority and recorded reason.
+  The comparison reads Baseline floor, Model suggestion (or "No model
+  suggestion — baseline stands"), and Final priority; it opens when values
+  differ or clamping occurred. Source wording matches the API `source`,
+  including "Earlier version (source unknown)" for legacy briefings.
   Verdict: **Not run**
-- [ ] Stepper reads Baseline floor, model suggestion (or "none —
-  baseline stands"), final priority; clamping is explicit when it
-  happened; source badge matches the API `source` value, legacy
-  reads "Earlier version (source unknown)". Verdict: **Not run**
-- [ ] "How I checked this" reads "No agent trace is available for
-  this briefing." — no empty panel, no investigation claim.
+- [ ] Technical details is collapsed initially; with no trace it reads
+  "No agent trace is available for this briefing." Investigator notes
+  distinguish explanation confidence from scanner-reported identity
+  confidence. Unknown-subject, failed, blocked, malformed and partial
+  lookup results are explicit limitations, never proof of absent history.
+  A similar-report count describes retained reports in its source/window,
+  not previous appearances of this host or a unique-device count.
   Verdict: **Not run**
-- [ ] Referenced events pair IDs with types; observations below them
-  carry the retained view for exactly those events (event ID and
-  role in each heading), never a profile's latest view.
-  A changed event's previous and current links for one profile
-  render as two rows. Verdict: **Not run**
-- [ ] Profile links come only from persisted links; a briefing with
-  no links says so; truncated sections say so. Verdict: **Not run**
-- [ ] Recommended check is text. There is no button, form or link
-  that scans, enforces or otherwise acts on the network.
-  Verdict: **Not run**
+- [ ] Scanner snapshots pair event IDs with types and retain exactly those
+  events' host/previous/current views, never a profile's latest view.
+  Profile links use persisted associations; missing links and omitted or
+  truncated evidence are explicit. View scanner snapshot and event/tool
+  citations open the required disclosures and focus the exact evidence
+  without changing the briefing hash route. Verdict: **Not run**
+- [ ] Recommended check is stored text. Copy controls copy the reported
+  IP/MAC and announce actual success or failure. There is no control that
+  scans, enforces or otherwise acts on the network. Verdict: **Not run**
 - [ ] Reported hosts list pages oldest-first; "Load more" appends
   without duplicating rows even when a profile gains another
   report mid-paging; exhaustion reads "End of retained list"; the
@@ -226,10 +247,14 @@ clamping with Show more (`<details>` disclosure used instead).
 
 ## 11. Decisions (Step 25)
 
-- [ ] Briefing dossier: expected / not-expected / snooze / note
-  record and round-trip; the audit trail lists them newest-first
-  with undone markers; Undo appends an undo row (no tombstones).
-  Verdict: **Not run**
+- [ ] Briefing dossier: Your decision starts with no selected kind and
+  disabled submit. An explicit expected / not-expected / snooze / note
+  choice enables a valid submission; a note requires nonempty text.
+  Decisions round-trip, the audit trail is newest-first with undone
+  markers, and Undo appends a row (no tombstones). A note alone does not
+  mark the briefing reviewed; effective review status comes from the
+  server. Refresh failure after a save retains the last loaded report
+  with a visible retry. Verdict: **Not run**
 - [ ] Profile page: note and label record; label head shows under
   "Your label"; undoing the head restores the prior label;
   undoing a stale head is refused, never a silent overwrite.
