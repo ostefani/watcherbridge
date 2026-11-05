@@ -25,51 +25,10 @@ Signed reports → Verify & store → Group → Prioritize → Explain or fallba
                                                   Dashboard · API · CLI
 ```
 
-## Quick start
+## Run the AI demo
 
-Requires **Go 1.26+** and a **C compiler** for SQLite. The viewer is embedded; Node.js is needed only for frontend development. The examples below use a POSIX shell.
-
-The [reviewer guide](docs/reviewer-guide.md) covers setup and demos on macOS, Linux, and Windows, including optional scanner integration.
-
-```sh
-git clone https://github.com/ostefani/WatcherBridge.git
-cd WatcherBridge
-CGO_ENABLED=1 go build -o watcherbridge ./cmd/watcherbridge
-
-mkdir -m 700 demo-data
-openssl rand -hex 32 > demo-data/webhook.secret
-chmod 600 demo-data/webhook.secret
-
-./watcherbridge -secret-file ./demo-data/webhook.secret \
-  -db ./demo-data/demo.db -scanrelay-url=
-```
-
-Open the [local dashboard](http://127.0.0.1:8081/). In another terminal, send a synthetic report using Python 3:
-
-```sh
-python3 docs/reviewer-mock.py demo-data/webhook.secret
-```
-
-The sender should print `Synthetic event accepted: 202`. Allow about 45 seconds for the grouping window to close. This demo performs no network scan and makes no external AI calls. The default `fake` provider produces marked fallback briefings, which may show degraded coverage in Health.
-
-For integration, configure a sender on the same machine to post to `http://127.0.0.1:8081/webhook` using the shared secret and the [signed webhook contract](docs/reviewer-guide.md#without-pro-the-webhook-contract). Compatible senders must implement that event schema and signature format.
-
-## AI explanations
-
-The live adapter uses the Meta Model API with a configurable model ID and endpoint. Store your API key in an owner-only file, stop the running bridge, and restart it with:
-
-```sh
-./watcherbridge -secret-file ./demo-data/webhook.secret \
-  -db ./demo-data/demo.db -scanrelay-url= \
-  -model-provider meta -model-id '<your-model-id>' \
-  -model-base-url '<your-https-responses-endpoint>' \
-  -model-key-file /absolute/path/to/model-api-key \
-  -agent-enabled
-```
-
-This example enables retained-evidence investigation. Without `-agent-enabled`, eligible groups use a single model request, with at most one repair. With the flag, groups whose deterministic baseline is medium or higher (by default) can use up to four read-only local evidence tools before a final answer, plus at most one repair across the run. Low-baseline groups still use the single-request path. The investigator can provide retained history and reported-service context, with its executed tools shown in the briefing trace; it may take longer and use more model tokens. It never scans the network or changes the deterministic priority floor. Failed investigation produces a deterministic fallback briefing.
-
-Keep redaction enabled for external providers. AI explanations are advisory; the bridge remains usable without a model key.
+See the [reviewer guide](docs/reviewer-guide.md) for setup and copy-paste
+commands to run the Meta AI demo with synthetic reports or SubnetLens Pro.
 
 ## Operation and development
 
