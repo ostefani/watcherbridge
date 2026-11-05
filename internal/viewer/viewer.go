@@ -769,6 +769,8 @@ type evidenceRefWire struct {
 
 // traceWire is one executed investigator tool step: validated args and
 // the scanned result envelope, both tokenized, never raw identifiers.
+// Outcome/Summary are the server's bounded presentation classification;
+// the raw status/args/result stay untouched.
 type traceWire struct {
 	Step       int    `json:"step"`
 	Tool       string `json:"tool"`
@@ -776,6 +778,130 @@ type traceWire struct {
 	Result     string `json:"result"`
 	Status     string `json:"status"`
 	DurationMS int64  `json:"duration_ms"`
+	Outcome    string `json:"outcome,omitempty"`
+	Summary    string `json:"summary,omitempty"`
+}
+
+// traceOutcome classifies one stored tool result for display (Go owns
+// the classification; the client renders it). It never treats a
+// completed transport as a successful evidentiary check: unknown
+// subjects, blocked results, errors, empty results and truncated or
+// unrecognized envelopes each map distinctly. Invalid JSON reads as
+// unavailable, never a guessed success. Counts stay unknown when the
+// envelope omits them.
+func traceOutcome(tool, status, resultJSON string) (string, string) {
+	const unavailable = "Result unavailable; no conclusion can be drawn from this lookup."
+	if status == "blocked" {
+		return "blocked", "Redaction blocked this result; retained context is unavailable."
+	}
+	if status == "error" {
+		return "error", "Tool execution failed; result unavailable."
+	}
+	if status != "ok" || len(resultJSON) == 0 || len(resultJSON) > 4096 {
+		return "unavailable", unavailable
+	}
+	var env struct {
+		Result    map[string]json.RawMessage `json:"result"`
+		Truncated bool                       `json:"truncated"`
+		Omitted   int                        `json:"omitted"`
+		Tool      string                     `json:"tool"`
+	}
+	if err := json.Unmarshal([]byte(resultJSON), &env); err != nil || env.Result == nil || env.Tool != tool || env.Omitted < 0 {
+		return "unavailable", unavailable
+	}
+	switch tool {
+	case "get_reported_profile", "get_reported_history", "get_reported_services", "compare_reported_context", "find_similar_reported_changes":
+	default:
+		return "unavailable", unavailable
+	}
+	if raw, ok := env.Result["error"]; ok {
+		var reason string
+		if json.Unmarshal(raw, &reason) != nil || reason == "" {
+			return "unavailable", unavailable
+		}
+		switch reason {
+		case "unknown subject":
+			return "unknown_subject", "The investigator could not resolve this lookup to a permitted reported subject; history remains unknown."
+		case "redaction_blocked":
+			return "blocked", "Redaction blocked this result; retained context is unavailable."
+		default:
+			return "error", "Tool execution failed; result unavailable."
+		}
+	}
+	integer := func(key string) (int64, bool) {
+		raw, ok := env.Result[key]
+		var n int64
+		if !ok || string(raw) == "null" || json.Unmarshal(raw, &n) != nil || n < 0 {
+			return 0, false
+		}
+		return n, true
+	}
+	partial := env.Truncated || env.Omitted > 0
+	if tool == "find_similar_reported_changes" {
+		count, countOK := integer("report_count")
+		days, daysOK := integer("window_days")
+		var kind string
+		if json.Unmarshal(env.Result["kind"], &kind) != nil || (kind != "appeared" && kind != "disappeared" && kind != "changed") || !countOK || !daysOK || days < 1 || days > 30 {
+			return "unavailable", unavailable
+		}
+		portText := ""
+		if raw, ok := env.Result["port"]; ok && string(raw) != "null" {
+			port, valid := integer("port")
+			if !valid || port < 1 || port > 65535 {
+				return "unavailable", unavailable
+			}
+			portText = fmt.Sprintf(" mentioning port %d", port)
+		}
+		noun := "reports"
+		if count == 1 {
+			noun = "report"
+		}
+		summary := fmt.Sprintf("%d retained %q %s%s received within the lookup's %d-day window in the same scanner-source scope; this may include the triggering event.", count, kind, noun, portText, days)
+		if partial {
+			return "truncated", summary + " Some result fields were omitted."
+		}
+		return "data", summary
+	}
+	if partial {
+		return "truncated", "Only part of this lookup result is available; omitted fields remain unknown."
+	}
+	// Only recognized result shapes support a positive presentation. In
+	// particular an unknown services marker is not an empty service list.
+	switch tool {
+	case "get_reported_history":
+		var briefings, observations []json.RawMessage
+		b, bok := env.Result["briefings"]
+		o, ook := env.Result["observations"]
+		if !bok || !ook || string(b) == "null" || string(o) == "null" || json.Unmarshal(b, &briefings) != nil || json.Unmarshal(o, &observations) != nil {
+			break
+		}
+		if len(briefings) == 0 && len(observations) == 0 {
+			return "empty", "No retained entries were returned by this history lookup."
+		}
+		return "data", "Retained history entries were returned for the resolved subject."
+	case "get_reported_profile":
+		var class string
+		if json.Unmarshal(env.Result["reference_class"], &class) == nil && (class == "reported_device" || class == "address" || class == "event" || class == "legacy") {
+			return "data", "Reported profile context was returned for the resolved subject."
+		}
+	case "get_reported_services":
+		var ports []json.RawMessage
+		if raw, ok := env.Result["ports"]; ok && string(raw) != "null" && json.Unmarshal(raw, &ports) == nil {
+			if len(ports) == 0 {
+				return "empty", "No retained ports matched this services lookup."
+			}
+			return "data", "Scanner-reported port evidence was returned."
+		}
+	case "compare_reported_context":
+		if n, ok := integer("samples"); ok && n == 0 {
+			return "empty", "No retained samples were returned for comparison."
+		}
+		var samples []json.RawMessage
+		if raw, ok := env.Result["samples"]; ok && json.Unmarshal(raw, &samples) == nil && len(samples) > 0 {
+			return "data", "Retained samples were returned for comparison; they do not represent the whole network."
+		}
+	}
+	return "unavailable", unavailable
 }
 
 // briefingSubjectWire is one persisted profile link with its
@@ -785,10 +911,16 @@ type briefingSubjectWire struct {
 	Role      string `json:"role"`
 }
 
-// referencedEventWire pairs one group event ID with its type.
+// referencedEventWire pairs one group event ID with its type and
+// report timing. OccurredAt is the scanner's reported event time,
+// ReceivedAt is local receipt, Target is the reported scan target.
 type referencedEventWire struct {
-	EventID   string `json:"event_id"`
-	EventType string `json:"event_type"`
+	EventID         string `json:"event_id"`
+	EventType       string `json:"event_type"`
+	OccurredAt      string `json:"occurred_at,omitempty"`
+	ReceivedAt      string `json:"received_at,omitempty"`
+	Target          string `json:"target,omitempty"`
+	TargetTruncated bool   `json:"target_truncated,omitempty"`
 }
 
 func viewOf(b store.Briefing) briefingView {
@@ -976,7 +1108,16 @@ func (v *Viewer) handleBriefing(w http.ResponseWriter, r *http.Request) {
 	view.ReferencedEvents = make([]referencedEventWire, 0, len(refs))
 	eventIDs := make([]string, 0, len(refs))
 	for _, ref := range refs {
-		view.ReferencedEvents = append(view.ReferencedEvents, referencedEventWire{EventID: ref.EventID, EventType: ref.EventType})
+		wire := referencedEventWire{EventID: ref.EventID, EventType: ref.EventType}
+		if !ref.OccurredAt.IsZero() {
+			wire.OccurredAt = ref.OccurredAt.UTC().Format(time.RFC3339)
+		}
+		if !ref.ReceivedAt.IsZero() {
+			wire.ReceivedAt = ref.ReceivedAt.UTC().Format(time.RFC3339)
+		}
+		wire.Target = ref.Target
+		wire.TargetTruncated = ref.TargetTruncated
+		view.ReferencedEvents = append(view.ReferencedEvents, wire)
 		eventIDs = append(eventIDs, ref.EventID)
 	}
 	view.ReferencedTruncated = refsTruncated
@@ -993,22 +1134,27 @@ func (v *Viewer) handleBriefing(w http.ResponseWriter, r *http.Request) {
 			ReceivedAt: o.ReceivedAt.UTC().Format(time.RFC3339),
 			Attributes: o.Attributes,
 			PortsTotal: o.PortsTotal, PortsTruncated: o.PortsTruncated,
+			ProfileID: o.ProfileID, ReferenceClass: o.ReferenceClass, SourceScope: o.SourceScope,
 		}
 		view.Observations = append(view.Observations, wire)
 	}
 	view.ObservationsTruncated = obsTruncated
 	// The investigator trace rides the detail fetch only: the executed
 	// tool steps in 0-based order, tokenized like every provider-bound
-	// surface. An empty trace stays absent, never null.
+	// surface. An empty trace stays absent, never null. Outcome/Summary
+	// are the server's bounded display classification; raw fields ride
+	// untouched beside them.
 	traces, err := v.store.AgentTraces(ctx, b.BriefingID)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	for _, tr := range traces {
+		outcome, summary := traceOutcome(tr.Tool, tr.Status, tr.ResultJSON)
 		view.Traces = append(view.Traces, traceWire{
 			Step: tr.Step, Tool: tr.Tool, Args: tr.ArgsJSON,
 			Result: tr.ResultJSON, Status: tr.Status, DurationMS: tr.DurationMS,
+			Outcome: outcome, Summary: summary,
 		})
 	}
 	// Operator decisions ride the subject view so the dossier shows
@@ -1061,7 +1207,9 @@ type deviceWire struct {
 // observationWire is one retained event view: the bounded attributes
 // snapshot plus, for the latest-evidence section only, the retained
 // port list. History items carry no per-item port list; the snapshot's
-// ports_total/ports_truncated says what exists.
+// ports_total/ports_truncated says what exists. The detail fetch adds
+// the exact persisted association for the view; profile/history/list
+// payloads leave them absent.
 type observationWire struct {
 	ObservationID  int64          `json:"observation_id"`
 	EventID        string         `json:"event_id"`
@@ -1072,6 +1220,9 @@ type observationWire struct {
 	Ports          []portWire     `json:"ports,omitempty"`
 	PortsTotal     int64          `json:"ports_total"`
 	PortsTruncated bool           `json:"ports_truncated"`
+	ProfileID      string         `json:"profile_id,omitempty"`
+	ReferenceClass string         `json:"reference_class,omitempty"`
+	SourceScope    string         `json:"source_scope,omitempty"`
 }
 
 // portWire is one retained port state.

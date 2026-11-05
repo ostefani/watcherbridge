@@ -105,3 +105,67 @@ export function windowLabel(value) {
   const match = /^(\d+)h0m0s$/.exec(value);
   return match ? `${match[1]} hours` : value;
 }
+
+/**
+ * Report time or range for one briefing's event index.
+ * Uses the scanner's reported event time (occurred_at), never
+ * briefing creation, receipt, or a profile's first report.
+ * @param {{event_id: string, occurred_at?: string}[]} [refs]
+ * @returns {{local: string, utc: string, partial: boolean}|null}
+ */
+export function reportRange(refs = []) {
+  const times = (refs ?? [])
+    .map((r) => new Date(r.occurred_at ?? ''))
+    .filter((d) => !Number.isNaN(d.getTime()))
+    .sort((a, b) => a - b);
+  if (times.length === 0) {
+    return null;
+  }
+  const partial = times.length !== refs.length;
+  const first = displayTime(times[0].toISOString());
+  if (times.length === 1) {
+    return { ...first, partial };
+  }
+  const last = displayTime(times[times.length - 1].toISOString());
+  return { local: `${first.local} – ${last.local}`, utc: `${first.utc} – ${last.utc}`, partial };
+}
+
+/**
+ * Structured reported identity for the unambiguous single-view case.
+ * Returns the one host/current view's reported hostname, IP and MAC
+ * when exactly one event carries exactly one such view; otherwise
+ * null so the caller renders per-event identities instead of
+ * collapsing conflicting values into one host.
+ * @param {{event_id: string, view_role: string, attributes?: Record<string, any>}[]} [observations]
+ */
+export function singleViewIdentity(observations = []) {
+  if (observations.length !== 1) return null;
+  const views = (observations ?? []).filter((o) => o.view_role === 'host' || o.view_role === 'current');
+  const events = new Set(views.map((o) => o.event_id));
+  if (views.length !== 1 || events.size !== 1) {
+    return null;
+  }
+  const attrs = views[0].attributes ?? {};
+  const pick = (v) => (typeof v === 'string' && v !== '' ? v : null);
+  return {
+    event_id: views[0].event_id,
+    view_role: views[0].view_role,
+    hostname: pick(attrs.hostname),
+    ip: pick(attrs.ip),
+    mac: pick(attrs.mac),
+    randomized: typeof attrs.randomized === 'boolean' ? attrs.randomized : null,
+    identity_confidence: pick(attrs.identity_confidence) ?? 'unknown',
+    identity_source: pick(attrs.identity_source) ?? 'unknown'
+  };
+}
+
+/** Tri-state scanner-reported randomization wording; missing stays unknown. */
+export function randomizedLabel(value) {
+  if (value === true) {
+    return 'Randomized (scanner-reported)';
+  }
+  if (value === false) {
+    return 'Not randomized (scanner-reported)';
+  }
+  return 'Randomization unknown';
+}

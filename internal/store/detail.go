@@ -95,10 +95,17 @@ func (s *Store) BriefingSubjects(ctx context.Context, briefingID string) ([]Brie
 }
 
 // ReferencedEvent pairs one group event ID with its recorded type: an
-// evidence index, not the evidence itself.
+// evidence index, not the evidence itself. OccurredAt is the scanner's
+// reported event time, ReceivedAt is local receipt; Target is the
+// reported scan target, never a derived subnet. Target longer than
+// maxDisplayRunes is capped with TargetTruncated.
 type ReferencedEvent struct {
-	EventID   string
-	EventType string
+	EventID         string
+	EventType       string
+	OccurredAt      time.Time
+	ReceivedAt      time.Time
+	Target          string
+	TargetTruncated bool
 }
 
 // BriefingReferencedEvents returns the group's event index in
@@ -106,7 +113,7 @@ type ReferencedEvent struct {
 // maxReferencedEvents, which only fires for groups retained from
 // older, wider limits.
 func (s *Store) BriefingReferencedEvents(ctx context.Context, groupID string) ([]ReferencedEvent, bool, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT ge.event_id, re.event_type
+	rows, err := s.db.QueryContext(ctx, `SELECT ge.event_id, re.event_type, re.occurred_at, re.received_at, COALESCE(re.target,'')
 		FROM group_events ge JOIN raw_events re ON re.event_id = ge.event_id
 		WHERE ge.group_id = ? ORDER BY ge.event_id ASC LIMIT ?`, groupID, maxReferencedEvents+1)
 	if err != nil {
@@ -116,8 +123,18 @@ func (s *Store) BriefingReferencedEvents(ctx context.Context, groupID string) ([
 	var out []ReferencedEvent
 	for rows.Next() {
 		var ref ReferencedEvent
-		if err := rows.Scan(&ref.EventID, &ref.EventType); err != nil {
+		var occurred, received int64
+		var target string
+		if err := rows.Scan(&ref.EventID, &ref.EventType, &occurred, &received, &target); err != nil {
 			return nil, false, err
+		}
+		ref.OccurredAt = fromNanos(occurred)
+		ref.ReceivedAt = fromNanos(received)
+		if v, cut := capRunesFlag(target, maxDisplayRunes); cut {
+			ref.Target = v
+			ref.TargetTruncated = true
+		} else {
+			ref.Target = v
 		}
 		out = append(out, ref)
 	}
@@ -133,6 +150,10 @@ func (s *Store) BriefingReferencedEvents(ctx context.Context, groupID string) ([
 // ReferencedObservation is the bounded retained projection for one
 // exact event: the attributes snapshot plus its port summary. It never
 // substitutes a profile's latest observation for an older event.
+// ProfileID, ReferenceClass and SourceScope name the exact persisted
+// association for this view; empty means the view predates the link or
+// the link is no longer retained, and the caller must render it
+// unlinked rather than guessing an event-to-profile match.
 type ReferencedObservation struct {
 	EventID        string
 	ViewRole       string
@@ -141,6 +162,9 @@ type ReferencedObservation struct {
 	Attributes     map[string]any
 	PortsTotal     int64
 	PortsTruncated bool
+	ProfileID      string
+	ReferenceClass string
+	SourceScope    string
 }
 
 // ObservationsForEvents returns the retained observations recorded for
@@ -158,9 +182,11 @@ func (s *Store) ObservationsForEvents(ctx context.Context, eventIDs []string) ([
 	for _, id := range eventIDs {
 		args = append(args, id)
 	}
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`SELECT event_id, view_role, reported_at, received_at, attributes_json
-		FROM reported_observations WHERE event_id IN (%s)
-		ORDER BY event_id ASC, view_role ASC LIMIT ?`, placeholders),
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`SELECT ro.event_id, ro.view_role, ro.reported_at, ro.received_at, ro.attributes_json,
+		ro.profile_id, COALESCE(rs.reference_class,''), COALESCE(rs.source_scope,'')
+		FROM reported_observations ro LEFT JOIN reported_subjects rs ON rs.profile_id = ro.profile_id
+		WHERE ro.event_id IN (%s)
+		ORDER BY ro.event_id ASC, ro.view_role ASC LIMIT ?`, placeholders),
 		append(args, maxReferenceObservations+1)...)
 	if err != nil {
 		return nil, false, err
@@ -173,7 +199,7 @@ func (s *Store) ObservationsForEvents(ctx context.Context, eventIDs []string) ([
 		var obs ReferencedObservation
 		var reported, received int64
 		var attrsRaw string
-		if err := rows.Scan(&obs.EventID, &obs.ViewRole, &reported, &received, &attrsRaw); err != nil {
+		if err := rows.Scan(&obs.EventID, &obs.ViewRole, &reported, &received, &attrsRaw, &obs.ProfileID, &obs.ReferenceClass, &obs.SourceScope); err != nil {
 			return nil, false, err
 		}
 		if len(out) >= maxReferenceObservations || pageBytes+int64(len(attrsRaw)) > maxReferenceObsBytes && len(out) > 0 {

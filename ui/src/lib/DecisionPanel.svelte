@@ -22,21 +22,28 @@
     reload = async () => {},
     memberScope = false,
     memberCount = 0,
-    kindHelp = {}
+    kindHelp = {},
+    // requireChoice leaves no kind preselected: the operator must make
+    // an explicit radio choice before submitting. Default false so
+    // unrelated incident/profile flows keep their current behavior.
+    requireChoice = false
   } = $props();
 
   const KIND_HELP = {
-    expected: 'Mark reviewed: this briefing needs no further action.',
+    expected: 'No further action needed.',
     not_expected: 'Flag for follow-up: this briefing still needs a check.',
-    snooze: 'Hide until a time. Empty keeps the server default (24h).',
+    snooze: 'Hide from attention until a time. Empty keeps the server default (24h).',
     note: 'Free-text note, kept with the audit (max 2000 characters).',
     label: 'Your label for this profile, never identity (max 256 characters).'
   };
 
-  // chosen overrides the parent-supplied first kind; the derived
-  // reads the prop each time so lint sees no stale capture.
+  // chosen is the operator's explicit choice. Without requireChoice
+  // the first offered kind stays preselected (existing flows); with
+  // it, kind remains null until the operator chooses, and nothing
+  // submits on its own. The derived reads the prop each time so lint
+  // sees no stale capture.
   let chosen = $state(/** @type {string|null} */ (null));
-  const kind = $derived(chosen ?? kinds[0] ?? 'note');
+  const kind = $derived(requireChoice ? chosen : (chosen ?? kinds[0] ?? 'note'));
   let untilText = $state('');
   let text = $state('');
   let pending = $state(false);
@@ -99,6 +106,12 @@
 
   const needsText = $derived(kind === 'note' || kind === 'label');
   const textCap = $derived(kind === 'label' ? 256 : 2000);
+  // Submittable only with an explicit kind inside the offered set; a
+  // note/label additionally needs nonempty text. Used only for the
+  // redesigned composer; other flows keep the pending-only gate.
+  const canSubmit = $derived(
+    kind !== null && kinds.includes(kind) && (!needsText || text.trim() !== '')
+  );
 
   // Shortcut presets from the dossier screen: adopt the kind and
   // hand focus to submit. Nothing submits without the operator.
@@ -126,6 +139,14 @@
   async function submit(/** @type {SubmitEvent} */ ev) {
     ev.preventDefault();
     if (pending) {
+      return;
+    }
+    // Programmatic guard mirrors the disabled button: no implicit or
+    // out-of-set kind ever submits from the redesigned composer.
+    if (requireChoice && !canSubmit) {
+      return;
+    }
+    if (kind === null) {
       return;
     }
     pending = true;
@@ -294,21 +315,22 @@
 
 </script>
 
-<section aria-label="Operator decisions">
-  <h3>Operator decisions</h3>
-  <p><span class="pill">Status: {statusLine()}</span></p>
+<section aria-label="Operator decisions" class:decision-card={requireChoice}>
+  <h3>{requireChoice ? 'Your decision' : 'Operator decisions'}</h3>
+  <p class="decision-status"><span class="pill" data-review={effective?.kind ?? 'unreviewed'}>Status: {statusLine()}</span></p>
 
   <form onsubmit={submit} aria-label="Record a decision">
     <fieldset>
-      <legend>Kind</legend>
+      <legend class:sr-only={requireChoice}>Choose a decision</legend>
       {#each kinds as k (k)}
-        <label>
-          <input type="radio" name="decision-kind" value={k} checked={kind === k} onchange={() => (chosen = k)} />
-          {k.replace('_', ' ')}
+        <label class:selected={kind === k}>
+          <input type="radio" name={`decision-kind-${subjectId}`} value={k} checked={kind === k} onchange={() => (chosen = k)} />
+          <span class="decision-label">{k === 'not_expected' ? 'Not expected' : k.charAt(0).toUpperCase() + k.slice(1)}</span>
+          {#if requireChoice}<span class="decision-hint">{({ expected: 'no further action', not_expected: 'investigate', snooze: 'hide until later', note: 'annotation only' })[k]}</span>{/if}
         </label>
       {/each}
     </fieldset>
-    <p class="help">{kindHelp[kind] ?? KIND_HELP[kind] ?? ''}</p>
+    <p class="help">{kind === null ? 'Choose a verdict to record it.' : (kindHelp[kind] ?? KIND_HELP[kind] ?? '')}</p>
     {#if memberScope}
       <label>
         <input type="checkbox" bind:checked={includeMembers} />
@@ -333,7 +355,7 @@
     {#if formError !== null}
       <p role="alert">{formError}</p>
     {/if}
-    <button type="submit" bind:this={submitButton} disabled={pending}>
+    <button type="submit" bind:this={submitButton} disabled={requireChoice ? (pending || !canSubmit) : pending}>
       {pending ? 'Recording…' : 'Record decision'}
     </button>
   </form>
@@ -355,8 +377,9 @@
     {#if memberError !== null}<p role="alert">{memberError}</p>{/if}
   {/if}
 
+  {#if requireChoice}<h4 class="history-heading">Recorded decisions</h4>{/if}
   {#if trail.length === 0}
-    <p>No decisions recorded.</p>
+    <p class="empty-history">No decisions recorded.</p>
   {:else}
     <ol class="trail">
       {#each trail as d (d.decision_id)}
@@ -394,3 +417,29 @@
     <p role="alert">{listError}</p>
   {/if}
 </section>
+
+<style>
+  .decision-card { padding: 26px; background: var(--surface); border: 1px solid var(--border); border-radius: 16px; overflow-wrap: anywhere; }
+  .decision-card h3 { font-size: 20px; margin-bottom: 10px; letter-spacing: -.4px; }
+  .decision-status { margin-bottom: 20px; }
+  .decision-card .decision-status .pill { padding: 5px 11px; font-size: 12px; }
+  .decision-card [data-review=unreviewed], .decision-card [data-review=snooze] { color: var(--warning); border-color: var(--warning-border); background: var(--warning-bg); }
+  .decision-card [data-review=expected] { color: var(--success); border-color: var(--success-border); background: var(--success-bg); }
+  .decision-card [data-review=not_expected] { color: var(--danger); border-color: var(--danger-border); background: var(--danger-bg); }
+  .decision-card fieldset { display: grid; gap: 0; border: 1px solid var(--border); border-radius: 11px; padding: 6px 0; margin: 0 0 12px; min-width: 0; }
+  .decision-card fieldset label { display: grid; grid-template-columns: 20px minmax(0,1fr); align-items: center; gap: 2px 12px; padding: 12px 16px; margin: 0; cursor: pointer; min-height: 66px; }
+  .decision-card fieldset label:hover { background: var(--subtle); }
+  .decision-card fieldset label.selected { background: var(--accent-soft); }
+  .decision-card fieldset input { grid-row: 1 / span 2; width: 18px; height: 18px; padding: 0; margin: 0; accent-color: var(--accent); }
+  .decision-label { font-weight: 600; }
+  .decision-hint { grid-column: 2; font-size: 12px; color: var(--muted); }
+  .decision-card button[type=submit] { width: 100%; margin-top: 8px; color: var(--surface); background: var(--text); border-color: var(--text); font-weight: 700; }
+  .decision-card button[type=submit]:disabled { opacity: .45; }
+  .decision-card .history-heading { margin: 24px 0 12px; padding-top: 20px; border-top: 1px solid var(--border); text-transform: uppercase; letter-spacing: .07em; font-size: 11px; color: var(--muted); }
+  .empty-history { color: var(--muted); font-size: 13px; margin-bottom: 0; }
+  .decision-card .trail { padding-left: 0; list-style: none; }
+  .decision-card .trail li { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .decision-card .trail time { color: var(--muted); font-size: 11px; }
+  .decision-card .trail .text { flex-basis: 100%; }
+  .decision-card .trail button { min-height: 32px; padding: 4px 8px; font-size: 12px; }
+</style>

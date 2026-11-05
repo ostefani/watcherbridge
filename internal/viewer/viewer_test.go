@@ -1287,3 +1287,57 @@ func TestOverviewFrozenKeys(t *testing.T) {
 		t.Fatalf("overview CSP = %q", rec.Header().Get("Content-Security-Policy"))
 	}
 }
+
+// traceOutcome is display classification only: completed transport is
+// never a successful evidentiary check, and unknown envelopes never
+// guess success.
+func TestTraceOutcome(t *testing.T) {
+	outcome, _ := traceOutcome("get_reported_profile", "blocked", `{"tool":"get_reported_profile","result":{"error":"redaction_blocked"}}`)
+	if outcome != "blocked" {
+		t.Fatalf("blocked status = %q", outcome)
+	}
+	outcome, _ = traceOutcome("get_reported_profile", "ok", `{"tool":"get_reported_profile","result":{"error":"unknown subject"}}`)
+	if outcome != "unknown_subject" {
+		t.Fatalf("unknown subject = %q", outcome)
+	}
+	outcome, summary := traceOutcome("find_similar_reported_changes", "ok", `{"tool":"find_similar_reported_changes","result":{"report_count":1,"kind":"appeared","window_days":7}}`)
+	if outcome != "data" || !strings.Contains(summary, "same scanner-source scope") {
+		t.Fatalf("similar = %q %q", outcome, summary)
+	}
+	if outcome, _ := traceOutcome("get_reported_profile", "ok", `not json`); outcome != "unavailable" {
+		t.Fatalf("invalid envelope = %q", outcome)
+	}
+	if outcome, _ := traceOutcome("get_reported_profile", "error", `{"tool":"x"}`); outcome != "error" {
+		t.Fatalf("error status = %q", outcome)
+	}
+}
+
+func TestTraceOutcomeRejectsUnsupportedConclusions(t *testing.T) {
+	for _, tt := range []struct{ name, tool, result, outcome string }{
+		{"trailing JSON", "get_reported_profile", `{"tool":"get_reported_profile","result":{"reference_class":"event"}} {}`, "unavailable"},
+		{"wrong tool", "get_reported_history", `{"tool":"get_reported_profile","result":{"reference_class":"event"}}`, "unavailable"},
+		{"unknown historical shape", "get_reported_history", `{"tool":"get_reported_history","result":{"unexpected":"yes"}}`, "unavailable"},
+		{"unknown services", "get_reported_services", `{"tool":"get_reported_services","result":{"services":"unknown"}}`, "unavailable"},
+		{"empty history", "get_reported_history", `{"tool":"get_reported_history","result":{"briefings":[],"observations":[]}}`, "empty"},
+		{"omitted context", "get_reported_profile", `{"tool":"get_reported_profile","omitted":1,"result":{"reference_class":"event"}}`, "truncated"},
+		{"invalid count", "find_similar_reported_changes", `{"tool":"find_similar_reported_changes","result":{"report_count":1.5,"kind":"appeared","window_days":7}}`, "unavailable"},
+		{"invalid window", "find_similar_reported_changes", `{"tool":"find_similar_reported_changes","result":{"report_count":1,"kind":"appeared","window_days":31}}`, "unavailable"},
+		{"invalid kind", "find_similar_reported_changes", `{"tool":"find_similar_reported_changes","result":{"report_count":1,"kind":"<script>","window_days":7}}`, "unavailable"},
+		{"invalid port", "find_similar_reported_changes", `{"tool":"find_similar_reported_changes","result":{"report_count":1,"kind":"appeared","window_days":7,"port":"<script>"}}`, "unavailable"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, _ := traceOutcome(tt.tool, "ok", tt.result)
+			if got != tt.outcome {
+				t.Fatalf("outcome = %q, want %q", got, tt.outcome)
+			}
+		})
+	}
+}
+
+func BenchmarkTraceOutcome(b *testing.B) {
+	result := `{"tool":"find_similar_reported_changes","result":{"report_count":1,"kind":"appeared","window_days":7,"port":null},"truncated":false,"omitted":0}`
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		traceOutcome("find_similar_reported_changes", "ok", result)
+	}
+}

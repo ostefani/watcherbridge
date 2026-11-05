@@ -33,6 +33,7 @@ for (const [from, to] of [
   [join(root, 'src', 'api.js'), join(out, 'api.js')],
   [join(lib, 'freshness.js'), join(out, 'freshness.js')],
   [join(lib, 'format.js'), join(out, 'format.js')],
+  [join(lib, 'evidenceNavigation.js'), join(out, 'evidenceNavigation.js')],
   [join(lib, 'roving.js'), join(out, 'roving.js')],
   [join(lib, 'paging.js'), join(out, 'paging.js')],
   [join(lib, 'purge.js'), join(out, 'purge.js')],
@@ -318,20 +319,23 @@ const cases = [
       'Why this priority',
       'Baseline floor',
       'Suggestion adjusted to respect the baseline floor and one-step raise limit.',
-      'Referenced events',
-      'evt-1 — host.appeared',
-      'Reported evidence',
-      'Retained reported context',
+      'Scanner snapshots',
+      'evt-1',
+      'host.appeared',
+      'Analysis and retained context',
       'prof-0000000000000001',
+      'Open reported context',
       'More profile links exist',
       'Recommended check',
-      'Operator decisions',
+      'Your decision',
       'Status: Reviewed: expected',
       'Record decision',
+      'Choose a verdict to record it.',
       'operator note',
       'Undo',
       'Show older decisions',
       'No agent trace is available',
+      'Technical details',
       'Provenance',
       'Snapshot covers 600 ports (truncated)'
     ],
@@ -342,13 +346,14 @@ const cases = [
     name: 'detail with agent trace',
     props: { id: 'brf-agent-1', initial: traceFixture },
     expect: [
-      'Likely explanation',
-      'Confidence: high',
+      'Possible explanation',
+      'Explanation confidence (model self-assessment): high',
       '1200 input tokens',
       '300 output tokens',
       'Event evt-1',
       'Tool step 0',
-      'Step 0: fetch_event — ok (12 ms)',
+      'fetch_event',
+      'step 0 · ok · 12 ms',
       'Cited evidence',
       'Executed tool steps'
     ],
@@ -591,9 +596,9 @@ if (reviewTitle('port_closed', confidenceViews('high', 'low')) !== 'Ports closed
   throw new Error('Specific reported-change categories must retain their title');
 }
 cases.push(
-  { component: Detail, name: 'appearance review uses reported event title', props: { id: 'brf-grp-1', initial: { ...detailFixture, kind: 'other', observations: [], referenced_events: [{ event_id: 'evt-1', event_type: 'host.appeared' }] } }, expect: ['<h2>New host reported</h2>'], absent: ['Other changes', confidenceTitle] },
+  { component: Detail, name: 'appearance review uses reported event title', props: { id: 'brf-grp-1', initial: { ...detailFixture, kind: 'other', observations: [], referenced_events: [{ event_id: 'evt-1', event_type: 'host.appeared' }] } }, expect: ['New host reported</h2>'], absent: ['Other changes', confidenceTitle] },
   { component: AttentionList, name: 'unloaded other review has neutral heading', props: { items: [{ ...attentionItem, change_kind: 'other' }] }, expect: ['Reported details changed'], absent: ['Other changes', confidenceTitle] },
-  { component: Detail, name: 'reported confidence decrease heading', props: { id: 'brf-grp-1', initial: { ...detailFixture, kind: 'other', observations: confidenceViews('high', 'low') } }, expect: [`<h2>${confidenceTitle}</h2>`] },
+  { component: Detail, name: 'reported confidence decrease heading', props: { id: 'brf-grp-1', initial: { ...detailFixture, kind: 'other', observations: confidenceViews('high', 'low') } }, expect: [`${confidenceTitle}</h2>`] },
   { component: AttentionList, name: 'loaded review title in attention list', props: { items: [{ ...attentionItem, change_kind: 'other' }], titles: { [attentionItem.id]: confidenceTitle } }, expect: [confidenceTitle], absent: ['Other changes'] }
 );
 for (const [types, expected] of [
@@ -611,8 +616,40 @@ cases.push(
   { component: AttentionList, name: 'standalone review navigation', props: { items: [attentionItem] }, expect: ['href="#/briefing/brf-grp-1"', 'Ports closed'] },
   { component: AttentionList, name: 'standalone incident navigation', props: { items: [{ ...attentionItem, id: 'inc-11-22', kind: 'incident' }] }, expect: ['href="#/incidents/inc-11-22"', 'Show members'] },
   { component: AttentionList, name: 'selected review button', props: { items: [attentionItem], selectedId: attentionItem.id, onselect: () => {} }, expect: ['<button', 'aria-current="true"', 'data-row'], absent: ['href="#/briefing/'] },
-  { component: Detail, name: 'embedded briefing keeps evidence and decisions', props: { id: 'brf-grp-1', initial: detailFixture, embedded: true }, expect: ['Reported evidence', 'Record decision', 'Recommended check'], absent: ['Back to Home', '<img'] }
+  { component: Detail, name: 'embedded briefing keeps evidence and decisions', props: { id: 'brf-grp-1', initial: detailFixture, embedded: true }, expect: ['Saved scanner reports', 'Record decision', 'Recommended check'], absent: ['Back to Home', '<img'] },
+  { component: Detail, name: 'null model suggestion stands on baseline', props: { id: 'brf-grp-1', initial: { ...detailFixture, model_suggestion: null } }, expect: ['No model suggestion — baseline stands'] },
+  { component: Detail, name: 'unlinked observation renders without a guessed link', props: { id: 'brf-grp-1', initial: { ...detailFixture, referenced_events: [{ event_id: 'evt-9', event_type: 'host.appeared' }], observations: [{ event_id: 'evt-9', view_role: 'host', reported_at: '2026-11-01T00:00:00Z', received_at: '2026-11-01T00:01:00Z', attributes: { hostname: 'lonely' }, ports_total: 0, ports_truncated: false }] } }, expect: ['No linked profile is available'] },
+  { component: Detail, name: 'server-classified unknown subject renders honestly', props: { id: 'brf-agent-1', initial: { ...traceFixture, traces: [{ step: 0, tool: 'get_reported_history', args: '{"host":"HOST_1"}', result: '{"tool":"get_reported_history","result":{"error":"unknown subject"}}', status: 'ok', duration_ms: 3, outcome: 'unknown_subject', summary: 'The investigator could not resolve this lookup to a permitted reported subject; history remains unknown.' }] } }, expect: ['unknown subject', 'The investigator could not resolve this lookup'] },
+  { component: Detail, name: 'missing report time stays explicit', props: { id: 'brf-grp-1', initial: { ...detailFixture, kind: 'other', observations: [], referenced_events: [{ event_id: 'evt-1', event_type: 'host.appeared' }] } }, expect: ['Report time', 'Not reported'] },
 );
+
+const appearanceFixture = {
+  ...detailFixture, kind: 'other', source: 'agent', clamped: false,
+  referenced_events: [{ event_id: 'appearance-1', event_type: 'host.appeared', occurred_at: '2026-11-05T15:38:41Z', target: '192.0.2.0/24' }],
+  observations: [{ event_id: 'appearance-1', view_role: 'host', attributes: { hostname: 'review-demo', ip: '192.0.2.10', mac: '02:00:00:00:00:10', vendor: '', os: '', identity_confidence: 'high' }, ports_total: 0 }],
+  decisions: [], effective_review: null
+};
+cases.push(
+  { component: Detail, name: 'appearance provides actionable identity and explicit review', props: { id: 'appearance', initial: appearanceFixture }, expect: ['Reported host', 'review-demo', '192.0.2.10', '02:00:00:00:00:10', '192.0.2.0/24', 'Your decision', 'No operator review', 'Scanner snapshot', 'aria-label="Copy IP address"', 'data-evidence="event:appearance-1"'], absent: ['href="#evt-', 'href="#step-', 'checked', 'Locally administered', 'Demo data', 'Reported by'] },
+  { component: Detail, name: 'partial evidence cannot become a single host summary', props: { id: 'appearance', initial: { ...appearanceFixture, observations_truncated: true } }, expect: ['Only part of the retained evidence is shown', 'some saved views are omitted'], absent: ['<dt>Reported host</dt>'] }
+);
+
+const { singleViewIdentity, reportRange } = await import('../src/lib/format.js');
+if (singleViewIdentity(confidenceViews('high', 'low')) !== null || !reportRange([{ occurred_at: '2026-11-05T15:00:00Z' }, {}]).partial) {
+  throw new Error('Previous/current and incomplete time ranges must stay explicit');
+}
+
+// Evidence navigation must open ancestors and focus the target without changing routes.
+const { revealEvidence } = await import('../src/lib/evidenceNavigation.js');
+const rootNode = { querySelectorAll: () => [targetNode] };
+const disclosure = { tagName: 'DETAILS', open: false, parentElement: rootNode };
+let scrolled = false;
+let focused = false;
+const targetNode = { dataset: { evidence: 'step:0' }, tagName: 'LI', parentElement: disclosure,
+  scrollIntoView: () => { scrolled = true; }, focus: () => { focused = true; } };
+if (!revealEvidence(rootNode, 'step:0') || !disclosure.open || !scrolled || !focused || revealEvidence(rootNode, 'missing')) {
+  throw new Error('Evidence navigation must reveal and focus the exact target');
+}
 
 // Live attention membership changes after decisions, window expiry or a new
 // top-N cut. The chosen review remains available even when its row disappears.
