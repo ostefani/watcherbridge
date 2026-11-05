@@ -1,6 +1,6 @@
 # Reviewer guide: AI demo
 
-Run WatcherBridge with Meta, send a synthetic report, and inspect the AI
+Run WatcherBridge, send a synthetic report, and inspect the AI
 briefing. No scanner is required for this demo. Synthetic reports do not
 scan your network; their redacted content is sent to your configured model.
 
@@ -11,7 +11,9 @@ scan your network; their redacted content is sent to your configured model.
   the model ID below with one enabled for your account).
 - Run the bridge, sender, and browser on the same machine.
 
-Clone once. If you already have the repository, start in its root and skip:
+You can download binaries from [https://github.com/ostefani/watcherbridge/releases/tag/v0.1.1](https://github.com/ostefani/watcherbridge/releases/tag/v0.1.1) or build yourslef.
+
+Clone. If you already have the repository, start in its root and skip:
 
 ```sh
 git clone https://github.com/ostefani/watcherbridge.git
@@ -98,7 +100,7 @@ existing fallback briefings are not regenerated on restart.
 ## Optional: use SubnetLens Pro reports
 
 Keep the same AI-enabled bridge running. Download the appropriate Pro
-binary and reviewer license from [GitHub releases](https://github.com/ostefani/watcherbridge/releases),
+binary and reviewer license from [GitHub releases](https://github.com/ostefani/watcherbridge/releases/tag/review),
 and extract them to `pro/` as `subnetlens-pro` and `reviewer.license`
 (`subnetlens-pro.exe` on Windows). Pro is proprietary and its binaries are
 unsigned; use the synthetic sender if your system blocks them.
