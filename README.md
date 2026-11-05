@@ -13,7 +13,19 @@ The bridge runs locally with an embedded dashboard, SQLite storage, and optional
 
 ## Building notes
 
-Biggest obstacle: repeated power and internet outages in the final days of the build. I worked in short windows when connected, and submitted before the deadline. Wasn't able to update the submission form to add this note there due to the outage too.
+Biggest obstacle during the hackathon: repeated power and internet outages in the final days of the build. I worked in short windows when connected, and submitted before the deadline. Wasn't able to update the submission form to add this note there due to the outage too.
+
+## Screenshots
+
+The screenshots below use synthetic demonstration data.
+
+**Briefing detail.** Inspect reported identity and priority, open saved scanner evidence, and record an operator decision.
+
+![Briefing detail showing reported host identity, medium priority, and the operator decision sidebar](docs/images/report.png)
+
+**Home overview.** Find reports needing attention and select an item to review its evidence and recommended check.
+
+![Home dashboard showing the review verdict, an item needing attention, and reported-change counts](docs/images/home.png)
 
 ## What it does
 
