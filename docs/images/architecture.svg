@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 384" role="img" aria-labelledby="title desc">
+  <title id="title">WatcherBridge deployment paths</title>
+  <desc id="desc">Standalone uses tap mode with no relay. In a parallel tap setup, the scanner sends separate deliveries to WatcherBridge and ScanRelay. In proxy mode, WatcherBridge stores the report before forwarding its original signed body and signature headers to ScanRelay. Every setup produces briefings for local review.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 10 5 0 10Z" fill="#47635a"/>
+    </marker>
+  </defs>
+  <rect x="1" y="1" width="758" height="382" rx="16" fill="#f3f6f1" stroke="#b6c5ba"/>
+  <g font-family="system-ui, sans-serif" fill="#173329">
+    <g font-size="15" font-weight="700">
+      <text x="24" y="36">01  Standalone</text>
+      <text x="24" y="134">02  Tap alongside ScanRelay</text>
+      <text x="24" y="254">03  Proxy to ScanRelay</text>
+    </g>
+    <g fill="none" stroke="#47635a" stroke-width="2" marker-end="url(#arrow)">
+      <path d="M176 75H298"/>
+      <path d="M462 75H584"/>
+      <path d="M176 170H298"/>
+      <path d="M176 180H215V213H584"/>
+      <path d="M176 293H298"/>
+      <path d="M462 293H584"/>
+    </g>
+    <g fill="#fff" stroke="#98b1a4">
+      <rect x="24" y="56" width="152" height="38" rx="7"/>
+      <rect x="24" y="151" width="152" height="38" rx="7"/>
+      <rect x="24" y="274" width="152" height="38" rx="7"/>
+      <rect x="584" y="56" width="152" height="38" rx="7"/>
+      <rect x="584" y="194" width="152" height="38" rx="7"/>
+      <rect x="584" y="274" width="152" height="38" rx="7"/>
+    </g>
+    <g fill="#d9efdf" stroke="#7aa28b">
+      <rect x="298" y="56" width="164" height="38" rx="7"/>
+      <rect x="298" y="151" width="164" height="38" rx="7"/>
+      <rect x="298" y="274" width="164" height="38" rx="7"/>
+    </g>
+    <g text-anchor="middle" font-size="14" font-weight="650">
+      <text x="100" y="80">Scanner</text>
+      <text x="100" y="175">Scanner</text>
+      <text x="100" y="298">Scanner</text>
+      <text x="380" y="80">WatcherBridge</text>
+      <text x="380" y="175">WatcherBridge</text>
+      <text x="380" y="298">WatcherBridge</text>
+      <text x="660" y="80">Local review</text>
+      <text x="660" y="218">ScanRelay</text>
+      <text x="660" y="298">ScanRelay</text>
+    </g>
+    <g text-anchor="middle" font-size="12" fill="#334f46">
+      <text x="237" y="67">Signed webhook</text>
+      <text x="523" y="67">Briefings</text>
+      <text x="237" y="162">Signed webhook</text>
+      <text x="398" y="205">Separate scanner delivery</text>
+      <text x="237" y="285">Signed webhook</text>
+      <text x="523" y="285">Original report</text>
+    </g>
+    <path d="M24 110H736M24 235H736M24 329H736" stroke="#c5d2c8"/>
+    <text x="24" y="352" font-size="13" font-weight="700">In every setup</text>
+    <text x="24" y="371" font-size="13">Verify and store in SQLite → Group reports → Prioritize and explain → Local dashboard / API / CLI</text>
+  </g>
+</svg>

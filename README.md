@@ -5,11 +5,23 @@
 ![Muse AI](https://img.shields.io/badge/AI-Muse-0866FF)
 ![Visitors](https://visitor-badge.laobi.icu/badge?page_id=ostefani.watcherbridge)
 
-Network scanners tell you what’s happening. But what does it actually mean? WatcherBridge receives signed change reports from a network scanner and turns them into a local review inbox. I used **SubnetLens Pro**, my proprietary network scanner, as the event source for this project. The demo can run on synthetic events — no real network data.
+Network scanners tell you what’s happening. But what does it actually mean? I already had **SubnetLens Pro**, my proprietary network scanner, which is built on top of open-source [SubnetLens](https://github.com/ostefani/subnetlens). Its watch mode detected and reported network changes and **ScanRelay** displayed the events. I still had to piece together why those changes mattered and what to check next.
+
+I built **WatcherBridge** to fill that gap. It receives signed reports from a network scanner and turns them into a local review inbox, with plain explanations of what changed, why it matters, and what to check next. I used SubnetLens Pro as the event source for this project. The demo can use synthetic reports, so reviewers can try it without a scanner or real network data.
 
 ## Building notes
 
 Biggest obstacle during the hackathon: repeated power and internet outages in the final days of the build. I worked in short windows when connected, and submitted before the deadline. Wasn't able to update the submission form to add this note there due to the outage too.
+
+## Deployment modes
+
+![WatcherBridge deployment diagram. Standalone runs without a relay. In tap mode the scanner can deliver separately to WatcherBridge and ScanRelay. In proxy mode WatcherBridge forwards the original report to ScanRelay. All setups provide local review.](docs/images/architecture.svg)
+
+- **Standalone** (`-mode tap -scanrelay-url=`). The scanner sends signed reports to WatcherBridge. Local briefings and review work without ScanRelay.
+- **Parallel tap** (`-mode tap`, the default). Configure the scanner with separate endpoints for WatcherBridge and ScanRelay. The scanner delivers to each independently.
+- **Proxy** (`-mode proxy -scanrelay-url=<url>`). WatcherBridge verifies and stores each accepted change report before forwarding the original body and signature headers to ScanRelay's `/webhook`. Proxy mode requires a relay URL.
+
+A configured relay URL also enables a separate briefing annotation publisher in either mode. Heartbeats terminate at WatcherBridge and update local source coverage, including in proxy mode.
 
 ## Screenshots
 
@@ -36,13 +48,13 @@ The screenshots below use synthetic demonstration data.
 ## Run the AI demo
 
 See the [reviewer guide](docs/reviewer-guide.md) for setup and copy-paste
-commands to run the Meta AI demo with synthetic reports or SubnetLens Pro.
+commands to run the Meta AI demo. The synthetic reports let you try it without
+a scanner or real network data. You can also use SubnetLens Pro as the event source.
 
 ## Operation and development
 
 - Run `./watcherbridge -h` for startup settings and `./watcherbridge status --window 24h --json` for the running bridge's overview. Status exits with `0` for quiet, `1` for review, `2` for act, or `3` when unavailable.
 - The listener accepts loopback addresses only. A quiet verdict describes retained reports and review state, not network security or host availability.
-- Tap mode receives events independently of other consumers. Proxy mode (`-mode proxy`) forwards original signed bytes to the configured relay. WatcherBridge can also publish briefing annotations to the relay. `-scanrelay-url=` disables relay integration.
 - Built with Go, SQLite in WAL mode, Svelte 5, Vite, and Server-Sent Events. Use the Node.js version in [ui/.nvmrc](ui/.nvmrc) and `make ui-check` for viewer changes.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for engineering conventions.
