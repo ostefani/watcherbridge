@@ -7,6 +7,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -30,10 +31,10 @@ type writeJob struct {
 }
 
 // ErrStoreClosed means the writer rejected the job before running it.
-var ErrStoreClosed = fmt.Errorf("store is closed")
+var ErrStoreClosed = errors.New("store is closed")
 
 // ErrQueueSaturated means the writer queue was full and did not admit the job.
-var ErrQueueSaturated = fmt.Errorf("writer queue saturated")
+var ErrQueueSaturated = errors.New("writer queue saturated")
 
 // DefaultQueueCap bounds the writer channel when the caller has no number.
 const DefaultQueueCap = 64

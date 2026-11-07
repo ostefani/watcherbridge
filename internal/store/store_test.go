@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -982,21 +983,28 @@ func TestCloseRejectsQueuedJobs(t *testing.T) {
 }
 
 func TestSubmitRacesClose(t *testing.T) {
-	s := openTestStore(t)
+	s, err := Open(filepath.Join(t.TempDir(), "bridge.db"), WithQueueCap(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	started := make(chan struct{})
 	signalStarted := sync.OnceFunc(func() { close(started) })
 	write := func(*sql.Tx) error { return nil }
+	const writerCount = 32
 	var writers sync.WaitGroup
-	for range 32 {
+	var closedSeen atomic.Int32
+	for range writerCount {
 		writers.Go(func() {
-			for range 100 {
+			for {
 				err := s.write(ctx, write)
 				signalStarted()
 				switch {
 				case errors.Is(err, ErrStoreClosed):
+					closedSeen.Add(1)
 					return
 				case err == nil, errors.Is(err, ErrQueueSaturated):
 				default:
@@ -1011,6 +1019,9 @@ func TestSubmitRacesClose(t *testing.T) {
 		t.Error(err)
 	}
 	writers.Wait()
+	if got := closedSeen.Load(); got != writerCount {
+		t.Fatalf("%d writers observed closure, want %d", got, writerCount)
+	}
 	if depth := s.QueueDepth(); depth != 0 {
 		t.Fatalf("closed store retained %d queued jobs", depth)
 	}
