@@ -84,7 +84,11 @@ func (s *Server) sweepOne(ctx context.Context, ev store.RawEvent) (done, landed 
 	if s.now().Sub(ev.SignatureTimestamp) >= s.cfg.TimestampTolerance-s.cfg.SweepSafetyMargin {
 		return s.park(ctx, ev.EventID, "stale_for_sweep"), false
 	}
-	if fwd, _, _, err := s.events.ForwardState(ctx, ev.EventID); err != nil || fwd {
+	fwd, _, _, err := s.events.ForwardState(ctx, ev.EventID)
+	if err != nil {
+		return false, false
+	}
+	if fwd {
 		return true, false
 	}
 	var headers map[string]string

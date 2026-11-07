@@ -95,8 +95,17 @@ func TestForwardAuditByteIdenticalAndMinimal(t *testing.T) {
 			t.Fatalf("unexpected forwarded header %q", k)
 		}
 	}
-	if out.Header.Get("X-SubnetLens-Event-ID") != id || out.Header.Get("X-SubnetLens-Signature-256") == "" {
-		t.Fatalf("signature headers not verbatim: %v", out.Header)
+	for _, name := range []string{
+		"X-SubnetLens-Event-ID", "X-SubnetLens-Event-Key", "X-SubnetLens-Event-Type",
+		"X-SubnetLens-Signature-Timestamp", "X-SubnetLens-Signature-256", "Content-Type",
+	} {
+		want := req.Header.Get(name)
+		if want == "" {
+			t.Fatalf("test request lacks %s", name)
+		}
+		if got := out.Header.Get(name); got != want {
+			t.Errorf("forwarded %s = %q, want %q", name, got, want)
+		}
 	}
 	// Nothing local is folded into the relay body: the forwarded bytes
 	// equal the producer submission, which carried no decision/rule

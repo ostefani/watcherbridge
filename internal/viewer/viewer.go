@@ -107,13 +107,13 @@ func (h *Hub) TrySubscribe(buf, max int) (*Subscription, func(), bool) {
 	if buf <= 0 {
 		buf = 32
 	}
-	ch := make(chan Event, buf)
-	sub := &Subscription{C: ch, ch: ch}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if max > 0 && len(h.subs) >= max {
 		return nil, nil, false
 	}
+	ch := make(chan Event, buf)
+	sub := &Subscription{C: ch, ch: ch}
 	h.subs[sub] = struct{}{}
 	return sub, func() {
 		h.mu.Lock()

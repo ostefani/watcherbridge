@@ -7,6 +7,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -26,16 +27,14 @@ type writeJob struct {
 	// raw runs on the writer goroutine without opening a transaction,
 	// for statements SQLite forbids inside one (e.g. wal_checkpoint).
 	raw  func() error
-	done chan error
+	done chan error // buffered so the writer can reply after caller cancellation
 }
 
-// ErrStoreClosed is returned when the store is shut down; ErrQueueSaturated
-// when the bounded writer queue is full. Both mean "retry later", never
-// "bad request".
-var (
-	ErrStoreClosed    = fmt.Errorf("store is closed")
-	ErrQueueSaturated = fmt.Errorf("writer queue saturated")
-)
+// ErrStoreClosed means the writer rejected the job before running it.
+var ErrStoreClosed = errors.New("store is closed")
+
+// ErrQueueSaturated means the writer queue was full and did not admit the job.
+var ErrQueueSaturated = errors.New("writer queue saturated")
 
 // DefaultQueueCap bounds the writer channel when the caller has no number.
 const DefaultQueueCap = 64
@@ -52,12 +51,11 @@ func WithQueueCap(n int) Option { return func(o *options) { o.queueCap = n } }
 // Store owns the database. The zero value is invalid; use Open.
 type Store struct {
 	db          *sql.DB
-	jobs        chan writeJob // never closed; quit signals shutdown
-	queueCap    int           // jobs capacity; the purge loop yields past half
+	jobs        chan writeJob // closed only under submitMu
+	submitMu    sync.Mutex    // serializes submission with closing jobs
 	quit        chan struct{}
 	wg          sync.WaitGroup
-	closeMu     sync.Mutex
-	closed      bool
+	closeOnce   sync.Once
 	closeErr    error
 	groupSeq    atomic.Int64
 	decisionSeq atomic.Int64
@@ -100,7 +98,7 @@ func (s *Store) QueueDepth() int { return len(s.jobs) }
 
 // QueueCap reports the writer queue capacity QueueDepth is measured
 // against. Zero on a Store that bypassed Open, which never purges.
-func (s *Store) QueueCap() int { return s.queueCap }
+func (s *Store) QueueCap() int { return cap(s.jobs) }
 
 func nanos(t time.Time) int64 { return t.UTC().UnixNano() }
 func fromNanos(n int64) time.Time {
@@ -270,7 +268,7 @@ func openStore(path string, opts ...Option) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("tighten database permissions: %w", err)
 	}
-	s := &Store{db: db, jobs: make(chan writeJob, o.queueCap), queueCap: o.queueCap, quit: make(chan struct{}), now: time.Now}
+	s := &Store{db: db, jobs: make(chan writeJob, o.queueCap), quit: make(chan struct{}), now: time.Now}
 	s.wg.Add(1)
 	go s.writer()
 	return s, nil
@@ -282,21 +280,11 @@ func openStore(path string, opts ...Option) (*Store, error) {
 // A database newer than this code is refused rather than silently misread.
 func (s *Store) writer() {
 	defer s.wg.Done()
-	for {
+	for job := range s.jobs {
 		select {
 		case <-s.quit:
-			// Answer every queued job before exiting: a caller with no
-			// deadline must never hang on a store that will never run
-			// its write. done is always buffered, so this never blocks.
-			for {
-				select {
-				case job := <-s.jobs:
-					job.done <- ErrStoreClosed
-				default:
-					return
-				}
-			}
-		case job := <-s.jobs:
+			job.done <- ErrStoreClosed
+		default:
 			job.done <- s.runJob(job)
 		}
 	}
@@ -335,54 +323,54 @@ func (s *Store) runJob(job writeJob) (err error) {
 // "unknown, retry safely" and rely on idempotency (e.g.
 // PersistEventAndGroup reports Inserted=false on the retry).
 func (s *Store) write(ctx context.Context, fn func(*sql.Tx) error) error {
-	return s.enqueue(ctx, writeJob{ctx: ctx, fn: fn, done: make(chan error, 1)})
+	return s.enqueue(writeJob{ctx: ctx, fn: fn, done: make(chan error, 1)})
 }
 
-// enqueue submits a job without ever blocking the caller: a full queue
-// fails fast so ingest can answer 503 instead of piling up memory.
-func (s *Store) enqueue(ctx context.Context, job writeJob) error {
-	select {
-	case <-s.quit:
-		return ErrStoreClosed
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
+// enqueue waits for the outcome of an admitted job. A full queue fails
+// fast so ingest can answer 503 instead of waiting for queue space.
+func (s *Store) enqueue(job writeJob) error {
+	if err := s.submit(job); err != nil {
+		return err
 	}
 	select {
-	case <-s.quit:
-		return ErrStoreClosed
-	case <-ctx.Done():
-		return ctx.Err()
-	case s.jobs <- job:
-	default:
-		return ErrQueueSaturated
-	}
-	select {
-	case <-s.quit:
-		// The writer drained the queue and answered every job it saw;
-		// a job submitted in the race window gets a closed answer here
-		// instead of hanging a deadline-less caller forever.
-		return ErrStoreClosed
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-job.ctx.Done():
+		return job.ctx.Err()
 	case err := <-job.done:
 		return err
 	}
 }
 
-// Close shuts the store down once and reports the result to every caller.
-// A concurrent second caller blocks on the mutex until the first shutdown
-// finishes, then receives the same error — nobody returns early while the
-// writer is still draining.
-func (s *Store) Close() error {
-	s.closeMu.Lock()
-	defer s.closeMu.Unlock()
-	if s.closed {
-		return s.closeErr
+func (s *Store) submit(job writeJob) error {
+	s.submitMu.Lock()
+	defer s.submitMu.Unlock()
+	select {
+	case <-s.quit:
+		return ErrStoreClosed
+	default:
 	}
-	s.closed = true
-	close(s.quit) // never close s.jobs: a blocked sender must not panic
-	s.wg.Wait()
-	s.closeErr = s.db.Close()
+	if err := job.ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case s.jobs <- job:
+		return nil
+	default:
+		return ErrQueueSaturated
+	}
+}
+
+// Close shuts the store down once and reports the result to every caller.
+// Concurrent callers wait for the same shutdown result while the writer
+// rejects queued jobs and finishes any in-flight work.
+func (s *Store) Close() error {
+	s.closeOnce.Do(func() {
+		s.submitMu.Lock()
+		close(s.quit)
+		close(s.jobs)
+		s.submitMu.Unlock()
+
+		s.wg.Wait()
+		s.closeErr = s.db.Close()
+	})
 	return s.closeErr
 }
