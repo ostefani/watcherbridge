@@ -8,7 +8,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -16,6 +18,53 @@ import (
 	"github.com/ostefani/watcherbridge/internal/config"
 	"github.com/ostefani/watcherbridge/internal/store"
 )
+
+func TestRunRejectsMissingModelKeyBeforeStartupWork(t *testing.T) {
+	var forwarded atomic.Int32
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		forwarded.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer relay.Close()
+
+	cfg := config.Default()
+	cfg.Mode = config.ModeProxy
+	cfg.Secret = "synthetic-secret-for-startup-validation"
+	cfg.ScanRelayURL = relay.URL
+	cfg.ModelProvider = "meta"
+	cfg.ModelAPIKey = ""
+	ctx := context.Background()
+	db := filepath.Join(t.TempDir(), "bridge.db")
+	cfg.ModelAPIKeyFile = filepath.Join(filepath.Dir(db), "missing-model-key")
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	_, seedErr := st.PersistEventAndGroup(ctx, store.RawEvent{
+		EventID: "abcd", EventKey: "startup-sweep", EventType: "host.appeared",
+		OccurredAt: now, ReceivedAt: now, SignatureTimestamp: now,
+		Payload: []byte("{}"), HeadersJSON: "{}",
+	}, "startup-sweep", store.GroupPolicy{QuietWindow: time.Minute})
+	if err := errors.Join(seedErr, st.Close()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := run(ctx, cfg, db); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("run = %v; want missing model key file error", err)
+	}
+	if n := forwarded.Load(); n != 0 {
+		t.Errorf("forwarded %d reports during refused startup", n)
+	}
+	st, err = store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.LatestPurgeRun(ctx); !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("startup purge should not run with invalid model credentials: %v", err)
+	}
+}
 
 func TestRunCancelsStartupSweep(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

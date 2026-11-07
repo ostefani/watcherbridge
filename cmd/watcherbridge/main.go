@@ -181,36 +181,11 @@ func run(ctx context.Context, cfg config.Config, db string) error {
 		return fmt.Errorf("source scope: %w", err)
 	}
 
-	// Startup ordering is a synchronization boundary, not launch order:
-	// recovery first, then the completed startup sweep, then the initial
-	// purge — only afterwards do serving and the background loops start.
-	// Each step runs to completion so retained work is never purged on
-	// a stale view and the sweep never races the first purge.
-	if recovered, err := st.Recover(ctx, time.Now()); err != nil {
-		return fmt.Errorf("startup recovery: %w", err)
-	} else if len(recovered) > 0 {
-		log.Printf("startup recovery: requeued %d groups", len(recovered))
-	}
+	// Finish fallible setup before replaying reports or purging retained data.
 	srv, err := server.New(cfg, st, forwarder.NewGate())
 	if err != nil {
 		return fmt.Errorf("server: %w", err)
 	}
-	// Operational counters are process-lifetime: the start time travels
-	// with every reading so a restart is interpretable, never silent.
-	opHealth := health.New()
-	srv.Health = opHealth
-	srv.Viewer().Overview.SetHealth(opHealth)
-	srv.SweepOnce(ctx)
-	if ctx.Err() != nil {
-		return nil
-	}
-	purgeSettings := store.PurgeSettings{BriefingRetention: cfg.BriefingRetention, SubjectRetention: cfg.SubjectRetention, DecisionRetention: cfg.DecisionRetention, RuleRetention: cfg.RulePurgeAfter, HeartbeatRetention: cfg.HeartbeatRetention, IncidentRetention: cfg.IncidentRetention, ActiveSource: cfg.SourceID}
-	if rep, err := st.PurgeOnce(ctx, purgeSettings, time.Now()); err != nil {
-		return fmt.Errorf("startup purge: %w", err)
-	} else {
-		log.Printf("startup purge: %+v", rep)
-	}
-	hub := srv.Viewer().Hub()
 
 	var prov provider.Provider
 	switch cfg.ModelProvider {
@@ -243,6 +218,36 @@ func run(ctx context.Context, cfg config.Config, db string) error {
 	if ctx.Err() != nil {
 		return nil
 	}
+	// Startup ordering is a synchronization boundary, not launch order:
+	// recovery first, then the completed startup sweep, then the initial
+	// purge — only afterwards do serving and the background loops start.
+	// Each step runs to completion so retained work is never purged on
+	// a stale view and the sweep never races the first purge.
+	if recovered, err := st.Recover(ctx, time.Now()); err != nil {
+		return fmt.Errorf("startup recovery: %w", err)
+	} else if len(recovered) > 0 {
+		log.Printf("startup recovery: requeued %d groups", len(recovered))
+	}
+	// Operational counters are process-lifetime: the start time travels
+	// with every reading so a restart is interpretable, never silent.
+	opHealth := health.New()
+	srv.Health = opHealth
+	srv.Viewer().Overview.SetHealth(opHealth)
+	srv.SweepOnce(ctx)
+	if ctx.Err() != nil {
+		return nil
+	}
+	purgeSettings := store.PurgeSettings{BriefingRetention: cfg.BriefingRetention, SubjectRetention: cfg.SubjectRetention, DecisionRetention: cfg.DecisionRetention, RuleRetention: cfg.RulePurgeAfter, HeartbeatRetention: cfg.HeartbeatRetention, IncidentRetention: cfg.IncidentRetention, ActiveSource: cfg.SourceID}
+	if rep, err := st.PurgeOnce(ctx, purgeSettings, time.Now()); err != nil {
+		return fmt.Errorf("startup purge: %w", err)
+	} else {
+		log.Printf("startup purge: %+v", rep)
+	}
+	hub := srv.Viewer().Hub()
+	if ctx.Err() != nil {
+		return nil
+	}
+
 	var pub *viewer.Publisher
 	if cfg.ScanRelayURL != "" {
 		timeout := cfg.ProxyForwardTimeout
