@@ -5,7 +5,8 @@
 // 202 accepted (persisted; forwarded in proxy mode), 401 bad signature or
 // timestamp, 400 malformed, 413 oversize, 405 non-POST, 503 saturated or
 // store unavailable with Retry-After, 502 ScanRelay delivery failed.
-// A duplicate host event is idempotent (202 when forwarded, 502 when not).
+// A duplicate host event keeps the first stored payload. In proxy mode it
+// returns 202 once forwarded and 502 if delivery has not succeeded.
 // H1 is persisted separately and never forwarded; identical retries are 202,
 // while conflicting reuse of a heartbeat ID is 409.
 package server
@@ -327,7 +328,8 @@ func (s *Server) persistAndReply(ctx context.Context, w http.ResponseWriter, bod
 	pctx, cancel := context.WithTimeout(ctx, s.cfg.PersistBudget)
 	defer cancel()
 
-	headersJSON, err := json.Marshal(store.WhitelistForwardHeaders(headerMap(r.Header)))
+	headers := store.WhitelistForwardHeaders(headerMap(r.Header))
+	headersJSON, err := json.Marshal(headers)
 	if err != nil {
 		return errMalformedBody
 	}
@@ -374,11 +376,15 @@ func (s *Server) persistAndReply(ctx context.Context, w http.ResponseWriter, bod
 		// doing its job. In-flight duplicates never reach here:
 		// they wait on the gate and follow the stored state.
 		s.Health.AddDuplicate()
-		if fwd, _, _, ferr := s.events.ForwardState(ctx, eventID); ferr == nil && fwd {
+		if s.cfg.Mode == config.ModeTap {
 			writeAccepted(w, eventID, eventType)
 			return nil
 		}
-		if s.cfg.Mode == config.ModeTap || s.forwardOne(ctx, body, headerMap(r.Header), eventID) {
+		forwarded, samePayload, err := s.events.RetryForwardState(ctx, eventID, body)
+		if err != nil {
+			return err
+		}
+		if forwarded || (samePayload && s.forwardOne(ctx, body, headers, eventID)) {
 			writeAccepted(w, eventID, eventType)
 			return nil
 		}
@@ -391,7 +397,7 @@ func (s *Server) persistAndReply(ctx context.Context, w http.ResponseWriter, bod
 		writeAccepted(w, eventID, eventType)
 		return nil
 	}
-	if s.forwardOne(ctx, body, headerMap(r.Header), eventID) {
+	if s.forwardOne(ctx, body, headers, eventID) {
 		s.Health.AddAccepted()
 		writeAccepted(w, eventID, eventType)
 		return nil
@@ -413,13 +419,16 @@ func (s *Server) reportPersistError(w http.ResponseWriter, eventID string, err e
 	s.writeSaturated(w, "persist unavailable")
 }
 
-// replyForStoredState answers a duplicate from the forwarded flag: 202 when
-// the event landed at ScanRelay, 502 when it did not so Pro retries. It never
-// forwards inline — a second forward inside this deadline could exceed it.
+// replyForStoredState accepts a stored tap event or a forwarded proxy event.
+// A waiter never forwards inline; a new request owns the next retry.
 func (s *Server) replyForStoredState(ctx context.Context, w http.ResponseWriter, eventID, eventType string) {
 	s.Health.AddDuplicate()
 	forwarded, _, _, err := s.events.ForwardState(ctx, eventID)
-	if err != nil || !forwarded {
+	if err != nil {
+		s.writeSaturated(w, "persist unavailable")
+		return
+	}
+	if s.cfg.Mode == config.ModeProxy && !forwarded {
 		writeError(w, http.StatusBadGateway, "scanrelay delivery failed")
 		return
 	}

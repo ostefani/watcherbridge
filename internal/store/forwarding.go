@@ -18,6 +18,14 @@ func (s *Store) ForwardState(ctx context.Context, eventID string) (forwarded boo
 	return fwd == 1, attempts, last.String, err
 }
 
+// RetryForwardState checks whether the event already landed or a newly
+// signed retry carries the exact bytes originally accepted for this ID.
+func (s *Store) RetryForwardState(ctx context.Context, eventID string, payload []byte) (forwarded, samePayload bool, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT forwarded, payload = ? FROM raw_events WHERE event_id = ?`, payload, eventID).
+		Scan(&forwarded, &samePayload)
+	return forwarded, samePayload, err
+}
+
 // MarkForwarded records a successful delivery once; repeats are no-ops.
 func (s *Store) MarkForwarded(ctx context.Context, eventID string, at time.Time) (bool, error) { // returns false on any error (captured var is only read on success)
 	matched := false

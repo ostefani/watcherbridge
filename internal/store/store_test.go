@@ -905,71 +905,114 @@ func TestPurgeFailedGroupEvents(t *testing.T) {
 // H1: shutdown answers every queued job. A slow write occupies the
 // writer while Background-context callers queue behind it; Close must
 // release them all with ErrStoreClosed instead of hanging them forever.
-func TestCloseDrainsQueuedJobs(t *testing.T) {
+func TestCloseRejectsQueuedJobs(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "drain.db"), WithQueueCap(16))
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer s.Close()
+	entered := make(chan struct{})
 	release := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	slowDone := make(chan error, 1)
 	go func() {
 		slowDone <- s.write(context.Background(), func(tx *sql.Tx) error {
+			close(entered)
 			<-release
 			return nil
 		})
 	}()
-	// Let the slow job reach the writer before queuing behind it.
-	time.Sleep(100 * time.Millisecond)
-	const waiters = 8
-	got := make(chan error, waiters)
-	for i := 0; i < waiters; i++ {
-		go func(i int) {
-			_, err := s.GetOrAssignPseudonym(context.Background(), "ip", fmt.Sprintf("10.9.9.%d", i))
-			got <- err
-		}(i)
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("writer never started the first job")
 	}
-	// All waiters must be queued (not saturated) before Close drains.
-	time.Sleep(200 * time.Millisecond)
-	// Close waits for the in-flight slow job by design (graceful
-	// shutdown), so engage it in the background and release the job
-	// concurrently — serial order would deadlock the test itself.
+
+	// Admit jobs explicitly so they are all pending when shutdown starts.
+	pending := make([]chan error, 8)
+	for i := range pending {
+		pending[i] = make(chan error, 1)
+		if err := s.submit(writeJob{ctx: ctx, done: pending[i], fn: func(*sql.Tx) error {
+			return fmt.Errorf("queued write ran during shutdown")
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	closed := make(chan error, 1)
 	go func() { closed <- s.Close() }()
-	time.Sleep(100 * time.Millisecond)
-	close(release)
+	select {
+	case <-s.quit:
+	case <-ctx.Done():
+		t.Fatal("close never stopped admission")
+	}
+	if err := s.write(ctx, func(*sql.Tx) error { return nil }); !errors.Is(err, ErrStoreClosed) {
+		t.Fatalf("new write during shutdown: %v", err)
+	}
+	unblock()
 	select {
 	case err := <-closed:
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("Close hung with a drained queue")
+	case <-ctx.Done():
+		t.Fatal("close did not join the writer")
 	}
-	// The in-flight write either committed before quit won the race
-	// (nil) or lost it (closed): both are honest outcomes, since the
-	// caller treats a close as "unknown, retry safely".
-	if err := <-slowDone; err != nil && !errors.Is(err, ErrStoreClosed) {
+	if err := <-slowDone; err != nil {
 		t.Fatalf("in-flight write: %v", err)
 	}
-	// Every queued waiter must RETURN — hanging is the H1 bug. A waiter
-	// the writer picked before noticing quit ran normally (nil); the
-	// rest were answered by the drain (closed).
-	for i := 0; i < waiters; i++ {
+	if err := s.write(ctx, func(*sql.Tx) error { return nil }); !errors.Is(err, ErrStoreClosed) {
+		t.Fatalf("new write after shutdown: %v", err)
+	}
+	for _, done := range pending {
 		select {
-		case err := <-got:
-			if err != nil && !errors.Is(err, ErrStoreClosed) {
+		case err := <-done:
+			if !errors.Is(err, ErrStoreClosed) {
 				t.Fatalf("queued write: %v", err)
 			}
-		case <-time.After(10 * time.Second):
-			t.Fatal("queued write hung across Close")
+		default:
+			t.Fatal("writer exited without rejecting a queued job")
 		}
 	}
-	// A submit after Close must fail fast, never hang or panic. The
-	// read path hits the closed pool first, so any prompt error
-	// satisfies the contract — in-flight calls are the ones owed
-	// ErrStoreClosed, and they were answered above.
-	if _, err := s.GetOrAssignPseudonym(context.Background(), "ip", "10.9.9.99"); err == nil {
-		t.Fatal("post-close submit must fail fast")
+	if depth := s.QueueDepth(); depth != 0 {
+		t.Fatalf("closed store retained %d queued jobs", depth)
+	}
+}
+
+func TestSubmitRacesClose(t *testing.T) {
+	s := openTestStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	started := make(chan struct{})
+	signalStarted := sync.OnceFunc(func() { close(started) })
+	write := func(*sql.Tx) error { return nil }
+	var writers sync.WaitGroup
+	for range 32 {
+		writers.Go(func() {
+			for range 100 {
+				err := s.write(ctx, write)
+				signalStarted()
+				switch {
+				case errors.Is(err, ErrStoreClosed):
+					return
+				case err == nil, errors.Is(err, ErrQueueSaturated):
+				default:
+					t.Errorf("write: %v", err)
+					return
+				}
+			}
+		})
+	}
+	<-started
+	if err := s.Close(); err != nil {
+		t.Error(err)
+	}
+	writers.Wait()
+	if depth := s.QueueDepth(); depth != 0 {
+		t.Fatalf("closed store retained %d queued jobs", depth)
 	}
 }
 

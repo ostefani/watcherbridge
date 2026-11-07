@@ -36,15 +36,12 @@ func (g *Gate) Acquire(eventID string) (release func(), wait <-chan struct{}) {
 	ch := make(chan struct{})
 	g.in[eventID] = ch
 	g.mu.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			g.mu.Lock()
-			delete(g.in, eventID)
-			g.mu.Unlock()
-			close(ch)
-		})
-	}, nil
+	return sync.OnceFunc(func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		delete(g.in, eventID)
+		close(ch)
+	}), nil
 }
 
 // InFlight reports how many events are currently gated (tests/metrics).

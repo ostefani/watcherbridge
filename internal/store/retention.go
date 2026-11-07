@@ -49,7 +49,7 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 		}
 		return nil
 	}
-	return s.enqueue(ctx, job)
+	return s.enqueue(job)
 }
 
 // MarkUndeliverable parks an event the forwarder can never send (e.g. its

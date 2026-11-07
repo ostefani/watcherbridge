@@ -221,16 +221,17 @@ func TestContractTable(t *testing.T) {
 	// 502: ScanRelay down.
 	h.relay.mode.Store("fail")
 	failID := uniqueID()
-	if rec := h.signedPost(t, failID, "host-b", "host.appeared", now); rec.Code != http.StatusBadGateway {
+	body := eventBody(failID, "host-b", "host.appeared")
+	sig := sign(h.secret, rts, failID, "host-b", "host.appeared", body)
+	if rec := h.post(t, body, failID, "host-b", "host.appeared", now, sig); rec.Code != http.StatusBadGateway {
 		t.Fatalf("forward failure: got %d", rec.Code)
 	}
-	// 202 duplicate of an unforwarded event: waiter path returns 502, and
-	// the retry after a successful forward returns 202.
-	if rec := h.signedPost(t, failID, "host-b", "host.appeared", now); rec.Code != http.StatusBadGateway {
+	// A retry remains 502 until the relay accepts the stored payload.
+	if rec := h.post(t, body, failID, "host-b", "host.appeared", now, sig); rec.Code != http.StatusBadGateway {
 		t.Fatalf("duplicate of unforwarded: got %d", rec.Code)
 	}
 	h.relay.mode.Store("accept")
-	if rec := h.signedPost(t, failID, "host-b", "host.appeared", now); rec.Code != http.StatusAccepted {
+	if rec := h.post(t, body, failID, "host-b", "host.appeared", now, sig); rec.Code != http.StatusAccepted {
 		t.Fatalf("retry after failure: got %d %s", rec.Code, rec.Body.String())
 	}
 	if h.srv.gate.InFlight() != 0 {
@@ -344,8 +345,60 @@ func TestWaiterReturns502WhenWinnerFails(t *testing.T) {
 	}
 	// Pro's retry then succeeds and is accepted.
 	h.relay.mode.Store("accept")
-	if rec := h.signedPost(t, id, "host-wf", "host.appeared", now); rec.Code != http.StatusAccepted {
+	if rec := h.post(t, body, id, "host-wf", "host.appeared", now, sig); rec.Code != http.StatusAccepted {
 		t.Fatalf("retry: got %d", rec.Code)
+	}
+}
+
+func TestProxyRetryCannotReplaceStoredPayload(t *testing.T) {
+	h := newHarness(t, nil)
+	now := time.Now()
+	id, key, typ := uniqueID(), "host-retry", "host.appeared"
+	body := eventBody(id, key, typ)
+	post := func(payload []byte, at time.Time) int {
+		sig := sign(h.secret, strconv.FormatInt(at.Unix(), 10), id, key, typ, payload)
+		return h.post(t, payload, id, key, typ, at, sig).Code
+	}
+	h.relay.mode.Store("fail")
+	if got := post(body, now); got != http.StatusBadGateway {
+		t.Fatalf("initial delivery status = %d", got)
+	}
+	h.relay.mode.Store("accept")
+	retryAt := now.Add(time.Second)
+	changed := bytes.Replace(body, []byte(`"cycle":1`), []byte(`"cycle":2`), 1)
+	if got := post(changed, retryAt); got != http.StatusBadGateway || h.relay.hits.Load() != 1 {
+		t.Fatalf("conflicting retry status = %d, relay hits = %d", got, h.relay.hits.Load())
+	}
+	if got := post(body, retryAt); got != http.StatusAccepted || h.relay.hits.Load() != 2 {
+		t.Fatalf("exact retry status = %d, relay hits = %d", got, h.relay.hits.Load())
+	}
+	if got := post(changed, retryAt); got != http.StatusAccepted || h.relay.hits.Load() != 2 {
+		t.Fatalf("conflict after delivery status = %d, relay hits = %d", got, h.relay.hits.Load())
+	}
+	stored, err := h.srv.events.StoredEvent(context.Background(), id)
+	h.relay.mu.Lock()
+	defer h.relay.mu.Unlock()
+	if err != nil || !bytes.Equal(stored.Payload, body) || !bytes.Equal(h.relay.bodies[1], body) {
+		t.Fatalf("stored and forwarded payloads must match the original: %v", err)
+	}
+}
+
+func TestTapWaiterFollowsStoredEvent(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.Mode = config.ModeTap })
+	ctx := context.Background()
+	id := uniqueID()
+	rec := httptest.NewRecorder()
+	h.srv.replyForStoredState(ctx, rec, id, "host.appeared")
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("missing event status = %d, Retry-After = %q", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	if got := h.signedPost(t, id, "host-tap", "host.appeared", time.Now()).Code; got != http.StatusAccepted {
+		t.Fatalf("initial delivery status = %d", got)
+	}
+	rec = httptest.NewRecorder()
+	h.srv.replyForStoredState(ctx, rec, id, "host.appeared")
+	if rec.Code != http.StatusAccepted || h.relay.hits.Load() != 0 {
+		t.Fatalf("tap waiter status = %d, relay hits = %d", rec.Code, h.relay.hits.Load())
 	}
 }
 
