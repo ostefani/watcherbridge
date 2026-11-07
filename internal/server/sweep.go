@@ -106,8 +106,7 @@ func (s *Server) park(ctx context.Context, eventID, reason string) bool {
 	return true
 }
 
-// SweepOnce runs one bounded sweep pass synchronously. Tests use it to avoid
-// timing flakes; Start uses the background loop.
+// SweepOnce finishes recovery forwarding before the startup purge and listener.
 func (s *Server) SweepOnce(ctx context.Context) { s.sweep(ctx) }
 
 // SetNow overrides the clock (tests only).

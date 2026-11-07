@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ostefani/watcherbridge/internal/config"
@@ -67,20 +68,8 @@ type Server struct {
 	sem   chan struct{} // in-flight cap; acquired before reading the body
 	proxy *http.Client  // never follows redirects; bounded by proxy timeout
 
-	http *http.Server
-
-	sweepCtx    context.Context // created in New so Shutdown is safe before Start
-	sweepCancel context.CancelFunc
-	sweepDone   chan struct{}
-
-	onShutdown []func() // hooks run at shutdown start, before handlers drain
-}
-
-// RegisterOnShutdown registers f to run when Shutdown starts, before the
-// HTTP server drains handlers. The viewer registers Close so open SSE tabs
-// stop blocking shutdown.
-func (s *Server) RegisterOnShutdown(f func()) {
-	s.onShutdown = append(s.onShutdown, f)
+	http  *http.Server
+	conns sync.WaitGroup
 }
 
 // New builds a Server. It resolves the secret, validates the config, and
@@ -102,11 +91,9 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 			return http.ErrUseLastResponse // 3xx is a forward failure, not a hop
 		},
 	}
-	sweepCtx, sweepCancel := context.WithCancel(context.Background())
 	s := &Server{
 		cfg: cfg, secret: secret, events: events, gate: gate, now: time.Now,
 		sem: make(chan struct{}, cfg.InFlightCap), proxy: proxy,
-		sweepCtx: sweepCtx, sweepCancel: sweepCancel, sweepDone: make(chan struct{}),
 	}
 	s.viewer = viewer.New(events, nil)
 	s.viewer.Heartbeat = cfg.SSEHeartbeat
@@ -153,6 +140,14 @@ func New(cfg config.Config, events *store.Store, gate *forwarder.Gate) (*Server,
 	root := mux
 	s.http = &http.Server{
 		Addr: cfg.Bind,
+		ConnState: func(_ net.Conn, state http.ConnState) {
+			switch state {
+			case http.StateNew:
+				s.conns.Add(1)
+			case http.StateClosed, http.StateHijacked:
+				s.conns.Done()
+			}
+		},
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			viewer.SetSecurityHeaders(w)
 			// Host policy applies before outer-mux canonicalization, so
@@ -182,38 +177,28 @@ func (s *Server) Handler() http.Handler { return s.http.Handler }
 // briefing worker callbacks through viewer.Fanout.
 func (s *Server) Viewer() *viewer.Viewer { return s.viewer }
 
-// Start serves ingest and runs the startup sweep on one background worker.
-// It blocks until the listener fails or Shutdown is called.
+// Start serves HTTP until the listener fails or Shutdown stops it.
+// The caller runs the recovery sweep before serving.
 func (s *Server) Start() error {
-	go func() {
-		defer close(s.sweepDone)
-		s.sweep(s.sweepCtx)
-	}()
 	err := s.http.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
-	s.sweepCancel() // listener failed; nothing left for the sweeper to serve
 	return err
 }
 
-// Shutdown cancels the sweeper first, waits for it and for in-flight
-// handlers, checkpoints the WAL through the writer, then returns. The
-// caller closes the store after Shutdown returns so an in-flight forward
-// can still commit its receipt.
+// Shutdown closes SSE streams and waits for the HTTP server to drain.
+// If the grace period expires, close the remaining connections to cancel
+// their request contexts.
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.sweepCancel()
-	for _, f := range s.onShutdown {
-		f()
-	}
+	s.viewer.Close()
 	err := s.http.Shutdown(ctx)
-	select {
-	case <-s.sweepDone:
-	case <-ctx.Done():
+	if err != nil {
+		err = errors.Join(err, s.http.Close())
 	}
-	if cerr := s.events.Checkpoint(ctx); cerr != nil {
-		log.Printf("ingest: shutdown checkpoint: %v", cerr)
-	}
+	// Shutdown joins the listener, so no more StateNew callbacks can add
+	// to conns. Close interrupts sockets but does not join their handlers.
+	s.conns.Wait()
 	return err
 }
 

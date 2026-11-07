@@ -334,7 +334,15 @@ func groupEventIDs(tx *sql.Tx, groupID string) ([]string, error) {
 // InsertBriefing stores the group's single briefing and marks it done.
 // The one_briefing_per_group unique index makes a second insert fail.
 func (s *Store) InsertBriefing(ctx context.Context, b Briefing) error {
-	return s.write(ctx, func(tx *sql.Tx) error {
+	_, err := s.InsertBriefingWithSeq(ctx, b)
+	return err
+}
+
+// InsertBriefingWithSeq inserts the briefing and returns its sequence after
+// the transaction commits.
+func (s *Store) InsertBriefingWithSeq(ctx context.Context, b Briefing) (int64, error) {
+	var seq int64
+	if err := s.write(ctx, func(tx *sql.Tx) error {
 		// The group owns provenance; a caller cannot relabel historical work.
 		var groupingVersion int
 		if err := tx.QueryRow(`SELECT grouping_version FROM active_groups WHERE group_id = ?`, b.GroupID).Scan(&groupingVersion); err != nil {
@@ -386,7 +394,6 @@ func (s *Store) InsertBriefing(ctx context.Context, b Briefing) error {
 		// rows are fine: replay compares by seq > last, never by
 		// contiguity. A missing state row fails the insert loudly rather
 		// than reusing an id.
-		var seq int64
 		if err := tx.QueryRow(`UPDATE seq_state SET next_seq = next_seq + 1 WHERE id = 0 RETURNING next_seq - 1`).Scan(&seq); err != nil {
 			return err
 		}
@@ -444,7 +451,10 @@ func (s *Store) InsertBriefing(ctx context.Context, b Briefing) error {
 			return err
 		}
 		return nil
-	})
+	}); err != nil {
+		return 0, err
+	}
+	return seq, nil
 }
 
 // AgentTraces reads one briefing's executed tool steps in 0-based

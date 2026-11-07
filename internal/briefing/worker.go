@@ -68,10 +68,9 @@ type Deps struct {
 
 // notifyBriefing fans a stored briefing out to the observer. Event IDs
 // come from the taken events (the insert already proved them equal to
-// the derived set), sorted to match the stored order. The writer assigns
-// seq inside the insert transaction, so the stored row is re-read for the
-// cursor the SSE id: field carries; on a read error the fanout still runs.
-func notifyBriefing(d Deps, taken store.TakenGroup, b store.Briefing) {
+// the derived set), sorted to match the stored order. The sequence is the
+// committed cursor returned by the insert transaction.
+func notifyBriefing(d Deps, taken store.TakenGroup, b store.Briefing, seq int64) {
 	if d.OnBriefing == nil {
 		return
 	}
@@ -82,11 +81,7 @@ func notifyBriefing(d Deps, taken store.TakenGroup, b store.Briefing) {
 	sort.Strings(ids)
 	b.EventIDs = ids
 	b.GroupingVersion = taken.GroupingVersion
-	if stored, err := d.Store.BriefingForGroup(context.Background(), taken.GroupID); err == nil {
-		b.Seq = stored.Seq
-	} else {
-		log.Printf("briefing: group %s reread for seq: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
-	}
+	b.Seq = seq
 	d.OnBriefing(b)
 }
 
@@ -333,7 +328,8 @@ func briefOne(ctx context.Context, d Deps, groupID string) (progressed bool) {
 	if taken.LastAttempt() {
 		// Final attempt: write the deterministic briefing inline instead
 		// of releasing, so a poison group converges to done, not failed.
-		if err := d.Store.InsertBriefing(ctx, b); err != nil {
+		seq, err := d.Store.InsertBriefingWithSeq(ctx, b)
+		if err != nil {
 			log.Printf("briefing: group %s final insert: %s", groupID, store.SanitizeErrorText(err.Error()))
 			if transientStoreErr(ctx, err) {
 				return releaseTransientErr(ctx, d, taken, err)
@@ -342,10 +338,11 @@ func briefOne(ctx context.Context, d Deps, groupID string) (progressed bool) {
 			return true
 		}
 		d.Health.AddProviderFallback()
-		notifyBriefing(d, taken, b)
+		notifyBriefing(d, taken, b, seq)
 		return true
 	}
-	if err := d.Store.InsertBriefing(ctx, b); err != nil {
+	seq, err := d.Store.InsertBriefingWithSeq(ctx, b)
+	if err != nil {
 		log.Printf("briefing: group %s insert: %s", groupID, store.SanitizeErrorText(err.Error()))
 		if transientStoreErr(ctx, err) {
 			return releaseTransientErr(ctx, d, taken, err)
@@ -353,7 +350,7 @@ func briefOne(ctx context.Context, d Deps, groupID string) (progressed bool) {
 		return releaseOrPark(ctx, d, taken, "insert failed")
 	}
 	d.Health.AddProviderFallback()
-	notifyBriefing(d, taken, b)
+	notifyBriefing(d, taken, b, seq)
 	if len(outcome.Skipped) > 0 {
 		log.Printf("briefing: group %s baseline %s skipped %d unknown-input rules", groupID, outcome.RuleID, len(outcome.Skipped))
 	}

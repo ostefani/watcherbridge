@@ -621,7 +621,7 @@ func BenchmarkBriefOneValid(b *testing.B) {
 	}
 }
 
-func TestOnBriefingFiresWithEventIDs(t *testing.T) {
+func TestOnBriefingFiresWithEventIDsAndSequence(t *testing.T) {
 	s := openWorkerStore(t)
 	gid := hostChangedGroup(t, s)
 	fake := provider.NewFake()
@@ -637,6 +637,13 @@ func TestOnBriefingFiresWithEventIDs(t *testing.T) {
 	}
 	if got[0].GroupID != gid || len(got[0].EventIDs) != 1 || got[0].EventIDs[0] != "evt-w1" {
 		t.Fatalf("callback briefing = %+v", got[0])
+	}
+	stored, err := s.BriefingForGroup(context.Background(), gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Seq <= 0 || got[0].Seq != stored.Seq {
+		t.Fatalf("callback sequence %d, stored sequence %d", got[0].Seq, stored.Seq)
 	}
 	if _, err := json.Marshal(got[0]); err != nil {
 		t.Fatal(err)

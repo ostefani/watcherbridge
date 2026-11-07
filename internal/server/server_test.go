@@ -7,9 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -957,51 +959,142 @@ func FuzzParseAndValidate(f *testing.F) {
 	})
 }
 
-// RegisterOnShutdown hooks run when Shutdown starts, so open SSE tabs stop
-// blocking the drain. The server is built directly (no fake relay), so the
-// listener uses an ephemeral loopback port: Start either blocks in
-// ListenAndServe or fails fast, and Shutdown must run the hooks either way.
-func TestRegisterOnShutdownRunsHooks(t *testing.T) {
-	cfg := config.Default()
-	// Isolate the test from operator UI reconnects on the default port.
-	cfg.Bind = "127.0.0.1:0"
-	cfg.Mode = config.ModeTap
-	cfg.Secret = "test-secret-long-enough-01234567"
-	st, err := store.Open(filepath.Join(t.TempDir(), "bridge.db"))
+func TestShutdownDrainsOpenStream(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) {
+		c.Bind = "127.0.0.1:0"
+		c.ViewerAllowedHosts = []string{"localhost"}
+	})
+	listener, err := net.Listen("tcp", h.srv.cfg.Bind)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = st.Close() })
-	srv, err := New(cfg, st, forwarder.NewGate())
-	if err != nil {
-		t.Fatal(err)
-	}
-	var mu sync.Mutex
-	calls := 0
-	hook := func() {
-		mu.Lock()
-		defer mu.Unlock()
-		calls++
-	}
-	srv.RegisterOnShutdown(hook)
-	srv.RegisterOnShutdown(hook)
-	startDone := make(chan error, 1)
-	go func() { startDone <- srv.Start() }()
-	time.Sleep(200 * time.Millisecond) // Start blocks in ListenAndServe or fails fast
+	t.Cleanup(func() { _ = h.srv.http.Close() })
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- h.srv.http.Serve(listener) }()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		t.Fatalf("shutdown: %v", err)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+listener.Addr().String()+"/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "localhost"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || h.srv.Viewer().Hub().SubscriberCount() != 1 {
+		t.Fatalf("expected an active SSE stream, got status %d", resp.StatusCode)
+	}
+
+	for range 2 {
+		if err := h.srv.Shutdown(ctx); err != nil {
+			t.Fatalf("shutdown: %v", err)
+		}
+	}
+	if n := h.srv.Viewer().Hub().SubscriberCount(); n != 0 {
+		t.Fatalf("%d subscribers remained after shutdown", n)
+	}
+	if err := <-serveDone; !errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("serve: %v", err)
+	}
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("stream did not end cleanly: %v", err)
+	}
+}
+
+func TestShutdownJoinsHandlerAfterGraceExpires(t *testing.T) {
+	h := newHarness(t, nil)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = h.srv.http.Close() })
+	cancelled := make(chan struct{})
+	release := make(chan struct{})
+	handlerDone := make(chan struct{})
+	h.srv.http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(handlerDone)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		close(cancelled)
+		<-release
+	})
+	go func() { _ = h.srv.http.Serve(listener) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+listener.Addr().String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	grace, stopGrace := context.WithCancel(ctx)
+	stopGrace()
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- h.srv.Shutdown(grace) }()
+	select {
+	case <-cancelled:
+	case <-ctx.Done():
+		close(release)
+		t.Fatal("forced shutdown did not cancel the request")
 	}
 	select {
-	case <-startDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Start did not return after Shutdown")
+	case err := <-shutdownDone:
+		close(release)
+		t.Fatalf("shutdown returned before the handler exited: %v", err)
+	case <-time.After(20 * time.Millisecond):
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if calls != 2 {
-		t.Fatalf("shutdown hooks ran %d/2", calls)
+	close(release)
+	select {
+	case err := <-shutdownDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("shutdown: %v", err)
+		}
+		select {
+		case <-handlerDone:
+		default:
+			t.Fatal("handler still running after shutdown")
+		}
+	case <-ctx.Done():
+		t.Fatal("shutdown did not return after the handler exited")
+	}
+}
+
+func TestStartDoesNotRepeatStartupSweep(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	h := newHarness(t, func(c *config.Config) { c.Bind = listener.Addr().String() })
+	h.relay.mode.Store("fail")
+	seedUnforwarded(t, h, uniqueID(), "host-retry", time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	h.srv.SweepOnce(ctx)
+	var sweepClockCalls atomic.Int32
+	h.srv.SetNow(func() time.Time {
+		sweepClockCalls.Add(1)
+		return time.Now()
+	})
+	if err := h.srv.Start(); err == nil {
+		t.Fatal("expected occupied bind to fail")
+	}
+	if err := h.srv.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown after bind failure: %v", err)
+	}
+	if hits := h.relay.hits.Load(); hits != 1 {
+		t.Fatalf("startup sweep made %d relay attempts, want 1", hits)
+	}
+	if calls := sweepClockCalls.Load(); calls != 0 {
+		t.Fatalf("listener startup read the sweep clock %d times", calls)
 	}
 }
 
