@@ -5,11 +5,7 @@
 ![Muse AI](https://img.shields.io/badge/AI-Muse-0866FF)
 ![Visitors](https://visitor-badge.laobi.icu/badge?page_id=ostefani.watcherbridge)
 
-**Turn network changes into clear explanations and a focused review inbox.**
-
-WatcherBridge receives signed network-change reports, preserves the original evidence, and groups related events into prioritized briefings: what changed, why it matters, and what to check next. I used **SubnetLens Pro**, my proprietary network scanner, as the event source for this project.
-
-The bridge runs locally with an embedded dashboard, SQLite storage, and optional AI explanations. It interprets reported changes; network discovery and host identification belong to the event source.
+Network scanners tell you what’s happening. But what does it actually mean? WatcherBridge receives signed change reports from a network scanner and turns them into a local review inbox. I used **SubnetLens Pro**, my proprietary network scanner, as the event source for this project. The demo can run on synthetic events — no real network data.
 
 ## Building notes
 
@@ -28,21 +24,14 @@ The screenshots below use synthetic demonstration data.
 </tr>
 </table>
 
-
-
 ## What it does
 
-- **Shows what needs attention.** Each briefing shows a priority derived from deterministic rules over the reported changes, with the reasoning behind it. AI may raise that priority by one level, up to high; only rules produce critical.
-- **Explains with evidence.** Briefings link to original reports and retained host context. An optional investigator uses bounded, read-only tools over local history.
-- **Supports review.** Mark changes expected or unexpected, snooze items, and add notes or labels. Review decisions stay local.
-- **Protects provider context.** Redaction is enabled by default, and a final leak scan blocks unsafe provider requests. Model failures produce marked deterministic fallbacks.
-- **Fits existing workflows.** Use the live dashboard, JSON API, or status CLI. Optionally forward original signed events and publish briefing annotations to a relay.
-
-```text
-Signed reports → Verify & store → Group → Prioritize → Explain or fallback
-                                                           ↓
-                                                  Dashboard · API · CLI
-```
+- **Keeps the scanner evidence.** WatcherBridge verifies signatures, preserves the original reports, and uses the context the scanner supplies. Network discovery and host identification belong to the scanner.
+- **Explains and prioritizes changes.** Briefings link to the underlying reports and explain what changed, why it matters, and what to check next. Local rules set priority. Optional AI can consult retained evidence through bounded, read-only tools and may raise priority by one level, up to high.
+- **Groups related briefings into incidents.** Qualifying appearance or disappearance briefings from the same source and scan target can form an incident. The highest member priority sets the minimum, with a floor of medium for disappearance incidents.
+- **Keeps review decisions local.** Mark changes expected or unexpected, snooze items, or add notes and labels. Three matching, eligible “expected” decisions can trigger a rule proposal. Operators can approve it with an optional expiry or revoke an active rule.
+- **Shows attention and coverage.** The overview pairs an **Act**, **Review**, or **Quiet** verdict with coverage for each source. Liveness is unknown until heartbeat support is established. After that, a stale heartbeat is flagged as blind even if another source is healthy. The overview is available in the dashboard, JSON API, and status CLI.
+- **Protects data sent to AI providers.** Redaction is enabled by default, and a final leak scan can block transmission. Model failures produce a clearly marked explanation based on local rules.
 
 ## Run the AI demo
 
@@ -53,7 +42,7 @@ commands to run the Meta AI demo with synthetic reports or SubnetLens Pro.
 
 - Run `./watcherbridge -h` for startup settings and `./watcherbridge status --window 24h --json` for the running bridge's overview. Status exits with `0` for quiet, `1` for review, `2` for act, or `3` when unavailable.
 - The listener accepts loopback addresses only. A quiet verdict describes retained reports and review state, not network security or host availability.
-- Tap mode receives events independently of other consumers. Proxy mode (`-mode proxy`) forwards original signed bytes to the configured relay. `-scanrelay-url=` disables relay integration.
+- Tap mode receives events independently of other consumers. Proxy mode (`-mode proxy`) forwards original signed bytes to the configured relay. WatcherBridge can also publish briefing annotations to the relay. `-scanrelay-url=` disables relay integration.
 - Built with Go, SQLite in WAL mode, Svelte 5, Vite, and Server-Sent Events. Use the Node.js version in [ui/.nvmrc](ui/.nvmrc) and `make ui-check` for viewer changes.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for engineering conventions.

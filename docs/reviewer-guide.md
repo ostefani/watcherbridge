@@ -1,17 +1,27 @@
 # Reviewer guide: AI demo
 
+Please review the WatcherBridge v0.1.1 release. If building from source, check out v0.1.1 before following the reviewer guide. Open source development continues on main.
+
 Run WatcherBridge, send a synthetic report, and inspect the AI
 briefing. No scanner is required for this demo. Synthetic reports do not
 scan your network; their redacted content is sent to your configured model.
 
 ## Requirements
 
-- Go 1.26+, a C compiler for SQLite/cgo, and Python 3. Node.js is not needed.
+- **Build from source:** Go 1.26 or later and a C compiler for SQLite via cgo.
+  The checkout includes the built dashboard, so the Go build can embed it
+  without Node.js.
+- **Use a release binary:** Download the binary for your platform and skip
+  the Go build command. Go and a C compiler are only needed for source builds.
+- **Run the synthetic demo:** Python 3.7 or later for the report sender
+  (`python3` on macOS/Linux, `py` on Windows). The macOS/Linux setup
+  also uses `openssl` to generate a webhook secret on first run.
 - A Meta Model API key with access to `muse-spark-1.3-contributor` (or replace
   the model ID below with one enabled for your account).
 - Run the bridge, sender, and browser on the same machine.
 
-You can download binaries from [https://github.com/ostefani/watcherbridge/releases/tag/v0.1.1](https://github.com/ostefani/watcherbridge/releases/tag/v0.1.1) or build yourslef.
+Download a binary from the [v0.1.1 release](https://github.com/ostefani/watcherbridge/releases/tag/v0.1.1)
+or build from source.
 
 Clone. If you already have the repository, start in its root and skip:
 
@@ -48,7 +58,7 @@ webhook secret and recreate `/tmp/model.key` only if it has been cleared.
 <details>
 <summary>Windows PowerShell</summary>
 
-Install Go, Python 3, and MinGW-w64 GCC with their executables on `PATH`.
+For a source build, install Go and MinGW-w64 GCC and put them on `PATH`.
 The private directory protects local files. Credentials use environment
 variables because the secret-file checks require Unix permission bits.
 
