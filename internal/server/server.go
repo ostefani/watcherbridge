@@ -38,8 +38,8 @@ import (
 // event forwarded without a 2xx.
 const replayBody = `{"error":"replayed request"}`
 
-// forwardRespCap bounds the forwarded-response read: status plus the small
-// replay body are all the forwarder ever needs.
+// forwardRespCap bounds the forwarded-response body. A conflict read allows
+// one extra byte to distinguish a complete replay response from a prefix.
 const forwardRespCap = 8 << 10
 
 // eventTypes is the allowlist of Pro webhook event types (Designv5 §4).
@@ -483,16 +483,24 @@ func (s *Server) forwardOne(ctx context.Context, body []byte, src map[string]str
 		return false
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, forwardRespCap))
+	limit := int64(forwardRespCap)
+	if resp.StatusCode == http.StatusConflict {
+		limit++
+	}
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 	if err != nil {
 		s.recordFailure(ctx, eventID, "read forward response")
+		return false
+	}
+	if len(respBody) > forwardRespCap {
+		s.recordFailure(ctx, eventID, "forward replay response too large")
 		return false
 	}
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		s.recordDelivered(ctx, eventID)
 		return true
-	case resp.StatusCode == http.StatusConflict && strings.TrimSpace(string(respBody)) == replayBody:
+	case resp.StatusCode == http.StatusConflict && string(bytes.TrimSpace(respBody)) == replayBody:
 		// ScanRelay proves an earlier attempt landed (e.g. the bridge
 		// crashed after accept but before the flag write).
 		s.recordDelivered(ctx, eventID)

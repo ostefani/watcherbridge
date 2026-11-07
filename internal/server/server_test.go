@@ -35,7 +35,7 @@ import (
 // (409 + the exact replay body), fail (500), or hang. It records every
 // forwarded body and header set byte-for-byte for golden comparison.
 type fakeRelay struct {
-	mode    atomic.Value // string: accept|replay|fail|hang
+	mode    atomic.Value // string
 	bodies  [][]byte
 	headers []http.Header
 	entered chan struct{}
@@ -60,11 +60,17 @@ func newFakeRelay(t *testing.T) *fakeRelay {
 		case f.entered <- struct{}{}:
 		default:
 		}
-		switch f.mode.Load().(string) {
+		switch mode := f.mode.Load().(string); mode {
 		case "replay":
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			_, _ = fmt.Fprintln(w, `{"error":"replayed request"}`)
+		case "replay-at-cap", "replay-over-cap":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, replayBody+strings.Repeat(" ", forwardRespCap-len(replayBody)))
+			if mode == "replay-over-cap" {
+				_, _ = io.WriteString(w, "x")
+			}
 		case "fail":
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
@@ -275,6 +281,34 @@ func TestReplayShapeMarksForwarded(t *testing.T) {
 	fwd, _, _, err := h.srv.events.ForwardState(context.Background(), id)
 	if err != nil || !fwd {
 		t.Fatalf("forwarded flag not set after replay shape: %v %v", fwd, err)
+	}
+}
+
+func TestReplayBodySizeBoundary(t *testing.T) {
+	h := newHarness(t, nil)
+	now := time.Now()
+	id, key, typ := uniqueID(), "host-r", "host.appeared"
+	body := eventBody(id, key, typ)
+	post := func(at time.Time) int {
+		sig := sign(h.secret, strconv.FormatInt(at.Unix(), 10), id, key, typ, body)
+		return h.post(t, body, id, key, typ, at, sig).Code
+	}
+	h.relay.mode.Store("replay-over-cap")
+	if got := post(now); got != http.StatusBadGateway {
+		t.Errorf("oversized replay status = %d, want 502", got)
+	}
+	if fwd, _, _, err := h.srv.events.ForwardState(context.Background(), id); err != nil || fwd {
+		t.Errorf("oversized replay marked delivery: forwarded=%t, err=%v", fwd, err)
+	}
+	h.relay.mode.Store("replay-at-cap")
+	if got := post(now.Add(time.Second)); got != http.StatusAccepted {
+		t.Errorf("at-cap replay status = %d, want 202", got)
+	}
+	if fwd, _, _, err := h.srv.events.ForwardState(context.Background(), id); err != nil || !fwd {
+		t.Errorf("valid retry did not mark delivery: forwarded=%t, err=%v", fwd, err)
+	}
+	if n := h.relay.hits.Load(); n != 2 {
+		t.Errorf("relay received %d requests, want one attempt and one retry", n)
 	}
 }
 
