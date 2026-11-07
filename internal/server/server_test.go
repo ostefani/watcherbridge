@@ -520,6 +520,24 @@ func TestHungScanRelay502Timing(t *testing.T) {
 	if elapsed < want || elapsed > want+2*time.Second {
 		t.Fatalf("502 took %v, want ~persist+%v", elapsed, want)
 	}
+	if fwd, attempts, reason, err := h.srv.events.ForwardState(context.Background(), id); err != nil ||
+		fwd || attempts != 1 || reason != "forward transport timeout" {
+		t.Fatalf("timeout receipt = (%t, %d, %q, %v)", fwd, attempts, reason, err)
+	}
+}
+
+func TestScanRelayClientTimeoutReceipt(t *testing.T) {
+	h := newHarness(t, nil)
+	h.srv.proxy.Timeout = 200 * time.Millisecond // Expire before the forward context.
+	h.relay.mode.Store("hang")
+	id := uniqueID()
+	if got := h.signedPost(t, id, "host-h", "host.appeared", time.Now()).Code; got != http.StatusBadGateway {
+		t.Fatalf("hung ScanRelay returned %d, want 502", got)
+	}
+	if fwd, attempts, reason, err := h.srv.events.ForwardState(context.Background(), id); err != nil ||
+		fwd || attempts != 1 || reason != "forward transport timeout" {
+		t.Fatalf("client timeout receipt = (%t, %d, %q, %v)", fwd, attempts, reason, err)
+	}
 }
 
 func seedUnforwarded(t *testing.T, h *harness, id, key string, sigAge time.Duration) {
@@ -782,14 +800,10 @@ func TestShutdownDuringSweepForward(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("sweep did not honor shutdown")
 	}
-	// The in-flight forward fails (context gone) but the store must still
-	// answer consistently: either forwarded or recorded as a failure.
-	fwd, attempts, _, err := h.srv.events.ForwardState(context.Background(), id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !fwd && attempts == 0 {
-		t.Fatal("in-flight sweep event vanished without a trace")
+	// Cancellation ends the HTTP request, but the receipt has its own budget.
+	if fwd, attempts, reason, err := h.srv.events.ForwardState(context.Background(), id); err != nil ||
+		fwd || attempts != 1 || reason != "forward transport canceled" {
+		t.Fatalf("canceled sweep receipt = (%t, %d, %q, %v)", fwd, attempts, reason, err)
 	}
 	if h.srv.gate.InFlight() != 0 {
 		t.Fatal("gate leaked after shutdown sweep")

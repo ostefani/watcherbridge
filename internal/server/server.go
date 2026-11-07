@@ -479,15 +479,7 @@ func (s *Server) forwardOne(ctx context.Context, body []byte, src map[string]str
 	}
 	resp, err := s.proxy.Do(out)
 	if err != nil {
-		// Transport errors can include the endpoint and peer-controlled text.
-		reason := "forward transport failure"
-		switch {
-		case errors.Is(err, context.DeadlineExceeded):
-			reason = "forward transport timeout"
-		case errors.Is(err, context.Canceled):
-			reason = "forward transport canceled"
-		}
-		s.recordFailure(ctx, eventID, reason)
+		s.recordFailure(ctx, eventID, forwarder.TransportFailure(err))
 		return false
 	}
 	defer resp.Body.Close()

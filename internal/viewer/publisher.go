@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"sync/atomic"
 	"time"
 
+	"github.com/ostefani/watcherbridge/internal/forwarder"
 	"github.com/ostefani/watcherbridge/internal/store"
 )
 
@@ -163,13 +165,13 @@ func (p *Publisher) post(ctx context.Context, b store.Briefing) {
 	// Every failure mode — refused, timeout, 404, 5xx — lands here: soft
 	// by contract, with the group ID as the only identifier in the log.
 	p.failed.Add(1)
-	log.Printf("publisher: group %s: giving up: %s", b.GroupID, store.SanitizeErrorText(last.Error()))
+	log.Printf("publisher: group %s: giving up: %s", b.GroupID, last)
 }
 
 func (p *Publisher) postOnce(ctx context.Context, raw []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(raw))
 	if err != nil {
-		return err
+		return errors.New("build annotation request")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// Same check order as the proxy forwarder: bearer first, then key.
@@ -180,7 +182,7 @@ func (p *Publisher) postOnce(ctx context.Context, raw []byte) error {
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return err
+		return errors.New(forwarder.TransportFailure(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
