@@ -215,8 +215,8 @@ type Viewer struct {
 	// answer 503, and the connect sequence skips the overview event.
 	Overview *Refresher
 
-	done      chan struct{}
-	closeOnce sync.Once
+	lifetime context.Context
+	cancel   context.CancelFunc
 }
 
 // New returns a Viewer over store, fanning worker callbacks into hub.
@@ -229,16 +229,17 @@ func New(s *store.Store, hub *Hub) *Viewer {
 	if hub == nil {
 		hub = NewHub()
 	}
-	v := &Viewer{store: s, hub: hub, done: make(chan struct{})}
+	lifetime, cancel := context.WithCancel(context.Background())
+	v := &Viewer{store: s, hub: hub, lifetime: lifetime, cancel: cancel}
 	v.Overview = NewRefresher(s, nil, nil,
 		overview.DefaultWindow, overview.DefaultMaxWindow, overview.DefaultMaxWindow)
 	return v
 }
 
 // Close unblocks every open stream handler so server shutdown never waits
-// out open tabs. The server wires it via RegisterOnShutdown.
+// out open tabs.
 func (v *Viewer) Close() {
-	v.closeOnce.Do(func() { close(v.done) })
+	v.cancel()
 }
 
 // Hub exposes the event hub for the briefing worker callbacks.
@@ -504,22 +505,23 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	// streamCtx cancels the request context when the viewer closes, so the
-	// connect sequence and replay reads never outlive shutdown: a slow
-	// peer with per-write progress could otherwise stretch them past the
-	// drain. The watcher goroutine exits at stream end either way.
-	streamCtx, stopStream := func() (context.Context, context.CancelFunc) {
-		ctx, stop := context.WithCancel(r.Context())
-		go func() {
-			select {
-			case <-v.done:
-				stop()
-			case <-ctx.Done():
-			}
-		}()
-		return ctx, stop
+	sub, unsub, ok := v.hub.TrySubscribe(32, v.MaxSubscribers)
+	if !ok {
+		writeViewerError(w, "too many stream subscribers", http.StatusServiceUnavailable)
+		return
+	}
+	defer unsub()
+
+	// Cancel snapshot and replay reads on viewer close or client disconnect.
+	streamCtx, cancel := context.WithCancel(r.Context())
+	stopClose := context.AfterFunc(v.lifetime, cancel)
+	defer func() {
+		stopClose()
+		cancel()
 	}()
-	defer stopStream()
+	if v.lifetime.Err() != nil {
+		return
+	}
 	rc := http.NewResponseController(w)
 	wto := v.WriteTimeout
 	if wto <= 0 {
@@ -527,11 +529,10 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	write := func(ev Event) bool {
 		// No new write starts after shutdown: at most the one in-flight
-		// write runs to its deadline. v.done is checked directly because
-		// Close() closes it synchronously, while the streamCtx
-		// cancellation propagates through a watcher goroutine.
+		// write runs to its deadline. Check viewer closure directly because
+		// the AfterFunc cancellation runs asynchronously.
 		select {
-		case <-v.done:
+		case <-v.lifetime.Done():
 			return false
 		case <-streamCtx.Done():
 			return false
@@ -544,7 +545,7 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	comment := func() bool {
 		select {
-		case <-v.done:
+		case <-v.lifetime.Done():
 			return false
 		case <-streamCtx.Done():
 			return false
@@ -563,13 +564,6 @@ func (v *Viewer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	hbTicker := time.NewTicker(hb)
 	defer hbTicker.Stop()
-
-	sub, unsub, ok := v.hub.TrySubscribe(32, v.MaxSubscribers)
-	if !ok {
-		writeViewerError(w, "too many stream subscribers", http.StatusServiceUnavailable)
-		return
-	}
-	defer unsub()
 
 	if groups, err := v.store.OpenGroupSnapshots(streamCtx); err == nil {
 		if !write(Event{Name: "group", Data: mustJSON(groupWireOf(time.Now().UTC(), v.GroupWindowSeconds, groups))}) {
@@ -658,11 +652,10 @@ func (v *Viewer) replay(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	for _, b := range rows {
 		// Shutdown is observed between records: each write gets a fresh
 		// deadline, so without this a merely slow peer could stretch
-		// replay past the whole shutdown grace. v.done is checked
-		// directly — Close() closes it synchronously, while the ctx
-		// cancellation propagates through a watcher goroutine.
+		// replay past the whole shutdown grace. Check viewer closure directly
+		// because the AfterFunc cancellation runs asynchronously.
 		select {
-		case <-v.done:
+		case <-v.lifetime.Done():
 			return false
 		case <-ctx.Done():
 			return false

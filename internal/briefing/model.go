@@ -304,7 +304,7 @@ func insertDeterministic(ctx context.Context, d Deps, taken store.TakenGroup, ou
 	if countFallback {
 		d.Health.AddProviderFallback()
 	}
-	notifyBriefing(d, taken, b)
+	notifyBriefing(ctx, d, taken, b)
 	if len(outcome.Skipped) > 0 {
 		log.Printf("briefing: group %s baseline %s skipped %d unknown-input rules", taken.GroupID, outcome.RuleID, len(outcome.Skipped))
 	}
@@ -502,7 +502,7 @@ func insertModelBriefing(ctx context.Context, d Deps, taken store.TakenGroup, ou
 		}
 		return releaseOrPark(ctx, d, taken, "insert failed")
 	}
-	notifyBriefing(d, taken, b)
+	notifyBriefing(ctx, d, taken, b)
 	if len(outcome.Skipped) > 0 {
 		log.Printf("briefing: group %s baseline %s skipped %d unknown-input rules", taken.GroupID, outcome.RuleID, len(outcome.Skipped))
 	}

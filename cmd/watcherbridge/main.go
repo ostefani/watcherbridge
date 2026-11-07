@@ -6,11 +6,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -134,12 +137,36 @@ func main() {
 	cfg.StableIdentityFields = strings.Split(*stableFields, ",")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	st, err := store.Open(*db)
+	// A second interrupt must be able to terminate a stalled drain.
+	stopOnSignal := context.AfterFunc(ctx, stop)
+	err := run(ctx, cfg, *db)
+	signalErr := ctx.Err()
+	stopOnSignal()
+	stop()
 	if err != nil {
-		log.Fatalf("open store: %v", err)
+		if !errors.Is(err, signalErr) {
+			log.Fatal(err)
+		}
+		log.Printf("watcherbridge: startup interrupted: %v", err)
 	}
+	log.Print("watcherbridge: stopped")
+}
+
+func run(ctx context.Context, cfg config.Config, db string) error {
+	if ctx.Err() != nil {
+		return nil
+	}
+	st, err := store.Open(db)
+	if err != nil {
+		return fmt.Errorf("open store: %w", err)
+	}
+	// Shutdown closes the store last, after the worker and publisher.
+	defer func() {
+		if err := st.Close(); err != nil {
+			log.Printf("close store: %v", err)
+		}
+	}()
+
 	// Effective-state queries share the configured audit horizon with
 	// purge, so a stalled purge never extends a verdict past retention.
 	st.SetDecisionRetention(cfg.DecisionRetention)
@@ -150,15 +177,9 @@ func main() {
 	// Single-source binding: refuse to serve a database that already
 	// holds another deployment's scoped receipts instead of mixing
 	// their subjects. Pre-scope rows carry '' and stay adoptable.
-	if err := st.BindSourceScope(context.Background(), cfg.SourceID); err != nil {
-		log.Fatalf("source scope: %v", err)
+	if err := st.BindSourceScope(ctx, cfg.SourceID); err != nil {
+		return fmt.Errorf("source scope: %w", err)
 	}
-	// Shutdown closes the store last, after the worker and publisher.
-	defer func() {
-		if err := st.Close(); err != nil {
-			log.Printf("close store: %v", err)
-		}
-	}()
 
 	// Startup ordering is a synchronization boundary, not launch order:
 	// recovery first, then the completed startup sweep, then the initial
@@ -166,13 +187,13 @@ func main() {
 	// Each step runs to completion so retained work is never purged on
 	// a stale view and the sweep never races the first purge.
 	if recovered, err := st.Recover(ctx, time.Now()); err != nil {
-		log.Fatalf("startup recovery: %v", err)
+		return fmt.Errorf("startup recovery: %w", err)
 	} else if len(recovered) > 0 {
 		log.Printf("startup recovery: requeued %d groups", len(recovered))
 	}
 	srv, err := server.New(cfg, st, forwarder.NewGate())
 	if err != nil {
-		log.Fatalf("server: %v", err)
+		return fmt.Errorf("server: %w", err)
 	}
 	// Operational counters are process-lifetime: the start time travels
 	// with every reading so a restart is interpretable, never silent.
@@ -180,13 +201,15 @@ func main() {
 	srv.Health = opHealth
 	srv.Viewer().Overview.SetHealth(opHealth)
 	srv.SweepOnce(ctx)
+	if ctx.Err() != nil {
+		return nil
+	}
 	purgeSettings := store.PurgeSettings{BriefingRetention: cfg.BriefingRetention, SubjectRetention: cfg.SubjectRetention, DecisionRetention: cfg.DecisionRetention, RuleRetention: cfg.RulePurgeAfter, HeartbeatRetention: cfg.HeartbeatRetention, IncidentRetention: cfg.IncidentRetention, ActiveSource: cfg.SourceID}
 	if rep, err := st.PurgeOnce(ctx, purgeSettings, time.Now()); err != nil {
-		log.Fatalf("startup purge: %v", err)
+		return fmt.Errorf("startup purge: %w", err)
 	} else {
 		log.Printf("startup purge: %+v", rep)
 	}
-	srv.RegisterOnShutdown(srv.Viewer().Close)
 	hub := srv.Viewer().Hub()
 
 	var prov provider.Provider
@@ -194,11 +217,11 @@ func main() {
 	case "meta":
 		key, err := cfg.ResolveModelKey()
 		if err != nil {
-			log.Fatalf("model key: %v", err)
+			return fmt.Errorf("model key: %w", err)
 		}
 		prov, err = provider.NewMetaAdapter(cfg.ModelBaseURL, cfg.ModelID, key, nil, cfg.MaxModelResponseBytes)
 		if err != nil {
-			log.Fatalf("model adapter: %v", err)
+			return fmt.Errorf("model adapter: %w", err)
 		}
 	case "fake":
 		log.Print("watcherbridge: fake model provider; all briefings are deterministic fallbacks")
@@ -208,6 +231,18 @@ func main() {
 		log.Print("watcherbridge: WARNING: redaction is off; raw values go to the provider and the leak scan is bypassed")
 	}
 
+	var summarizer provider.Summarizer
+	if cfg.IncidentSummaryEnabled {
+		var ok bool
+		summarizer, ok = prov.(provider.Summarizer)
+		if !ok {
+			return fmt.Errorf("incident summaries require a provider with explicit summary capability")
+		}
+	}
+
+	if ctx.Err() != nil {
+		return nil
+	}
 	var pub *viewer.Publisher
 	if cfg.ScanRelayURL != "" {
 		timeout := cfg.ProxyForwardTimeout
@@ -224,13 +259,17 @@ func main() {
 	// The overview refresher recomputes on briefing inserts and its own
 	// timer, coalesced to 1/s, broadcasting only on hash change.
 	ov := srv.Viewer().Overview
-	overviewDone := make(chan struct{})
-	go func() {
-		defer close(overviewDone)
+	ctx, cancel := context.WithCancel(ctx)
+	var workers sync.WaitGroup
+	defer func() {
+		cancel()
+		workers.Wait()
+	}()
+	workers.Go(func() {
 		ov.Run(ctx, cfg.OverviewTick, func(body []byte) {
 			hub.Broadcast("overview", json.RawMessage(body))
 		})
-	}()
+	})
 	onBriefingChanged := func(b store.Briefing) {
 		onBriefing(b)
 		ov.Trigger()
@@ -240,8 +279,7 @@ func main() {
 	// serialized writer, so a slow purge batch delays individual writes
 	// but never blocks provider calls or the briefing tick. Small batches
 	// plus pressure yield provide the isolation; join before the store.
-	purgeDone := make(chan error, 1)
-	go func() { purgeDone <- runPurgeLoop(ctx, st, cfg, purgeSettings) }()
+	workers.Go(func() { runPurgeLoop(ctx, st, cfg.PurgeInterval, purgeSettings) })
 
 	// The incident correlator sits beside them on the same terms: one
 	// bounded pass per tick through the serialized writer, joined
@@ -252,10 +290,7 @@ func main() {
 		Window: cfg.IncidentWindow, Quiet: cfg.IncidentQuiet, MinRefs: cfg.IncidentMinRefs,
 		SummaryEnabled: cfg.IncidentSummaryEnabled,
 	}
-	incidentDone := make(chan error, 1)
-	go func() {
-		incidentDone <- runIncidentLoop(ctx, st, hub, ov, cfg.IncidentTick, incidentSettings)
-	}()
+	workers.Go(func() { runIncidentLoop(ctx, st, hub, ov, cfg.IncidentTick, incidentSettings) })
 
 	// The closed-incident summary worker sits beside them on the same
 	// terms: one worker, one durable queue capped at 100 outstanding
@@ -265,30 +300,24 @@ func main() {
 	// incident event plus an overview refresh) without changing
 	// membership, reopening incidents, modifying decisions or
 	// publishing scanner annotations.
-	summaryDone := make(chan error, 1)
-	if cfg.IncidentSummaryEnabled {
-		summarizer, ok := prov.(provider.Summarizer)
-		if !ok {
-			log.Fatalf("incident summaries require a provider with explicit summary capability")
-		}
+	if summarizer != nil {
 		onSummary := func(incidentID string) {
 			hub.Broadcast("incident", viewer.IncidentEventOf(store.IncidentReport{Changed: []string{incidentID}}))
 			ov.Trigger()
 		}
-		go func() {
-			summaryDone <- incidentsummary.Run(ctx, incidentsummary.Deps{
+		workers.Go(func() {
+			if err := incidentsummary.Run(ctx, incidentsummary.Deps{
 				Store: st, Provider: summarizer,
 				Redaction: redactor.Policy{Enabled: cfg.Redaction, MaxFieldChars: cfg.MaxFieldChars},
 				Now:       time.Now, Health: opHealth, OnComplete: onSummary,
-			})
-		}()
-	} else {
-		close(summaryDone)
+			}); err != nil {
+				log.Printf("summary worker: %v", err)
+			}
+		})
 	}
 
-	workerDone := make(chan error, 1)
-	go func() {
-		workerDone <- briefing.Run(ctx, briefing.Deps{
+	workers.Go(func() {
+		if err := briefing.Run(ctx, briefing.Deps{
 			Store:       st,
 			SourceScope: cfg.SourceID,
 			Groups: store.GroupPolicy{QuietWindow: cfg.GroupQuietWindow,
@@ -309,39 +338,43 @@ func main() {
 			Health:           opHealth,
 			OnBriefing:       onBriefingChanged,
 			OnGroups:         onGroups,
-		})
-	}()
+		}); err != nil {
+			log.Printf("briefing worker: %v", err)
+		}
+	})
 
 	log.Printf("watcherbridge: serving ingest and viewer on http://%s/ (%s mode)", cfg.Bind, cfg.Mode)
+	serveDone := make(chan error, 1)
 	go func() {
-		<-ctx.Done()
-		shut, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGrace)
-		defer cancel()
-		if err := srv.Shutdown(shut); err != nil {
-			log.Printf("server shutdown: %v", err)
-		}
+		defer cancel() // Stop the workers if the listener exits on its own.
+		serveDone <- srv.Start()
 	}()
-	if err := srv.Start(); err != nil {
-		log.Printf("server: %v", err)
+
+	<-ctx.Done()
+	shut, stopShutdown := context.WithTimeout(context.Background(), cfg.ShutdownGrace)
+	defer stopShutdown()
+	reportSlowDrain := context.AfterFunc(shut, func() {
+		log.Print("watcherbridge: shutdown grace expired; waiting for HTTP and background work to exit")
+	})
+	shutdownErr := srv.Shutdown(shut)
+	serveErr := <-serveDone
+	workers.Wait()
+	reportSlowDrain()
+
+	// Use remaining grace for the explicit checkpoint. Store close still
+	// lets SQLite perform its usual last-connection WAL cleanup.
+	if shut.Err() == nil {
+		if err := st.Checkpoint(shut); err != nil {
+			log.Printf("shutdown checkpoint: %v", err)
+		}
 	}
-	// Ingest stopped: drain the worker, the purge loop, and the overview
-	// refresher, then shut the publisher down so queued annotations
-	// flush before the store closes.
-	stop()
-	if err := <-workerDone; err != nil {
-		log.Printf("worker: %v", err)
+	if serveErr != nil {
+		serveErr = fmt.Errorf("server: %w", serveErr)
 	}
-	if err := <-purgeDone; err != nil {
-		log.Printf("purge loop: %v", err)
+	if shutdownErr != nil {
+		shutdownErr = fmt.Errorf("server shutdown: %w", shutdownErr)
 	}
-	if err := <-incidentDone; err != nil {
-		log.Printf("incident loop: %v", err)
-	}
-	if err := <-summaryDone; err != nil {
-		log.Printf("summary loop: %v", err)
-	}
-	<-overviewDone
-	log.Print("watcherbridge: stopped")
+	return errors.Join(serveErr, shutdownErr)
 }
 
 // runIncidentLoop ticks CorrelateIncidents until ctx ends. A pass
@@ -349,13 +382,13 @@ func main() {
 // event and triggers an overview refresh; quiet passes stay silent.
 // Errors are logged and retried next tick: the durable cursor makes
 // every pass safely repeatable.
-func runIncidentLoop(ctx context.Context, st *store.Store, hub *viewer.Hub, ov *viewer.Refresher, tick time.Duration, settings store.IncidentSettings) error {
+func runIncidentLoop(ctx context.Context, st *store.Store, hub *viewer.Hub, ov *viewer.Refresher, tick time.Duration, settings store.IncidentSettings) {
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		case <-ticker.C:
 		}
 		rep, err := st.CorrelateIncidents(ctx, settings, time.Now())
@@ -374,13 +407,13 @@ func runIncidentLoop(ctx context.Context, st *store.Store, hub *viewer.Hub, ov *
 // runPurgeLoop ticks PurgeOnce until ctx ends. Errors are logged and
 // retried next tick: a transient failure must not kill the process,
 // and the next pass reselects remaining eligible work.
-func runPurgeLoop(ctx context.Context, st *store.Store, cfg config.Config, settings store.PurgeSettings) error {
-	tick := time.NewTicker(cfg.PurgeInterval)
+func runPurgeLoop(ctx context.Context, st *store.Store, interval time.Duration, settings store.PurgeSettings) {
+	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		case <-tick.C:
 		}
 		rep, err := st.PurgeOnce(ctx, settings, time.Now())

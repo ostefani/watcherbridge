@@ -3,8 +3,8 @@
 Please review the WatcherBridge v0.1.1 release. If building from source, check out v0.1.1 before following the reviewer guide. Open source development continues on main.
 
 Run WatcherBridge, send a synthetic report, and inspect the AI
-briefing. No scanner is required for this demo. Synthetic reports do not
-scan your network; their redacted content is sent to your configured model.
+briefing. No scanner is required for this demo. Synthetic reports contain
+sample network data. Their content is sent to your configured model.
 
 ## Requirements
 
