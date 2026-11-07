@@ -479,7 +479,15 @@ func (s *Server) forwardOne(ctx context.Context, body []byte, src map[string]str
 	}
 	resp, err := s.proxy.Do(out)
 	if err != nil {
-		s.recordFailure(ctx, eventID, err.Error())
+		// Transport errors can include the endpoint and peer-controlled text.
+		reason := "forward transport failure"
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			reason = "forward transport timeout"
+		case errors.Is(err, context.Canceled):
+			reason = "forward transport canceled"
+		}
+		s.recordFailure(ctx, eventID, reason)
 		return false
 	}
 	defer resp.Body.Close()
@@ -506,7 +514,7 @@ func (s *Server) forwardOne(ctx context.Context, body []byte, src map[string]str
 		s.recordDelivered(ctx, eventID)
 		return true
 	default:
-		s.recordFailure(ctx, eventID, "scanrelay status "+resp.Status)
+		s.recordFailure(ctx, eventID, "scanrelay status "+strconv.Itoa(resp.StatusCode))
 		return false
 	}
 }
