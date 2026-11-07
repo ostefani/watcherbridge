@@ -49,7 +49,7 @@ fi
 chmod 600 demo-data/webhook.secret
 printf '%s' 'LLM_your_api_key_here' > /tmp/model.key && chmod 600 /tmp/model.key
 
-./watcherbridge -secret-file ./demo-data/webhook.secret -db ./demo-data/demo.db -scanrelay-url= -model-provider meta -model-base-url https://api.meta.ai/v1/responses -model-id muse-spark-1.3-contributor -model-key-file /tmp/model.key -agent-enabled -group-quiet-window 5s
+./watcherbridge -secret-file ./demo-data/webhook.secret -db ./demo-data/demo.db -scanrelay-url= -model-provider meta -model-base-url https://api.meta.ai/v1/responses -model-id muse-spark-1.3-contributor -model-key-file /tmp/model.key -agent-enabled -group-quiet-window 5s -provider-timeout 60s -agent-max-steps 2
 ```
 
 For later restarts, run only the same AI-enabled bridge command. Keep the
