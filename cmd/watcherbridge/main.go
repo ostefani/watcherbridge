@@ -144,7 +144,7 @@ func main() {
 	stopOnSignal()
 	stop()
 	if err != nil {
-		if !errors.Is(err, signalErr) {
+		if signalErr == nil || !errors.Is(err, signalErr) {
 			log.Fatal(err)
 		}
 		log.Printf("watcherbridge: startup interrupted: %v", err)
@@ -343,7 +343,7 @@ func run(ctx context.Context, cfg config.Config, db string) error {
 		}
 	})
 
-	log.Printf("watcherbridge: serving ingest and viewer on http://%s/ (%s mode)", cfg.Bind, cfg.Mode)
+	log.Printf("watcherbridge: starting HTTP listener on http://%s/ (%s mode)", cfg.Bind, cfg.Mode)
 	serveDone := make(chan error, 1)
 	go func() {
 		defer cancel() // Stop the workers if the listener exits on its own.
@@ -353,13 +353,13 @@ func run(ctx context.Context, cfg config.Config, db string) error {
 	<-ctx.Done()
 	shut, stopShutdown := context.WithTimeout(context.Background(), cfg.ShutdownGrace)
 	defer stopShutdown()
-	reportSlowDrain := context.AfterFunc(shut, func() {
+	stopSlowDrainReport := context.AfterFunc(shut, func() {
 		log.Print("watcherbridge: shutdown grace expired; waiting for HTTP and background work to exit")
 	})
 	shutdownErr := srv.Shutdown(shut)
 	serveErr := <-serveDone
 	workers.Wait()
-	reportSlowDrain()
+	stopSlowDrainReport()
 
 	// Use remaining grace for the explicit checkpoint. Store close still
 	// lets SQLite perform its usual last-connection WAL cleanup.

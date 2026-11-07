@@ -294,7 +294,8 @@ func insertDeterministic(ctx context.Context, d Deps, taken store.TakenGroup, ou
 		now = d.Now()
 	}
 	b := deterministicBriefing(taken, outcome, now, contextNote, source, countFallback, traces, usage)
-	if err := d.Store.InsertBriefing(ctx, b); err != nil {
+	seq, err := d.Store.InsertBriefingWithSeq(ctx, b)
+	if err != nil {
 		log.Printf("briefing: group %s %s insert: %s", taken.GroupID, source, store.SanitizeErrorText(err.Error()))
 		if transientStoreErr(ctx, err) {
 			return releaseTransientErr(ctx, d, taken, err)
@@ -304,7 +305,7 @@ func insertDeterministic(ctx context.Context, d Deps, taken store.TakenGroup, ou
 	if countFallback {
 		d.Health.AddProviderFallback()
 	}
-	notifyBriefing(ctx, d, taken, b)
+	notifyBriefing(d, taken, b, seq)
 	if len(outcome.Skipped) > 0 {
 		log.Printf("briefing: group %s baseline %s skipped %d unknown-input rules", taken.GroupID, outcome.RuleID, len(outcome.Skipped))
 	}
@@ -495,14 +496,15 @@ func insertModelBriefing(ctx context.Context, d Deps, taken store.TakenGroup, ou
 		cost := usage.CostMicros
 		b.CostMicros = &cost
 	}
-	if err := d.Store.InsertBriefing(ctx, b); err != nil {
+	seq, err := d.Store.InsertBriefingWithSeq(ctx, b)
+	if err != nil {
 		log.Printf("briefing: group %s insert: %s", taken.GroupID, store.SanitizeErrorText(err.Error()))
 		if transientStoreErr(ctx, err) {
 			return releaseTransientErr(ctx, d, taken, err)
 		}
 		return releaseOrPark(ctx, d, taken, "insert failed")
 	}
-	notifyBriefing(ctx, d, taken, b)
+	notifyBriefing(d, taken, b, seq)
 	if len(outcome.Skipped) > 0 {
 		log.Printf("briefing: group %s baseline %s skipped %d unknown-input rules", taken.GroupID, outcome.RuleID, len(outcome.Skipped))
 	}
