@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -31,14 +33,16 @@ func TestProducerEnvelopeRejectsTap(t *testing.T) {
 	// 400: unknown event type with a valid signature over the same bytes.
 	weird := []byte(`{"event_id":"evt-x","event_key":"host-a","event_type":"host.mutated"}`)
 	wts := strconv.FormatInt(now.Unix(), 10)
-	if rec := h.post(t, weird, "evt-x", "host-a", "host.mutated", now, sign(h.secret, wts, "evt-x", "host-a", "host.mutated", weird)); rec.Code != http.StatusBadRequest {
+	if rec := h.post(t, weird, "evt-x", "host-a", "host.mutated", now, sign(h.secret, wts, "evt-x", "host-a", "host.mutated", weird)); rec.Code != http.StatusBadRequest ||
+		strings.TrimSpace(rec.Body.String()) != `{"error":"unknown event_type"}` {
 		t.Fatalf("unknown event type: got %d %s", rec.Code, rec.Body.String())
 	}
 
 	// 400: non-JSON body with a valid signature.
 	raw := []byte("not json at all{{{")
 	rts := strconv.FormatInt(now.Unix(), 10)
-	if rec := h.post(t, raw, "evt-raw", "host-a", "host.appeared", now, sign(h.secret, rts, "evt-raw", "host-a", "host.appeared", raw)); rec.Code != http.StatusBadRequest {
+	if rec := h.post(t, raw, "evt-raw", "host-a", "host.appeared", now, sign(h.secret, rts, "evt-raw", "host-a", "host.appeared", raw)); rec.Code != http.StatusBadRequest ||
+		strings.TrimSpace(rec.Body.String()) != `{"error":"invalid event body"}` {
 		t.Fatalf("malformed body: got %d %s", rec.Code, rec.Body.String())
 	}
 }
@@ -180,11 +184,11 @@ func TestProducerEnvelopeMismatchRejected(t *testing.T) {
 			// body bytes: authentication passes, consistency must fail.
 			rec := h.post(t, body, id, "host-a", "host.appeared", now,
 				sign(h.secret, ts, id, "host-a", "host.appeared", body))
-			if rec.Code != http.StatusBadRequest {
+			if rec.Code != http.StatusBadRequest || strings.TrimSpace(rec.Body.String()) != `{"error":"body envelope does not match signed headers"}` {
 				t.Fatalf("split envelope: got %d, want 400 (%s)", rec.Code, rec.Body.String())
 			}
-			if _, err := h.srv.events.StoredEvent(context.Background(), id); err == nil {
-				t.Fatal("split envelope was persisted")
+			if _, err := h.srv.events.StoredEvent(context.Background(), id); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("split envelope lookup returned %v, want sql.ErrNoRows", err)
 			}
 		})
 	}

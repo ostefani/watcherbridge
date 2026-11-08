@@ -157,19 +157,15 @@ func TestValidateRejects(t *testing.T) {
 		"in-flight bytes above budget": func(c *Config) { c.InFlightCap = 65 },
 		"write below handler":          func(c *Config) { c.WriteTimeout = c.HandlerDeadline },
 		"write above pro timeout":      func(c *Config) { c.WriteTimeout = c.ProSenderTimeout },
-		"handler above pro":            func(c *Config) { c.HandlerDeadline, c.WriteTimeout = c.ProSenderTimeout, 2*c.ProSenderTimeout },
 		"grace below handler":          func(c *Config) { c.ShutdownGrace = time.Second },
 		"margin above tolerance":       func(c *Config) { c.SweepSafetyMargin = c.TimestampTolerance },
 		"tick above window":            func(c *Config) { c.GrouperTick = c.GroupQuietWindow + time.Second },
-		"tick above lease":             func(c *Config) { c.GrouperTick = c.ProcessingLease },
 		"ages inverted":                func(c *Config) { c.EstablishedAge, c.StrongHistoryAge = c.StrongHistoryAge, c.EstablishedAge },
 		"unknown stable field":         func(c *Config) { c.StableIdentityFields = []string{"banner"} },
 		"empty stable fields":          func(c *Config) { c.StableIdentityFields = nil },
 		"zero in-flight":               func(c *Config) { c.InFlightCap = 0 },
 		"two sweep workers":            func(c *Config) { c.SweepWorkers = 2 },
 		"unknown model provider":       func(c *Config) { c.ModelProvider = "openai" },
-		"meta without model ID":        func(c *Config) { c.ModelProvider = "meta" },
-		"meta without base URL":        func(c *Config) { c.ModelProvider = "meta"; c.ModelID = "m" },
 		"meta without key":             func(c *Config) { c.ModelProvider = "meta"; c.ModelID = "m"; c.ModelBaseURL = "https://m.example/v1" },
 		"meta key and key file": func(c *Config) {
 			c.ModelProvider = "meta"
@@ -180,7 +176,6 @@ func TestValidateRejects(t *testing.T) {
 		},
 		"zero provider timeout":   func(c *Config) { c.ProviderTimeout = 0 },
 		"zero response cap":       func(c *Config) { c.MaxModelResponseBytes = 0 },
-		"lease below 2x provider": func(c *Config) { c.ProcessingLease = 2*c.ProviderTimeout + c.Margin },
 		"zero SSE heartbeat":      func(c *Config) { c.SSEHeartbeat = 0 },
 		"zero SSE replay cap":     func(c *Config) { c.SSEReplayMax = 0 },
 		"oversize SSE replay cap": func(c *Config) { c.SSEReplayMax = 501 },
@@ -217,6 +212,46 @@ func TestValidateRejects(t *testing.T) {
 		if err := c.Validate(); err == nil {
 			t.Errorf("%s: expected validation error", name)
 		}
+	}
+}
+
+func TestValidateIsolatesEndpointAndBudgetRules(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{"missing model ID", func(c *Config) {
+			c.ModelProvider, c.ModelID, c.ModelAPIKey = "meta", "", "test-key"
+		}, "model ID is required"},
+		{"missing model URL", func(c *Config) {
+			c.ModelProvider, c.ModelID, c.ModelAPIKey = "meta", "m", "test-key"
+			c.ModelBaseURL = ""
+		}, "model base URL must be a valid http(s) endpoint"},
+		{"grouper tick at lease", func(c *Config) {
+			c.GrouperTick = c.ProcessingLease
+			c.GroupQuietWindow = c.GrouperTick
+			c.GroupMaxWindow = c.GroupQuietWindow
+		}, "must be below the processing lease"},
+		{"lease at provider budget", func(c *Config) {
+			// Meet the agent lease rule exactly while isolating the strict
+			// provider lease rule. Give the larger margin a valid HTTP budget.
+			c.AgentTimeout, c.AgentMaxSteps = c.ProviderTimeout, 1
+			c.Margin = leaseMargin
+			c.ProcessingLease = 2*c.ProviderTimeout + c.Margin
+			c.HandlerDeadline = c.ProxyForwardTimeout + c.PersistBudget + c.Margin
+			c.WriteTimeout = c.HandlerDeadline + time.Second
+			c.ProSenderTimeout = c.WriteTimeout + time.Second
+			c.ShutdownGrace = c.WriteTimeout
+		}, "must exceed 2 x provider timeout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := Default()
+			tc.mutate(&c)
+			if err := c.Validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate returned %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 

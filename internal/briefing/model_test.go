@@ -871,6 +871,11 @@ func TestDecodeModelBriefingRejects(t *testing.T) {
 	if _, err := decodeModelBriefing([]byte(full)); err != nil {
 		t.Fatalf("valid answer rejected: %v", err)
 	}
+	raw := strings.Replace(full, `"evidence_refs":[{"event_id":"e1"}]`, `"evidence_refs":[{"event_id":"e1","private-model-field":true}]`, 1)
+	taken := store.TakenGroup{Events: []store.RawEvent{{EventID: "e1"}}}
+	if got := acceptAnswer([]byte(raw), taken, nil, false, -1); got.OK || got.Correction != "unknown field in evidence ref" {
+		t.Errorf("evidence reference accepted=%t, correction=%q", got.OK, got.Correction)
+	}
 }
 
 func TestDecodeEvidenceRefRejectionDiagnostics(t *testing.T) {
@@ -880,7 +885,7 @@ func TestDecodeEvidenceRefRejectionDiagnostics(t *testing.T) {
 		{`{"event_id":"e1"}]`, "trailing data after evidence ref"},
 	} {
 		if _, err := decodeEvidenceRef(json.RawMessage(tc.raw)); err == nil || err.Error() != tc.want {
-			t.Errorf("evidence decoder returned %v, want %q", err, tc.want)
+			t.Errorf("evidence decoder for %q returned %v, want %q", tc.raw, err, tc.want)
 		}
 	}
 }

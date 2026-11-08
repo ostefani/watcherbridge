@@ -16,7 +16,7 @@ func TestDecodeCitationRejectionDiagnostics(t *testing.T) {
 		{`{"member":"M1"}}`, "trailing data after citation"},
 	} {
 		if _, err := decodeCitation(json.RawMessage(tc.raw)); err == nil || err.Error() != tc.want {
-			t.Errorf("citation decoder returned %v, want %q", err, tc.want)
+			t.Errorf("citation decoder for %q returned %v, want %q", tc.raw, err, tc.want)
 		}
 	}
 }
@@ -95,6 +95,7 @@ func TestIncidentSummaryValidation(t *testing.T) {
 		{"stray closer", valid + "}", "trailing data after summary object"},
 		{"malformed", `{"summary":`, "malformed summary JSON"},
 		{"missing fields", `{"summary":"s"}`, "missing or empty required field"},
+		{"unknown citation field", strings.Replace(valid, `"member":"M1"`, `"member":"M1","private-model-field":true`, 1), "unknown field in citation"},
 	} {
 		if _, correction, ok := acceptSummary([]byte(tc.raw), aliases, issued, nil, true, briefing.Medium); ok ||
 			correction != tc.want {
