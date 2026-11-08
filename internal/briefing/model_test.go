@@ -858,6 +858,7 @@ func TestDecodeModelBriefingRejects(t *testing.T) {
 	for name, raw := range map[string]string{
 		"unknown field":  strings.Replace(full, `"recommended_check"`, `"bogus","recommended_check"`, 1),
 		"trailing data":  full + " {}",
+		"stray closer":   full + "]",
 		"empty field":    strings.Replace(full, `"what_changed":"w"`, `"what_changed":""`, 1),
 		"missing likely": strings.Replace(full, `,"likely_explanation":"likely"`, ``, 1),
 		"not json":       `{"event_ids":`,

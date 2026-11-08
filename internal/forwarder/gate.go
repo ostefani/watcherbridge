@@ -15,8 +15,9 @@ import (
 //  1. Acquire right after signature verification, before persisting.
 //  2. Release only after the forward outcome (MarkForwarded / failure) is
 //     committed, so a waking duplicate reads the final state.
-//  3. A duplicate that waited must not forward itself; it only reads state
-//     and replies (202 when forwarded, 502 otherwise).
+//  3. A duplicate that waited only reads stored state. Tap returns 202 for
+//     a stored event. Proxy returns 202 if forwarded and 502 otherwise.
+//     Both return 503 if the state cannot be read.
 type Gate struct {
 	mu sync.Mutex
 	in map[string]chan struct{}

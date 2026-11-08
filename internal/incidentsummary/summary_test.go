@@ -78,6 +78,12 @@ func TestIncidentSummaryValidation(t *testing.T) {
 		t.Fatalf("correction = %q", correction)
 	}
 
+	valid := []byte(`{"summary":"s","hypothesis":"h","confidence":"medium","priority_suggestion":null,"priority_reason":"r","citations":[{"member":"M1"}]}`)
+	if _, correction, ok := acceptSummary(append(valid, '}'), aliases, issued, nil, true, briefing.Medium); ok ||
+		correction != "trailing data after summary object" {
+		t.Fatalf("summary with a stray closer: accepted=%t, correction=%q", ok, correction)
+	}
+
 	// Forged citations are rejected.
 	forged := mustJSON(map[string]any{
 		"summary": "s", "hypothesis": "h", "confidence": "medium",

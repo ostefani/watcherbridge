@@ -122,7 +122,7 @@ stored fallback briefings in place.
 | `-group-quiet-window` | `45s` | How long a group waits after its latest report before it can close for briefing. |
 | `-group-max-window` | `120s` | Maximum grouping window. Must cover the quiet window. |
 | `-grouper-tick` | `1s` | Worker interval for checking group closure and processing briefings. Must be at most the quiet window and shorter than the processing lease. |
-| `-stable-fields` | `mac,hostname,host_id,identity_confidence,identity_source` | Scanner change fields that break the stability check used by the local baseline. |
+| `-stable-fields` | `mac,`<br>`hostname,`<br>`host_id,`<br>`identity_confidence,`<br>`identity_source` | Scanner change fields that break the stability check used by the local baseline. |
 | `-overview-window` | `24h` | Default period covered by the overview. |
 | `-overview-max-window` | `168h` | Maximum overview period. Must cover the default period and fit within briefing retention. |
 | `-overview-tick` | `30s` | Periodic overview refresh interval, from `5s` to `5m`. |

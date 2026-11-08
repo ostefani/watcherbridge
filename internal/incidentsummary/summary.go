@@ -96,7 +96,7 @@ func decodeCitation(raw json.RawMessage) (modelCitation, error) {
 		}
 		return c, fmt.Errorf("malformed citation")
 	}
-	if dec.More() {
+	if len(bytes.Trim(raw[dec.InputOffset():], " \t\r\n")) != 0 {
 		return c, fmt.Errorf("trailing data after citation")
 	}
 	if c.Member == nil || *c.Member == "" {
@@ -115,7 +115,7 @@ func decodeModelSummary(raw []byte) (modelSummary, error) {
 		}
 		return m, fmt.Errorf("malformed summary JSON")
 	}
-	if dec.More() {
+	if len(bytes.Trim(raw[dec.InputOffset():], " \t\r\n")) != 0 {
 		return m, fmt.Errorf("trailing data after summary object")
 	}
 	if m.Summary == "" || m.Hypothesis == "" || m.Confidence == "" || m.Reason == "" || m.Citations == nil {

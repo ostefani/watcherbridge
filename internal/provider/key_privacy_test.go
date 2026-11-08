@@ -68,6 +68,7 @@ func TestMetaDiagnosticsExcludeEndpointAndPeerText(t *testing.T) {
 		{"body read", "read provider response", &http.Response{StatusCode: 200, Body: io.NopCloser(iotest.ErrReader(cause))}, nil, context.DeadlineExceeded},
 		{"status", "provider status 503", &http.Response{StatusCode: 503, Status: "503 " + marker, Body: io.NopCloser(strings.NewReader(marker))}, nil, nil},
 		{"malformed envelope", "decode provider envelope", okResponse(marker), nil, nil},
+		{"trailing envelope data", "decode provider envelope", okResponse(`{"output":[{"type":"message","content":[{"type":"output_text","text":"{}"}]}]}` + marker), nil, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client := &http.Client{Transport: &stubTripper{respond: func(*http.Request) (*http.Response, error) {

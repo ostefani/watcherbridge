@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,7 +52,7 @@ type MetaAdapter struct {
 func NewMetaAdapter(baseURL, modelID, apiKey string, client *http.Client, maxBytes int64) (*MetaAdapter, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("model base URL must be an http(s) endpoint")
+		return nil, errors.New("model base URL must be an http(s) endpoint")
 	}
 	if modelID == "" {
 		return nil, fmt.Errorf("model ID is required")
@@ -216,9 +217,8 @@ type responsesEnvelope struct {
 // Unfinished responses and missing answer text are provider failures.
 func extractResponse(raw []byte) ([]byte, Usage, error) {
 	var env responsesEnvelope
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	if err := dec.Decode(&env); err != nil {
-		return nil, Usage{}, fmt.Errorf("decode provider envelope")
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, Usage{}, errors.New("decode provider envelope")
 	}
 	if env.Status != "" && env.Status != "completed" {
 		return nil, Usage{}, fmt.Errorf("provider response did not complete")

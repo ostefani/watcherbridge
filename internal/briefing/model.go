@@ -59,7 +59,7 @@ func decodeEvidenceRef(raw json.RawMessage) (modelEvidenceRef, error) {
 		}
 		return r, fmt.Errorf("malformed evidence ref")
 	}
-	if dec.More() {
+	if len(bytes.Trim(raw[dec.InputOffset():], " \t\r\n")) != 0 {
 		return r, fmt.Errorf("trailing data after evidence ref")
 	}
 	if (r.Event == nil) == (r.Step == nil) {
@@ -89,7 +89,7 @@ func decodeModelBriefing(raw []byte) (modelBriefing, error) {
 		}
 		return m, fmt.Errorf("malformed model JSON")
 	}
-	if dec.More() {
+	if len(bytes.Trim(raw[dec.InputOffset():], " \t\r\n")) != 0 {
 		return m, fmt.Errorf("trailing data after briefing object")
 	}
 	if len(m.EventIDs) == 0 || m.Host == "" || m.What == "" ||
