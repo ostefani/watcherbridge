@@ -853,8 +853,10 @@ func TestProjectionProgressesWhileProviderBlocked(t *testing.T) {
 	}
 }
 
+const validModelBriefingJSON = `{"event_ids":["e1"],"host":"HOST_1","what_changed":"w","context":"c","model_suggestion":"high","priority_reason":"r","recommended_check":"k","likely_explanation":"likely","confidence":"high","evidence_refs":[{"event_id":"e1"}]}`
+
 func TestDecodeModelBriefingRejects(t *testing.T) {
-	full := `{"event_ids":["e1"],"host":"HOST_1","what_changed":"w","context":"c","model_suggestion":"high","priority_reason":"r","recommended_check":"k","likely_explanation":"likely","confidence":"high","evidence_refs":[{"event_id":"e1"}]}`
+	const full = validModelBriefingJSON
 	for _, tc := range []struct{ name, raw, want string }{
 		{"unknown field", strings.TrimSuffix(full, "}") + `,"bogus":true}`, "unknown field"},
 		{"trailing data", full + " {}", "trailing data after briefing object"},
@@ -871,9 +873,14 @@ func TestDecodeModelBriefingRejects(t *testing.T) {
 	if _, err := decodeModelBriefing([]byte(full)); err != nil {
 		t.Fatalf("valid answer rejected: %v", err)
 	}
-	raw := strings.Replace(full, `"evidence_refs":[{"event_id":"e1"}]`, `"evidence_refs":[{"event_id":"e1","private-model-field":true}]`, 1)
+}
+
+func TestAcceptAnswerPreservesEvidenceCorrection(t *testing.T) {
+	raw := strings.Replace(validModelBriefingJSON, `"evidence_refs":[{"event_id":"e1"}]`, `"evidence_refs":[{"event_id":"e1","private-model-field":true}]`, 1)
 	taken := store.TakenGroup{Events: []store.RawEvent{{EventID: "e1"}}}
-	if got := acceptAnswer([]byte(raw), taken, nil, false, -1); got.OK || got.Correction != "unknown field in evidence ref" {
+	issued := redactor.TokenMap{"HOST_1": "synthetic-host"}
+	const tokensEnforced, maxToolStep = true, -1 // Single-call briefings have no tool steps.
+	if got := acceptAnswer([]byte(raw), taken, issued, tokensEnforced, maxToolStep); got.OK || got.Correction != "unknown field in evidence ref" {
 		t.Errorf("evidence reference accepted=%t, correction=%q", got.OK, got.Correction)
 	}
 }

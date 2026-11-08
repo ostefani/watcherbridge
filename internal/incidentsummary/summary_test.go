@@ -96,6 +96,7 @@ func TestIncidentSummaryValidation(t *testing.T) {
 		{"malformed", `{"summary":`, "malformed summary JSON"},
 		{"missing fields", `{"summary":"s"}`, "missing or empty required field"},
 		{"unknown citation field", strings.Replace(valid, `"member":"M1"`, `"member":"M1","private-model-field":true`, 1), "unknown field in citation"},
+		{"malformed citation", strings.Replace(valid, `"member":"M1"`, `"member":7`, 1), "malformed citation"},
 	} {
 		if _, correction, ok := acceptSummary([]byte(tc.raw), aliases, issued, nil, true, briefing.Medium); ok ||
 			correction != tc.want {
