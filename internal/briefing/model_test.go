@@ -380,8 +380,8 @@ func TestModelRepairThenSuccess(t *testing.T) {
 			bundle = append([]byte(nil), payload...)
 			return provider.RawBriefing{JSON: []byte(`{"bogus":true}`)}, nil
 		}
-		if !strings.Contains(string(payload), "unknown field") {
-			t.Fatalf("correction must cite the schema error, got %q", payload)
+		if got, want := string(payload), repairPrompt("unknown field"); got != want {
+			t.Fatalf("repair prompt = %q, want %q", got, want)
 		}
 		return provider.RawBriefing{JSON: validAnswer(t, bundle, valid, strptr("medium"), nil)}, nil
 	}

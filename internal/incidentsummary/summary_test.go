@@ -81,7 +81,7 @@ func TestIncidentSummaryValidation(t *testing.T) {
 	})
 	if _, correction, ok := acceptSummary(bad, aliases, issued, nil, true, briefing.Medium); ok {
 		t.Fatal("unknown field accepted")
-	} else if !strings.Contains(correction, "unknown field") {
+	} else if correction != "unknown field" {
 		t.Fatalf("correction = %q", correction)
 	}
 
