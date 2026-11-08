@@ -39,11 +39,13 @@ The screenshots below use synthetic demonstration data.
 ## What it does
 
 - **Keeps the scanner evidence.** WatcherBridge verifies signatures, preserves the original reports, and uses the context the scanner supplies. Network discovery and host identification belong to the scanner.
-- **Explains and prioritizes changes.** Briefings link to the underlying reports and explain what changed, why it matters, and what to check next. Local rules set priority. Optional AI can consult retained evidence through bounded, read-only tools and may raise priority by one level, up to high.
-- **Groups related briefings into incidents.** Qualifying appearance or disappearance briefings from the same source and scan target can form an incident. The highest member priority sets the minimum, with a floor of medium for disappearance incidents.
+- **Explains and prioritizes changes.** Briefings link to the underlying reports and explain what changed, why it matters, and what to check next. Local rules set the baseline priority. A model can suggest a one-level increase, capped at high. WatcherBridge resolves the final priority.
+- **Investigates changes with retained evidence.** When enabled, the AI investigator uses read-only tools to look up reported host history, services, and similar changes. The briefing can cite saved reports or investigator lookups and show when retained evidence was unavailable or incomplete.
+- **Groups related briefings into incidents.** Qualifying appearance or disappearance briefings from the same source and scan target can form an incident. The highest member priority sets the minimum, with a floor of medium for disappearance incidents. When incident summaries are enabled, WatcherBridge uses AI to summarize a bounded sample of briefings from newly closed incidents. The summary shows how many briefings were sampled or omitted and can link to cited briefings. Possible explanations are labelled as hypotheses.
 - **Keeps review decisions local.** Mark changes expected or unexpected, snooze items, or add notes and labels. Three matching, eligible “expected” decisions can trigger a rule proposal. Operators can approve it with an optional expiry or revoke an active rule.
-- **Shows attention and coverage.** The overview pairs an **Act**, **Review**, or **Quiet** verdict with coverage for each source. Liveness is unknown until heartbeat support is established. After that, a stale heartbeat is flagged as blind even if another source is healthy. The overview is available in the dashboard, JSON API, and status CLI.
+- **Shows attention and coverage.** The overview pairs an **Act**, **Review**, or **Quiet** verdict with coverage for each source. Liveness is unknown until heartbeat support is established. Once a source has established heartbeat support, its coverage is marked Blind when its heartbeat becomes stale, even if another source is healthy. The overview is available in the dashboard, JSON API, and status CLI.
 - **Protects data sent to AI providers.** Redaction is enabled by default, and a final leak scan can block transmission. Model failures produce a clearly marked explanation based on local rules.
+
 
 ## Run the AI demo
 
