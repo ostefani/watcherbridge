@@ -88,6 +88,14 @@ func FuzzDecode(f *testing.F) {
 		if valid && err == ErrTrailingData {
 			t.Fatal("valid JSON classified as trailing data")
 		}
+		var ref output
+		refErr := json.Unmarshal(raw, &ref)
+		if err == nil && (refErr != nil || ref != dst) {
+			t.Fatal("strict and standard decoding disagree on accepted input")
+		}
+		if refErr == nil && err != nil && err != ErrUnknownField {
+			t.Fatalf("standard decoding succeeded but strict decoding returned %v", err)
+		}
 	})
 }
 

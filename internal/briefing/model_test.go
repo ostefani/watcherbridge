@@ -855,16 +855,16 @@ func TestProjectionProgressesWhileProviderBlocked(t *testing.T) {
 
 func TestDecodeModelBriefingRejects(t *testing.T) {
 	full := `{"event_ids":["e1"],"host":"HOST_1","what_changed":"w","context":"c","model_suggestion":"high","priority_reason":"r","recommended_check":"k","likely_explanation":"likely","confidence":"high","evidence_refs":[{"event_id":"e1"}]}`
-	for name, raw := range map[string]string{
-		"unknown field":  strings.Replace(full, `"recommended_check"`, `"bogus","recommended_check"`, 1),
-		"trailing data":  full + " {}",
-		"stray closer":   full + "]",
-		"empty field":    strings.Replace(full, `"what_changed":"w"`, `"what_changed":""`, 1),
-		"missing likely": strings.Replace(full, `,"likely_explanation":"likely"`, ``, 1),
-		"not json":       `{"event_ids":`,
+	for _, tc := range []struct{ name, raw, want string }{
+		{"unknown field", strings.TrimSuffix(full, "}") + `,"bogus":true}`, "unknown field"},
+		{"trailing data", full + " {}", "trailing data after briefing object"},
+		{"stray closer", full + "]", "trailing data after briefing object"},
+		{"empty field", strings.Replace(full, `"what_changed":"w"`, `"what_changed":""`, 1), "missing or empty required field"},
+		{"missing likely", strings.Replace(full, `,"likely_explanation":"likely"`, ``, 1), "missing or empty required field"},
+		{"not JSON", `{"event_ids":`, "malformed model JSON"},
 	} {
-		if _, err := decodeModelBriefing([]byte(raw)); err == nil {
-			t.Fatalf("%s: expected rejection", name)
+		if _, err := decodeModelBriefing([]byte(tc.raw)); err == nil || err.Error() != tc.want {
+			t.Errorf("%s: got %v, want %q", tc.name, err, tc.want)
 		}
 	}
 	if _, err := decodeModelBriefing([]byte(full)); err != nil {

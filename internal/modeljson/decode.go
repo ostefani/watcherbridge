@@ -18,11 +18,14 @@ var (
 )
 
 // Decode reads one JSON value into dst, rejecting unknown fields and trailing
-// data with unwrapped sentinel errors. Invalid destinations return
-// [json.InvalidUnmarshalError]. On error, dst may be partially populated.
+// data with unwrapped sentinel errors. Decode checks dst before reading raw
+// and returns a [*json.InvalidUnmarshalError] for an invalid destination.
+// On a decoding error, dst may be partially populated.
 //
-// Decode follows encoding/json rules for null, case-insensitive field matching,
-// and duplicate keys. Callers must validate required fields and values.
+// Decode follows encoding/json rules for null and case-insensitive field
+// matching. Later duplicate keys replace or merge into earlier values,
+// depending on the destination type. Callers must validate required fields
+// and values.
 func Decode(raw []byte, dst any) error {
 	v := reflect.ValueOf(dst)
 	if v.Kind() != reflect.Pointer || v.IsNil() {
