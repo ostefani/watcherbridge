@@ -88,14 +88,17 @@ type modelCitation struct {
 
 func decodeCitation(raw json.RawMessage) (modelCitation, error) {
 	var c modelCitation
-	switch modeljson.Decode(raw, &c) {
-	case modeljson.ErrUnknownField:
-		return c, errors.New("unknown field in citation")
-	case modeljson.ErrTrailingData:
-		return c, errors.New("trailing data after citation")
-	case nil:
-	default:
-		return c, errors.New("malformed citation")
+	if err := modeljson.Decode(raw, &c); err != nil {
+		switch err {
+		case modeljson.ErrUnknownField:
+			return c, errors.New("unknown field in citation")
+		case modeljson.ErrTrailingData:
+			return c, errors.New("trailing data after citation")
+		case modeljson.ErrMalformed:
+			return c, errors.New("malformed citation")
+		default:
+			return c, err
+		}
 	}
 	if c.Member == nil || *c.Member == "" {
 		return c, fmt.Errorf("citation must name a member alias")
@@ -105,14 +108,17 @@ func decodeCitation(raw json.RawMessage) (modelCitation, error) {
 
 func decodeModelSummary(raw []byte) (modelSummary, error) {
 	var m modelSummary
-	switch modeljson.Decode(raw, &m) {
-	case modeljson.ErrUnknownField:
-		return m, errors.New("unknown field")
-	case modeljson.ErrTrailingData:
-		return m, errors.New("trailing data after summary object")
-	case nil:
-	default:
-		return m, errors.New("malformed summary JSON")
+	if err := modeljson.Decode(raw, &m); err != nil {
+		switch err {
+		case modeljson.ErrUnknownField:
+			return m, errors.New("unknown field")
+		case modeljson.ErrTrailingData:
+			return m, errors.New("trailing data after summary object")
+		case modeljson.ErrMalformed:
+			return m, errors.New("malformed summary JSON")
+		default:
+			return m, err
+		}
 	}
 	if m.Summary == "" || m.Hypothesis == "" || m.Confidence == "" || m.Reason == "" || m.Citations == nil {
 		return m, fmt.Errorf("missing or empty required field")

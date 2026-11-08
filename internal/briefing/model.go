@@ -51,14 +51,17 @@ type modelEvidenceRef struct {
 // values.
 func decodeEvidenceRef(raw json.RawMessage) (modelEvidenceRef, error) {
 	var r modelEvidenceRef
-	switch modeljson.Decode(raw, &r) {
-	case modeljson.ErrUnknownField:
-		return r, errors.New("unknown field in evidence ref")
-	case modeljson.ErrTrailingData:
-		return r, errors.New("trailing data after evidence ref")
-	case nil:
-	default:
-		return r, errors.New("malformed evidence ref")
+	if err := modeljson.Decode(raw, &r); err != nil {
+		switch err {
+		case modeljson.ErrUnknownField:
+			return r, errors.New("unknown field in evidence ref")
+		case modeljson.ErrTrailingData:
+			return r, errors.New("trailing data after evidence ref")
+		case modeljson.ErrMalformed:
+			return r, errors.New("malformed evidence ref")
+		default:
+			return r, err
+		}
 	}
 	if (r.Event == nil) == (r.Step == nil) {
 		return r, fmt.Errorf("evidence ref must name exactly one target")
@@ -77,14 +80,17 @@ func decodeEvidenceRef(raw json.RawMessage) (modelEvidenceRef, error) {
 // to log and to quote back in the single repair prompt.
 func decodeModelBriefing(raw []byte) (modelBriefing, error) {
 	var m modelBriefing
-	switch modeljson.Decode(raw, &m) {
-	case modeljson.ErrUnknownField:
-		return m, errors.New("unknown field")
-	case modeljson.ErrTrailingData:
-		return m, errors.New("trailing data after briefing object")
-	case nil:
-	default:
-		return m, errors.New("malformed model JSON")
+	if err := modeljson.Decode(raw, &m); err != nil {
+		switch err {
+		case modeljson.ErrUnknownField:
+			return m, errors.New("unknown field")
+		case modeljson.ErrTrailingData:
+			return m, errors.New("trailing data after briefing object")
+		case modeljson.ErrMalformed:
+			return m, errors.New("malformed model JSON")
+		default:
+			return m, err
+		}
 	}
 	if len(m.EventIDs) == 0 || m.Host == "" || m.What == "" ||
 		m.Context == "" || m.Reason == "" || m.Check == "" ||

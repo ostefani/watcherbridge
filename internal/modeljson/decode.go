@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 )
 
@@ -23,13 +24,13 @@ var (
 // Decode follows encoding/json rules for null, case-insensitive field matching,
 // and duplicate keys. Callers must validate required fields and values.
 func Decode(raw []byte, dst any) error {
+	v := reflect.ValueOf(dst)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return &json.InvalidUnmarshalError{Type: reflect.TypeOf(dst)}
+	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
-		var invalid *json.InvalidUnmarshalError
-		if errors.As(err, &invalid) {
-			return invalid
-		}
 		// encoding/json has no typed unknown-field error.
 		if strings.HasPrefix(err.Error(), "json: unknown field ") {
 			return ErrUnknownField
