@@ -3,7 +3,10 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -21,16 +24,57 @@ import (
 // listener: the proxy client needs only a RoundTripper, never a port,
 // so sandboxed runners can execute outbound-audit tests.
 type stubRelayTripper struct {
-	requests []*http.Request
-	bodies   [][]byte
-	status   int
+	requests   []*http.Request
+	bodies     [][]byte
+	status     int
+	statusLine string
+	err        error
 }
 
 func (s *stubRelayTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 	body, _ := io.ReadAll(r.Body)
 	s.requests = append(s.requests, r)
 	s.bodies = append(s.bodies, body)
-	return &http.Response{StatusCode: s.status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &http.Response{StatusCode: s.status, Status: s.statusLine, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+}
+
+func TestForwardFailureDiagnosticsExcludeExternalText(t *testing.T) {
+	const marker = "synthetic-private-relay-detail"
+	for _, tc := range []struct {
+		name string
+		stub stubRelayTripper
+		want string
+	}{
+		{"transport", stubRelayTripper{err: errors.New(marker)}, "scanrelay transport failure"},
+		{"timeout", stubRelayTripper{err: fmt.Errorf("%s: %w", marker, context.DeadlineExceeded)}, "scanrelay transport timeout"},
+		{"cancellation", stubRelayTripper{err: fmt.Errorf("%s: %w", marker, context.Canceled)}, "scanrelay transport canceled"},
+		{"http status", stubRelayTripper{status: http.StatusServiceUnavailable, statusLine: "503 " + marker}, "scanrelay status 503"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newProxyStubHarness(t, &tc.stub)
+			var logs bytes.Buffer
+			previous := log.Writer()
+			log.SetOutput(&logs)
+			t.Cleanup(func() { log.SetOutput(previous) })
+
+			id := uniqueID()
+			rec := h.signedPost(t, id, "host-a", "host.appeared", time.Now())
+			if rec.Code != http.StatusBadGateway || strings.Contains(rec.Body.String(), marker) {
+				t.Errorf("unexpected webhook response: %d %s", rec.Code, rec.Body.String())
+			}
+			forwarded, attempts, reason, err := h.srv.events.ForwardState(context.Background(), id)
+			if err != nil || forwarded || attempts != 1 || reason != tc.want {
+				t.Errorf("receipt = (%t, %d, %q, %v), want one failed attempt with reason %q", forwarded, attempts, reason, err, tc.want)
+			}
+			if got := logs.String(); !strings.Contains(got, "failed: "+tc.want+"\n") || strings.Contains(got, marker) ||
+				strings.Contains(got, h.srv.cfg.ScanRelayURL) {
+				t.Errorf("unexpected forwarding logs: %q", got)
+			}
+		})
+	}
 }
 
 func newProxyStubHarness(t *testing.T, stub *stubRelayTripper) *harness {

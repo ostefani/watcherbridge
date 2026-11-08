@@ -380,8 +380,8 @@ func TestModelRepairThenSuccess(t *testing.T) {
 			bundle = append([]byte(nil), payload...)
 			return provider.RawBriefing{JSON: []byte(`{"bogus":true}`)}, nil
 		}
-		if !strings.Contains(string(payload), "unknown field") {
-			t.Fatalf("correction must cite the schema error, got %q", payload)
+		if got, want := string(payload), repairPrompt("unknown field"); got != want {
+			t.Fatalf("repair prompt = %q, want %q", got, want)
 		}
 		return provider.RawBriefing{JSON: validAnswer(t, bundle, valid, strptr("medium"), nil)}, nil
 	}
@@ -853,21 +853,47 @@ func TestProjectionProgressesWhileProviderBlocked(t *testing.T) {
 	}
 }
 
+const validModelBriefingJSON = `{"event_ids":["e1"],"host":"HOST_1","what_changed":"w","context":"c","model_suggestion":"high","priority_reason":"r","recommended_check":"k","likely_explanation":"likely","confidence":"high","evidence_refs":[{"event_id":"e1"}]}`
+
 func TestDecodeModelBriefingRejects(t *testing.T) {
-	full := `{"event_ids":["e1"],"host":"HOST_1","what_changed":"w","context":"c","model_suggestion":"high","priority_reason":"r","recommended_check":"k","likely_explanation":"likely","confidence":"high","evidence_refs":[{"event_id":"e1"}]}`
-	for name, raw := range map[string]string{
-		"unknown field":  strings.Replace(full, `"recommended_check"`, `"bogus","recommended_check"`, 1),
-		"trailing data":  full + " {}",
-		"empty field":    strings.Replace(full, `"what_changed":"w"`, `"what_changed":""`, 1),
-		"missing likely": strings.Replace(full, `,"likely_explanation":"likely"`, ``, 1),
-		"not json":       `{"event_ids":`,
+	const full = validModelBriefingJSON
+	for _, tc := range []struct{ name, raw, want string }{
+		{"unknown field", strings.TrimSuffix(full, "}") + `,"bogus":true}`, "unknown field"},
+		{"trailing data", full + " {}", "trailing data after briefing object"},
+		{"stray closer", full + "]", "trailing data after briefing object"},
+		{"empty field", strings.Replace(full, `"what_changed":"w"`, `"what_changed":""`, 1), "missing or empty required field"},
+		{"missing likely", strings.Replace(full, `,"likely_explanation":"likely"`, ``, 1), "missing or empty required field"},
+		{"not JSON", `{"event_ids":`, "malformed model JSON"},
+		{"wrong field type", strings.Replace(full, `"event_ids":["e1"]`, `"event_ids":"e1"`, 1), "malformed model JSON"},
 	} {
-		if _, err := decodeModelBriefing([]byte(raw)); err == nil {
-			t.Fatalf("%s: expected rejection", name)
+		if _, err := decodeModelBriefing([]byte(tc.raw)); err == nil || err.Error() != tc.want {
+			t.Errorf("%s: got %v, want %q", tc.name, err, tc.want)
 		}
 	}
 	if _, err := decodeModelBriefing([]byte(full)); err != nil {
 		t.Fatalf("valid answer rejected: %v", err)
+	}
+}
+
+func TestAcceptAnswerPreservesEvidenceCorrection(t *testing.T) {
+	raw := strings.Replace(validModelBriefingJSON, `"evidence_refs":[{"event_id":"e1"}]`, `"evidence_refs":[{"event_id":"e1","private-model-field":true}]`, 1)
+	taken := store.TakenGroup{Events: []store.RawEvent{{EventID: "e1"}}}
+	issued := redactor.TokenMap{"HOST_1": "synthetic-host"}
+	const tokensEnforced, maxToolStep = true, -1 // Single-call briefings have no tool steps.
+	if got := acceptAnswer([]byte(raw), taken, issued, tokensEnforced, maxToolStep); got.OK || got.Correction != "unknown field in evidence ref" {
+		t.Errorf("evidence reference accepted=%t, correction=%q", got.OK, got.Correction)
+	}
+}
+
+func TestDecodeEvidenceRefRejectionDiagnostics(t *testing.T) {
+	for _, tc := range []struct{ raw, want string }{
+		{`{"event_id":"e1","private-model-field":true}`, "unknown field in evidence ref"},
+		{`{"event_id":`, "malformed evidence ref"},
+		{`{"event_id":"e1"}]`, "trailing data after evidence ref"},
+	} {
+		if _, err := decodeEvidenceRef(json.RawMessage(tc.raw)); err == nil || err.Error() != tc.want {
+			t.Errorf("evidence decoder for %q returned %v, want %q", tc.raw, err, tc.want)
+		}
 	}
 }
 

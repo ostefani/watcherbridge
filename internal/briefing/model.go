@@ -1,14 +1,14 @@
 package briefing
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
+	"github.com/ostefani/watcherbridge/internal/modeljson"
 	"github.com/ostefani/watcherbridge/internal/provider"
 	"github.com/ostefani/watcherbridge/internal/redactor"
 	"github.com/ostefani/watcherbridge/internal/store"
@@ -51,16 +51,17 @@ type modelEvidenceRef struct {
 // values.
 func decodeEvidenceRef(raw json.RawMessage) (modelEvidenceRef, error) {
 	var r modelEvidenceRef
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&r); err != nil {
-		if strings.Contains(err.Error(), "unknown field") {
-			return r, fmt.Errorf("unknown field in evidence ref")
+	if err := modeljson.Decode(raw, &r); err != nil {
+		switch err {
+		case modeljson.ErrUnknownField:
+			return r, errors.New("unknown field in evidence ref")
+		case modeljson.ErrTrailingData:
+			return r, errors.New("trailing data after evidence ref")
+		case modeljson.ErrMalformed:
+			return r, errors.New("malformed evidence ref")
+		default:
+			return r, err
 		}
-		return r, fmt.Errorf("malformed evidence ref")
-	}
-	if dec.More() {
-		return r, fmt.Errorf("trailing data after evidence ref")
 	}
 	if (r.Event == nil) == (r.Step == nil) {
 		return r, fmt.Errorf("evidence ref must name exactly one target")
@@ -79,18 +80,17 @@ func decodeEvidenceRef(raw json.RawMessage) (modelEvidenceRef, error) {
 // to log and to quote back in the single repair prompt.
 func decodeModelBriefing(raw []byte) (modelBriefing, error) {
 	var m modelBriefing
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&m); err != nil {
-		// encoding/json exports no typed unknown-field error; the
-		// message form is stable stdlib behavior.
-		if strings.Contains(err.Error(), "unknown field") {
-			return m, fmt.Errorf("unknown field")
+	if err := modeljson.Decode(raw, &m); err != nil {
+		switch err {
+		case modeljson.ErrUnknownField:
+			return m, errors.New("unknown field")
+		case modeljson.ErrTrailingData:
+			return m, errors.New("trailing data after briefing object")
+		case modeljson.ErrMalformed:
+			return m, errors.New("malformed model JSON")
+		default:
+			return m, err
 		}
-		return m, fmt.Errorf("malformed model JSON")
-	}
-	if dec.More() {
-		return m, fmt.Errorf("trailing data after briefing object")
 	}
 	if len(m.EventIDs) == 0 || m.Host == "" || m.What == "" ||
 		m.Context == "" || m.Reason == "" || m.Check == "" ||

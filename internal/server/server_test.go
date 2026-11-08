@@ -35,7 +35,7 @@ import (
 // (409 + the exact replay body), fail (500), or hang. It records every
 // forwarded body and header set byte-for-byte for golden comparison.
 type fakeRelay struct {
-	mode    atomic.Value // string: accept|replay|fail|hang
+	mode    atomic.Value // string
 	bodies  [][]byte
 	headers []http.Header
 	entered chan struct{}
@@ -60,11 +60,17 @@ func newFakeRelay(t *testing.T) *fakeRelay {
 		case f.entered <- struct{}{}:
 		default:
 		}
-		switch f.mode.Load().(string) {
+		switch mode := f.mode.Load().(string); mode {
 		case "replay":
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			_, _ = fmt.Fprintln(w, `{"error":"replayed request"}`)
+		case "replay-at-cap", "replay-over-cap":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, replayBody+strings.Repeat(" ", forwardRespCap-len(replayBody)))
+			if mode == "replay-over-cap" {
+				_, _ = io.WriteString(w, "x")
+			}
 		case "fail":
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
@@ -278,6 +284,34 @@ func TestReplayShapeMarksForwarded(t *testing.T) {
 	}
 }
 
+func TestReplayBodySizeBoundary(t *testing.T) {
+	h := newHarness(t, nil)
+	now := time.Now()
+	id, key, typ := uniqueID(), "host-r", "host.appeared"
+	body := eventBody(id, key, typ)
+	post := func(at time.Time) int {
+		sig := sign(h.secret, strconv.FormatInt(at.Unix(), 10), id, key, typ, body)
+		return h.post(t, body, id, key, typ, at, sig).Code
+	}
+	h.relay.mode.Store("replay-over-cap")
+	if got := post(now); got != http.StatusBadGateway {
+		t.Errorf("oversized replay status = %d, want 502", got)
+	}
+	if fwd, _, _, err := h.srv.events.ForwardState(context.Background(), id); err != nil || fwd {
+		t.Errorf("oversized replay marked delivery: forwarded=%t, err=%v", fwd, err)
+	}
+	h.relay.mode.Store("replay-at-cap")
+	if got := post(now.Add(time.Second)); got != http.StatusAccepted {
+		t.Errorf("at-cap replay status = %d, want 202", got)
+	}
+	if fwd, _, _, err := h.srv.events.ForwardState(context.Background(), id); err != nil || !fwd {
+		t.Errorf("valid retry did not mark delivery: forwarded=%t, err=%v", fwd, err)
+	}
+	if n := h.relay.hits.Load(); n != 2 {
+		t.Errorf("relay received %d requests, want one attempt and one retry", n)
+	}
+}
+
 func TestWaiterFollowsWinner(t *testing.T) {
 	h := newHarness(t, nil)
 	now := time.Now()
@@ -485,6 +519,24 @@ func TestHungScanRelay502Timing(t *testing.T) {
 	want := h.srv.cfg.ProxyForwardTimeout
 	if elapsed < want || elapsed > want+2*time.Second {
 		t.Fatalf("502 took %v, want ~persist+%v", elapsed, want)
+	}
+	if fwd, attempts, reason, err := h.srv.events.ForwardState(context.Background(), id); err != nil ||
+		fwd || attempts != 1 || reason != "scanrelay transport timeout" {
+		t.Fatalf("timeout receipt = (%t, %d, %q, %v)", fwd, attempts, reason, err)
+	}
+}
+
+func TestScanRelayClientTimeoutReceipt(t *testing.T) {
+	h := newHarness(t, nil)
+	h.srv.proxy.Timeout = 200 * time.Millisecond // Expire before the forward context.
+	h.relay.mode.Store("hang")
+	id := uniqueID()
+	if got := h.signedPost(t, id, "host-h", "host.appeared", time.Now()).Code; got != http.StatusBadGateway {
+		t.Fatalf("hung ScanRelay returned %d, want 502", got)
+	}
+	if fwd, attempts, reason, err := h.srv.events.ForwardState(context.Background(), id); err != nil ||
+		fwd || attempts != 1 || reason != "scanrelay transport timeout" {
+		t.Fatalf("client timeout receipt = (%t, %d, %q, %v)", fwd, attempts, reason, err)
 	}
 }
 
@@ -748,14 +800,10 @@ func TestShutdownDuringSweepForward(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("sweep did not honor shutdown")
 	}
-	// The in-flight forward fails (context gone) but the store must still
-	// answer consistently: either forwarded or recorded as a failure.
-	fwd, attempts, _, err := h.srv.events.ForwardState(context.Background(), id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !fwd && attempts == 0 {
-		t.Fatal("in-flight sweep event vanished without a trace")
+	// Cancellation ends the HTTP request, but the receipt has its own budget.
+	if fwd, attempts, reason, err := h.srv.events.ForwardState(context.Background(), id); err != nil ||
+		fwd || attempts != 1 || reason != "scanrelay transport canceled" {
+		t.Fatalf("canceled sweep receipt = (%t, %d, %q, %v)", fwd, attempts, reason, err)
 	}
 	if h.srv.gate.InFlight() != 0 {
 		t.Fatal("gate leaked after shutdown sweep")
@@ -991,6 +1039,7 @@ func FuzzParseAndValidate(f *testing.F) {
 	ts := strconv.FormatInt(now.Unix(), 10)
 	body := eventBody("evt-seed", "host-a", "host.appeared")
 	f.Add(ts, "evt-seed", "host-a", "host.appeared", body)
+	f.Add(ts, "evt-seed", "host-a", "host.appeared", append(bytes.Clone(body), ']'))
 	f.Add("not-a-number", "evt-seed", "host-a", "host.appeared", body)
 	f.Add(ts, "evt bad spaces!!", "host-a", "host.appeared", body)
 	f.Add(ts, strings.Repeat("x", 200), "host-a", "host.appeared", body)
@@ -1008,6 +1057,10 @@ func FuzzParseAndValidate(f *testing.F) {
 		}
 		if d := math.Abs(float64(now.Sub(sigTime))); d > float64(300*time.Second) {
 			t.Fatalf("timestamp outside window accepted: %v", time.Duration(d))
+		}
+		// The host event path checks the complete JSON body after HMAC.
+		if eventType != "scan.heartbeat" && checkEnvelopeConsistency(body, eventID, eventKey, eventType) == nil && !json.Valid(body) {
+			t.Fatal("envelope check accepted malformed JSON")
 		}
 	})
 }

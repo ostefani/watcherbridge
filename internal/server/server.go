@@ -29,6 +29,7 @@ import (
 	"github.com/ostefani/watcherbridge/internal/config"
 	"github.com/ostefani/watcherbridge/internal/forwarder"
 	"github.com/ostefani/watcherbridge/internal/health"
+	"github.com/ostefani/watcherbridge/internal/netdiag"
 	"github.com/ostefani/watcherbridge/internal/store"
 	"github.com/ostefani/watcherbridge/internal/viewer"
 )
@@ -38,8 +39,8 @@ import (
 // event forwarded without a 2xx.
 const replayBody = `{"error":"replayed request"}`
 
-// forwardRespCap bounds the forwarded-response read: status plus the small
-// replay body are all the forwarder ever needs.
+// forwardRespCap bounds the forwarded-response body. A conflict read allows
+// one extra byte to distinguish a complete replay response from a prefix.
 const forwardRespCap = 8 << 10
 
 // eventTypes is the allowlist of Pro webhook event types (Designv5 §4).
@@ -479,26 +480,34 @@ func (s *Server) forwardOne(ctx context.Context, body []byte, src map[string]str
 	}
 	resp, err := s.proxy.Do(out)
 	if err != nil {
-		s.recordFailure(ctx, eventID, err.Error())
+		s.recordFailure(ctx, eventID, "scanrelay "+netdiag.TransportFailure(err))
 		return false
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, forwardRespCap))
+	limit := int64(forwardRespCap)
+	if resp.StatusCode == http.StatusConflict {
+		limit++
+	}
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 	if err != nil {
 		s.recordFailure(ctx, eventID, "read forward response")
+		return false
+	}
+	if len(respBody) > forwardRespCap {
+		s.recordFailure(ctx, eventID, "forward replay response too large")
 		return false
 	}
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		s.recordDelivered(ctx, eventID)
 		return true
-	case resp.StatusCode == http.StatusConflict && strings.TrimSpace(string(respBody)) == replayBody:
+	case resp.StatusCode == http.StatusConflict && string(bytes.TrimSpace(respBody)) == replayBody:
 		// ScanRelay proves an earlier attempt landed (e.g. the bridge
 		// crashed after accept but before the flag write).
 		s.recordDelivered(ctx, eventID)
 		return true
 	default:
-		s.recordFailure(ctx, eventID, "scanrelay status "+resp.Status)
+		s.recordFailure(ctx, eventID, "scanrelay status "+strconv.Itoa(resp.StatusCode))
 		return false
 	}
 }

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"sync/atomic"
 	"time"
 
+	"github.com/ostefani/watcherbridge/internal/netdiag"
 	"github.com/ostefani/watcherbridge/internal/store"
 )
 
@@ -169,7 +171,7 @@ func (p *Publisher) post(ctx context.Context, b store.Briefing) {
 func (p *Publisher) postOnce(ctx context.Context, raw []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(raw))
 	if err != nil {
-		return err
+		return errors.New("build annotation request")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// Same check order as the proxy forwarder: bearer first, then key.
@@ -180,7 +182,7 @@ func (p *Publisher) postOnce(ctx context.Context, raw []byte) error {
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return err
+		return errors.New("scanrelay " + netdiag.TransportFailure(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {

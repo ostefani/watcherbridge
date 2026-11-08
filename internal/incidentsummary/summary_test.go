@@ -9,6 +9,18 @@ import (
 	"github.com/ostefani/watcherbridge/internal/redactor"
 )
 
+func TestDecodeCitationRejectionDiagnostics(t *testing.T) {
+	for _, tc := range []struct{ raw, want string }{
+		{`{"member":"M1","private-model-field":true}`, "unknown field in citation"},
+		{`{"member":`, "malformed citation"},
+		{`{"member":"M1"}}`, "trailing data after citation"},
+	} {
+		if _, err := decodeCitation(json.RawMessage(tc.raw)); err == nil || err.Error() != tc.want {
+			t.Errorf("citation decoder for %q returned %v, want %q", tc.raw, err, tc.want)
+		}
+	}
+}
+
 // TestIncidentSummaryValidation exercises the resolver matrix and the
 // strict output contract: abstention, downgrade, excessive raise, high
 // cap, critical floor and disappearance floor, plus repeated
@@ -74,8 +86,22 @@ func TestIncidentSummaryValidation(t *testing.T) {
 	})
 	if _, correction, ok := acceptSummary(bad, aliases, issued, nil, true, briefing.Medium); ok {
 		t.Fatal("unknown field accepted")
-	} else if !strings.Contains(correction, "unknown field") {
+	} else if correction != "unknown field" {
 		t.Fatalf("correction = %q", correction)
+	}
+
+	const valid = `{"summary":"s","hypothesis":"h","confidence":"medium","priority_suggestion":null,"priority_reason":"r","citations":[{"member":"M1"}]}`
+	for _, tc := range []struct{ name, raw, want string }{
+		{"stray closer", valid + "}", "trailing data after summary object"},
+		{"malformed", `{"summary":`, "malformed summary JSON"},
+		{"missing fields", `{"summary":"s"}`, "missing or empty required field"},
+		{"unknown citation field", strings.Replace(valid, `"member":"M1"`, `"member":"M1","private-model-field":true`, 1), "unknown field in citation"},
+		{"malformed citation", strings.Replace(valid, `"member":"M1"`, `"member":7`, 1), "malformed citation"},
+	} {
+		if _, correction, ok := acceptSummary([]byte(tc.raw), aliases, issued, nil, true, briefing.Medium); ok ||
+			correction != tc.want {
+			t.Errorf("%s: accepted=%t, correction=%q, want %q", tc.name, ok, correction, tc.want)
+		}
 	}
 
 	// Forged citations are rejected.

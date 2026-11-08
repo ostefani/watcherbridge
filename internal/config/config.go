@@ -426,7 +426,7 @@ func checkPresent(secret Secret, what string) (Secret, error) {
 func loopbackOrHTTPS(raw, what string) error {
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return fmt.Errorf("%s must be a valid http(s) endpoint, got %q", what, raw)
+		return fmt.Errorf("%s must be a valid http(s) endpoint", what)
 	}
 	if u.Scheme == "https" {
 		return nil
@@ -436,7 +436,7 @@ func loopbackOrHTTPS(raw, what string) error {
 	} else if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 		return nil
 	}
-	return fmt.Errorf("%s must be https or loopback http, got %q", what, raw)
+	return fmt.Errorf("%s must be https or loopback http", what)
 }
 
 // hopByHopHeaders can never carry credentials: intermediaries may strip

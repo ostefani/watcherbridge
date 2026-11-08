@@ -1,14 +1,14 @@
 package incidentsummary
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/ostefani/watcherbridge/internal/briefing"
+	"github.com/ostefani/watcherbridge/internal/modeljson"
 	"github.com/ostefani/watcherbridge/internal/redactor"
 	"github.com/ostefani/watcherbridge/internal/store"
 )
@@ -88,16 +88,17 @@ type modelCitation struct {
 
 func decodeCitation(raw json.RawMessage) (modelCitation, error) {
 	var c modelCitation
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&c); err != nil {
-		if strings.Contains(err.Error(), "unknown field") {
-			return c, fmt.Errorf("unknown field in citation")
+	if err := modeljson.Decode(raw, &c); err != nil {
+		switch err {
+		case modeljson.ErrUnknownField:
+			return c, errors.New("unknown field in citation")
+		case modeljson.ErrTrailingData:
+			return c, errors.New("trailing data after citation")
+		case modeljson.ErrMalformed:
+			return c, errors.New("malformed citation")
+		default:
+			return c, err
 		}
-		return c, fmt.Errorf("malformed citation")
-	}
-	if dec.More() {
-		return c, fmt.Errorf("trailing data after citation")
 	}
 	if c.Member == nil || *c.Member == "" {
 		return c, fmt.Errorf("citation must name a member alias")
@@ -107,16 +108,17 @@ func decodeCitation(raw json.RawMessage) (modelCitation, error) {
 
 func decodeModelSummary(raw []byte) (modelSummary, error) {
 	var m modelSummary
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&m); err != nil {
-		if strings.Contains(err.Error(), "unknown field") {
-			return m, fmt.Errorf("unknown field")
+	if err := modeljson.Decode(raw, &m); err != nil {
+		switch err {
+		case modeljson.ErrUnknownField:
+			return m, errors.New("unknown field")
+		case modeljson.ErrTrailingData:
+			return m, errors.New("trailing data after summary object")
+		case modeljson.ErrMalformed:
+			return m, errors.New("malformed summary JSON")
+		default:
+			return m, err
 		}
-		return m, fmt.Errorf("malformed summary JSON")
-	}
-	if dec.More() {
-		return m, fmt.Errorf("trailing data after summary object")
 	}
 	if m.Summary == "" || m.Hypothesis == "" || m.Confidence == "" || m.Reason == "" || m.Citations == nil {
 		return m, fmt.Errorf("missing or empty required field")
