@@ -1039,6 +1039,7 @@ func FuzzParseAndValidate(f *testing.F) {
 	ts := strconv.FormatInt(now.Unix(), 10)
 	body := eventBody("evt-seed", "host-a", "host.appeared")
 	f.Add(ts, "evt-seed", "host-a", "host.appeared", body)
+	f.Add(ts, "evt-seed", "host-a", "host.appeared", append(bytes.Clone(body), ']'))
 	f.Add("not-a-number", "evt-seed", "host-a", "host.appeared", body)
 	f.Add(ts, "evt bad spaces!!", "host-a", "host.appeared", body)
 	f.Add(ts, strings.Repeat("x", 200), "host-a", "host.appeared", body)
@@ -1056,6 +1057,10 @@ func FuzzParseAndValidate(f *testing.F) {
 		}
 		if d := math.Abs(float64(now.Sub(sigTime))); d > float64(300*time.Second) {
 			t.Fatalf("timestamp outside window accepted: %v", time.Duration(d))
+		}
+		// The host event path checks the complete JSON body after HMAC.
+		if eventType != "scan.heartbeat" && checkEnvelopeConsistency(body, eventID, eventKey, eventType) == nil && !json.Valid(body) {
+			t.Fatal("envelope check accepted malformed JSON")
 		}
 	})
 }

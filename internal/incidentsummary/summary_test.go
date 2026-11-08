@@ -9,6 +9,13 @@ import (
 	"github.com/ostefani/watcherbridge/internal/redactor"
 )
 
+func TestDecodeCitationRejectsTrailingData(t *testing.T) {
+	if _, err := decodeCitation(json.RawMessage(`{"member":"M1"}}`)); err == nil ||
+		err.Error() != "trailing data after citation" {
+		t.Fatalf("citation decoder returned %v", err)
+	}
+}
+
 // TestIncidentSummaryValidation exercises the resolver matrix and the
 // strict output contract: abstention, downgrade, excessive raise, high
 // cap, critical floor and disappearance floor, plus repeated

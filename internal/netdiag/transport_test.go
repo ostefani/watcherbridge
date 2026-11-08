@@ -48,7 +48,7 @@ func TestHTTPClientTransportFailure(t *testing.T) {
 	listen := func(t *testing.T) net.Listener {
 		t.Helper()
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
-		if errors.Is(err, os.ErrPermission) {
+		if errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EADDRNOTAVAIL) {
 			t.Skipf("loopback listener unavailable: %v", err)
 		}
 		if err != nil {
@@ -72,6 +72,7 @@ func TestHTTPClientTransportFailure(t *testing.T) {
 		}
 	})
 	t.Run("untrusted TLS", func(t *testing.T) {
+		// Supply the listener so bind errors can skip instead of panicking in NewTLSServer.
 		relay := &httptest.Server{
 			Listener: listen(t),
 			Config: &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -872,6 +872,13 @@ func TestDecodeModelBriefingRejects(t *testing.T) {
 	}
 }
 
+func TestDecodeEvidenceRefRejectsTrailingData(t *testing.T) {
+	if _, err := decodeEvidenceRef(json.RawMessage(`{"event_id":"e1"}]`)); err == nil ||
+		err.Error() != "trailing data after evidence ref" {
+		t.Fatalf("evidence decoder returned %v", err)
+	}
+}
+
 func TestCheckModelBriefingRules(t *testing.T) {
 	taken := store.TakenGroup{Events: []store.RawEvent{{EventID: "e1"}}}
 	issued := redactor.TokenMap{"HOST_1": "w", "IP_1": "10.0.0.1"}
