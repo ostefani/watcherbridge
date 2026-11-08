@@ -862,6 +862,7 @@ func TestDecodeModelBriefingRejects(t *testing.T) {
 		{"empty field", strings.Replace(full, `"what_changed":"w"`, `"what_changed":""`, 1), "missing or empty required field"},
 		{"missing likely", strings.Replace(full, `,"likely_explanation":"likely"`, ``, 1), "missing or empty required field"},
 		{"not JSON", `{"event_ids":`, "malformed model JSON"},
+		{"wrong field type", strings.Replace(full, `"event_ids":["e1"]`, `"event_ids":"e1"`, 1), "malformed model JSON"},
 	} {
 		if _, err := decodeModelBriefing([]byte(tc.raw)); err == nil || err.Error() != tc.want {
 			t.Errorf("%s: got %v, want %q", tc.name, err, tc.want)
@@ -872,10 +873,15 @@ func TestDecodeModelBriefingRejects(t *testing.T) {
 	}
 }
 
-func TestDecodeEvidenceRefRejectsTrailingData(t *testing.T) {
-	if _, err := decodeEvidenceRef(json.RawMessage(`{"event_id":"e1"}]`)); err == nil ||
-		err.Error() != "trailing data after evidence ref" {
-		t.Fatalf("evidence decoder returned %v", err)
+func TestDecodeEvidenceRefRejectionDiagnostics(t *testing.T) {
+	for _, tc := range []struct{ raw, want string }{
+		{`{"event_id":"e1","private-model-field":true}`, "unknown field in evidence ref"},
+		{`{"event_id":`, "malformed evidence ref"},
+		{`{"event_id":"e1"}]`, "trailing data after evidence ref"},
+	} {
+		if _, err := decodeEvidenceRef(json.RawMessage(tc.raw)); err == nil || err.Error() != tc.want {
+			t.Errorf("evidence decoder returned %v, want %q", err, tc.want)
+		}
 	}
 }
 

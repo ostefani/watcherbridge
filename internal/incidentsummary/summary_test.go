@@ -9,10 +9,15 @@ import (
 	"github.com/ostefani/watcherbridge/internal/redactor"
 )
 
-func TestDecodeCitationRejectsTrailingData(t *testing.T) {
-	if _, err := decodeCitation(json.RawMessage(`{"member":"M1"}}`)); err == nil ||
-		err.Error() != "trailing data after citation" {
-		t.Fatalf("citation decoder returned %v", err)
+func TestDecodeCitationRejectionDiagnostics(t *testing.T) {
+	for _, tc := range []struct{ raw, want string }{
+		{`{"member":"M1","private-model-field":true}`, "unknown field in citation"},
+		{`{"member":`, "malformed citation"},
+		{`{"member":"M1"}}`, "trailing data after citation"},
+	} {
+		if _, err := decodeCitation(json.RawMessage(tc.raw)); err == nil || err.Error() != tc.want {
+			t.Errorf("citation decoder returned %v, want %q", err, tc.want)
+		}
 	}
 }
 
@@ -85,10 +90,16 @@ func TestIncidentSummaryValidation(t *testing.T) {
 		t.Fatalf("correction = %q", correction)
 	}
 
-	valid := []byte(`{"summary":"s","hypothesis":"h","confidence":"medium","priority_suggestion":null,"priority_reason":"r","citations":[{"member":"M1"}]}`)
-	if _, correction, ok := acceptSummary(append(valid, '}'), aliases, issued, nil, true, briefing.Medium); ok ||
-		correction != "trailing data after summary object" {
-		t.Fatalf("summary with a stray closer: accepted=%t, correction=%q", ok, correction)
+	const valid = `{"summary":"s","hypothesis":"h","confidence":"medium","priority_suggestion":null,"priority_reason":"r","citations":[{"member":"M1"}]}`
+	for _, tc := range []struct{ name, raw, want string }{
+		{"stray closer", valid + "}", "trailing data after summary object"},
+		{"malformed", `{"summary":`, "malformed summary JSON"},
+		{"missing fields", `{"summary":"s"}`, "missing or empty required field"},
+	} {
+		if _, correction, ok := acceptSummary([]byte(tc.raw), aliases, issued, nil, true, briefing.Medium); ok ||
+			correction != tc.want {
+			t.Errorf("%s: accepted=%t, correction=%q, want %q", tc.name, ok, correction, tc.want)
+		}
 	}
 
 	// Forged citations are rejected.
