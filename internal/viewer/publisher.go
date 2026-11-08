@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ostefani/watcherbridge/internal/forwarder"
+	"github.com/ostefani/watcherbridge/internal/netdiag"
 	"github.com/ostefani/watcherbridge/internal/store"
 )
 
@@ -165,7 +165,7 @@ func (p *Publisher) post(ctx context.Context, b store.Briefing) {
 	// Every failure mode — refused, timeout, 404, 5xx — lands here: soft
 	// by contract, with the group ID as the only identifier in the log.
 	p.failed.Add(1)
-	log.Printf("publisher: group %s: giving up: %s", b.GroupID, last)
+	log.Printf("publisher: group %s: giving up: %s", b.GroupID, store.SanitizeErrorText(last.Error()))
 }
 
 func (p *Publisher) postOnce(ctx context.Context, raw []byte) error {
@@ -182,7 +182,7 @@ func (p *Publisher) postOnce(ctx context.Context, raw []byte) error {
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return errors.New(forwarder.TransportFailure(err))
+		return errors.New("scanrelay " + netdiag.TransportFailure(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {

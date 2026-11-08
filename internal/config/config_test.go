@@ -10,6 +10,21 @@ import (
 	"time"
 )
 
+func TestInvalidEndpointDiagnosticsExcludeQuery(t *testing.T) {
+	const marker = "synthetic-private-endpoint-key"
+	for _, endpoint := range []string{
+		"ftp://private.example/path?key=" + marker,
+		"http://private.example/path?key=" + marker,
+	} {
+		for _, field := range []string{"model base URL", "ScanRelay URL"} {
+			err := loopbackOrHTTPS(endpoint, field)
+			if err == nil || !strings.Contains(err.Error(), field) || strings.Contains(err.Error(), marker) {
+				t.Errorf("endpoint validation for %s returned %v", field, err)
+			}
+		}
+	}
+}
+
 func TestDefaultPairs(t *testing.T) {
 	c := Default()
 	if err := c.Validate(); err != nil {

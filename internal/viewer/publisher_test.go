@@ -150,12 +150,19 @@ func TestPublisherFailureLogExcludesExternalText(t *testing.T) {
 	const marker = "synthetic-private-relay-detail"
 	for _, tc := range []struct {
 		name, endpoint, want string
+		response             *http.Response
 	}{
-		{"transport", "http://private.example/api/annotations", "forward transport failure"},
-		{"request construction", "http://private.example/%" + marker, "build annotation request"},
+		{"transport", "http://private.example/api/annotations", "scanrelay transport failure", nil},
+		{"request construction", "http://private.example/%" + marker, "build annotation request", nil},
+		{"http status", "http://private.example/api/annotations", "scanrelay status 503",
+			&http.Response{StatusCode: 503, Status: "503 " + marker, Body: http.NoBody}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stub := &stubTripper{respond: func(*http.Request) (*http.Response, error) {
+				if tc.response != nil {
+					resp := *tc.response
+					return &resp, nil
+				}
 				return nil, errors.New(marker)
 			}}
 			p := NewPublisher(tc.endpoint, "", "", "", time.Second, &http.Client{Transport: stub})
@@ -171,6 +178,21 @@ func TestPublisherFailureLogExcludesExternalText(t *testing.T) {
 				t.Fatalf("failed = %d, logs = %q", p.Failed(), got)
 			}
 		})
+	}
+}
+
+func TestPublisherCancellationStopsRetries(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	stub := &stubTripper{respond: func(r *http.Request) (*http.Response, error) {
+		cancel()
+		return nil, r.Context().Err()
+	}}
+	p := NewPublisher("http://private.example/api/annotations", "", "", "", time.Second, &http.Client{Transport: stub})
+	p.retryBase = time.Millisecond
+	p.post(ctx, testBriefing())
+	if len(stub.requests) != 1 || p.Posted() != 0 || p.Failed() != 0 {
+		t.Fatalf("canceled post: attempts=%d posted=%d failed=%d", len(stub.requests), p.Posted(), p.Failed())
 	}
 }
 

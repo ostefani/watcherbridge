@@ -1,9 +1,14 @@
 package provider
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"testing/iotest"
 )
 
 // Provider credentials travel header-only (Step 30 §5.9): the Bearer [REDACTED]
@@ -48,5 +53,34 @@ func TestProviderKeyHeaderOnly(t *testing.T) {
 		t.Fatal("status 500 must fail")
 	} else if strings.Contains(err.Error(), apiKey) {
 		t.Fatalf("error quotes key material: %q", err)
+	}
+}
+
+func TestMetaDiagnosticsExcludeEndpointAndPeerText(t *testing.T) {
+	const marker = "synthetic-private-provider-detail"
+	cause := fmt.Errorf("%s: %w", marker, context.DeadlineExceeded)
+	for _, tc := range []struct {
+		name, want string
+		response   *http.Response
+		err, match error
+	}{
+		{"transport", "provider call: transport timeout", nil, cause, context.DeadlineExceeded},
+		{"body read", "read provider response", &http.Response{StatusCode: 200, Body: io.NopCloser(iotest.ErrReader(cause))}, nil, context.DeadlineExceeded},
+		{"status", "provider status 503", &http.Response{StatusCode: 503, Status: "503 " + marker, Body: io.NopCloser(strings.NewReader(marker))}, nil, nil},
+		{"malformed envelope", "decode provider envelope", okResponse(marker), nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &http.Client{Transport: &stubTripper{respond: func(*http.Request) (*http.Response, error) {
+				return tc.response, tc.err
+			}}}
+			a, err := NewMetaAdapter("https://model.example/v1/brief?key="+marker, "test", marker, client, 64<<10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = a.Brief(t.Context(), []byte("{}"), nil)
+			if err == nil || err.Error() != tc.want || (tc.match != nil && !errors.Is(err, tc.match)) {
+				t.Fatalf("Brief error = %v, want %q matching %v", err, tc.want, tc.match)
+			}
+		})
 	}
 }

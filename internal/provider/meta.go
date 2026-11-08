@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/ostefani/watcherbridge/internal/netdiag"
 )
 
 // noRedirect refuses redirects: a 3xx from the model endpoint is a failure,
@@ -49,7 +51,7 @@ type MetaAdapter struct {
 func NewMetaAdapter(baseURL, modelID, apiKey string, client *http.Client, maxBytes int64) (*MetaAdapter, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("model base URL must be an http(s) endpoint, got %q", baseURL)
+		return nil, fmt.Errorf("model base URL must be an http(s) endpoint")
 	}
 	if modelID == "" {
 		return nil, fmt.Errorf("model ID is required")
@@ -138,16 +140,25 @@ func (a *MetaAdapter) RepairSummary(ctx context.Context, correction string, _ ma
 	return RawSummary{JSON: raw.JSON, Usage: raw.Usage}, nil
 }
 
+// responseError preserves error matching without printing remote text.
+type responseError struct {
+	message string
+	cause   error
+}
+
+func (e *responseError) Error() string { return e.message }
+func (e *responseError) Unwrap() error { return e.cause }
+
 func (a *MetaAdapter) post(ctx context.Context, body []byte) (RawBriefing, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL, bytes.NewReader(body))
 	if err != nil {
-		return RawBriefing{}, fmt.Errorf("build provider request: %w", err)
+		return RawBriefing{}, &responseError{message: "build provider request", cause: err}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+a.apiKey)
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return RawBriefing{}, fmt.Errorf("provider call: %w", err)
+		return RawBriefing{}, &responseError{message: "provider call: " + netdiag.TransportFailure(err), cause: err}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -160,7 +171,7 @@ func (a *MetaAdapter) post(ctx context.Context, body []byte) (RawBriefing, error
 	// safe to hold, but never safe to hold unbounded.
 	raw, err := io.ReadAll(http.MaxBytesReader(sinkWriter{}, resp.Body, a.maxBytes))
 	if err != nil {
-		return RawBriefing{}, fmt.Errorf("read provider response: %w", err)
+		return RawBriefing{}, &responseError{message: "read provider response", cause: err}
 	}
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return RawBriefing{}, fmt.Errorf("provider returned an empty body")
@@ -207,7 +218,7 @@ func extractResponse(raw []byte) ([]byte, Usage, error) {
 	var env responsesEnvelope
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	if err := dec.Decode(&env); err != nil {
-		return nil, Usage{}, fmt.Errorf("decode provider envelope: %v", strings.TrimSpace(err.Error()))
+		return nil, Usage{}, fmt.Errorf("decode provider envelope")
 	}
 	if env.Status != "" && env.Status != "completed" {
 		return nil, Usage{}, fmt.Errorf("provider response did not complete")

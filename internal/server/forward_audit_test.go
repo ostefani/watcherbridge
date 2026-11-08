@@ -48,9 +48,9 @@ func TestForwardFailureDiagnosticsExcludeExternalText(t *testing.T) {
 		stub stubRelayTripper
 		want string
 	}{
-		{"transport", stubRelayTripper{err: errors.New(marker)}, "forward transport failure"},
-		{"timeout", stubRelayTripper{err: fmt.Errorf("%s: %w", marker, context.DeadlineExceeded)}, "forward transport timeout"},
-		{"cancellation", stubRelayTripper{err: fmt.Errorf("%s: %w", marker, context.Canceled)}, "forward transport canceled"},
+		{"transport", stubRelayTripper{err: errors.New(marker)}, "scanrelay transport failure"},
+		{"timeout", stubRelayTripper{err: fmt.Errorf("%s: %w", marker, context.DeadlineExceeded)}, "scanrelay transport timeout"},
+		{"cancellation", stubRelayTripper{err: fmt.Errorf("%s: %w", marker, context.Canceled)}, "scanrelay transport canceled"},
 		{"http status", stubRelayTripper{status: http.StatusServiceUnavailable, statusLine: "503 " + marker}, "scanrelay status 503"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

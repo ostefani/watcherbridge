@@ -29,6 +29,7 @@ import (
 	"github.com/ostefani/watcherbridge/internal/config"
 	"github.com/ostefani/watcherbridge/internal/forwarder"
 	"github.com/ostefani/watcherbridge/internal/health"
+	"github.com/ostefani/watcherbridge/internal/netdiag"
 	"github.com/ostefani/watcherbridge/internal/store"
 	"github.com/ostefani/watcherbridge/internal/viewer"
 )
@@ -479,7 +480,7 @@ func (s *Server) forwardOne(ctx context.Context, body []byte, src map[string]str
 	}
 	resp, err := s.proxy.Do(out)
 	if err != nil {
-		s.recordFailure(ctx, eventID, forwarder.TransportFailure(err))
+		s.recordFailure(ctx, eventID, "scanrelay "+netdiag.TransportFailure(err))
 		return false
 	}
 	defer resp.Body.Close()

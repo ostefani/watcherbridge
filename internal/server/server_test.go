@@ -521,7 +521,7 @@ func TestHungScanRelay502Timing(t *testing.T) {
 		t.Fatalf("502 took %v, want ~persist+%v", elapsed, want)
 	}
 	if fwd, attempts, reason, err := h.srv.events.ForwardState(context.Background(), id); err != nil ||
-		fwd || attempts != 1 || reason != "forward transport timeout" {
+		fwd || attempts != 1 || reason != "scanrelay transport timeout" {
 		t.Fatalf("timeout receipt = (%t, %d, %q, %v)", fwd, attempts, reason, err)
 	}
 }
@@ -535,7 +535,7 @@ func TestScanRelayClientTimeoutReceipt(t *testing.T) {
 		t.Fatalf("hung ScanRelay returned %d, want 502", got)
 	}
 	if fwd, attempts, reason, err := h.srv.events.ForwardState(context.Background(), id); err != nil ||
-		fwd || attempts != 1 || reason != "forward transport timeout" {
+		fwd || attempts != 1 || reason != "scanrelay transport timeout" {
 		t.Fatalf("client timeout receipt = (%t, %d, %q, %v)", fwd, attempts, reason, err)
 	}
 }
@@ -802,7 +802,7 @@ func TestShutdownDuringSweepForward(t *testing.T) {
 	}
 	// Cancellation ends the HTTP request, but the receipt has its own budget.
 	if fwd, attempts, reason, err := h.srv.events.ForwardState(context.Background(), id); err != nil ||
-		fwd || attempts != 1 || reason != "forward transport canceled" {
+		fwd || attempts != 1 || reason != "scanrelay transport canceled" {
 		t.Fatalf("canceled sweep receipt = (%t, %d, %q, %v)", fwd, attempts, reason, err)
 	}
 	if h.srv.gate.InFlight() != 0 {
