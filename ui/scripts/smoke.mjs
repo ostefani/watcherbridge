@@ -22,9 +22,13 @@ for (const name of readdirSync(lib)) {
   const source = readFileSync(join(lib, name), 'utf8');
   const { js } = compile(source, { generate: 'server', filename: name });
   // Compiled output keeps the .svelte specifier; rewrite to the compiled sibling.
+  // `@/` aliases resolve only under Vite, so map them onto the flat
+  // copies below: `@/api.js` is exact (extension required in node),
+  // `@/lib/<name>.js` is generic for every helper a screen imports.
   const code = js.code
     .replaceAll(/from '(\.\/[^']+)\.svelte'/g, "from '$1.js'")
-    .replaceAll("from '../api.js'", "from './api.js'");
+    .replaceAll("from '@/api.js'", "from './api.js'")
+    .replaceAll(/from '@\/lib\/([^']+)'/g, "from './$1'");
   writeFileSync(join(out, name.replace(/\.svelte$/, '.js')), code);
 }
 // Plain JS siblings the screens import at runtime, copied next to the

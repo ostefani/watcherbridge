@@ -1,6 +1,6 @@
 <script>
   import { onDestroy, onMount, untrack } from 'svelte';
-  import { fetchBriefing } from '../api.js';
+  import { fetchBriefing } from '@/api.js';
   import { createFetchGuard } from './freshness.js';
   import { typingTarget } from './roving.js';
   import { displayTime, sourceLabel, reviewTitle, reportRange, singleViewIdentity } from './format.js';

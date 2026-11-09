@@ -1,7 +1,7 @@
 <script>
   import { changeLabel, reviewTitle } from './format.js';
   import { onDestroy, onMount } from 'svelte';
-  import { fetchIncident } from '../api.js';
+  import { fetchIncident } from '@/api.js';
 
   // Attention list: server-ordered (flagged, priority, incident, newest,
   // stable ID). Briefing and incident rows link to their detail
@@ -12,7 +12,7 @@
   let { items = [], selectedId = null, titles = {}, onselect = null } = $props();
 
   let expanded = $state(/** @type {Record<string, boolean>} */ ({}));
-  let memberCache = $state(/** @type {Record<string, import('../wire.js').IncidentMember[]>} */ ({}));
+  let memberCache = $state(/** @type {Record<string, import('@/wire.js').IncidentMember[]>} */ ({}));
   let expandError = $state(/** @type {Record<string, string>} */ ({}));
   let expanding = $state(/** @type {Record<string, boolean>} */ ({}));
   let alive = true;

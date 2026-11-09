@@ -1,6 +1,6 @@
 <script>
   import { onDestroy, onMount } from 'svelte';
-  import { fetchIncident } from '../api.js';
+  import { fetchIncident } from '@/api.js';
   import { createFetchGuard } from './freshness.js';
   import { displayTime } from './format.js';
   import DecisionPanel from './DecisionPanel.svelte';
@@ -73,7 +73,7 @@
     note: 'Free-text note, kept with the audit (max 2000 characters).'
   };
 
-  function countLine(/** @type {import('../wire.js').Incident} */ inc) {
+  function countLine(/** @type {import('@/wire.js').Incident} */ inc) {
     const reports = `${inc.member_count} member report${inc.member_count === 1 ? '' : 's'}`;
     const refs = `${inc.qualified_refs} qualified upstream reference${inc.qualified_refs === 1 ? '' : 's'}`;
     return `${reports} · ${refs}`;

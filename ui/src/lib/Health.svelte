@@ -1,6 +1,6 @@
 <script>
   import { onDestroy, onMount } from 'svelte';
-  import { fetchHealth } from '../api.js';
+  import { fetchHealth } from '@/api.js';
   import { createFetchGuard } from './freshness.js';
   import { latestRunNeedsAttention } from './purge.js';
   import { displayTime } from './format.js';

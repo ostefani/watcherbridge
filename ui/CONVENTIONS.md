@@ -10,8 +10,8 @@ Governing contracts: [Designv9 §8](../.innerdoc/Designv9.md#8-svelte-viewer-and
 | | `containers/` | `components/` |
 |---|---|---|
 | Role | Smart: fetch, hold state, subscribe, post, wire everything together | Dumb: render props, emit callbacks |
-| May import | `$api`, `$lib`, components, context | Other components, `$lib/format` (pure helpers) |
-| May not import | Other containers (`App` alone composes pages) | `$api`, `$containers`, context, `window` listeners |
+| May import | `@/api`, `@/lib`, components, context | Other components, `@/lib/format` (pure helpers) |
+| May not import | Other containers (`App` alone composes pages) | `@/api`, `@/containers`, context, `window` listeners |
 | Local state | Only what orchestration needs | UI-only state (open/closed, a form draft, a copied flag) |
 
 Enforced by `eslint.config.js` (`no-restricted-imports`); `App` has its own
@@ -32,7 +32,7 @@ Component props: data in, `on<something>` callbacks out (`onselect`,
 `ondecided`). No `reload` callback props — containers own refetching.
 Appearance variants ride on props (`variant`, `layout`), never on
 parent selectors reaching into children. Shared derivation lives in
-`$lib/format/*` with plain-node unit coverage, not inside components.
+`@/lib/format/*` with plain-node unit coverage, not inside components.
 
 ## CSS
 
@@ -73,7 +73,14 @@ allowlist / forbidden automation stack). JSDoc wire typedefs with
 
 - CSS Modules over `<style src>` (needs a new dep + Design exception)
   or global-prefix naming (leak-prone).
-- Aliases `$lib $components $containers $api $styles` (vite + jsconfig)
-  so moves never rewrite specifiers.
+- One `@` alias for the src root (vite + jsconfig) so moves never
+  rewrite specifiers; imports use `@/lib/x`, never `..` traversal.
+  Node-run scripts keep relative paths; the harness resolves `@`
+  through an inline `module.registerHooks()` resolver (own code, zero
+  dependencies) where dynamic imports need it.
 - Health migrates first, Briefing and Decisions last; one screen per
   step so the app stays shippable.
+- `lib/async` is plain JS over `svelte/store`, not `.svelte.js` runes:
+  runes need the compiler, which plain node lacks, and no test runner
+  may be added — so unit coverage lives in `scripts/characterize.mjs`.
+  Components consume the stores with `$data` as usual.

@@ -49,11 +49,10 @@ export default defineConfig({
   },
   resolve: {
     alias: {
-      $lib: `${src}lib`,
-      $components: `${src}components`,
-      $containers: `${src}containers`,
-      $api: `${src}api`,
-      $styles: `${src}styles`
+      // Single src root: imports use `@/lib/x`, never `..` traversal.
+      // `@/api.js` is the file today; it becomes `@/api/…` when the
+      // Phase 2 folder split lands, with no alias change.
+      '@': src
     }
   },
   server: {

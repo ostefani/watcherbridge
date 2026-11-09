@@ -6,11 +6,7 @@
     "moduleResolution": "Bundler",
     "target": "ESNext",
     "paths": {
-      "$lib/*": ["src/lib/*"],
-      "$components/*": ["src/components/*"],
-      "$containers/*": ["src/containers/*"],
-      "$api/*": ["src/api/*"],
-      "$styles/*": ["src/styles/*"]
+      "@/*": ["src/*"]
     }
   },
   "include": ["src", "scripts", "vite.config.js", "eslint.config.js"]

@@ -46,9 +46,9 @@ export default [
     rules: {
       'no-restricted-imports': ['error', {
         patterns: [
-          { group: ['$api', '$api/*'], message: 'components render props; fetching lives in containers.' },
-          { group: ['$containers', '$containers/*'], message: 'components never import containers.' },
-          { group: ['$lib/events/context*', '**/events/context*'], message: 'components read connection state from props, not context.' }
+          { group: ['@/api*'], message: 'components render props; fetching lives in containers.' },
+          { group: ['@/containers', '@/containers/*'], message: 'components never import containers.' },
+          { group: ['@/lib/events/context*', '**/events/context*'], message: 'components read connection state from props, not context.' }
         ]
       }]
     }
@@ -58,7 +58,7 @@ export default [
     rules: {
       'no-restricted-imports': ['error', {
         patterns: [
-          { group: ['$containers', '$containers/*'], message: 'containers never import each other; App alone composes pages.' }
+          { group: ['@/containers', '@/containers/*'], message: 'containers never import each other; App alone composes pages.' }
         ]
       }]
     }
@@ -75,7 +75,7 @@ export default [
     rules: {
       'no-restricted-imports': ['error', {
         patterns: [
-          { group: ['$components', '$components/*', '$containers', '$containers/*'], message: 'lib stays UI-free; containers compose lib, never the reverse.' }
+          { group: ['@/components', '@/components/*', '@/containers', '@/containers/*'], message: 'lib stays UI-free; containers compose lib, never the reverse.' }
         ]
       }]
     }

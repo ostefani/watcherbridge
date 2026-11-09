@@ -1,6 +1,6 @@
 <script>
   import { onDestroy } from 'svelte';
-  import { fetchDecisions, fetchDecisionMembers, postDecision, postUndo } from '../api.js';
+  import { fetchDecisions, fetchDecisionMembers, postDecision, postUndo } from '@/api.js';
   import { memberUndoReview, memberUndoNote, continueMemberUndo } from './memberUndo.js';
 
   // Operator decisions (Designv9 §5.1): explicit immutable verdicts

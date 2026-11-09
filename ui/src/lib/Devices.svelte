@@ -1,6 +1,6 @@
 <script>
   import { onDestroy, onMount } from 'svelte';
-  import { fetchDevices } from '../api.js';
+  import { fetchDevices } from '@/api.js';
   import { createFetchGuard } from './freshness.js';
   import { nextPageRows } from './paging.js';
   import { displayTime, classLabel } from './format.js';
