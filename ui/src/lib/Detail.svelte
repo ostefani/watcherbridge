@@ -297,7 +297,7 @@
   .identity-grid > div { min-width: 0; }
   .identity-grid dt { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 7px; }
   .identity-grid dd { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; font-size: 15px; font-weight: 600; margin: 0; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  /* .mono now lives in styles/utilities.css (single definition). */
   .identity-group { grid-column: 1 / -1; }
   .identity-group p { margin: 5px 0 0; }
   .evidence-index { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 12px; margin-top: 24px; padding-top: 14px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }

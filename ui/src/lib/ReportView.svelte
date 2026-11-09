@@ -61,5 +61,5 @@
   .attributes { padding: 0; border: 0; }
   .attributes summary { font-size: 12px; color: var(--accent); }
   .profile-chip { display: flex; flex-wrap: wrap; gap: 5px 12px; border: 1px solid var(--border); background: var(--accent-soft); border-radius: 9px; padding: 10px 12px; text-decoration: none; font-size: 13px; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  /* .mono now lives in styles/utilities.css (single definition). */
 </style>
