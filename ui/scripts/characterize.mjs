@@ -221,6 +221,88 @@ function bugPin(id, name, cond) {
   check('cap flag names the limit', get(capped.capped) === true);
 }
 
+// lib/events: transport lifecycle with injectable source and scheduler.
+{
+  const { get } = await import('svelte/store');
+  const { createEventStream, INCIDENT_KINDS } = await import('../src/lib/events/stream.js');
+  class FakeSource {
+    constructor() { this.handlers = {}; this.closed = false; this.onopen = null; this.onerror = null; }
+    addEventListener(kind, fn) { ((this.handlers[kind] ??= [])).push(fn); }
+    removeEventListener(kind, fn) { this.handlers[kind] = (this.handlers[kind] ?? []).filter((h) => h !== fn); }
+    emit(kind, data) { for (const fn of this.handlers[kind] ?? []) { fn(data === undefined ? {} : { data }); } }
+    close() { this.closed = true; }
+  }
+  const sources = [];
+  const scheduled = [];
+  const seen = { overviews: [], incidents: [] };
+  const stream = createEventStream({
+    url: '/events',
+    retryMs: 2000,
+    createSource: (url) => { const s = new FakeSource(); s.url = url; sources.push(s); return s; },
+    schedule: (fn, ms) => { scheduled.push({ fn, ms }); return scheduled.length; },
+    cancelSchedule: (t) => { scheduled[t - 1].cancelled = true; },
+    onOverview: (o) => seen.overviews.push(o),
+    onIncident: (k) => seen.incidents.push(k)
+  });
+  stream.connect();
+  check('stream opens connecting on the right url', get(stream.connection) === 'connecting' && sources[0].url === '/events');
+  sources[0].onopen();
+  check('open means live', get(stream.connection) === 'live');
+  sources[0].emit('overview', '{"verdict":"quiet"}');
+  sources[0].emit('overview', 'not json{{{');
+  check('valid frame lands, malformed degrades silently',
+    seen.overviews.length === 1 && seen.overviews[0].verdict === 'quiet' && get(stream.connection) === 'live');
+  check('incident kinds are open/incident/resync', INCIDENT_KINDS.join(',') === 'open,incident,resync');
+  for (const kind of INCIDENT_KINDS) { sources[0].emit(kind); }
+  check('every incident kind bumps the revision once',
+    get(stream.incidentRevision) === 3 && seen.incidents.join(',') === 'open,incident,resync');
+  sources[0].onerror();
+  check('error closes, retries with delay',
+    sources[0].closed && get(stream.connection) === 'retrying' && scheduled.length === 1 && scheduled[0].ms === 2000);
+  scheduled[0].fn();
+  check('retry reconnects on a fresh source', sources.length === 2 && !sources[1].closed);
+  sources[1].onerror();
+  stream.disconnect();
+  scheduled[1].fn();
+  check('disconnect voids the pending retry', sources.length === 2 && get(stream.connection) === 'retrying');
+}
+
+// lib/router: table parity with App's inline parser.
+{
+  const { parseRoute, routeTitle } = await import('../src/lib/router/routes.js');
+  check('briefing route decodes id', JSON.stringify(parseRoute('#/briefing/brf%201')) === JSON.stringify({ name: 'briefing', id: 'brf 1' }));
+  check('incident route', parseRoute('#/incidents/inc-1').name === 'incident');
+  check('device route', parseRoute('#/devices/prof-1').id === 'prof-1');
+  check('devices accepts trailing slash', parseRoute('#/devices/').name === 'devices' && parseRoute('#/devices').name === 'devices');
+  check('health route', parseRoute('#/health').name === 'health');
+  check('empty and unknown fall home',
+    parseRoute('').name === 'home' && parseRoute(null).name === 'home' && parseRoute('#/nope').name === 'home');
+  check('titles cover every route',
+    ['home', 'devices', 'device', 'briefing', 'incident', 'health'].every((n) => routeTitle(n) !== 'Review overview' || n === 'home') &&
+    routeTitle('briefing') === 'Briefing' && routeTitle('mystery') === 'Review overview');
+}
+
+// lib/shortcuts: scoped dispatch with typing/modifier silence, help from one table.
+{
+  const { createShortcutRegistry } = await import('../src/lib/shortcuts/registry.js');
+  const reg = createShortcutRegistry();
+  const handled = [];
+  reg.register('global', 'j', 'Move between rows', () => handled.push('j'));
+  reg.register('global', '?', 'Toggle shortcuts', () => handled.push('?'));
+  reg.register('briefing', 'e', 'Preset expected', () => handled.push('e'));
+  const key = (k, extra = {}) => ({ key: k, target: { tagName: 'BUTTON' }, ...extra });
+  check('registered keys dispatch', reg.dispatch('global', key('j')) && reg.dispatch('briefing', key('e')) && handled.join(',') === 'j,e');
+  check('scopes stay separate', !reg.dispatch('global', key('e')) && !reg.dispatch('briefing', key('j')));
+  check('typing and modifiers stay silent',
+    !reg.dispatch('global', { key: 'j', target: { tagName: 'INPUT' } }) &&
+    !reg.dispatch('global', key('j', { metaKey: true })) &&
+    !reg.dispatch('global', key('j', { ctrlKey: true })) &&
+    !reg.dispatch('global', key('z')));
+  const help = reg.describe('global');
+  check('help derives from bindings',
+    help.length === 2 && help.some((h) => h.key === '?' && h.label === 'Toggle shortcuts'));
+}
+
 console.log(`characterize: ${pass} checks passed`);
 if (bugs.length > 0) {
   for (const b of bugs) {
