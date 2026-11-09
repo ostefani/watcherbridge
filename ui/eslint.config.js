@@ -35,5 +35,49 @@ export default [
     languageOptions: {
       globals: { ...globals.node }
     }
+  },
+  {
+    // Folder-split boundaries (CONVENTIONS): components render props and
+    // never fetch; containers orchestrate and never import each other
+    // (App alone composes pages); lib stays free of UI layers.
+    // These patterns match nothing until Phases 2-5 create the folders,
+    // so they lock the contract before the first move.
+    files: ['src/components/**/*.{js,svelte}'],
+    rules: {
+      'no-restricted-imports': ['error', {
+        patterns: [
+          { group: ['$api', '$api/*'], message: 'components render props; fetching lives in containers.' },
+          { group: ['$containers', '$containers/*'], message: 'components never import containers.' },
+          { group: ['$lib/events/context*', '**/events/context*'], message: 'components read connection state from props, not context.' }
+        ]
+      }]
+    }
+  },
+  {
+    files: ['src/containers/**/*.{js,svelte}'],
+    rules: {
+      'no-restricted-imports': ['error', {
+        patterns: [
+          { group: ['$containers', '$containers/*'], message: 'containers never import each other; App alone composes pages.' }
+        ]
+      }]
+    }
+  },
+  {
+    // App is the single composer: it may import page containers.
+    files: ['src/containers/App/**/*.{js,svelte}'],
+    rules: {
+      'no-restricted-imports': 'off'
+    }
+  },
+  {
+    files: ['src/lib/**/*.{js,svelte.js}'],
+    rules: {
+      'no-restricted-imports': ['error', {
+        patterns: [
+          { group: ['$components', '$components/*', '$containers', '$containers/*'], message: 'lib stays UI-free; containers compose lib, never the reverse.' }
+        ]
+      }]
+    }
   }
 ];
