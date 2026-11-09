@@ -1,5 +1,11 @@
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
+import { fileURLToPath } from 'node:url';
+
+// Phase 0 folder split: stable import roots so components, containers,
+// lib modules and the api folder land without rewriting specifiers.
+// The target folders arrive in Phases 2-5; no source imports them yet.
+const src = fileURLToPath(new URL('./src/', import.meta.url));
 
 // Step 22 toolchain (Designv9 §8.1): JavaScript only, CSP-safe output.
 // Separate JS/CSS assets, no sourcemaps, no inlined data URIs, no
@@ -39,6 +45,15 @@ export default defineConfig({
         chunkFileNames: 'assets/[name].js',
         assetFileNames: 'assets/[name].[ext]'
       }
+    }
+  },
+  resolve: {
+    alias: {
+      $lib: `${src}lib`,
+      $components: `${src}components`,
+      $containers: `${src}containers`,
+      $api: `${src}api`,
+      $styles: `${src}styles`
     }
   },
   server: {
