@@ -9,42 +9,87 @@ import { compile } from 'svelte/compiler';
 import { render } from 'svelte/server';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-const lib = join(root, 'src', 'lib');
+const src = join(root, 'src');
 // Inside the project so bare 'svelte' imports resolve to ui/node_modules.
 const out = join(root, '.smoke-tmp');
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
 
-for (const name of readdirSync(lib)) {
-  if (!name.endsWith('.svelte')) {
-    continue;
+// Stub for CSS Modules: SSR has no Vite, so `styles.x` resolves to the
+// class key itself. Text/hostile-content assertions are unaffected. Only
+// string keys resolve — symbol lookups (`then`, `toPrimitive`) stay
+// undefined so the stub never impersonates a thenable or primitive.
+writeFileSync(join(out, 'css-stub.js'),
+  'export default new Proxy({}, { get: (_, prop) => (typeof prop === \'string\' ? prop : undefined) });\n');
+
+/** Recursively collect .svelte files; basenames must stay unique. */
+function collectSvelte(dir) {
+  const found = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      found.push(...collectSvelte(full));
+    } else if (entry.name.endsWith('.svelte')) {
+      found.push(full);
+    }
   }
-  const source = readFileSync(join(lib, name), 'utf8');
-  const { js } = compile(source, { generate: 'server', filename: name });
-  // Compiled output keeps the .svelte specifier; rewrite to the compiled sibling.
-  // `@/` aliases resolve only under Vite, so map them onto the flat
-  // copies below: `@/api.js` is exact (extension required in node),
-  // `@/lib/<name>.js` is generic for every helper a screen imports.
+  return found;
+}
+
+const seen = new Set();
+for (const full of collectSvelte(src)) {
+  const base = full.slice(full.lastIndexOf('/') + 1);
+  if (seen.has(base)) {
+    throw new Error(`smoke: duplicate component basename ${base}; basenames must stay unique`);
+  }
+  seen.add(base);
+  const source = readFileSync(full, 'utf8');
+  const { js } = compile(source, { generate: 'server', filename: base });
+  // Compiled output keeps .svelte specifiers; `@/` aliases resolve only
+  // under Vite, so map everything onto the flat copies below. Order
+  // matters: the async rule precedes the generic lib rule.
   const code = js.code
     .replaceAll(/from '(\.\/[^']+)\.svelte'/g, "from '$1.js'")
+    .replaceAll(/from '@\/(?:components|containers)\/[^/]+\/([^']+)\.svelte'/g, "from './$1.js'")
     .replaceAll("from '@/api.js'", "from './api.js'")
-    .replaceAll(/from '@\/lib\/([^']+)'/g, "from './$1'");
-  writeFileSync(join(out, name.replace(/\.svelte$/, '.js')), code);
+    .replaceAll(/from '@\/lib\/(?:[^']*\/)?([^'/]+)'/g, "from './$1'")
+    .replaceAll(/from '[^']*\.module\.css'/g, "from './css-stub.js'");
+  writeFileSync(join(out, base.replace(/\.svelte$/, '.js')), code);
 }
-// Plain JS siblings the screens import at runtime, copied next to the
-// compiled output so bare relative specifiers resolve inside .smoke-tmp.
-for (const [from, to] of [
-  [join(root, 'src', 'api.js'), join(out, 'api.js')],
-  [join(lib, 'freshness.js'), join(out, 'freshness.js')],
-  [join(lib, 'format.js'), join(out, 'format.js')],
-  [join(lib, 'evidenceNavigation.js'), join(out, 'evidenceNavigation.js')],
-  [join(lib, 'roving.js'), join(out, 'roving.js')],
-  [join(lib, 'paging.js'), join(out, 'paging.js')],
-  [join(lib, 'purge.js'), join(out, 'purge.js')],
-  [join(lib, 'memberUndo.js'), join(out, 'memberUndo.js')]
-]) {
-  writeFileSync(to, readFileSync(from, 'utf8'));
+// Plain JS siblings the screens import at runtime. Every `src/lib`
+// helper is copied flat (basenames share the uniqueness rule above),
+// so a new helper import never needs a harness edit — it just lands.
+const lib = join(src, 'lib');
+// api.js lives beside lib/, not inside it.
+writeFileSync(join(out, 'api.js'), readFileSync(join(src, 'api.js'), 'utf8'));
+seen.add('api.js');
+function collectJs(dir) {
+  const found = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      found.push(...collectJs(full));
+    } else if (entry.name.endsWith('.js')) {
+      found.push(full);
+    }
+  }
+  return found;
 }
+for (const full of collectJs(lib)) {
+  const base = full.slice(full.lastIndexOf('/') + 1);
+  // Barrel files are bundler ergonomics; SSR imports concrete modules.
+  if (base === 'index.js') {
+    continue;
+  }
+  if (seen.has(base)) {
+    throw new Error(`smoke: duplicate helper basename ${base}; basenames must stay unique`);
+  }
+  seen.add(base);
+  writeFileSync(join(out, base), readFileSync(full, 'utf8'));
+}
+// NOTE: the flat `.smoke-tmp` layout is a permanent constraint — every
+// compiled component and helper shares one directory, so basenames must
+// stay unique across `src/` forever, not just during the migration.
 
 // The specifier is built from constants (own temp dir, fixed name),
 // never from network or user input.
@@ -57,7 +102,7 @@ const { default: Devices } = await import(pathToFileURL(join(out, 'Devices.js'))
 // eslint-disable-next-line no-unsanitized/method
 const { default: Device } = await import(pathToFileURL(join(out, 'Device.js')).href);
 // eslint-disable-next-line no-unsanitized/method
-const { default: Health } = await import(pathToFileURL(join(out, 'Health.js')).href);
+const { default: HealthContainer } = await import(pathToFileURL(join(out, 'HealthContainer.js')).href);
 // eslint-disable-next-line no-unsanitized/method
 const { default: Incident } = await import(pathToFileURL(join(out, 'Incident.js')).href);
 
@@ -409,7 +454,7 @@ const cases = [
     absent: ['<img']
   },
   {
-    component: Health,
+    component: HealthContainer,
     name: 'health with purge failure',
     props: { stream: 'live', initial: healthFixture },
     expect: [
@@ -426,7 +471,7 @@ const cases = [
     ]
   },
   {
-    component: Health,
+    component: HealthContainer,
     name: 'health with partial heartbeat',
     props: { stream: 'live', initial: {
       ...healthFixture,

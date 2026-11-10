@@ -6,7 +6,7 @@
   import { forwardIncidentEvents } from './lib/incidentEvents.js';
   import Devices from './lib/Devices.svelte';
   import Device from './lib/Device.svelte';
-  import Health from './lib/Health.svelte';
+  import HealthContainer from './containers/HealthContainer/HealthContainer.svelte';
   import ConnectionStatus from './lib/ConnectionStatus.svelte';
   import { createFetchGuard } from './lib/freshness.js';
   import { moveRowFocus, typingTarget } from './lib/roving.js';
@@ -196,7 +196,7 @@
     {:else if route.name === 'device'}
       <Device id={route.id} {stream} />
     {:else if route.name === 'health'}
-      <Health {stream} />
+      <HealthContainer {stream} />
     {/if}
   {/key}
 </main>

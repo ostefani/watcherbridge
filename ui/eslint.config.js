@@ -26,9 +26,9 @@ export default [
     }
   },
   {
-    // The real outDir plus a local fallback: a stale or misconfigured
-    // build must never be linted as a source.
-    ignores: ['../internal/viewer/web/dist/**', 'dist/**']
+    // Generated output is never a source: the real outDir plus local
+    // fallbacks (a stale or misconfigured build, the SSR smoke tree).
+    ignores: ['../internal/viewer/web/dist/**', 'dist/**', '.smoke-tmp/**']
   },
   {
     files: ['scripts/**/*.mjs'],

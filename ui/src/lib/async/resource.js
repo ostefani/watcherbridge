@@ -11,12 +11,14 @@
 import { writable, get } from 'svelte/store';
 
 /**
+ * Fetch-owned data with a failed-refresh notice. The mount-time
+ * snapshot (if any) stays a container concern: containers render
+ * `data ?? snapshot`, so the resource never captures props at init.
  * @template T
  * @param {() => Promise<T>} fetcher
- * @param {{initial?: T|null}} [options] snapshot rendered before any fetch
  */
-export function createResource(fetcher, { initial = null } = {}) {
-  const data = writable(initial);
+export function createResource(fetcher) {
+  const data = writable(null);
   const error = writable(null);
   const refreshError = writable(null);
   const loading = writable(false);
@@ -62,4 +64,19 @@ export function createResource(fetcher, { initial = null } = {}) {
   }
 
   return { data, error, refreshError, loading, refresh, invalidate };
+}
+
+/**
+ * Which failure (if any) is visible next to rendered content. A
+ * data-less failure renders as the error state, never a notice; a
+ * snapshot counts as rendered content, so its failures must surface
+ * too — otherwise a failed refresh on a snapshot screen is silent.
+ * @param {{data: unknown, initial: unknown, error: string|null, refreshError: string|null}} state
+ * @returns {string|null} notice text, or null when nothing may show
+ */
+export function failureNotice({ data = null, initial = null, error = null, refreshError = null } = {}) {
+  if ((data ?? initial) === null) {
+    return null;
+  }
+  return refreshError ?? (data === null ? error : null);
 }

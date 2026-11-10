@@ -145,14 +145,29 @@ function bugPin(id, name, cond) {
     /detail\s*=\s*null/.test(effect.split('$effect')[1] ?? ''));
 }
 
-// BUG-3: Health mounted from a snapshot never refreshes on reconnect:
-// the edge requires `health !== null`, but snapshot screens keep
-// `health` null forever (only `shown` sees the snapshot). Structural
-// pin until HealthContainer owns reconnect policy via createResource.
+// Reconnect edge and failure visibility, behaviorally. BUG-3's fix is
+// the edge decision plus the snapshot-aware notice — both pure units,
+// so no source regex is needed. Container wiring (calling refresh on a
+// true edge) stays on the manual reconnect checklist with the rest of
+// the runtime behavior smoke cannot mount.
 {
-  const health = readFileSync(join(root, 'src/lib/Health.svelte'), 'utf8');
-  bugPin('BUG-3', 'reconnect edge admits snapshot state',
-    /live\s*&&\s*!wasLive\s*&&\s*shown\s*!==\s*null/.test(health));
+  const { shouldRefreshOnReconnect } = await import('../src/lib/events/reconnect.js');
+  const edge = (over) => shouldRefreshOnReconnect({ live: false, wasLive: false, data: null, initial: null, ...over });
+  check('snapshot plus reconnect edge refreshes',
+    edge({ live: true, initial: 'snap' }) && edge({ live: true, data: 'fetched' }));
+  check('no edge without liveness change or content',
+    !edge({ live: true }) && !edge({ live: true, wasLive: true, initial: 'snap' }) &&
+    !edge({ live: false, initial: 'snap' }) && !edge({ live: true, data: null, initial: null }));
+  const { failureNotice } = await import('../src/lib/async/resource.js');
+  const failed = (over) => failureNotice({ data: null, initial: null, error: null, refreshError: null, ...over });
+  check('snapshot plus failing fetch yields a visible notice',
+    failed({ initial: 'snap', error: 'offline' }) === 'offline');
+  check('fetched data plus failing fetch yields a visible notice',
+    failed({ data: 'rows', refreshError: 'offline' }) === 'offline');
+  check('data-less failure is an error, not a notice',
+    failed({ error: 'offline' }) === null);
+  check('quiet state yields no notice',
+    failed({ data: 'rows' }) === null && failed({}) === null);
 }
 
 // lib/async: per-operation guards never cancel each other, resources
@@ -185,16 +200,23 @@ function bugPin(id, name, cond) {
   // Failure without data is an error; with data it is a notice.
   const r2 = createResource(() => Promise.reject(new Error('offline')));
   check('data-less failure is an error', (await r2.refresh()) === 'failed' && get(r2.error) === 'offline');
-  const r3 = createResource(() => Promise.reject(new Error('offline')), { initial: 'kept' });
-  check('failed refresh keeps snapshot', (await r3.refresh()) === 'failed' &&
-    get(r3.data) === 'kept' && get(r3.refreshError) === 'offline' && get(r3.error) === null);
+  let calls = 0;
+  const r3 = createResource(() => ((calls += 1) === 1 ? Promise.resolve('first') : Promise.reject(new Error('offline'))));
+  check('first load applies', (await r3.refresh()) === 'applied');
+  check('failed refresh keeps data with notice', (await r3.refresh()) === 'failed' &&
+    get(r3.data) === 'first' && get(r3.refreshError) === 'offline' && get(r3.error) === null);
   // Invalidate voids in flight without clearing rendered data.
+  let answer = () => Promise.resolve('seeded');
+  const r4 = createResource(() => answer());
+  check('seed applies', (await r4.refresh()) === 'applied');
   const gate = deferred();
-  const r4 = createResource(() => gate.promise, { initial: 'shown' });
+  answer = () => gate.promise;
   const pending = r4.refresh();
   r4.invalidate();
   gate.resolve('late');
-  check('invalidated refresh stays out', (await pending) === 'stale' && get(r4.data) === 'shown');
+  check('invalidated refresh keeps rendered data',
+    (await pending) === 'stale' && get(r4.data) === 'seeded' &&
+    get(r4.error) === null && get(r4.refreshError) === null);
 }
 {
   const { get } = await import('svelte/store');

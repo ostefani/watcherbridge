@@ -124,6 +124,10 @@ time {
   color: var(--muted);
   font-size: 13px;
 }
+/* TRANSITIONAL: the .pill family (including .priority and both data-*
+   variants) transfers to a Pill component when its last global consumer
+   migrates — find them with: grep -rn 'class="[^"]*\bpill\b' src.
+   Do not extend these rules; new screens use the component. */
 .pill {
   display: inline-flex;
   align-items: center;
@@ -389,6 +393,9 @@ time {
   font-weight: 400;
   color: var(--muted);
 }
+/* TRANSITIONAL: .sources transfers to components/SourceCard when its
+   last global consumer migrates — find them with:
+   grep -rn 'class="[^"]*\bsources\b' src. New screens use their own module. */
 .sources {
   list-style: none;
   padding: 0;
@@ -557,26 +564,9 @@ details>section {
   padding: 16px 0;
   border-top: 1px solid var(--border);
 }
-.health-metrics {
-  display: grid;
-  grid-template-columns: repeat(5,minmax(0,1fr));
-  gap: 12px;
-  margin-bottom: 0;
-}
-.health-metrics>div {
-  background: var(--subtle);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 16px;
-}
-.health-metrics dd {
-  font-size: 26px;
-  margin-top: 10px;
-}
-.health-metrics small {
-  font-size: 13px;
-  color: var(--muted);
-}
+/* .health-metrics moved to components/HealthSummary/HealthSummary.module.css
+   (sole consumer). The `health-metrics` hook class stays on the element so
+   `dl:not(.digest,…)` below keeps excluding it. */
 .stepper {
   display: flex;
   flex-wrap: wrap;
@@ -637,9 +627,6 @@ label input:not([type=checkbox],[type=radio]),label select,label textarea {
   .detail-pane {
     position: static;
   }
-  .health-metrics {
-    grid-template-columns: repeat(3,minmax(0,1fr));
-  }
 }
 @media(max-width:640px) {
   .briefing .stepper {
@@ -691,9 +678,6 @@ label input:not([type=checkbox],[type=radio]),label select,label textarea {
   }
   dd {
     margin-bottom: 10px;
-  }
-  .health-metrics {
-    grid-template-columns: repeat(2,minmax(0,1fr));
   }
 }
 
