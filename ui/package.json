@@ -1,7 +1,7 @@
 {
   "name": "watcherbridge-ui",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "WatcherBridge local viewer (Svelte 5 + Vite, JavaScript only)",
   "type": "module",
   "engines": {
@@ -12,7 +12,9 @@
     "build": "vite build",
     "lint": "eslint . --max-warnings 0",
     "size": "node ./scripts/size.mjs",
-    "smoke": "node ./scripts/smoke.mjs"
+    "smoke": "node ./scripts/smoke.mjs",
+    "characterize": "node ./scripts/characterize.mjs",
+    "styleguard": "node ./scripts/styleguard.mjs"
   },
   "dependencies": {
     "svelte": "5.57.3"

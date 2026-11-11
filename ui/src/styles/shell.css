@@ -1,0 +1,20 @@
+/* App shell composition: the content pane owned by App.svelte.
+   Page-unique hooks (one main per app); responsive padding lives with
+   the pane it sizes. Header, footer, help and skip-link internals are
+   styled in their own component modules. */
+.shell-main {
+  max-width: 1500px;
+  margin: 0 auto;
+  padding: 28px;
+  min-height: calc(100dvh - 160px);
+}
+
+.shell-main:focus {
+  outline: none;
+}
+
+@media (max-width: 640px) {
+  .shell-main {
+    padding: 16px;
+  }
+}

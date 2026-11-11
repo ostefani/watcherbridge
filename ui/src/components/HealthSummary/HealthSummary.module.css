@@ -1,0 +1,30 @@
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(5,minmax(0,1fr));
+  gap: 12px;
+  margin-bottom: 0;
+}
+.metrics>div {
+  background: var(--subtle);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+.metrics dd {
+  font-size: 26px;
+  margin-top: 10px;
+}
+.metrics small {
+  font-size: 13px;
+  color: var(--muted);
+}
+@media(max-width:1050px) {
+  .metrics {
+    grid-template-columns: repeat(3,minmax(0,1fr));
+  }
+}
+@media(max-width:640px) {
+  .metrics {
+    grid-template-columns: repeat(2,minmax(0,1fr));
+  }
+}

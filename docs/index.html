@@ -97,7 +97,12 @@
               <dl class="readout"><div><dt>Storage</dt><dd>Local SQLite</dd></div><div><dt>Evidence</dt><dd>Original signed report</dd></div><div><dt>Identity</dt><dd>Scanner-reported</dd></div></dl>
             </article>
             <article id="explain" class="stage">
-              <div><p class="eyebrow">03 / Optional AI</p><h3>Explain the change.</h3><p>Local rules set the priority floor. If configured, AI can explain the change using redacted context and may suggest a one-level increase up to high. A final leak check guards provider requests. If the model fails, the bridge stores a marked fallback.</p></div>
+              <div>
+                <p class="eyebrow">03 / Optional AI</p>
+                <h3>Explain the change.</h3>
+                <p>Local rules set the priority floor. If configured, AI can explain the change using redacted context and may suggest a one-level increase up to high. A final leak check guards provider requests. If the model fails, the bridge stores a marked fallback.</p>
+                <p>When enabled, the AI investigator can use read-only tools to look up retained scanner reports about host history, services, and similar changes. The briefing can cite supporting evidence and show where lookups were incomplete.</p>
+              </div>
               <dl class="readout"><div><dt>Example finding</dt><dd>Scanner reported a host appearance</dd></div><div><dt>Suggested check</dt><dd>Confirm against your asset inventory</dd></div><div><dt>Model context</dt><dd>Redacted by default</dd></div></dl>
             </article>
             <article id="decide" class="stage">
@@ -112,8 +117,8 @@
     <section id="review" class="review wrap" aria-labelledby="review-title">
       <p class="eyebrow">02 / Review workflow</p>
       <div class="section-heading">
-        <h2 id="review-title">From one report<br>to the bigger picture.</h2>
-        <p>The local dashboard brings together scanner evidence, priority reasoning, and operator decisions.</p>
+        <h2 id="review-title">From report to decision.</h2>
+        <p>Review what the scanner reported, see why it was prioritized, and record your decision in the local dashboard.</p>
       </div>
       <div class="review-grid">
         <figure class="product-shot">
@@ -121,9 +126,21 @@
           <figcaption>Briefing detail / Synthetic demonstration data</figcaption>
         </figure>
         <div class="features">
-          <article><span>01</span><div><h3>Review related changes together</h3><p>Qualifying appearance or disappearance briefings from the same source and target can form one incident with links to its members.</p></div></article>
-          <article><span>02</span><div><h3>Turn repeat decisions into policy</h3><p>By default, three matching, eligible “expected” decisions can produce a rule proposal for operator approval.</p></div></article>
-          <article><span>03</span><div><h3>See where coverage is uncertain</h3><p>The overview pairs an Act, Review, or Quiet verdict with per-source coverage. Liveness stays unknown until heartbeat capability is established.</p></div></article>
+          <article>
+            <span aria-hidden="true">01</span>
+            <h3>Review related changes</h3>
+            <p>WatcherBridge groups qualifying appearance or disappearance reports into incidents. Optional AI summaries for closed incidents show how many briefings were sampled or omitted, label hypotheses, and can cite member briefings.</p>
+          </article>
+          <article>
+            <span aria-hidden="true">02</span>
+            <h3>Approve review rules</h3>
+            <p>By default, three matching, eligible “expected” decisions can trigger a rule proposal. An operator decides whether to approve it.</p>
+          </article>
+          <article>
+            <span aria-hidden="true">03</span>
+            <h3>Check scanner coverage</h3>
+            <p>See the Act, Review, or Quiet verdict beside each source’s coverage. A source’s liveness stays unknown until it sends a heartbeat.</p>
+          </article>
         </div>
       </div>
     </section>

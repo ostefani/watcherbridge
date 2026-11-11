@@ -1,0 +1,51 @@
+.historyHeading {
+  margin: 24px 0 12px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.emptyHistory {
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 0;
+}
+
+.trail {
+  padding: 0;
+  list-style: none;
+}
+
+.trail li {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  padding: 12px 0;
+  font-size: 13px;
+}
+
+.trail time {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.trail .text {
+  flex-basis: 100%;
+  overflow-wrap: anywhere;
+}
+
+.trail .until {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.trail button {
+  min-height: 32px;
+  padding: 4px 8px;
+  font-size: 12px;
+}

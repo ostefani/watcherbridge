@@ -1,0 +1,7 @@
+.help {
+  margin: 16px 28px;
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
