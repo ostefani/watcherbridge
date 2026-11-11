@@ -148,6 +148,20 @@ func (s *Store) TakeGroup(ctx context.Context, groupID string) (TakenGroup, erro
 // the state check and unique briefing index). See Designv5 settings.
 func (s *Store) ReleaseStale(ctx context.Context, now time.Time, maxAge time.Duration) ([]string, error) {
 	cutoff := nanos(now.Add(-maxAge))
+	// Idle ticks are the common case: check for candidates with a
+	// read-only query first so an idle tick never opens a write
+	// transaction (channel round-trip, writer-queue slot, empty
+	// commit). A row created between this read and the write below is
+	// harmless: the guarded UPDATE skips rows that changed state, and
+	// the next tick re-reads. All actual mutations still go through
+	// the single writer below.
+	var idle bool
+	if err := s.db.QueryRowContext(ctx, `SELECT NOT EXISTS (SELECT 1 FROM active_groups WHERE status = 'processing' AND processing_since IS NOT NULL AND processing_since <= ?)`, cutoff).Scan(&idle); err != nil {
+		return nil, err
+	}
+	if idle {
+		return nil, nil
+	}
 	var ids []string
 	err := s.write(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.Query(`SELECT group_id FROM active_groups WHERE status = 'processing' AND processing_since IS NOT NULL AND processing_since <= ?`, cutoff)
@@ -238,6 +252,20 @@ func (s *Store) Recover(ctx context.Context, now time.Time) ([]string, error) {
 // runtime tick counterpart of Recover (which is startup-only): it never
 // touches processing groups, so in-flight briefings are not requeued.
 func (s *Store) CloseDue(ctx context.Context, now time.Time) ([]string, error) {
+	// Idle ticks are the common case: check for candidates with a
+	// read-only query first so an idle tick never opens a write
+	// transaction (channel round-trip, writer-queue slot, empty
+	// commit). A row created between this read and the write below is
+	// harmless: the guarded UPDATE skips rows that changed state, and
+	// the next tick re-reads. All actual mutations still go through
+	// the single writer below.
+	var idle bool
+	if err := s.db.QueryRowContext(ctx, `SELECT NOT EXISTS (SELECT 1 FROM active_groups WHERE status = 'open' AND deadline_at <= ?)`, nanos(now)).Scan(&idle); err != nil {
+		return nil, err
+	}
+	if idle {
+		return nil, nil
+	}
 	var ids []string
 	err := s.write(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.Query(`SELECT group_id FROM active_groups WHERE status = 'open' AND deadline_at <= ?`, nanos(now))
