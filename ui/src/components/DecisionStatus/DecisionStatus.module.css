@@ -1,0 +1,33 @@
+.title {
+  font-size: 20px;
+  margin-bottom: 10px;
+  letter-spacing: -.4px;
+}
+
+.status {
+  margin-bottom: 20px;
+}
+
+.status .review {
+  padding: 5px 11px;
+  font-size: 12px;
+}
+
+.status .review[data-review=unreviewed],
+.status .review[data-review=snooze] {
+  color: var(--warning);
+  border-color: var(--warning-border);
+  background: var(--warning-bg);
+}
+
+.status .review[data-review=expected] {
+  color: var(--success);
+  border-color: var(--success-border);
+  background: var(--success-bg);
+}
+
+.status .review[data-review=not_expected] {
+  color: var(--danger);
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+}

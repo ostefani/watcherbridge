@@ -52,6 +52,7 @@ for (const full of collectSvelte(src)) {
     .replaceAll(/from '(\.\/[^']+)\.svelte'/g, "from '$1.js'")
     .replaceAll(/from '@\/(?:components|containers)\/[^/]+\/([^']+)\.svelte'/g, "from './$1.js'")
     .replaceAll("from '@/api.js'", "from './api.js'")
+    .replaceAll(/from '@\/lib\/(?:[^']*\/)?([^'/]+)\.svelte'/g, "from './$1.js'")
     .replaceAll(/from '@\/lib\/(?:[^']*\/)?([^'/]+)'/g, "from './$1'")
     .replaceAll(/from '[^']*\.module\.css'/g, "from './css-stub.js'");
   writeFileSync(join(out, base.replace(/\.svelte$/, '.js')), code);
@@ -85,7 +86,13 @@ for (const full of collectJs(lib)) {
     throw new Error(`smoke: duplicate helper basename ${base}; basenames must stay unique`);
   }
   seen.add(base);
-  writeFileSync(join(out, base), readFileSync(full, 'utf8'));
+  // Helpers import each other through `@/`, which plain node cannot
+  // resolve here — map them onto the flat copies like the compiled
+  // components above, so a new helper import just lands.
+  const helperCode = readFileSync(full, 'utf8')
+    .replaceAll("from '@/api.js'", "from './api.js'")
+    .replaceAll(/from '@\/lib\/(?:[^']*\/)?([^'/]+)'/g, "from './$1'");
+  writeFileSync(join(out, base), helperCode);
 }
 // NOTE: the flat `.smoke-tmp` layout is a permanent constraint — every
 // compiled component and helper shares one directory, so basenames must
@@ -94,17 +101,17 @@ for (const full of collectJs(lib)) {
 // The specifier is built from constants (own temp dir, fixed name),
 // never from network or user input.
 // eslint-disable-next-line no-unsanitized/method
-const { default: Home } = await import(pathToFileURL(join(out, 'Home.js')).href);
+const { default: HomeContainer } = await import(pathToFileURL(join(out, 'HomeContainer.js')).href);
 // eslint-disable-next-line no-unsanitized/method
-const { default: Detail } = await import(pathToFileURL(join(out, 'Detail.js')).href);
+const { default: BriefingContainer } = await import(pathToFileURL(join(out, 'BriefingContainer.js')).href);
 // eslint-disable-next-line no-unsanitized/method
-const { default: Devices } = await import(pathToFileURL(join(out, 'Devices.js')).href);
+const { default: DevicesContainer } = await import(pathToFileURL(join(out, 'DevicesContainer.js')).href);
 // eslint-disable-next-line no-unsanitized/method
-const { default: Device } = await import(pathToFileURL(join(out, 'Device.js')).href);
+const { default: DeviceContainer } = await import(pathToFileURL(join(out, 'DeviceContainer.js')).href);
 // eslint-disable-next-line no-unsanitized/method
 const { default: HealthContainer } = await import(pathToFileURL(join(out, 'HealthContainer.js')).href);
 // eslint-disable-next-line no-unsanitized/method
-const { default: Incident } = await import(pathToFileURL(join(out, 'Incident.js')).href);
+const { default: IncidentContainer } = await import(pathToFileURL(join(out, 'IncidentContainer.js')).href);
 
 // eslint-disable-next-line no-unsanitized/method
 const { default: AttentionList } = await import(pathToFileURL(join(out, 'AttentionList.js')).href);
@@ -361,7 +368,7 @@ const healthFixture = {
 
 const cases = [
   {
-    component: Detail,
+    component: BriefingContainer,
     name: 'detail full with hostile text',
     props: { id: 'brf-grp-1', initial: detailFixture },
     expect: [
@@ -391,7 +398,7 @@ const cases = [
     absent: ['<img', '<b>']
   },
   {
-    component: Detail,
+    component: BriefingContainer,
     name: 'detail with agent trace',
     props: { id: 'brf-agent-1', initial: traceFixture },
     expect: [
@@ -414,10 +421,9 @@ const cases = [
     ]
   },
   {
-    component: Devices,
+    component: DevicesContainer,
     name: 'devices list',
     props: {
-      stream: 'live',
       initial: {
         devices: [
           { ...legacyDevice, history: undefined },
@@ -435,9 +441,9 @@ const cases = [
     absent: ['<img']
   },
   {
-    component: Device,
+    component: DeviceContainer,
     name: 'legacy device with hostile label',
-    props: { id: legacyDevice.profile_id, stream: 'live', initial: legacyDevice },
+    props: { id: legacyDevice.profile_id, initial: legacyDevice },
     expect: [
       'Earlier bridge-inferred association; not used for current identity',
       'Your label',
@@ -456,7 +462,7 @@ const cases = [
   {
     component: HealthContainer,
     name: 'health with purge failure',
-    props: { stream: 'live', initial: healthFixture },
+    props: { initial: healthFixture },
     expect: [
       'data-state="degraded"',
       'Awaiting operator</dt><dd>1',
@@ -473,7 +479,7 @@ const cases = [
   {
     component: HealthContainer,
     name: 'health with partial heartbeat',
-    props: { stream: 'live', initial: {
+    props: { initial: {
       ...healthFixture,
       sources: [{
         scope: 'lab', status: 'degraded', liveness: 'reporting', heartbeat_enabled: true,
@@ -557,7 +563,7 @@ const cases = [
     expect: ['Overview unavailable', 'overview 500']
   },
   {
-    component: Incident,
+    component: IncidentContainer,
     name: 'incident detail with shared evidence',
     props: { id: 'inc-11-22', initial: incidentFixture },
     expect: [
@@ -581,7 +587,7 @@ const cases = [
     absent: ['<img', 'More members exist than shown']
   },
   {
-    component: Incident,
+    component: IncidentContainer,
     name: 'incident closed and truncated',
     props: {
       id: 'inc-11-22',
@@ -645,9 +651,9 @@ if (reviewTitle('port_closed', confidenceViews('high', 'low')) !== 'Ports closed
   throw new Error('Specific reported-change categories must retain their title');
 }
 cases.push(
-  { component: Detail, name: 'appearance review uses reported event title', props: { id: 'brf-grp-1', initial: { ...detailFixture, kind: 'other', observations: [], referenced_events: [{ event_id: 'evt-1', event_type: 'host.appeared' }] } }, expect: ['New host reported</h2>'], absent: ['Other changes', confidenceTitle] },
+  { component: BriefingContainer, name: 'appearance review uses reported event title', props: { id: 'brf-grp-1', initial: { ...detailFixture, kind: 'other', observations: [], referenced_events: [{ event_id: 'evt-1', event_type: 'host.appeared' }] } }, expect: ['New host reported</h2>'], absent: ['Other changes', confidenceTitle] },
   { component: AttentionList, name: 'unloaded other review has neutral heading', props: { items: [{ ...attentionItem, change_kind: 'other' }] }, expect: ['Reported details changed'], absent: ['Other changes', confidenceTitle] },
-  { component: Detail, name: 'reported confidence decrease heading', props: { id: 'brf-grp-1', initial: { ...detailFixture, kind: 'other', observations: confidenceViews('high', 'low') } }, expect: [`${confidenceTitle}</h2>`] },
+  { component: BriefingContainer, name: 'reported confidence decrease heading', props: { id: 'brf-grp-1', initial: { ...detailFixture, kind: 'other', observations: confidenceViews('high', 'low') } }, expect: [`${confidenceTitle}</h2>`] },
   { component: AttentionList, name: 'loaded review title in attention list', props: { items: [{ ...attentionItem, change_kind: 'other' }], titles: { [attentionItem.id]: confidenceTitle } }, expect: [confidenceTitle], absent: ['Other changes'] }
 );
 for (const [types, expected] of [
@@ -665,11 +671,11 @@ cases.push(
   { component: AttentionList, name: 'standalone review navigation', props: { items: [attentionItem] }, expect: ['href="#/briefing/brf-grp-1"', 'Ports closed'] },
   { component: AttentionList, name: 'standalone incident navigation', props: { items: [{ ...attentionItem, id: 'inc-11-22', kind: 'incident' }] }, expect: ['href="#/incidents/inc-11-22"', 'Show members'] },
   { component: AttentionList, name: 'selected review button', props: { items: [attentionItem], selectedId: attentionItem.id, onselect: () => {} }, expect: ['<button', 'aria-current="true"', 'data-row'], absent: ['href="#/briefing/'] },
-  { component: Detail, name: 'embedded briefing keeps evidence and decisions', props: { id: 'brf-grp-1', initial: detailFixture, embedded: true }, expect: ['Saved scanner reports', 'Record decision', 'Recommended check'], absent: ['Back to Home', '<img'] },
-  { component: Detail, name: 'null model suggestion stands on baseline', props: { id: 'brf-grp-1', initial: { ...detailFixture, model_suggestion: null } }, expect: ['No model suggestion — baseline stands'] },
-  { component: Detail, name: 'unlinked observation renders without a guessed link', props: { id: 'brf-grp-1', initial: { ...detailFixture, referenced_events: [{ event_id: 'evt-9', event_type: 'host.appeared' }], observations: [{ event_id: 'evt-9', view_role: 'host', reported_at: '2026-11-01T00:00:00Z', received_at: '2026-11-01T00:01:00Z', attributes: { hostname: 'lonely' }, ports_total: 0, ports_truncated: false }] } }, expect: ['No linked profile is available'] },
-  { component: Detail, name: 'server-classified unknown subject renders honestly', props: { id: 'brf-agent-1', initial: { ...traceFixture, traces: [{ step: 0, tool: 'get_reported_history', args: '{"host":"HOST_1"}', result: '{"tool":"get_reported_history","result":{"error":"unknown subject"}}', status: 'ok', duration_ms: 3, outcome: 'unknown_subject', summary: 'The investigator could not resolve this lookup to a permitted reported subject; history remains unknown.' }] } }, expect: ['unknown subject', 'The investigator could not resolve this lookup'] },
-  { component: Detail, name: 'missing report time stays explicit', props: { id: 'brf-grp-1', initial: { ...detailFixture, kind: 'other', observations: [], referenced_events: [{ event_id: 'evt-1', event_type: 'host.appeared' }] } }, expect: ['Report time', 'Not reported'] },
+  { component: BriefingContainer, name: 'embedded briefing keeps evidence and decisions', props: { id: 'brf-grp-1', initial: detailFixture, layout: 'embedded' }, expect: ['Saved scanner reports', 'Record decision', 'Recommended check'], absent: ['Back to Home', '<img'] },
+  { component: BriefingContainer, name: 'null model suggestion stands on baseline', props: { id: 'brf-grp-1', initial: { ...detailFixture, model_suggestion: null } }, expect: ['No model suggestion — baseline stands'] },
+  { component: BriefingContainer, name: 'unlinked observation renders without a guessed link', props: { id: 'brf-grp-1', initial: { ...detailFixture, referenced_events: [{ event_id: 'evt-9', event_type: 'host.appeared' }], observations: [{ event_id: 'evt-9', view_role: 'host', reported_at: '2026-11-01T00:00:00Z', received_at: '2026-11-01T00:01:00Z', attributes: { hostname: 'lonely' }, ports_total: 0, ports_truncated: false }] } }, expect: ['No linked profile is available'] },
+  { component: BriefingContainer, name: 'server-classified unknown subject renders honestly', props: { id: 'brf-agent-1', initial: { ...traceFixture, traces: [{ step: 0, tool: 'get_reported_history', args: '{"host":"HOST_1"}', result: '{"tool":"get_reported_history","result":{"error":"unknown subject"}}', status: 'ok', duration_ms: 3, outcome: 'unknown_subject', summary: 'The investigator could not resolve this lookup to a permitted reported subject; history remains unknown.' }] } }, expect: ['unknown subject', 'The investigator could not resolve this lookup'] },
+  { component: BriefingContainer, name: 'missing report time stays explicit', props: { id: 'brf-grp-1', initial: { ...detailFixture, kind: 'other', observations: [], referenced_events: [{ event_id: 'evt-1', event_type: 'host.appeared' }] } }, expect: ['Report time', 'Not reported'] },
 );
 
 const appearanceFixture = {
@@ -679,8 +685,8 @@ const appearanceFixture = {
   decisions: [], effective_review: null
 };
 cases.push(
-  { component: Detail, name: 'appearance provides actionable identity and explicit review', props: { id: 'appearance', initial: appearanceFixture }, expect: ['Reported host', 'review-demo', '192.0.2.10', '02:00:00:00:00:10', '192.0.2.0/24', 'Your decision', 'No operator review', 'Scanner snapshot', 'aria-label="Copy IP address"', 'data-evidence="event:appearance-1"'], absent: ['href="#evt-', 'href="#step-', 'checked', 'Locally administered', 'Demo data', 'Reported by'] },
-  { component: Detail, name: 'partial evidence cannot become a single host summary', props: { id: 'appearance', initial: { ...appearanceFixture, observations_truncated: true } }, expect: ['Only part of the retained evidence is shown', 'some saved views are omitted'], absent: ['<dt>Reported host</dt>'] }
+  { component: BriefingContainer, name: 'appearance provides actionable identity and explicit review', props: { id: 'appearance', initial: appearanceFixture }, expect: ['Reported host', 'review-demo', '192.0.2.10', '02:00:00:00:00:10', '192.0.2.0/24', 'Your decision', 'No operator review', 'Scanner snapshot', 'aria-label="Copy IP address"', 'data-evidence="event:appearance-1"'], absent: ['href="#evt-', 'href="#step-', 'checked', 'Locally administered', 'Demo data', 'Reported by'] },
+  { component: BriefingContainer, name: 'partial evidence cannot become a single host summary', props: { id: 'appearance', initial: { ...appearanceFixture, observations_truncated: true } }, expect: ['Only part of the retained evidence is shown', 'some saved views are omitted'], absent: ['<dt>Reported host</dt>'] }
 );
 
 const { singleViewIdentity, reportRange } = await import('../src/lib/format.js');
@@ -716,10 +722,10 @@ for (const kind of ['briefing', 'incident']) {
 cases.push({ name: 'closed review allows empty layout', props: { overview: base(), selected: null }, expect: ['data-empty="true"'], absent: ['aria-label="Selected review"', 'Close review'] });
 
 for (const c of cases) {
-  const { body } = render(c.component ?? Home, { props: c.props });
+  const { body } = render(c.component ?? HomeContainer, { props: c.props });
   // Strip SSR hydration markers, which split copy across expressions.
   const stripped = body.replaceAll(/<!--.*?-->/g, '');
-  if (c.component === Incident && (stripped.includes('[object Object]') || !stripped.includes('Source: lab'))) {
+  if (c.component === IncidentContainer && (stripped.includes('[object Object]') || !stripped.includes('Source: lab'))) {
     console.error(`[${c.name}] incident timestamps or source scope rendered incorrectly`);
     failed++;
   }
@@ -818,29 +824,10 @@ if (failed > 0) {
 }
 console.log('smoke: freshness guard holds');
 
-// EventTarget exercises actual incident connection recovery without a
-// browser runner: live updates, reconnects and resync all invalidate,
-// and a closed connection cannot keep refreshing mounted screens.
-{
-  const { forwardIncidentEvents } = await import('../src/lib/incidentEvents.js');
-  const source = new EventTarget();
-  const target = new EventTarget();
-  let invalidations = 0;
-  let refreshes = 0;
-  target.addEventListener('watcherbridge:incident', () => invalidations++);
-  const stop = forwardIncidentEvents(source, target, () => refreshes++);
-  for (const kind of ['open', 'incident', 'resync', 'open']) {
-    source.dispatchEvent(new Event(kind));
-  }
-  if (invalidations !== 4 || refreshes !== 4) {
-    throw new Error('incident state did not recover on open/update/resync');
-  }
-  stop();
-  source.dispatchEvent(new Event('incident'));
-  if (invalidations !== 4 || refreshes !== 4) {
-    throw new Error('closed incident connection retained its listeners');
-  }
-}
+// Live incident invalidation now travels through the event stream's
+// incidentRevision counter (covered behaviorally by characterize);
+// the window-event forwarder it replaced is deleted, and screens
+// subscribe from context with a standalone fallback.
 
 // Exercise the same bounded continuation state the undo panel uses.
 {

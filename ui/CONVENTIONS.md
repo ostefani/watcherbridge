@@ -18,6 +18,12 @@ Enforced by `eslint.config.js` (`no-restricted-imports`); `App` has its own
 override as the single composer. `src/lib` holds no markup or CSS and never
 imports UI layers.
 
+Shared-widget exception (plan step 33): screens may embed
+`DecisionsContainer` — a subject-parameterized review widget with no page
+coupling — through a targeted `eslint-disable-next-line` at the import.
+Page containers (Home, Devices, Device, Incident, Briefing) stay
+App-composed; embedded full pages still arrive through App snippets.
+
 ## Layout
 
 Every unit lives in its own folder — components included — so styles,
@@ -42,12 +48,16 @@ parent selectors reaching into children. Shared derivation lives in
 - The `.svelte` file has no `<style>` block; the CSS file next to it is
   the single owner of its classes. Scoping is enforced by hashed class
   names; hyphenated names use bracket access.
-- No cross-component styling. Today's `.decision-card .trail` and
-  `.dossier .briefing-heading` parent selectors become props or CSS
-  custom properties during migration.
-- Global CSS is only `styles/tokens.css` (custom properties, theming),
-  `styles/base.css` (element defaults) and `styles/utilities.css`
-  (`.sr-only`, `.mono`). Everything else gets an owner component.
+- No cross-component styling. The old `.decision-card .trail` parent
+  selectors are gone with the component split; the dossier keeps its
+  page-unique selectors in `styles/dossier.css` (verbatim move, zero
+  visual change) until a visual pass splits them per component.
+- Global CSS is `styles/tokens.css` (custom properties, theming),
+  `styles/base.css` (element defaults), `styles/utilities.css`
+  (`.sr-only`, `.mono`), `styles/dossier.css` (briefing page shell,
+  page-unique hooks) and `styles/shell.css` (app content pane). Only
+  page-unique selectors may live here; everything else gets an owner
+  component module. Enforced by `npm run styleguard` in `make ui-check`.
 - Server output must stay CSP-clean (separate CSS assets, no inline
   styles); `smoke.mjs` stubs CSS imports for SSR.
 
@@ -61,11 +71,14 @@ allowlist / forbidden automation stack). JSDoc wire typedefs with
 
 - `npm run smoke` — SSR render assertions (wire shapes, hostile text
   inertness) plus pure-unit asserts (guard, paging, undo, purge).
-- `npm run characterize` — pins current behavior (20 checks) and three
-  failing bug pins (BUG-1 shared reload/page guard, BUG-2 Detail id
-  reset, BUG-3 Health snapshot reconnect). Pins flip green with their
-  owning migrations; the harness is intentionally not in `make ui-check`
-  until the pins clear (wiring is a step-38 gate decision).
+- `npm run characterize` — pins current behavior plus unit coverage
+  for `lib/async` fencing, pager seeding/replace, briefing derivations
+  and the evidence-key contract. The BUG-1/2/3 pins flipped green with
+  their owning migrations (Devices pager, Briefing resource reset,
+  Health snapshot reconnect); only lifecycle behavior stays on the
+  manual checklist, which smoke cannot mount.
+- `npm run styleguard` — fails on any inline `<style>` block; runs in
+  `make ui-check`.
 - Release sign-off remains the human walkthrough in
   `.innerdoc/ui-manual-checklist.md`.
 

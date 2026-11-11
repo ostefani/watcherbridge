@@ -122,27 +122,83 @@ function bugPin(id, name, cond) {
     randomizedLabel(false).startsWith('Not randomized') && randomizedLabel(null) === 'Randomization unknown');
 }
 
-// BUG-1: Devices reload and load-more share one guard. A reload that
-// starts first and lands after a page start is dropped, so the list
-// keeps stale rows and appends the page onto them. Phase 2 gives each
-// operation its own guard (latestOnly per operation).
+// BUG-1 (fixed by the Devices migration): reload and load-more run on
+// independent operations inside createPager, so a reload that lands
+// after a page start still applies instead of being dropped.
 {
-  const guard = createFetchGuard();
-  const reloadToken = guard.start();
-  guard.start(); // concurrent load-more intent takes the single slot
-  bugPin('BUG-1', 'reload completion applies after a concurrent page start', guard.current(reloadToken));
+  const { get } = await import('svelte/store');
+  const { createPager } = await import('../src/lib/async/pager.js');
+  const pending = [];
+  const pager = createPager({
+    fetchPage: (cursor) => new Promise((resolve) => pending.push({ cursor, resolve })),
+    keyOf: (r) => r.id, cap: 10
+  });
+  const pReset = pager.loadMore(true); // reload starts first
+  const pPage = pager.loadMore(); // page starts after, lands first
+  pending[1].resolve({ rows: [{ id: 'p' }], nextAfter: 'p1' });
+  check('page landing first applies', (await pPage) === 'applied' && get(pager.rows).length === 1);
+  pending[0].resolve({ rows: [{ id: 'r' }], nextAfter: '' });
+  check('reload landing after a page start still applies',
+    (await pReset) === 'applied' && get(pager.rows).length === 1 && get(pager.rows)[0].id === 'r' &&
+    get(pager.exhausted));
+  // Snapshot seeding: seeded rows render with no fetch; a failed reset
+  // keeps them with an error instead of emptying the list.
+  const seeded = createPager({
+    fetchPage: async () => { throw new Error('offline'); },
+    keyOf: (r) => r.id, cap: 10,
+    // Thunk form, as .svelte callers pass it (init-capture rule).
+    initial: () => ({ rows: [{ id: 's' }], nextAfter: 'c9' })
+  });
+  check('seed renders without fetching', get(seeded.rows).length === 1 && get(seeded.started) === true);
+  check('failed reset keeps the seed with an error',
+    (await seeded.reset()) === 'failed' && get(seeded.rows).length === 1 && get(seeded.error) === 'offline');
 }
 
-// BUG-2: Detail keeps the previous briefing rendered while the next
-// id fetches (embedded selected-review switches briefings without
-// resetting). Structural pin: the id-change effect must clear the
-// rendered briefing before refetching. Phase 5 replaces this with a
-// keyed resource reset covered by a behavioral test.
+// lib/format/briefingView: pure dossier derivations with unit coverage.
 {
-  const detail = readFileSync(join(root, 'src/lib/Detail.svelte'), 'utf8');
-  const effect = detail.slice(detail.indexOf('Refetch only when the briefing ID changes'));
-  bugPin('BUG-2', 'id change clears the rendered briefing before refetch',
-    /detail\s*=\s*null/.test(effect.split('$effect')[1] ?? ''));
+  const { priorityDiffers, lookupLimits, lookupReceipts, identityComplete } = await import('../src/lib/format/briefingView.js');
+  check('equal values collapse the comparison',
+    !priorityDiffers({ clamped: false, baseline: 'low', priority: 'low', model_suggestion: 'low' }));
+  check('null suggestion falls back to baseline',
+    !priorityDiffers({ clamped: false, baseline: 'low', priority: 'low', model_suggestion: null }));
+  check('raise or clamp opens the comparison',
+    priorityDiffers({ clamped: false, baseline: 'low', priority: 'medium', model_suggestion: 'medium' }) &&
+    priorityDiffers({ clamped: true, baseline: 'low', priority: 'low', model_suggestion: 'low' }));
+  check('null briefing collapses', !priorityDiffers(null));
+  const traces = [
+    { step: 0, summary: 'history', outcome: 'ok' },
+    { step: 1, summary: 'history', outcome: 'ok' },
+    { step: 2, summary: 'other', outcome: 'unknown_subject' }
+  ];
+  check('only failing lookups limit context',
+    lookupLimits(traces).length === 1 && lookupLimits(traces)[0].step === 2);
+  const receipts = lookupReceipts(traces);
+  check('receipts group by summary in first-seen order',
+    receipts.length === 2 && receipts[0].steps.join(',') === '0,1' && receipts[1].key === 'other');
+  check('complete dossier needs full retention',
+    identityComplete({ observations_truncated: false, referenced_truncated: false }) &&
+    !identityComplete({ observations_truncated: true, referenced_truncated: false }) &&
+    !identityComplete(null));
+}
+
+// lib/format/evidence: the navigation key contract.
+{
+  const { eventKey, stepKey, REPORTS_KEY } = await import('../src/lib/format/evidence.js');
+  check('evidence keys are explicit',
+    eventKey('evt-1') === 'event:evt-1' && stepKey(2) === 'step:2' && REPORTS_KEY === 'reports');
+}
+
+// BUG-2 (fixed by the Briefing migration): the briefing resource
+// resets when the id changes, so the previous briefing never renders
+// while the next one fetches. Resetting is lifecycle, so the pin stays
+// structural on the owning mechanism; selection switches stay on the
+// manual checklist with the rest of the runtime behavior smoke cannot
+// mount.
+{
+  const container = readFileSync(join(root, 'src/containers/BriefingContainer/BriefingContainer.svelte'), 'utf8');
+  const effect = container.slice(container.indexOf('Reset the resource'));
+  bugPin('BUG-2', 'id change resets the briefing resource before refetch',
+    /createResource/.test(effect) && /invalidate/.test(effect));
 }
 
 // Reconnect edge and failure visibility, behaviorally. BUG-3's fix is
@@ -241,6 +297,15 @@ function bugPin(id, name, cond) {
   });
   await capped.loadMore();
   check('cap flag names the limit', get(capped.capped) === true);
+  // Replace restarts from applied data: in-flight pages land stale.
+  const gated = (() => { let r; const p = new Promise((res) => { r = res; }); return { promise: p, resolve: r }; })();
+  const swapping = createPager({ fetchPage: () => gated.promise, keyOf: (r) => r.id, cap: 10 });
+  const late = swapping.loadMore();
+  swapping.replace([{ id: 'fresh' }], '');
+  gated.resolve({ rows: [{ id: 'old' }], nextAfter: 'c' });
+  check('replace wins over an in-flight page',
+    (await late) === 'stale' && get(swapping.rows).length === 1 && get(swapping.rows)[0].id === 'fresh' &&
+    get(swapping.exhausted) === true && get(swapping.error) === null);
 }
 
 // lib/events: transport lifecycle with injectable source and scheduler.

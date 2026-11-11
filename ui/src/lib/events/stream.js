@@ -5,9 +5,9 @@
 // No module singletons: App creates one instance and shares it through
 // `./context.js`, so prerender never connects.
 //
-// Mirrors the current App wiring: `open`/`incident`/`resync` all mean
-// "incident state may have changed" (see `../incidentEvents.js`, which
-// this replaces at migration time).
+// `open`/`incident`/`resync` all mean "incident state may have
+// changed". Screens subscribe to `incidentRevision` from context, so
+// no window-event bus remains.
 
 import { writable } from 'svelte/store';
 

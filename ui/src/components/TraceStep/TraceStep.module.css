@@ -1,0 +1,15 @@
+.step {
+  list-style: none;
+  border-top: 1px solid var(--border);
+  padding: 12px 0;
+}
+
+.toolName {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.step p {
+  margin: 8px 0;
+}

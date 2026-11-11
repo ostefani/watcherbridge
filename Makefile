@@ -1,7 +1,8 @@
 # WatcherBridge make targets. Go targets use the module cache; UI
 # targets run inside ui/ with the pinned Node toolchain (.nvmrc).
 # `make ui-check` is the Step 22 gate: lint (a11y warnings fatal),
-# committed-dist build, and the 200 KiB gzip budget.
+# no-inline-style guard, committed-dist build, and the 200 KiB gzip
+# budget.
 
 .PHONY: ui ui-check ui-drift
 
@@ -9,7 +10,7 @@ ui:
 	cd ui && npm ci --no-audit --no-fund && npm run build
 
 ui-check:
-	cd ui && npm ci --no-audit --no-fund && npm run lint && npm run build && npm run smoke && npm run size
+	cd ui && npm ci --no-audit --no-fund && npm run lint && npm run styleguard && npm run build && npm run smoke && npm run size
 
 # ui-drift rebuilds the bundle and fails when the committed output
 # differs: internal/viewer/web/dist must always match ui/ sources.

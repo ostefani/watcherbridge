@@ -600,22 +600,9 @@ label {
 label input:not([type=checkbox],[type=radio]),label select,label textarea {
   margin-top: 4px;
 }
-.trail {
-  list-style: none;
-  padding: 0;
-}
-.trail li {
-  border-top: 1px solid var(--border);
-  padding: 12px 0;
-  font-size: 13px;
-}
-.trail .text {
-  overflow-wrap: anywhere;
-}
-.trail .until {
-  color: var(--muted);
-  font-size: 12px;
-}
+/* The decision trail moved to components/DecisionTrail with its own
+   module (transitional global rules removed once the last global
+   consumer migrated). */
 @media(max-width:1050px) {
   .review-workspace {
     grid-template-columns: minmax(0,1fr);

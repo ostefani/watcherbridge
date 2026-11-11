@@ -3,6 +3,7 @@
   import { fetchHealth } from '@/api.js';
   import { createResource, failureNotice } from '@/lib/async/resource.js';
   import { shouldRefreshOnReconnect } from '@/lib/events/reconnect.js';
+  import { getConnectionOrNull } from '@/lib/events/context.js';
   import HealthSummary from '@/components/HealthSummary/HealthSummary.svelte';
   import SourceList from '@/components/SourceList/SourceList.svelte';
   import PipelineDetails from '@/components/PipelineDetails/PipelineDetails.svelte';
@@ -14,7 +15,11 @@
   // `initial` carries a prerender snapshot. A failed refresh keeps
   // rendered data with a notice and Retry; only a data-less failure
   // becomes an error.
-  let { stream, initial = null } = $props();
+  let { initial = null } = $props();
+
+  // Liveness comes from the shared connection (context), never a
+  // drilled prop; standalone renders simply never refresh on an edge.
+  const connection = getConnectionOrNull();
 
   // Snapshot-first rendering: fetched data wins once it lands, but the
   // mount-time snapshot fills in until (or instead of) the fetch. Reads
@@ -38,12 +43,17 @@
   // stale (was BUG-3: the edge required fetched data to exist).
   let wasLive = false;
   $effect(() => {
-    const live = stream === 'live';
-    const edge = shouldRefreshOnReconnect({ live, wasLive, data: $data, initial });
-    wasLive = live;
-    if (edge) {
-      resource.refresh();
+    if (!connection) {
+      return;
     }
+    return connection.connection.subscribe((state) => {
+      const live = state === 'live';
+      const edge = shouldRefreshOnReconnect({ live, wasLive, data: $data, initial });
+      wasLive = live;
+      if (edge) {
+        resource.refresh();
+      }
+    });
   });
 </script>
 

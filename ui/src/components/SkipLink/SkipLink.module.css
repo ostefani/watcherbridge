@@ -1,0 +1,12 @@
+.skip {
+  position: fixed;
+  left: 16px;
+  top: -100px;
+  z-index: 10;
+  padding: 12px;
+  background: var(--surface);
+}
+
+.skip:focus {
+  top: 12px;
+}

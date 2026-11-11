@@ -17,3 +17,18 @@ export function setConnection(stream) {
 export function getConnection() {
   return getContext(KEY);
 }
+
+/**
+ * The connection, or null when rendered outside App (SSR harness,
+ * standalone screens). Screens use this to read connection state and
+ * the incident revision from context instead of prop drilling; the
+ * null path keeps direct renders working without a provider.
+ * @returns {ReturnType<import('./stream.js').createEventStream>|null}
+ */
+export function getConnectionOrNull() {
+  try {
+    return getConnection();
+  } catch {
+    return null;
+  }
+}

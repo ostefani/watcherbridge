@@ -1,0 +1,80 @@
+/* Briefing dossier page shell (plan step 34). Moved verbatim from the
+   old Detail screen's scoped <style>: every selector is already scoped
+   under page-unique hooks (.dossier, .dossier-card, .dossier-side, the
+   section classes below), so making them global changes no element.
+   Verified: none of these hooks occur in base.css, utilities.css or
+   any other screen. The single intentional rename is `.embedded` to
+   `[data-layout='embedded']`: the fork is now the BriefingContainer
+   `layout` prop ('page' | 'embedded'), not a bare class.
+   Component-level splitting waits for a visual pass: these rules
+   compose the page (grid, card surface, responsive order), and the
+   release walkthrough owns visual sign-off. */
+
+.dossier { max-width: 1400px; margin: 0 auto; container-type: inline-size; }
+.dossier-back { margin: 0 0 20px; }
+.dossier-back a { text-decoration: none; }
+.dossier-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, .48fr); gap: 20px 24px; align-items: start; }
+.dossier-layout > :not(.dossier-side) { grid-column: 1; min-width: 0; }
+.dossier-card { padding: 26px; margin: 0; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); overflow-wrap: anywhere; }
+.dossier-side { grid-column: 2; grid-row: 1 / span 7; position: sticky; top: 20px; max-height: calc(100dvh - 40px); overflow: auto; border-radius: 16px; }
+.dossier .briefing-heading { align-items: flex-start; flex-wrap: wrap; margin-bottom: 16px; }
+.dossier .briefing-heading h2 { font-size: clamp(23px, 2.1vw, 30px); line-height: 1.22; letter-spacing: -.7px; flex: 1 1 260px; }
+.dossier .briefing-heading .priority { text-transform: uppercase; letter-spacing: .06em; font-weight: 700; padding: 5px 12px; }
+.dossier .briefing-description { font-size: 16px; line-height: 1.65; margin-bottom: 24px; }
+.dossier .identity-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 22px 28px; border-top: 1px solid var(--border); padding-top: 22px; margin: 0; }
+.identity-grid > div { min-width: 0; }
+.identity-grid dt { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 7px; }
+.identity-grid dd { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; font-size: 15px; font-weight: 600; margin: 0; }
+/* .mono now lives in styles/utilities.css (single definition). */
+.identity-group { grid-column: 1 / -1; }
+.identity-group p { margin: 5px 0 0; }
+.evidence-index { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 12px; margin-top: 24px; padding-top: 14px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+.snapshot-note { display: flex; gap: 12px; padding: 15px 18px; border: 1px solid var(--accent); border-radius: 12px; color: var(--accent); background: var(--accent-soft); }
+.snapshot-note p { margin: 0; }
+.info-mark { display: inline-grid; place-items: center; border: 1.5px solid currentColor; border-radius: 50%; width: 19px; height: 19px; flex: none; margin-top: 2px; font-size: 12px; font-weight: 700; }
+.dossier h3 { font-size: 18px; margin-bottom: 12px; letter-spacing: -.3px; }
+.section-heading { display: flex; align-items: flex-start; gap: 12px; }
+.section-heading h3 { margin-bottom: 5px; }
+.section-heading .section-note { margin: 0; }
+.spread { justify-content: space-between; flex-wrap: wrap; margin-bottom: 12px; }
+.section-icon { display: grid; place-items: center; width: 34px; height: 34px; background: var(--accent-soft); color: var(--accent); border-radius: 9px; font-size: 23px; flex: none; }
+.recommended-action { margin: 18px 0; border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 9px; padding: 16px; font-size: 15px; line-height: 1.7; }
+.copy-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.copy-chip { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 5px 8px 5px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--subtle); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; min-width: 0; }
+.priority-rule { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
+.priority-rule code { padding: 4px 8px; border-radius: 6px; background: var(--subtle); border: 1px solid var(--border); }
+.priority-comparison, .context-links { border: 0; border-top: 1px solid var(--border); border-radius: 0; padding: 0; margin: 16px 0 0; }
+.priority-comparison summary, .context-links summary { color: var(--accent); font-size: 13px; }
+.hypothesis, .context-text { line-height: 1.7; }
+.context-limit { padding: 12px 14px; border: 1px solid var(--warning-border); background: var(--warning-bg); color: var(--warning); border-radius: 9px; font-size: 13px; }
+.lookup-receipts { list-style: none; margin: 0; padding: 0; }
+.lookup-receipts li { display: flex; align-items: flex-start; gap: 12px; padding: 12px 0; border-top: 1px solid var(--border); }
+.receipt-steps { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.lookup-receipts p { margin: 0; font-size: 13px; }
+.receipt-mark { color: var(--muted); font-weight: 700; }
+.text-link { border: 0; background: transparent; color: var(--accent); font-size: 13px; padding: 6px 0; min-height: 36px; text-align: left; }
+.text-link:hover { text-decoration: underline; background: transparent; }
+.citation-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.citation { font-size: 12px; color: var(--accent); background: var(--accent-soft); padding: 4px 9px; min-height: 32px; }
+.tech-block { padding: 0 24px; }
+.tech-block > summary { padding: 20px 0; font-size: 15px; }
+.tech-block > summary span { margin-left: 10px; font-weight: 400; }
+.tech-body { border-top: 1px solid var(--border); padding: 18px 0 8px; }
+.trace-list { padding: 0; margin: 0 0 20px; }
+[data-layout='embedded'] .dossier-layout { display: flex; flex-direction: column; gap: 16px; }
+[data-layout='embedded'] .dossier-layout > * { width: 100%; }
+[data-layout='embedded'] .dossier-side { position: static; max-height: none; overflow: visible; order: 1; }
+[data-layout='embedded'] .recommended-card { order: 0; }
+[data-layout='embedded'] .dossier-card:not(.briefing-summary,.recommended-card), [data-layout='embedded'] .tech-block { order: 2; }
+[data-layout='embedded'] .dossier-card { padding: 20px; }
+@container (max-width: 840px) {
+  .dossier-layout { display: flex; flex-direction: column; }
+  .dossier-layout > * { width: 100%; }
+  .dossier-side { position: static; max-height: none; overflow: visible; order: 1; }
+  .dossier-card:not(.briefing-summary,.recommended-card), .tech-block { order: 2; }
+}
+@container (max-width: 500px) {
+  .dossier .identity-grid { grid-template-columns: minmax(0,1fr); gap: 18px; }
+  .dossier-card { padding: 20px; }
+  .tech-block { padding: 0 20px; }
+}

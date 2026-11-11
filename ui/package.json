@@ -13,7 +13,8 @@
     "lint": "eslint . --max-warnings 0",
     "size": "node ./scripts/size.mjs",
     "smoke": "node ./scripts/smoke.mjs",
-    "characterize": "node ./scripts/characterize.mjs"
+    "characterize": "node ./scripts/characterize.mjs",
+    "styleguard": "node ./scripts/styleguard.mjs"
   },
   "dependencies": {
     "svelte": "5.57.3"
