@@ -48,7 +48,7 @@ export default [
         patterns: [
           { group: ['@/api*'], message: 'components render props; fetching lives in containers.' },
           { group: ['@/containers', '@/containers/*'], message: 'components never import containers.' },
-          { group: ['@/lib/events/context*', '**/events/context*'], message: 'components read connection state from props, not context.' }
+          { group: ['@/lib/context*', '**/lib/context*'], message: 'components read connection state from props, not context.' }
         ]
       }]
     }

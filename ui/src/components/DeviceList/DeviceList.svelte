@@ -1,4 +1,5 @@
 <script>
+  import Notice from '@/components/Notice/Notice.svelte';
   import DeviceRow from '@/components/DeviceRow/DeviceRow.svelte';
 
   // Pure list rendering: rows and list states in, intents out. The
@@ -20,7 +21,7 @@
 </script>
 
 {#if stale}
-  <p role="status">Connection recovered — this list may miss new reports. <button type="button" onclick={onReload}>Reload</button></p>
+  <Notice actionLabel="Reload" onAction={onReload}>Connection recovered — this list may miss new reports.</Notice>
 {/if}
 {#if devices.length === 0}
   <p>No reported subjects retained.</p>
@@ -32,7 +33,7 @@
   </ul>
 {/if}
 {#if error !== null}
-  <p role="alert">Page failed ({error}) — earlier rows kept. <button type="button" onclick={onRetry}>Retry</button></p>
+  <Notice kind="alert" actionLabel="Retry" onAction={onRetry}>Page failed ({error}) — earlier rows kept.</Notice>
 {/if}
 {#if capped}
   <p>List capped at {cap} rows; use the API for the full set.</p>

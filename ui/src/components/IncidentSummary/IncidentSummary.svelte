@@ -1,4 +1,5 @@
 <script>
+  import Pill from '@/components/Pill/Pill.svelte';
   // Optional bounded summary over the sampled member reports. Coverage
   // wording stays explicit: the sample may not represent every member.
   let { summary } = $props();
@@ -6,7 +7,7 @@
 
 <section aria-label="Incident summary">
   <h3>Summary</h3>
-  <p><span class="pill">Summary status: {summary.status}</span></p>
+  <p><Pill>Summary status: {summary.status}</Pill></p>
   {#if summary.summary}<p>{summary.summary}</p>{/if}
   {#if summary.hypothesis}<p><strong>Hypothesis:</strong> {summary.hypothesis}</p>{/if}
   {#if summary.confidence}<p>Display confidence: {summary.confidence}</p>{/if}

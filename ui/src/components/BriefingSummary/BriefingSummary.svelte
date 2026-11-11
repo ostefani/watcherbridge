@@ -1,6 +1,7 @@
 <script>
+  import Pill from '@/components/Pill/Pill.svelte';
   import IdentityGrid from '@/components/IdentityGrid/IdentityGrid.svelte';
-  import { eventKey, REPORTS_KEY } from '@/lib/format/evidence.js';
+  import { eventKey, REPORTS_KEY } from '@/lib/evidence.js';
 
   // Briefing summary: the reported change with its priority, the
   // single-view identity grid, and the scanner-report index. Text
@@ -24,7 +25,7 @@
 <section class="briefing-summary dossier-card" aria-label="Summary">
   <div class="briefing-heading">
     <h2>{title}</h2>
-    <span class="pill priority" data-priority={priority} aria-label={`Priority: ${priority}`}>{priority} priority</span>
+    <Pill priority data-priority={priority} aria-label={`Priority: ${priority}`}>{priority} priority</Pill>
   </div>
   <p class="briefing-description">{description}</p>
   <IdentityGrid {identity} {identityComplete} {primaryEvent} {eventCount} {range} {referencedTruncated} {source} />

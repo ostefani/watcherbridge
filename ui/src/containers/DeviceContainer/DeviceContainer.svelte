@@ -1,10 +1,11 @@
 <script>
+  import Notice from '@/components/Notice/Notice.svelte';
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
   import { fetchDevice } from '@/api.js';
-  import { getConnectionOrNull } from '@/lib/events/context.js';
-  import { createResource, failureNotice } from '@/lib/async/resource.js';
-  import { createPager } from '@/lib/async/pager.js';
+  import { getConnectionOrNull } from '@/lib/context.js';
+  import { createResource, failureNotice } from '@/lib/resource.js';
+  import { createPager } from '@/lib/pager.js';
   import DeviceProfile from '@/components/DeviceProfile/DeviceProfile.svelte';
   import LatestEvidence from '@/components/LatestEvidence/LatestEvidence.svelte';
   import HistoryList from '@/components/HistoryList/HistoryList.svelte';
@@ -94,15 +95,15 @@
     <p><a href="#/devices">Back to reported hosts</a> <button type="button" onclick={load}>Retry</button></p>
   </section>
 {:else if profile === null}
-  <p role="status">Loading reported host…</p>
+  <Notice>Loading reported host…</Notice>
 {:else}
   <article aria-label="Reported host detail">
     <p><a href="#/devices">Back to reported hosts</a></p>
     {#if stale}
-      <p role="status">Connection recovered — this page may miss new reports. <button type="button" onclick={load}>Reload</button></p>
+      <Notice actionLabel="Reload" onAction={load}>Connection recovered — this page may miss new reports.</Notice>
     {/if}
     {#if notice !== null}
-      <p role="alert">Refresh failed ({notice}) — showing retained data. <button type="button" onclick={load}>Retry</button></p>
+      <Notice kind="alert" actionLabel="Retry" onAction={load}>Refresh failed ({notice}) — showing retained data.</Notice>
     {/if}
     <DeviceProfile {profile} />
     <DecisionsContainer

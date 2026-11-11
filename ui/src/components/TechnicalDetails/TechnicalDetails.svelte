@@ -1,5 +1,5 @@
 <script>
-  import { displayTime } from '@/lib/format.js';
+  import TimeStamp from '@/components/TimeStamp/TimeStamp.svelte';
   import TraceStep from '@/components/TraceStep/TraceStep.svelte';
 
   // Technical details: executed tool steps, model accounting and
@@ -17,7 +17,6 @@
     createdAt,
     host
   } = $props();
-  const created = $derived(displayTime(createdAt));
 </script>
 
 <details class="tech-block dossier-card" aria-label="Technical details">
@@ -30,7 +29,7 @@
     <h4>Provenance</h4><dl>
       <dt>Briefing</dt><dd>{briefingId}</dd><dt>Group</dt><dd>{groupId}</dd>
       <dt>Grouping version</dt><dd>{groupingVersion}</dd><dt>Sequence</dt><dd>{seq}</dd>
-      <dt>Created</dt><dd><time datetime={createdAt} title={created?.utc}>{created?.local}</time></dd>
+      <dt>Created</dt><dd><TimeStamp iso={createdAt} /></dd>
       <dt>Grouping anchor</dt><dd>{host}</dd>
     </dl>
   </div>

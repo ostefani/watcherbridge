@@ -1,10 +1,9 @@
 <script>
-  import { displayTime } from '@/lib/format.js';
+  import TimeStamp from '@/components/TimeStamp/TimeStamp.svelte';
 
   // Latest retained observation with its attribute snapshot and port
   // summary. An absent observation is explicit, never a gap claim.
   let { latest } = $props();
-  const at = $derived(latest === null ? null : displayTime(latest.reported_at));
 </script>
 
 <section aria-label="Latest evidence">
@@ -12,7 +11,7 @@
   {#if latest === null}
     <p>No retained observation.</p>
   {:else}
-    <p>Reported <time datetime={latest.reported_at} title={at?.utc}>{at?.local}</time> ({latest.view_role}).</p>
+    <p>Reported <TimeStamp iso={latest.reported_at} /> ({latest.view_role}).</p>
     <dl>
       {#each Object.entries(latest.attributes ?? {}) as [key, value] (key)}
         <dt>{key}</dt>

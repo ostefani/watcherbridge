@@ -1,6 +1,7 @@
 <script>
+  import Pill from '@/components/Pill/Pill.svelte';
   import LookupReceipts from '@/components/LookupReceipts/LookupReceipts.svelte';
-  import { eventKey, stepKey } from '@/lib/format/evidence.js';
+  import { eventKey, stepKey } from '@/lib/evidence.js';
 
   // Investigator notes: the model or fallback explanation with its
   // confidence, limits, retained context, cited evidence and linked
@@ -23,7 +24,7 @@
 <section class="dossier-card investigator-notes" aria-label="Investigator notes">
   <h3>{source === 'agent' ? 'Investigator notes' : 'Analysis and retained context'}</h3>
   {#if likelyExplanation}<p class="hypothesis"><strong>Possible explanation:</strong> {likelyExplanation}</p>{/if}
-  {#if confidence}<p><span class="pill">Explanation confidence (model self-assessment): {confidence}</span></p>{/if}
+  {#if confidence}<p><Pill>Explanation confidence (model self-assessment): {confidence}</Pill></p>{/if}
   {#if limited}<p class="context-limit"><strong>Investigation has limits.</strong> Some lookups could not establish retained context. Missing lookup results do not prove this host has no history.</p>{/if}
   <p class="context-text">{context}</p>
   <LookupReceipts {receipts} {onJump} />

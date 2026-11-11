@@ -1,4 +1,5 @@
 <script>
+  import Pill from '@/components/Pill/Pill.svelte';
   import styles from './TraceStep.module.css';
   // One executed investigator tool step. Outcome and summary are the
   // server's bounded display classification (Go owns it); the raw
@@ -22,7 +23,7 @@
 
 <li class={styles.step} id={anchor} data-evidence={`step:${step.step}`} tabindex="-1">
   <span class={`mono ${styles.toolName}`}>{step.tool}</span>
-  {#if step.outcome}<span class="pill">{step.outcome.replaceAll('_', ' ')}</span>{/if}
+  {#if step.outcome}<Pill>{step.outcome.replaceAll('_', ' ')}</Pill>{/if}
   <span class="section-note">step {step.step} · {step.status} · {step.duration_ms} ms</span>
   <p>{headline}</p>
   <details>

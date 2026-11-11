@@ -1,5 +1,6 @@
 <script>
-  import { displayTime } from '@/lib/format.js';
+  import Notice from '@/components/Notice/Notice.svelte';
+  import TimeStamp from '@/components/TimeStamp/TimeStamp.svelte';
 
   // Independently paged observation history over retained events. The
   // history cutoff comes from retention policy on the Health screen —
@@ -23,17 +24,16 @@
   {:else}
     <ol>
       {#each observations as obs (obs.observation_id)}
-        {@const at = displayTime(obs.reported_at)}
         <li>
           {obs.event_id} ({obs.view_role}) —
-          <time datetime={obs.reported_at} title={at.utc}>{at.local}</time>,
+          <TimeStamp iso={obs.reported_at} />,
           {obs.ports_total} ports{obs.ports_truncated ? ' (truncated)' : ''}
         </li>
       {/each}
     </ol>
   {/if}
   {#if historyError !== null}
-    <p role="alert">Older page failed ({historyError}). <button type="button" onclick={onRetry}>Retry</button></p>
+    <Notice kind="alert" actionLabel="Retry" onAction={onRetry}>Older page failed ({historyError}).</Notice>
   {/if}
   {#if capped}
     <p>History capped at {cap} rows; use the API for the full set.</p>

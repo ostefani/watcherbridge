@@ -1,7 +1,9 @@
 <script>
+  import Notice from '@/components/Notice/Notice.svelte';
+  import Pill from '@/components/Pill/Pill.svelte';
   import { onDestroy, onMount } from 'svelte';
   import { fetchIncident } from '@/api.js';
-  import { getConnectionOrNull } from '@/lib/events/context.js';
+  import { getConnectionOrNull } from '@/lib/context.js';
 
   // Incident members container: fetches and caches the member briefings
   // for one expanded incident row. Rendered through AttentionList's
@@ -91,15 +93,15 @@
 
 {#if expanded}
   {#if loading && members === undefined}
-    <p role="status">Loading members…</p>
+    <Notice>Loading members…</Notice>
   {:else if loadError !== undefined}
-    <p role="alert">{loadError}</p>
+    <Notice kind="alert">{loadError}</Notice>
   {:else if members !== undefined}
     <ol>
       {#each members as m (m.briefing_id)}
         <li>
           <a href={`#/briefing/${m.briefing_id}`}>{m.briefing_id}</a>
-          <span class="pill">{m.priority}</span>
+          <Pill>{m.priority}</Pill>
         </li>
       {/each}
     </ol>

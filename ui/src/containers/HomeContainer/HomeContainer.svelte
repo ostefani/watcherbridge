@@ -1,4 +1,5 @@
 <script>
+  import Notice from '@/components/Notice/Notice.svelte';
   import AttentionList from '@/components/AttentionList/AttentionList.svelte';
   import VerdictHeader from '@/components/VerdictHeader/VerdictHeader.svelte';
   import DigestBar from '@/components/DigestBar/DigestBar.svelte';
@@ -49,7 +50,7 @@
     <p>The bridge did not return an overview ({loadError}). The connection retries automatically.</p>
   </section>
 {:else if overview === null}
-  <p role="status">Loading overview…</p>
+  <Notice>Loading overview…</Notice>
 {:else}
   {#if overview.receipts === 0}
     <p class="coverage-note">
@@ -57,9 +58,9 @@
     </p>
   {/if}
   {#if degraded}
-    <p role="alert" class="coverage-note">
+    <Notice kind="alert" class="coverage-note">
       Coverage is {overview.coverage}. Treat quiet results with caution until the reasons below clear.
-    </p>
+    </Notice>
   {/if}
   <VerdictHeader
     verdict={overview.verdict}

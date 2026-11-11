@@ -1,4 +1,5 @@
 <script>
+  import Pill from '@/components/Pill/Pill.svelte';
   // Per-source coverage and liveness: every source renders independently
   // with its own reasons, so one healthy source never masks a silent one.
   // Unknown liveness is the honest pre-H1 state, not a gap.
@@ -14,8 +15,8 @@
       {#each sources as source (source.scope)}
         <li>
           <strong>{source.scope}</strong>
-          <span class="pill">Status: {source.status}</span>
-          <span class="pill">Liveness: {source.liveness}</span>
+          <Pill>Status: {source.status}</Pill>
+          <Pill>Liveness: {source.liveness}</Pill>
           {#if source.last_report_at}
             <span>
               Last report

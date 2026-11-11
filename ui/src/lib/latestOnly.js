@@ -1,7 +1,7 @@
 // Latest-wins guard for one async operation. Each operation (reload,
 // load-more, decision page, …) owns an instance, so intents never
 // cancel each other — the flaw BUG-1 pins in screens that share a
-// single guard. Stream-frame fencing lives in lib/events, not here.
+// single guard. Stream-frame fencing lives in lib/stream.js, not here.
 
 /**
  * @returns {{start: () => number, current: (token: number) => boolean, invalidate: () => void}}

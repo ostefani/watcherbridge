@@ -1,4 +1,5 @@
 <script>
+  import Pill from '@/components/Pill/Pill.svelte';
   import { changeLabel, reviewTitle } from '@/lib/format.js';
 
   // Attention list (pure): server-ordered (flagged, priority, incident,
@@ -28,9 +29,9 @@
       {#each items as item (item.id)}
         <li data-status={item.status}>
           {#snippet row()}
-            <span class="pill priority" data-priority={item.priority} aria-label={`Priority: ${item.priority}`}>{item.priority}</span>
+            <Pill priority data-priority={item.priority} aria-label={`Priority: ${item.priority}`}>{item.priority}</Pill>
             <span class="row-main"><strong>{item.kind === 'incident' ? 'Incident · ' : ''}{item.kind === 'briefing' ? (titles[item.id] ?? reviewTitle(item.change_kind)) : changeLabel(item.change_kind)}</strong><code>{item.id}</code></span>
-            <span class="row-meta"><span class="pill">{item.status}</span><time datetime={item.created_at} title={item.created_at}>{new Date(item.created_at).toLocaleString()}</time></span>
+            <span class="row-meta"><Pill>{item.status}</Pill><time datetime={item.created_at} title={item.created_at}>{new Date(item.created_at).toLocaleString()}</time></span>
           {/snippet}
           {#if item.kind === 'briefing' || item.kind === 'incident'}
             {#if onselect}

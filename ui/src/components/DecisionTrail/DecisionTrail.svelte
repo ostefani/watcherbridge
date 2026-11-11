@@ -1,4 +1,6 @@
 <script>
+  import Notice from '@/components/Notice/Notice.svelte';
+  import Pill from '@/components/Pill/Pill.svelte';
   import styles from './DecisionTrail.module.css';
 
   // Decision trail: the bounded audit window with per-row undo, older
@@ -27,8 +29,8 @@
   <ol class={styles.trail}>
     {#each trail as d (d.decision_id)}
       <li>
-        <span class="pill">{d.kind.replace('_', ' ')}</span>
-        {#if d.undone}<span class="pill">undone</span>{/if}
+        <Pill>{d.kind.replace('_', ' ')}</Pill>
+        {#if d.undone}<Pill>undone</Pill>{/if}
         {#if d.text}<span class={styles.text}>{d.text}</span>{/if}
         {#if d.until}<span class={styles.until}>until {d.until}</span>{/if}
         <time datetime={d.created_at}>{new Date(d.created_at).toLocaleString()}</time>
@@ -53,9 +55,9 @@
     <button type="button" onclick={onNewer} disabled={paging}>Show newer decisions</button>
   {/if}
   {#if note !== null}
-    <p role="note">{note}</p>
+    <Notice kind="note">{note}</Notice>
   {/if}
 {/if}
 {#if listError !== null}
-  <p role="alert">{listError}</p>
+  <Notice kind="alert">{listError}</Notice>
 {/if}

@@ -1,4 +1,5 @@
 <script>
+  import Pill from '@/components/Pill/Pill.svelte';
   import styles from './DecisionStatus.module.css';
 
   // Decision status: the panel title and the effective-review pill.
@@ -22,4 +23,4 @@
 </script>
 
 <h3 class={card ? styles.title : undefined}>{title}</h3>
-<p class={styles.status}><span class={card ? `pill ${styles.review}` : 'pill'} data-review={effective?.kind ?? 'unreviewed'}>Status: {statusLine()}</span></p>
+<p class={styles.status}><Pill large={card} data-review={effective?.kind ?? 'unreviewed'}>Status: {statusLine()}</Pill></p>

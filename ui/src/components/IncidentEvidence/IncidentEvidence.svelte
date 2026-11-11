@@ -1,5 +1,6 @@
 <script>
-  import { displayTime } from '@/lib/format.js';
+  import TimeStamp from '@/components/TimeStamp/TimeStamp.svelte';
+  import Pill from '@/components/Pill/Pill.svelte';
 
   // Member evidence: accept-time snapshots of member priorities and
   // qualified references. The incident never rewrites member briefings;
@@ -27,11 +28,10 @@
   {:else}
     <ol>
       {#each members as m (m.briefing_id)}
-        {@const reported = displayTime(m.created_at)}
         <li>
           <a href={`#/briefing/${m.briefing_id}`}>{m.briefing_id}</a>
-          <span class="pill">{m.priority}</span>
-          <time datetime={m.created_at} title={reported.utc}>{reported.local}</time>
+          <Pill>{m.priority}</Pill>
+          <TimeStamp iso={m.created_at} />
           <span>{m.refs.length} qualified reference{m.refs.length === 1 ? '' : 's'}</span>
         </li>
       {/each}

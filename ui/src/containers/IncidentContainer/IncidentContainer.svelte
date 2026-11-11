@@ -1,8 +1,9 @@
 <script>
+  import Notice from '@/components/Notice/Notice.svelte';
   import { onDestroy, onMount } from 'svelte';
   import { fetchIncident } from '@/api.js';
-  import { createResource } from '@/lib/async/resource.js';
-  import { getConnectionOrNull } from '@/lib/events/context.js';
+  import { createResource } from '@/lib/resource.js';
+  import { getConnectionOrNull } from '@/lib/context.js';
   import IncidentHeader from '@/components/IncidentHeader/IncidentHeader.svelte';
   import IncidentScope from '@/components/IncidentScope/IncidentScope.svelte';
   import IncidentEvidence from '@/components/IncidentEvidence/IncidentEvidence.svelte';
@@ -81,7 +82,7 @@
 <p><a href="#/">Back to overview</a></p>
 
 {#if notice !== null}
-  <p role="alert">Refresh failed: {notice} <button type="button" onclick={reload}>Retry</button></p>
+  <Notice kind="alert" actionLabel="Retry" onAction={reload}>Refresh failed: {notice}</Notice>
 {/if}
 {#if shown === null}
   <p>Loading incident…</p>

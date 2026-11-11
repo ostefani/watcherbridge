@@ -1,17 +1,17 @@
 <script>
-  import { displayTime, classLabel } from '@/lib/format.js';
+  import Notice from '@/components/Notice/Notice.svelte';
+  import TimeStamp from '@/components/TimeStamp/TimeStamp.svelte';
+  import { classLabel } from '@/lib/format.js';
 
   // Reported profile identity and provenance: upstream facts, last
   // report and retention-adjacent wording. Purge claims live on the
   // Health screen, never here.
   let { profile } = $props();
-  const first = $derived(displayTime(profile.first_report_at));
-  const last = $derived(displayTime(profile.last_report_at));
 </script>
 
 <h2>{profile.profile_id} — {classLabel(profile.class)}</h2>
 {#if profile.class === 'legacy'}
-  <p role="note">Earlier bridge-inferred association; not used for current identity.</p>
+  <Notice kind="note">Earlier bridge-inferred association; not used for current identity.</Notice>
 {:else if profile.class === 'address' || profile.class === 'event'}
   <p>This page describes {profile.class === 'address' ? 'address context' : 'unresolved events'}, not a device.</p>
 {/if}
@@ -29,7 +29,7 @@
     <dd>{profile.operator_label}</dd>
   {/if}
   <dt>First report</dt>
-  <dd><time datetime={profile.first_report_at} title={first.utc}>{first.local}</time></dd>
+  <dd><TimeStamp iso={profile.first_report_at} /></dd>
   <dt>Last report</dt>
-  <dd><time datetime={profile.last_report_at} title={last.utc}>{last.local}</time></dd>
+  <dd><TimeStamp iso={profile.last_report_at} /></dd>
 </dl>

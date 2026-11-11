@@ -1,4 +1,5 @@
 <script>
+  import Pill from '@/components/Pill/Pill.svelte';
   // Priority explanation: baseline floor, model suggestion and final
   // priority with the one-step raise limit. The comparison opens when
   // the reader needs it: equal values stay collapsed.
@@ -17,7 +18,7 @@
 <section class="dossier-card" aria-label="Why this priority">
   <h3>Why this priority</h3>
   <p class="priority-reason">{priorityReason}</p>
-  <div class="priority-rule"><span class="pill priority" data-priority={priority}>Final priority: {priority}</span>{#if baselineRule}<code>{baselineRule}</code>{/if}</div>
+  <div class="priority-rule"><Pill priority data-priority={priority}>Final priority: {priority}</Pill>{#if baselineRule}<code>{baselineRule}</code>{/if}</div>
   <details class="priority-comparison" open={differs}>
     <summary>How the priority was computed</summary>
     <ol class="stepper">

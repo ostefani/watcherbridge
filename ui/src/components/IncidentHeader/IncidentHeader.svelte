@@ -1,12 +1,11 @@
 <script>
-  import { displayTime } from '@/lib/format.js';
+  import TimeStamp from '@/components/TimeStamp/TimeStamp.svelte';
+  import Pill from '@/components/Pill/Pill.svelte';
 
   // Incident identity: kind, lifecycle status, priority floor and the
   // open/closed timestamp. Status wording is the list state, never a
   // claim about the upstream scanner.
   let { incident } = $props();
-  const opened = $derived(displayTime(incident.opened_at));
-  const closed = $derived(displayTime(incident.closed_at));
 
   const KIND_LABEL = {
     burst_appearance: 'Burst appearance',
@@ -16,11 +15,11 @@
 
 <h2>{KIND_LABEL[incident.kind] ?? incident.kind}</h2>
 <p>
-  <span class="pill">{incident.status}</span>
-  <span class="pill">Floor: {incident.floor}</span>
+  <Pill>{incident.status}</Pill>
+  <Pill>Floor: {incident.floor}</Pill>
   {#if incident.status === 'closed' && incident.closed_at}
-    <span>Closed <time datetime={incident.closed_at} title={closed.utc}>{closed.local}</time></span>
+    <span>Closed <TimeStamp iso={incident.closed_at} /></span>
   {:else}
-    <span>Open since <time datetime={incident.opened_at} title={opened.utc}>{opened.local}</time></span>
+    <span>Open since <TimeStamp iso={incident.opened_at} /></span>
   {/if}
 </p>

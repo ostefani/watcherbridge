@@ -1,10 +1,6 @@
 <script>
   import ConnectionStatus from '@/components/ConnectionStatus/ConnectionStatus.svelte';
   import styles from './AppHeader.module.css';
-
-  // App header: brand, view navigation and the connection state line.
-  // The route and the connection state arrive as props from App, which
-  // owns routing and the event stream; this component only renders.
   let { routeName, helpOpen = false, connectionState = 'connecting', onToggleHelp = () => {} } = $props();
 </script>
 

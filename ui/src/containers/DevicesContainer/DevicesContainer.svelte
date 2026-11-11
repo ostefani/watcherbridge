@@ -1,8 +1,9 @@
 <script>
+  import Notice from '@/components/Notice/Notice.svelte';
   import { onMount } from 'svelte';
   import { fetchDevices } from '@/api.js';
-  import { createPager } from '@/lib/async/pager.js';
-  import { getConnectionOrNull } from '@/lib/events/context.js';
+  import { createPager } from '@/lib/pager.js';
+  import { getConnectionOrNull } from '@/lib/context.js';
   import DeviceList from '@/components/DeviceList/DeviceList.svelte';
 
   // Devices container: owns paging, snapshot seeding and the reconnect
@@ -84,9 +85,9 @@
   <h2>Reported hosts</h2>
   <p class="section-note">Scanner-reported subjects. Classes distinguish device references, address context, unresolved events and legacy profiles.</p>
   {#if loading}
-    <p role="status">Loading reported hosts…</p>
+    <Notice>Loading reported hosts…</Notice>
   {:else if $error !== null && empty}
-    <p role="alert">The bridge did not return reported hosts ({$error}).</p>
+    <Notice kind="alert">The bridge did not return reported hosts ({$error}).</Notice>
     <button type="button" onclick={retry}>Retry</button>
   {:else}
     <DeviceList

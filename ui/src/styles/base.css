@@ -124,43 +124,8 @@ time {
   color: var(--muted);
   font-size: 13px;
 }
-/* TRANSITIONAL: the .pill family (including .priority and both data-*
-   variants) transfers to a Pill component when its last global consumer
-   migrates — find them with: grep -rn 'class="[^"]*\bpill\b' src.
-   Do not extend these rules; new screens use the component. */
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 2px 9px;
-  background: var(--subtle);
-  font-size: 12px;
-  color: var(--muted);
-  vertical-align: middle;
-}
-.pill[data-state=ok],.priority[data-priority=low] {
-  color: var(--success);
-  background: var(--success-bg);
-  border-color: var(--success-border);
-}
-.pill[data-state=degraded],.priority[data-priority=medium] {
-  color: var(--warning);
-  background: var(--warning-bg);
-  border-color: var(--warning-border);
-}
-.pill[data-state=blind],.priority[data-priority=high],.priority[data-priority=critical] {
-  color: var(--danger);
-  background: var(--danger-bg);
-  border-color: var(--danger-border);
-}
-.priority {
-  text-transform: uppercase;
-  border-radius: 5px;
-  font-weight: 650;
-  letter-spacing: .03em;
-}
+/* Pill badges live in components/Pill (Pill.module.css owns the base,
+   priority and data-* variants). */
 .conn {
   margin: 0 0 0 auto;
   display: flex;
@@ -233,14 +198,7 @@ time {
   color: var(--surface);
   font-weight: 650;
 }
-.pills {
-  list-style: none;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 0;
-  margin: 0 0 12px;
-}
+/* Verdict pills live in components/VerdictHeader (VerdictHeader.module.css). */
 .context {
   font-size: 12px;
   color: var(--muted);

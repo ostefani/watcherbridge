@@ -127,7 +127,7 @@ function bugPin(id, name, cond) {
 // after a page start still applies instead of being dropped.
 {
   const { get } = await import('svelte/store');
-  const { createPager } = await import('../src/lib/async/pager.js');
+  const { createPager } = await import('../src/lib/pager.js');
   const pending = [];
   const pager = createPager({
     fetchPage: (cursor) => new Promise((resolve) => pending.push({ cursor, resolve })),
@@ -240,9 +240,9 @@ function bugPin(id, name, cond) {
     (await seeded.reset()) === 'failed' && get(seeded.rows).length === 1 && get(seeded.error) === 'offline');
 }
 
-// lib/format/briefingView: pure dossier derivations with unit coverage.
+// lib/briefingView: pure dossier derivations with unit coverage.
 {
-  const { priorityDiffers, lookupLimits, lookupReceipts, identityComplete } = await import('../src/lib/format/briefingView.js');
+  const { priorityDiffers, lookupLimits, lookupReceipts, identityComplete } = await import('../src/lib/briefingView.js');
   check('equal values collapse the comparison',
     !priorityDiffers({ clamped: false, baseline: 'low', priority: 'low', model_suggestion: 'low' }));
   check('null suggestion falls back to baseline',
@@ -267,11 +267,11 @@ function bugPin(id, name, cond) {
     !identityComplete(null));
 }
 
-// lib/decisions: submission payload shaping with unit coverage. The
+// lib/payload: submission payload shaping with unit coverage. The
 // container posts only built payloads, so a bad snooze date surfaces
 // as form text without touching the network.
 {
-  const { buildDecisionPayload } = await import('../src/lib/decisions/payload.js');
+  const { buildDecisionPayload } = await import('../src/lib/payload.js');
   const ctx = { subjectKind: 'briefing', subjectId: 'brf-1', requestId: 'req-1', memberScope: true };
   const note = buildDecisionPayload({ kind: 'note', text: 'look', includeMembers: true }, ctx);
   check('note carries text and membership',
@@ -288,9 +288,9 @@ function bugPin(id, name, cond) {
     plain.payload.includeMembers === undefined && plain.payload.kind === 'expected');
 }
 
-// lib/format/evidence: the navigation key contract.
+// lib/evidence: the navigation key contract.
 {
-  const { eventKey, stepKey, REPORTS_KEY } = await import('../src/lib/format/evidence.js');
+  const { eventKey, stepKey, REPORTS_KEY } = await import('../src/lib/evidence.js');
   check('evidence keys are explicit',
     eventKey('evt-1') === 'event:evt-1' && stepKey(2) === 'step:2' && REPORTS_KEY === 'reports');
 }
@@ -314,14 +314,14 @@ function bugPin(id, name, cond) {
 // true edge) stays on the manual reconnect checklist with the rest of
 // the runtime behavior smoke cannot mount.
 {
-  const { shouldRefreshOnReconnect } = await import('../src/lib/events/reconnect.js');
+  const { shouldRefreshOnReconnect } = await import('../src/lib/reconnect.js');
   const edge = (over) => shouldRefreshOnReconnect({ live: false, wasLive: false, data: null, initial: null, ...over });
   check('snapshot plus reconnect edge refreshes',
     edge({ live: true, initial: 'snap' }) && edge({ live: true, data: 'fetched' }));
   check('no edge without liveness change or content',
     !edge({ live: true }) && !edge({ live: true, wasLive: true, initial: 'snap' }) &&
     !edge({ live: false, initial: 'snap' }) && !edge({ live: true, data: null, initial: null }));
-  const { failureNotice } = await import('../src/lib/async/resource.js');
+  const { failureNotice } = await import('../src/lib/resource.js');
   const failed = (over) => failureNotice({ data: null, initial: null, error: null, refreshError: null, ...over });
   check('snapshot plus failing fetch yields a visible notice',
     failed({ initial: 'snap', error: 'offline' }) === 'offline');
@@ -333,10 +333,10 @@ function bugPin(id, name, cond) {
     failed({ data: 'rows' }) === null && failed({}) === null);
 }
 
-// lib/async: per-operation guards never cancel each other, resources
+// lib: per-operation guards never cancel each other (latestOnly), resources
 // keep data across failed refreshes, pagers merge by key under a cap.
 {
-  const { latestOnly } = await import('../src/lib/async/latestOnly.js');
+  const { latestOnly } = await import('../src/lib/latestOnly.js');
   const reloadOp = latestOnly();
   const pageOp = latestOnly();
   const reloadToken = reloadOp.start();
@@ -347,7 +347,7 @@ function bugPin(id, name, cond) {
 }
 {
   const { get } = await import('svelte/store');
-  const { createResource } = await import('../src/lib/async/resource.js');
+  const { createResource } = await import('../src/lib/resource.js');
   const deferred = () => {
     let resolve, reject;
     const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
@@ -383,7 +383,7 @@ function bugPin(id, name, cond) {
 }
 {
   const { get } = await import('svelte/store');
-  const { createPager } = await import('../src/lib/async/pager.js');
+  const { createPager } = await import('../src/lib/pager.js');
   const pages = {
     '': { rows: [{ id: 'a' }, { id: 'b' }], nextAfter: 'c1' },
     c1: { rows: [{ id: 'b' }, { id: 'c' }], nextAfter: '' }
@@ -415,12 +415,12 @@ function bugPin(id, name, cond) {
     get(swapping.exhausted) === true && get(swapping.error) === null);
 }
 
-// lib/events: transport lifecycle with an injectable source. Errors
+// lib/stream: transport lifecycle with an injectable source. Errors
 // never close the source: the browser's native retry carries
 // Last-Event-ID so the server resumes bounded replay.
 {
   const { get } = await import('svelte/store');
-  const { createEventStream, INCIDENT_KINDS } = await import('../src/lib/events/stream.js');
+  const { createEventStream, INCIDENT_KINDS } = await import('../src/lib/stream.js');
   class FakeSource {
     constructor() { this.handlers = {}; this.closed = false; this.onopen = null; this.onerror = null; this.readyState = 0; }
     addEventListener(kind, fn) { ((this.handlers[kind] ??= [])).push(fn); }
@@ -470,9 +470,9 @@ function bugPin(id, name, cond) {
   check('disconnect voids the pending retry', sources.length === 2 && get(stream.connection) === 'retrying');
 }
 
-// lib/router: table parity with App's inline parser.
+// lib/routes: table parity with App's inline parser.
 {
-  const { parseRoute, routeTitle } = await import('../src/lib/router/routes.js');
+  const { parseRoute, routeTitle } = await import('../src/lib/routes.js');
   check('briefing route decodes id', JSON.stringify(parseRoute('#/briefing/brf%201')) === JSON.stringify({ name: 'briefing', id: 'brf 1' }));
   check('incident route', parseRoute('#/incidents/inc-1').name === 'incident');
   check('device route', parseRoute('#/devices/prof-1').id === 'prof-1');
@@ -485,9 +485,9 @@ function bugPin(id, name, cond) {
     routeTitle('briefing') === 'Briefing' && routeTitle('mystery') === 'Review overview');
 }
 
-// lib/shortcuts: scoped dispatch with typing/modifier silence, help from one table.
+// lib/registry: scoped dispatch with typing/modifier silence, help from one table.
 {
-  const { createShortcutRegistry } = await import('../src/lib/shortcuts/registry.js');
+  const { createShortcutRegistry } = await import('../src/lib/registry.js');
   const reg = createShortcutRegistry();
   const handled = [];
   reg.register('global', 'j', 'Move between rows', () => handled.push('j'));

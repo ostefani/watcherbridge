@@ -1,5 +1,5 @@
 <script>
-  import { displayTime } from '@/lib/format.js';
+  import TimeStamp from '@/components/TimeStamp/TimeStamp.svelte';
 
   // Pipeline internals over process lifetime: ingest, provider,
   // redaction and writer saturation counters plus queue depth.
@@ -10,7 +10,7 @@
   <summary>Pipeline (process lifetime)</summary>
   <dl>
     <dt>Started</dt>
-    <dd>{displayTime(process.started_at).local}</dd>
+    <dd><TimeStamp iso={process.started_at} /></dd>
     <dt>Ingest accepted</dt>
     <dd>{process.ingest_accepted}</dd>
     <dt>Ingest duplicates</dt>

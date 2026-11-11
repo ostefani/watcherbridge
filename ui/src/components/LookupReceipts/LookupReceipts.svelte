@@ -1,5 +1,5 @@
 <script>
-  import { stepKey } from '@/lib/format/evidence.js';
+  import { stepKey } from '@/lib/evidence.js';
 
   // Lookup receipts: what the investigator could establish, grouped by
   // interpreted result with links back to the executed tool steps.

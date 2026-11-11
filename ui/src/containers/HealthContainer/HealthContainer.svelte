@@ -1,9 +1,10 @@
 <script>
+  import Notice from '@/components/Notice/Notice.svelte';
   import { onMount } from 'svelte';
   import { fetchHealth } from '@/api.js';
-  import { createResource, failureNotice } from '@/lib/async/resource.js';
-  import { shouldRefreshOnReconnect } from '@/lib/events/reconnect.js';
-  import { getConnectionOrNull } from '@/lib/events/context.js';
+  import { createResource, failureNotice } from '@/lib/resource.js';
+  import { shouldRefreshOnReconnect } from '@/lib/reconnect.js';
+  import { getConnectionOrNull } from '@/lib/context.js';
   import HealthSummary from '@/components/HealthSummary/HealthSummary.svelte';
   import SourceList from '@/components/SourceList/SourceList.svelte';
   import PipelineDetails from '@/components/PipelineDetails/PipelineDetails.svelte';
@@ -61,10 +62,10 @@
   <h2>Health</h2>
   <p class="section-note">Source coverage, processing, and retention. Liveness describes the source, not host presence.</p>
   {#if $error !== null && shown === null}
-    <p role="alert">The bridge did not return health ({$error}).</p>
+    <Notice kind="alert">The bridge did not return health ({$error}).</Notice>
     <button type="button" onclick={() => resource.refresh()}>Retry</button>
   {:else if shown === null}
-    <p role="status">Loading health…</p>
+    <Notice>Loading health…</Notice>
   {:else}
     <HealthSummary health={shown} refreshError={notice} onRetry={() => resource.refresh()} />
     <SourceList sources={shown.sources} />

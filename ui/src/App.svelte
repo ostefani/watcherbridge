@@ -2,10 +2,10 @@
   import { onMount } from 'svelte';
   import { fetchOverview } from '@/api.js';
   import { createFetchGuard } from '@/lib/freshness.js';
-  import { createEventStream } from '@/lib/events/stream.js';
-  import { setConnection } from '@/lib/events/context.js';
-  import { createShortcutRegistry } from '@/lib/shortcuts/registry.js';
-  import { parseRoute, routeTitle } from '@/lib/router/routes.js';
+  import { createEventStream } from '@/lib/stream.js';
+  import { setConnection } from '@/lib/context.js';
+  import { createShortcutRegistry } from '@/lib/registry.js';
+  import { parseRoute, routeTitle } from '@/lib/routes.js';
   import { moveRowFocus, typingTarget } from '@/lib/roving.js';
   import HomeContainer from './containers/HomeContainer/HomeContainer.svelte';
   import IncidentMembersContainer from './containers/IncidentMembersContainer/IncidentMembersContainer.svelte';

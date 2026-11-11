@@ -1,4 +1,5 @@
 <script>
+  import Notice from '@/components/Notice/Notice.svelte';
   import { memberUndoNote } from '@/lib/memberUndo.js';
 
   // Member undo review: the fan-out of an undo onto member briefings,
@@ -6,7 +7,7 @@
   let { review, paging = false, error = null, onMore = async () => {} } = $props();
 </script>
 
-<p role="status">{memberUndoNote(review)}</p>
+<Notice>{memberUndoNote(review)}</Notice>
 {#if review.members.length > 0}
   <ul>
     {#each review.members as m (m.decision_id)}
@@ -19,4 +20,4 @@
     {paging ? 'Loading…' : error ? 'Retry remaining member decisions' : 'Show remaining member decisions'}
   </button>
 {/if}
-{#if error !== null}<p role="alert">{error}</p>{/if}
+{#if error !== null}<Notice kind="alert">{error}</Notice>{/if}

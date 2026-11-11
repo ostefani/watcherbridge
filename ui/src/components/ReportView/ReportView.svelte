@@ -1,19 +1,19 @@
 <script>
-  import { displayTime, randomizedLabel, classLabel } from '@/lib/format.js';
+  import TimeStamp from '@/components/TimeStamp/TimeStamp.svelte';
+  import Pill from '@/components/Pill/Pill.svelte';
+  import { randomizedLabel, classLabel } from '@/lib/format.js';
   import styles from './ReportView.module.css';
   let { ref, views = [], profileLinks = [] } = $props();
-  const reported = $derived(displayTime(ref.occurred_at));
-  const received = $derived(displayTime(ref.received_at));
   const value = (v) => typeof v === 'string' && v.trim() !== '' ? v : 'Not reported';
 </script>
 
 <details class={styles.card} data-evidence={`event:${ref.event_id}`} tabindex="-1" aria-label={`Saved report ${ref.event_id}`}>
   <summary>
-    <span class={styles.heading}><span class={`mono ${styles.reportId}`}>{ref.event_id}</span><span class="pill">{ref.event_type}</span></span>
-    <span class={styles.reportTime}>Reported <time datetime={ref.occurred_at} title={reported.utc}>{reported.local}</time></span>
+    <span class={styles.heading}><span class={`mono ${styles.reportId}`}>{ref.event_id}</span><Pill>{ref.event_type}</Pill></span>
+    <span class={styles.reportTime}>Reported <TimeStamp iso={ref.occurred_at} /></span>
   </summary>
   <div class={styles.body}>
-    <p class="section-note">Reported scan target: <span class="mono">{ref.target || 'Not reported'}</span>{#if ref.target_truncated} (truncated){/if}<br />Received <time datetime={ref.received_at} title={received.utc}>{received.local}</time></p>
+    <p class="section-note">Reported scan target: <span class="mono">{ref.target || 'Not reported'}</span>{#if ref.target_truncated} (truncated){/if}<br />Received <TimeStamp iso={ref.received_at} /></p>
     {#if views.length === 0}
       <p>No retained observation for this event. Its reference is retained, but a saved scanner view is unavailable.</p>
     {:else}
@@ -29,7 +29,7 @@
             {#if attrs.os}<div><dt>Reported OS</dt><dd>{attrs.os}</dd></div>{/if}
             {#if attrs.device}<div><dt>Reported device</dt><dd>{attrs.device}</dd></div>{/if}
           </dl>
-          <p class={styles.confidence}><span class="pill">Scanner-reported identity confidence: {attrs.identity_confidence || 'unknown'}</span><span class="section-note">Identity source: {attrs.identity_source || 'unknown'}</span></p>
+          <p class={styles.confidence}><Pill>Scanner-reported identity confidence: {attrs.identity_confidence || 'unknown'}</Pill><span class="section-note">Identity source: {attrs.identity_source || 'unknown'}</span></p>
           <p class="section-note">{randomizedLabel(attrs.randomized)}</p>
           {#if attrs.attributes_truncated}<p class="section-note">Some reported fields were truncated at ingest.</p>{/if}
           <details class={styles.attributes}><summary>Saved report view · technical attributes</summary><pre>{JSON.stringify(attrs, null, 2)}</pre></details>

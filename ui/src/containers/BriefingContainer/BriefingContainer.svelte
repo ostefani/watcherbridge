@@ -1,11 +1,12 @@
 <script>
+  import Notice from '@/components/Notice/Notice.svelte';
   import { onMount, untrack } from 'svelte';
   import { fetchBriefing } from '@/api.js';
-  import { createResource } from '@/lib/async/resource.js';
+  import { createResource } from '@/lib/resource.js';
   import { reviewTitle, reportRange, singleViewIdentity } from '@/lib/format.js';
-  import { priorityDiffers, lookupLimits, lookupReceipts, identityComplete } from '@/lib/format/briefingView.js';
+  import { priorityDiffers, lookupLimits, lookupReceipts, identityComplete } from '@/lib/briefingView.js';
   import { revealEvidence } from '@/lib/evidenceNavigation.js';
-  import { createShortcutRegistry } from '@/lib/shortcuts/registry.js';
+  import { createShortcutRegistry } from '@/lib/registry.js';
   import BriefingSummary from '@/components/BriefingSummary/BriefingSummary.svelte';
   import SnapshotNote from '@/components/SnapshotNote/SnapshotNote.svelte';
   import RecommendedCheck from '@/components/RecommendedCheck/RecommendedCheck.svelte';
@@ -111,12 +112,12 @@
     <button type="button" onclick={load}>Retry</button>
   </section>
 {:else if shown === null}
-  <p role="status">Loading briefing…</p>
+  <Notice>Loading briefing…</Notice>
 {:else}
   <article class="briefing dossier" data-layout={layout} aria-label="Briefing shown" bind:this={articleElement}>
     {#if layout === 'page'}<p class="dossier-back"><a href="#/">← Back to Home</a></p>{/if}
     {#if notice !== null}
-      <p role="alert">The saved view could not be refreshed. Your last loaded report is still shown. <button type="button" onclick={load}>Retry refresh</button></p>
+      <Notice kind="alert" actionLabel="Retry refresh" onAction={load}>The saved view could not be refreshed. Your last loaded report is still shown.</Notice>
     {/if}
 
     <div class="dossier-layout">

@@ -2,7 +2,7 @@
   import { onDestroy } from 'svelte';
   import { fetchDecisions, fetchDecisionMembers, postDecision, postUndo } from '@/api.js';
   import { memberUndoReview, continueMemberUndo } from '@/lib/memberUndo.js';
-  import { buildDecisionPayload } from '@/lib/decisions/payload.js';
+  import { buildDecisionPayload } from '@/lib/payload.js';
   import DecisionStatus from '@/components/DecisionStatus/DecisionStatus.svelte';
   import DecisionComposer from '@/components/DecisionComposer/DecisionComposer.svelte';
   import DecisionTrail from '@/components/DecisionTrail/DecisionTrail.svelte';

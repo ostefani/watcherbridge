@@ -1,4 +1,5 @@
 <script>
+  import Notice from '@/components/Notice/Notice.svelte';
   import { tick } from 'svelte';
   import styles from './DecisionComposer.module.css';
 
@@ -117,7 +118,7 @@
     </label>
   {/if}
   {#if outcomeNote !== null}
-    <p role="status">{outcomeNote}</p>
+    <Notice>{outcomeNote}</Notice>
   {/if}
   {#if kind === 'snooze'}
     <label>
@@ -132,7 +133,7 @@
     </label>
   {/if}
   {#if formError !== null}
-    <p role="alert">{formError}</p>
+    <Notice kind="alert">{formError}</Notice>
   {/if}
   <button type="submit" bind:this={submitButton} disabled={card ? (pending || !canSubmit) : pending}>
     {pending ? 'Recording…' : 'Record decision'}

@@ -1,5 +1,7 @@
 <script>
+  import Pill from '@/components/Pill/Pill.svelte';
   import { windowLabel } from '@/lib/format.js';
+  import styles from './VerdictHeader.module.css';
   // Verdict header: the server owns the verdict; this only presents it.
   // Coverage sits beside the verdict as text, never hidden behind a
   // green badge. Quiet always carries its context (receipts, window,
@@ -16,10 +18,10 @@
       {/each}
     </ol>
   </div>
-  <ul class="pills">
-    <li class="pill">Verdict: {verdict}</li>
-    <li class="pill" data-state={coverage}>Coverage: {coverage}</li>
-    <li class="pill">Liveness: {liveness}</li>
+  <ul class={styles.list}>
+    <li><Pill>Verdict: {verdict}</Pill></li>
+    <li><Pill data-state={coverage}>Coverage: {coverage}</Pill></li>
+    <li><Pill>Liveness: {liveness}</Pill></li>
   </ul>
   {#if reasons.length > 0}
     <ul class="reasons">

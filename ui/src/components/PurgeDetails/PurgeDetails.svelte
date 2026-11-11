@@ -1,5 +1,5 @@
 <script>
-  import { displayTime } from '@/lib/format.js';
+  import TimeStamp from '@/components/TimeStamp/TimeStamp.svelte';
 
   // Retention and purge: per-table totals, the policy line (never a
   // per-profile boundary) and the latest fully successful run on its
@@ -27,8 +27,7 @@
     </p>
   {/if}
   {#if purge.last_success}
-    {@const ok = displayTime(purge.last_success.finished_at ?? purge.last_success.started_at)}
-    <p>Latest fully successful purge: {ok.local}.</p>
+    <p>Latest fully successful purge: <TimeStamp iso={purge.last_success.finished_at ?? purge.last_success.started_at} />.</p>
   {:else}
     <p>No fully successful purge recorded yet.</p>
   {/if}

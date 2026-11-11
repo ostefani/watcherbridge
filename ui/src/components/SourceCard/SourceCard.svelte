@@ -1,5 +1,5 @@
 <script>
-  import { displayTime } from '@/lib/format.js';
+  import TimeStamp from '@/components/TimeStamp/TimeStamp.svelte';
 
   // One source card: capability limits, heartbeat, last report and
   // reasons. Unknown stays unknown — a missing capability never
@@ -19,12 +19,11 @@
     <dt>Heartbeat</dt>
     <dd>
       {source.heartbeat_enabled ? 'enabled (delivery opt-in, not identity proof)' : 'disabled'}
-      {#if source.last_heartbeat_at}— last at {displayTime(source.last_heartbeat_at).local}{/if}
+      {#if source.last_heartbeat_at}— last at <TimeStamp iso={source.last_heartbeat_at} />{/if}
     </dd>
     {#if source.heartbeat}
-      {@const scan = displayTime(source.heartbeat.completed_at)}
       <dt>Last completed scan</dt>
-      <dd><time datetime={source.heartbeat.completed_at} title={scan.utc}>{scan.local}</time></dd>
+      <dd><TimeStamp iso={source.heartbeat.completed_at} /></dd>
       <dt>Scan result</dt>
       <dd>{source.heartbeat.status}, {source.heartbeat.issue_count} {source.heartbeat.issue_count === 1 ? 'issue' : 'issues'}, {source.heartbeat.duration_ms} ms</dd>
       <dt>Reported host records</dt>
@@ -33,9 +32,8 @@
       <dd>{source.heartbeat.clock_skew_seconds} seconds (includes delivery delay)</dd>
     {/if}
     {#if source.last_report_at}
-      {@const at = displayTime(source.last_report_at)}
       <dt>Last report</dt>
-      <dd><time datetime={source.last_report_at} title={at.utc}>{at.local}</time></dd>
+      <dd><TimeStamp iso={source.last_report_at} /></dd>
     {/if}
     {#if source.delivery_status}
       <dt>Delivery</dt>
