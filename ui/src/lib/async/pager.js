@@ -1,11 +1,10 @@
 // Cursor pager with merge-by-key, a row cap and per-operation fencing.
-// Reset and append run on independent generations with a reset epoch:
-// a reload landing after a page start still applies (the BUG-1 case),
-// but appends requested against an older cursor never land after a
-// reset commits — committing a reset retires every older append, so a
-// late page cannot reopen an exhausted list. Failures change nothing,
-// so pending appends stay valid when the reset that follows them
-// fails. Failures preserve existing rows; only the error slot changes.
+// resetGen orders reloads; pageGen invalidates appends. A reload
+// landing after a page start still applies (the BUG-1 case), but a
+// committed reset retires every older append, so a late page cannot
+// reopen an exhausted list. Only a successful commit clears the error
+// slot and voids pending appends: a failed reset changes nothing, so
+// a pending append against the still-valid cursor lands normally.
 //
 // Unlike createResource, the pager seeds from the mount-time snapshot:
 // cursor and merge live here, so the container passes `initial` once and
@@ -26,7 +25,8 @@ export function createPager({ fetchPage, keyOf, cap, initial = null }) {
   const rows = writable(snap ? [...snap.rows] : []);
   const cursor = writable(snap ? (snap.nextAfter ?? '') : '');
   const started = writable(snap !== null);
-  const error = writable(null);
+  const failure = writable(/** @type {{message: string, reset: boolean}|null} */ (null));
+  const error = derived(failure, ($failure) => $failure?.message ?? null);
   const loadingMore = writable(false);
   const exhausted = derived([cursor, started], ([$cursor, $started]) => $started && $cursor === '');
   const capped = derived([rows, cursor], ([$rows, $cursor]) => $cursor !== '' && $rows.length >= cap);
@@ -35,17 +35,12 @@ export function createPager({ fetchPage, keyOf, cap, initial = null }) {
 
   async function loadMore(reset = false) {
     const my = reset ? (resetGen += 1) : (pageGen += 1);
-    // Appends also capture the reset epoch: a reset requested after
-    // this append started voids it at landing, whether that reset
-    // later applies or fails. The commit bump below covers the other
-    // direction — appends requested before the reset they overlap.
-    const myReset = resetGen;
     const gen = () => (reset ? resetGen : pageGen);
-    error.set(null);
+    failure.set(null);
     loadingMore.set(true);
     try {
       const page = await fetchPage(reset ? '' : get(cursor));
-      if (my !== gen() || myReset !== resetGen) {
+      if (my !== gen()) {
         return 'stale';
       }
       const base = reset ? [] : get(rows);
@@ -54,21 +49,23 @@ export function createPager({ fetchPage, keyOf, cap, initial = null }) {
       cursor.set(page.nextAfter ?? '');
       started.set(true);
       if (reset) {
-        // A committed reset retires every append requested against an
-        // older cursor — even ones requested after this reset started.
-        // Landing appends still re-check their epoch, so only the
-        // pre-commit ones go stale; later appends use the new cursor.
+        // A committed reset owns the list now: clear the error slot
+        // (a previous page failure refers to the old state) and retire
+        // every append requested against an older cursor, so a late
+        // page cannot reopen an exhausted list. Appends requested after
+        // this commit use the new cursor and are unaffected.
+        failure.set(null);
         pageGen += 1;
       }
       return 'applied';
     } catch (err) {
-      if (my !== gen() || myReset !== resetGen) {
+      if (my !== gen()) {
         return 'stale';
       }
-      error.set(err instanceof Error ? err.message : String(err));
+      failure.set({ message: err instanceof Error ? err.message : String(err), reset });
       return 'failed';
     } finally {
-      if (my === gen() && myReset === resetGen) {
+      if (my === gen()) {
         loadingMore.set(false);
       }
     }
@@ -84,12 +81,12 @@ export function createPager({ fetchPage, keyOf, cap, initial = null }) {
   function replace(nextRows, nextAfter = '') {
     resetGen += 1;
     pageGen += 1;
-    error.set(null);
+    failure.set(null);
     loadingMore.set(false);
     rows.set([...nextRows]);
     cursor.set(nextAfter ?? '');
     started.set(true);
   }
 
-  return { rows, cursor, started, exhausted, capped, error, loadingMore, loadMore, reset, replace };
+  return { rows, cursor, started, exhausted, capped, failure, error, loadingMore, loadMore, reset, replace };
 }

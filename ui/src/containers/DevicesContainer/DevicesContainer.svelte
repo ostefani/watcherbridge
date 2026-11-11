@@ -32,17 +32,13 @@
     // it at component top level trips the init-capture rule.
     initial: () => (initial ? { rows: initial.devices ?? [], nextAfter: initial.next_after ?? '' } : null)
   });
-  const { rows, started, error, exhausted, capped } = pager;
+  const { rows, started, error, failure, exhausted, capped } = pager;
   const empty = $derived($rows.length === 0);
   const loading = $derived(!$started && empty && $error === null);
 
-  // Repeat the last intent on retry: a failed reset retries the reset,
-  // a failed page retries the page.
-  let lastWasReset = false;
   let stale = $state(false);
 
   async function reload() {
-    lastWasReset = true;
     const status = await pager.reset();
     if (status === 'applied') {
       stale = false;
@@ -50,14 +46,13 @@
   }
 
   async function page() {
-    lastWasReset = false;
     await pager.loadMore();
   }
 
   function retry() {
-    if (lastWasReset) {
+    if ($failure?.reset === true) {
       reload();
-    } else {
+    } else if ($failure?.reset === false) {
       page();
     }
   }

@@ -179,6 +179,54 @@ function bugPin(id, name, cond) {
       (await pPage) === 'stale' && get(reloading.rows).length === 1 && get(reloading.rows)[0].id === 'n' &&
       get(reloading.exhausted));
   }
+  // A failed reset changes nothing: a pending append against the
+  // still-valid cursor lands and fills the list instead of going
+  // stale with it.
+  {
+    const recovering = [];
+    const retrying = createPager({
+      fetchPage: (cursor) => new Promise((resolve, reject) => recovering.push({ cursor, resolve, reject })),
+      keyOf: (r) => r.id, cap: 10
+    });
+    const pPage = retrying.loadMore();
+    const pReload = retrying.reset();
+    recovering[1].reject(new Error('offline'));
+    check('failed reset reports failure without rows',
+      (await pReload) === 'failed' && get(retrying.rows).length === 0 && get(retrying.error) === 'offline');
+    recovering[0].resolve({ rows: [{ id: 'o' }], nextAfter: 'old' });
+    check('pending append survives a failed reset',
+      (await pPage) === 'applied' && get(retrying.rows).length === 1 && get(retrying.rows)[0].id === 'o' &&
+      !get(retrying.exhausted));
+  }
+  // Retry follows the displayed failure even when the last click
+  // started the other operation.
+  for (const resetFailsLast of [true, false]) {
+    const pendingFailures = [];
+    const overlapping = createPager({
+      fetchPage: (cursor) => new Promise((resolve, reject) => pendingFailures.push({ cursor, reject })),
+      keyOf: (row) => row.id,
+      cap: 10,
+      initial: { rows: [{ id: 'existing' }], nextAfter: 'next' }
+    });
+    const reload = overlapping.reset();
+    const append = overlapping.loadMore();
+    const [reloadRequest, appendRequest] = pendingFailures;
+    if (resetFailsLast) {
+      appendRequest.reject(new Error('page failed'));
+      await append;
+      reloadRequest.reject(new Error('reload failed'));
+      await reload;
+    } else {
+      reloadRequest.reject(new Error('reload failed'));
+      await reload;
+      appendRequest.reject(new Error('page failed'));
+      await append;
+    }
+    const message = resetFailsLast ? 'reload failed' : 'page failed';
+    check(`visible failure identifies the operation when ${message} last`,
+      reloadRequest.cursor === '' && appendRequest.cursor === 'next' &&
+      get(overlapping.error) === message && get(overlapping.failure)?.reset === resetFailsLast);
+  }
   // Snapshot seeding: seeded rows render with no fetch; a failed reset
   // keeps them with an error instead of emptying the list.
   const seeded = createPager({
