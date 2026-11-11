@@ -141,6 +141,44 @@ function bugPin(id, name, cond) {
   check('reload landing after a page start still applies',
     (await pReset) === 'applied' && get(pager.rows).length === 1 && get(pager.rows)[0].id === 'r' &&
     get(pager.exhausted));
+  // Reverse order: an append requested before a successful reset never
+  // lands after it — a late page cannot reopen an exhausted list.
+  {
+    const late = [];
+    const relisting = createPager({
+      fetchPage: (cursor) => new Promise((resolve) => late.push({ cursor, resolve })),
+      keyOf: (r) => r.id, cap: 10
+    });
+    const pPage = relisting.loadMore(); // append with the old cursor
+    const pReload = relisting.reset(); // reset requested after
+    late[1].resolve({ rows: [{ id: 'n' }], nextAfter: '' });
+    check('reset landing before a pending append still applies',
+      (await pReload) === 'applied' && get(relisting.rows).length === 1 && get(relisting.rows)[0].id === 'n');
+    late[0].resolve({ rows: [{ id: 'o' }], nextAfter: 'old' });
+    check('late append from the previous cursor lands stale',
+      (await pPage) === 'stale' && get(relisting.rows).length === 1 && get(relisting.rows)[0].id === 'n' &&
+      get(relisting.exhausted));
+  }
+  // Reload-first order: the append is requested after the reset but
+  // still against the old cursor. The reset commits first and retires
+  // it; the late page must not reopen the exhausted list.
+  {
+    const early = [];
+    const reloading = createPager({
+      fetchPage: (cursor) => new Promise((resolve) => early.push({ cursor, resolve })),
+      keyOf: (r) => r.id, cap: 10
+    });
+    const pReload = reloading.reset(); // reload starts first
+    const pPage = reloading.loadMore(); // append still on the old cursor
+    check('append runs against the pre-reset cursor', early[1].cursor === '');
+    early[0].resolve({ rows: [{ id: 'n' }], nextAfter: '' });
+    check('reload committing first still applies',
+      (await pReload) === 'applied' && get(reloading.rows).length === 1 && get(reloading.rows)[0].id === 'n');
+    early[1].resolve({ rows: [{ id: 'o' }], nextAfter: 'old' });
+    check('append landing after a committed reset lands stale',
+      (await pPage) === 'stale' && get(reloading.rows).length === 1 && get(reloading.rows)[0].id === 'n' &&
+      get(reloading.exhausted));
+  }
   // Snapshot seeding: seeded rows render with no fetch; a failed reset
   // keeps them with an error instead of emptying the list.
   const seeded = createPager({
@@ -179,6 +217,27 @@ function bugPin(id, name, cond) {
     identityComplete({ observations_truncated: false, referenced_truncated: false }) &&
     !identityComplete({ observations_truncated: true, referenced_truncated: false }) &&
     !identityComplete(null));
+}
+
+// lib/decisions: submission payload shaping with unit coverage. The
+// container posts only built payloads, so a bad snooze date surfaces
+// as form text without touching the network.
+{
+  const { buildDecisionPayload } = await import('../src/lib/decisions/payload.js');
+  const ctx = { subjectKind: 'briefing', subjectId: 'brf-1', requestId: 'req-1', memberScope: true };
+  const note = buildDecisionPayload({ kind: 'note', text: 'look', includeMembers: true }, ctx);
+  check('note carries text and membership',
+    note.payload.text === 'look' && note.payload.includeMembers === true &&
+    note.payload.requestId === 'req-1' && note.error === undefined);
+  const snooze = buildDecisionPayload({ kind: 'snooze', untilText: '2030-01-02T03:04' }, ctx);
+  check('valid snooze converts to ISO',
+    typeof snooze.payload.until === 'string' && !Number.isNaN(Date.parse(snooze.payload.until)));
+  const bad = buildDecisionPayload({ kind: 'snooze', untilText: 'not a date' }, ctx);
+  check('garbage snooze date never reaches the network',
+    bad.error === 'snooze time is not a date' && bad.payload === undefined);
+  const plain = buildDecisionPayload({ kind: 'expected' }, { ...ctx, memberScope: false });
+  check('non-member scope omits membership',
+    plain.payload.includeMembers === undefined && plain.payload.kind === 'expected');
 }
 
 // lib/format/evidence: the navigation key contract.
@@ -308,12 +367,14 @@ function bugPin(id, name, cond) {
     get(swapping.exhausted) === true && get(swapping.error) === null);
 }
 
-// lib/events: transport lifecycle with injectable source and scheduler.
+// lib/events: transport lifecycle with an injectable source. Errors
+// never close the source: the browser's native retry carries
+// Last-Event-ID so the server resumes bounded replay.
 {
   const { get } = await import('svelte/store');
   const { createEventStream, INCIDENT_KINDS } = await import('../src/lib/events/stream.js');
   class FakeSource {
-    constructor() { this.handlers = {}; this.closed = false; this.onopen = null; this.onerror = null; }
+    constructor() { this.handlers = {}; this.closed = false; this.onopen = null; this.onerror = null; this.readyState = 0; }
     addEventListener(kind, fn) { ((this.handlers[kind] ??= [])).push(fn); }
     removeEventListener(kind, fn) { this.handlers[kind] = (this.handlers[kind] ?? []).filter((h) => h !== fn); }
     emit(kind, data) { for (const fn of this.handlers[kind] ?? []) { fn(data === undefined ? {} : { data }); } }
@@ -324,7 +385,6 @@ function bugPin(id, name, cond) {
   const seen = { overviews: [], incidents: [] };
   const stream = createEventStream({
     url: '/events',
-    retryMs: 2000,
     createSource: (url) => { const s = new FakeSource(); s.url = url; sources.push(s); return s; },
     schedule: (fn, ms) => { scheduled.push({ fn, ms }); return scheduled.length; },
     cancelSchedule: (t) => { scheduled[t - 1].cancelled = true; },
@@ -344,10 +404,18 @@ function bugPin(id, name, cond) {
   check('every incident kind bumps the revision once',
     get(stream.incidentRevision) === 3 && seen.incidents.join(',') === 'open,incident,resync');
   sources[0].onerror();
-  check('error closes, retries with delay',
-    sources[0].closed && get(stream.connection) === 'retrying' && scheduled.length === 1 && scheduled[0].ms === 2000);
+  check('mid-stream error marks retrying without closing the source',
+    !sources[0].closed && get(stream.connection) === 'retrying' && sources.length === 1 && scheduled.length === 0);
+  sources[0].onopen();
+  check('native retry on the same source resumes live',
+    get(stream.connection) === 'live' && sources.length === 1 && !sources[0].closed);
+  sources[0].readyState = 2; // rejected handshake (e.g. the 503 subscriber cap)
+  sources[0].onerror();
+  check('closed source reconnects explicitly after the specified delay',
+    sources[0].closed && get(stream.connection) === 'retrying' && scheduled.length === 1 && scheduled[0].ms === 3000);
   scheduled[0].fn();
-  check('retry reconnects on a fresh source', sources.length === 2 && !sources[1].closed);
+  check('explicit retry opens a fresh source', sources.length === 2 && !sources[1].closed);
+  sources[1].readyState = 2;
   sources[1].onerror();
   stream.disconnect();
   scheduled[1].fn();

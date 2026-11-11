@@ -2,6 +2,7 @@
   import { onDestroy } from 'svelte';
   import { fetchDecisions, fetchDecisionMembers, postDecision, postUndo } from '@/api.js';
   import { memberUndoReview, continueMemberUndo } from '@/lib/memberUndo.js';
+  import { buildDecisionPayload } from '@/lib/decisions/payload.js';
   import DecisionStatus from '@/components/DecisionStatus/DecisionStatus.svelte';
   import DecisionComposer from '@/components/DecisionComposer/DecisionComposer.svelte';
   import DecisionTrail from '@/components/DecisionTrail/DecisionTrail.svelte';
@@ -95,25 +96,23 @@
     composer?.applyPreset(next);
   }
 
+  // Returns 'ok' when the draft posted (including an idempotent
+  // duplicate) and 'error' otherwise. Never throws: the composer must
+  // await this without producing an unhandled rejection, and drafts
+  // clear only on 'ok' so a failed submit keeps the form for retry.
   async function submit({ kind, untilText, text, includeMembers }) {
     pending = true;
     formError = null;
     try {
-      const d = { subjectKind, subjectId, kind, requestId };
-      if (kind === 'snooze' && untilText !== '') {
-        const at = new Date(untilText);
-        if (Number.isNaN(at.getTime())) {
-          throw new Error('snooze time is not a date');
-        }
-        d.until = at.toISOString();
+      const built = buildDecisionPayload(
+        { kind, untilText, text, includeMembers },
+        { subjectKind, subjectId, requestId, memberScope }
+      );
+      if (built.error) {
+        formError = built.error;
+        return 'error';
       }
-      if (kind === 'note' || kind === 'label') {
-        d.text = text;
-      }
-      if (memberScope) {
-        d.includeMembers = includeMembers;
-      }
-      const out = await postDecision(d);
+      const out = await postDecision(built.payload);
       requestId = crypto.randomUUID();
       outcomeNote = null;
       memberReview = null;
@@ -130,9 +129,10 @@
         outcomeNote = `Recorded on the incident and ${out.members.length} member briefing${out.members.length === 1 ? '' : 's'}.`;
       }
       await ondecided?.();
+      return 'ok';
     } catch (err) {
       formError = err instanceof Error ? err.message : String(err);
-      throw err;
+      return 'error';
     } finally {
       pending = false;
     }

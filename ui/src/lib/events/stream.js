@@ -8,6 +8,15 @@
 // `open`/`incident`/`resync` all mean "incident state may have
 // changed". Screens subscribe to `incidentRevision` from context, so
 // no window-event bus remains.
+//
+// Reconnects are native while the source is still connecting: on a
+// mid-stream drop the source stays open and the browser retries with
+// Last-Event-ID, so the server resumes bounded replay instead of
+// restarting the stream. A rejected handshake (non-200, e.g. the 503
+// subscriber cap) moves the source to CLOSED, where native retry is
+// dead — that path gets an explicit reconnect after 3s. Closing and
+// recreating a live source would drop the cursor (a fresh EventSource
+// sends no Last-Event-ID).
 
 import { writable } from 'svelte/store';
 
@@ -16,7 +25,7 @@ export const INCIDENT_KINDS = ['open', 'incident', 'resync'];
 /**
  * @param {object} [options]
  * @param {string} [options.url] stream URL
- * @param {number} [options.retryMs] reconnect delay after an error
+ * @param {number} [options.retryMs] explicit reconnect delay after a rejected handshake (CLOSED)
  * @param {(url: string) => EventSource} [options.createSource] transport factory (fake in tests)
  * @param {(fn: () => void, ms: number) => unknown} [options.schedule] retry scheduler (manual in tests)
  * @param {(t: unknown) => void} [options.cancelSchedule]
@@ -25,7 +34,7 @@ export const INCIDENT_KINDS = ['open', 'incident', 'resync'];
  */
 export function createEventStream({
   url = '/events',
-  retryMs = 2000,
+  retryMs = 3000,
   createSource = (u) => new EventSource(u),
   schedule = (fn, ms) => setTimeout(fn, ms),
   cancelSchedule = (t) => clearTimeout(t),
@@ -92,14 +101,27 @@ export function createEventStream({
       if (my !== gen) {
         return;
       }
-      cleanup();
+      if (next.readyState === 2 /* CLOSED: handshake rejected, e.g. the 503 cap */) {
+        // Native retry is dead on a closed source, so reconnect
+        // explicitly after the specified delay. The fresh handshake
+        // carries no Last-Event-ID; the server answers that with a
+        // fresh snapshot and overview, and the client loads state as
+        // on first load.
+        cleanup();
+        connection.set('retrying');
+        const mine = gen;
+        timer = schedule(() => {
+          if (mine === gen) {
+            connect();
+          }
+        }, retryMs);
+        return;
+      }
+      // Still connecting (mid-stream drop): leave the source open so
+      // the browser's native retry carries Last-Event-ID and the
+      // server resumes instead of restarting. The next onopen flips
+      // back to live; disconnect() still closes explicitly.
       connection.set('retrying');
-      const mine = gen;
-      timer = schedule(() => {
-        if (mine === gen) {
-          connect();
-        }
-      }, retryMs);
     };
   }
 

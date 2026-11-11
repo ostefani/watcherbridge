@@ -1,4 +1,5 @@
 <script>
+  import { tick } from 'svelte';
   import styles from './DecisionComposer.module.css';
 
   // Decision composer: the operator's explicit choice as form draft
@@ -57,12 +58,17 @@
   // and hand focus to submit. Nothing submits without the operator.
   // The container exposes this through DecisionsContainer so the
   // shortcut registry calls the composer directly instead of driving
-  // it through a preset prop and an effect.
-  export function applyPreset(next) {
-    if (kinds.includes(next)) {
-      chosen = next;
-      submitButton?.focus();
+  // it through a preset prop and an effect. Focus waits a tick: on a
+  // fresh briefing the submit button is disabled until the choice
+  // lands, and focusing a disabled button is a silent no-op.
+  // Makes no network calls itself — presetting posts nothing.
+  export async function applyPreset(next) {
+    if (!kinds.includes(next)) {
+      return;
     }
+    chosen = next;
+    await tick();
+    submitButton?.focus();
   }
 
   async function submit(/** @type {SubmitEvent} */ ev) {
@@ -78,9 +84,13 @@
     if (kind === null) {
       return;
     }
-    // The container throws on network failure, so drafts clear only
-    // after it reports success — a failed submit keeps the form.
-    await onSubmit({ kind, untilText, text, includeMembers });
+    // The container reports 'ok'/'error' instead of throwing, so this
+    // await never produces an unhandled rejection; drafts clear only
+    // on 'ok', and a failed submit keeps the form for retry.
+    const posted = await onSubmit({ kind, untilText, text, includeMembers });
+    if (posted !== 'ok') {
+      return;
+    }
     chosen = null;
     untilText = '';
     text = '';
@@ -92,7 +102,7 @@
   <fieldset>
     <legend class:sr-only={card}>Choose a decision</legend>
     {#each kinds as k (k)}
-      <label class:selected={kind === k}>
+      <label class={kind === k ? styles.selected : undefined}>
         <input type="radio" name={`decision-kind-${subjectId}`} value={k} checked={kind === k} onchange={() => (chosen = k)} />
         <span class={styles.decisionLabel}>{k === 'not_expected' ? 'Not expected' : k.charAt(0).toUpperCase() + k.slice(1)}</span>
         {#if card}<span class={styles.decisionHint}>{({ expected: 'no further action', not_expected: 'investigate', snooze: 'hide until later', note: 'annotation only' })[k]}</span>{/if}
