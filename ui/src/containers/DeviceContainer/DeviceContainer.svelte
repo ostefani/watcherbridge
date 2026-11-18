@@ -4,7 +4,7 @@
   import { fetchDevice } from '@/api.js';
   import { getConnectionOrNull } from '@/lib/context.js';
   import { createResource } from '@/lib/resource.svelte.js';
-  import { createPager } from '@/lib/pager.js';
+  import { createPager } from '@/lib/pager.svelte.js';
   import DeviceProfile from '@/components/DeviceProfile/DeviceProfile.svelte';
   import LatestEvidence from '@/components/LatestEvidence/LatestEvidence.svelte';
   import HistoryList from '@/components/HistoryList/HistoryList.svelte';
@@ -46,8 +46,6 @@
     initial: () => (initial ? { rows: initial.history ?? [], nextAfter: initial.history_next_after ?? '' } : null)
   });
 
-  const { rows: historyRows, error: historyLoadError, exhausted: historyExhausted, capped: historyCapped } = historyPager;
-
   let stale = $state(false);
 
   async function load() {
@@ -67,7 +65,10 @@
     if (initial === null) {
       load();
     }
-    return profileResource.invalidate;
+    return () => {
+      profileResource.invalidate();
+      historyPager.invalidate();
+    };
   });
 
   let wasLive = false;
@@ -113,10 +114,10 @@
     />
     <LatestEvidence latest={profile.latest} />
     <HistoryList
-      observations={$historyRows}
-      historyError={$historyLoadError}
-      exhausted={$historyExhausted}
-      capped={$historyCapped}
+      observations={historyPager.rows}
+      historyError={historyPager.error}
+      exhausted={historyPager.exhausted}
+      capped={historyPager.capped}
       cap={HISTORY_CAP}
       onOlder={older}
       onRetry={older}

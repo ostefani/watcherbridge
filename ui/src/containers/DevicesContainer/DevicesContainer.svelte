@@ -1,8 +1,8 @@
 <script>
   import Notice from '@/components/Notice/Notice.svelte';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { fetchDevices } from '@/api.js';
-  import { createPager } from '@/lib/pager.js';
+  import { createPager } from '@/lib/pager.svelte.js';
   import { getConnectionOrNull } from '@/lib/context.js';
   import DeviceList from '@/components/DeviceList/DeviceList.svelte';
 
@@ -33,9 +33,8 @@
     // it at component top level trips the init-capture rule.
     initial: () => (initial ? { rows: initial.devices ?? [], nextAfter: initial.next_after ?? '' } : null)
   });
-  const { rows, started, error, failure, exhausted, capped } = pager;
-  const empty = $derived($rows.length === 0);
-  const loading = $derived(!$started && empty && $error === null);
+  const empty = $derived(pager.rows.length === 0);
+  const loading = $derived(!pager.started && empty && pager.error === null);
 
   let stale = $state(false);
 
@@ -51,9 +50,9 @@
   }
 
   function retry() {
-    if ($failure?.reset === true) {
+    if (pager.failure?.reset === true) {
       reload();
-    } else if ($failure?.reset === false) {
+    } else if (pager.failure?.reset === false) {
       page();
     }
   }
@@ -62,6 +61,7 @@
     if (initial === null) {
       reload();
     }
+    return pager.invalidate;
   });
 
   // A reconnect edge marks the list stale without resetting paging.
@@ -70,14 +70,14 @@
     if (!connection) {
       return;
     }
-    return connection.connection.subscribe((state) => {
+    return connection.connection.subscribe((state) => untrack(() => {
       const live = state === 'live';
-      const edge = live && !wasLive && $rows.length > 0;
+      const edge = live && !wasLive && pager.rows.length > 0;
       wasLive = live;
       if (edge) {
         stale = true;
       }
-    });
+    }));
   });
 </script>
 
@@ -86,16 +86,16 @@
   <p class="section-note">Scanner-reported subjects. Classes distinguish device references, address context, unresolved events and legacy profiles.</p>
   {#if loading}
     <Notice>Loading reported hosts…</Notice>
-  {:else if $error !== null && empty}
-    <Notice kind="alert">The bridge did not return reported hosts ({$error}).</Notice>
+  {:else if pager.error !== null && empty}
+    <Notice kind="alert">The bridge did not return reported hosts ({pager.error}).</Notice>
     <button type="button" onclick={retry}>Retry</button>
   {:else}
     <DeviceList
-      devices={$rows}
+      devices={pager.rows}
       {stale}
-      error={$error}
-      exhausted={$exhausted}
-      capped={$capped}
+      error={pager.error}
+      exhausted={pager.exhausted}
+      capped={pager.capped}
       cap={ROW_CAP}
       onReload={reload}
       onLoadMore={page}

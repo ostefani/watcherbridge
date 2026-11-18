@@ -1,5 +1,6 @@
 import { flushSync } from 'svelte';
 import { createSelectedResource } from '@/lib/resource.svelte.js';
+import { createWindowPager } from '@/lib/windowPager.svelte.js';
 
 export async function checkSelectedResource(check) {
   const pending = Object.create(null);
@@ -32,4 +33,61 @@ export async function checkSelectedResource(check) {
   } finally {
     dispose();
   }
+}
+
+export async function checkWindowPager(check) {
+  const row = (cursor) => ({ cursor, decision_id: String(cursor) });
+  let head = $state.raw([row(1000)]);
+  let complete;
+  let defer = false;
+  let empty = false;
+  let failed = false;
+  const audit = createWindowPager({
+    getHead: () => head,
+    getSubject: () => ['briefing', 'example'],
+    fetchPage: async ({ before, limit }) => {
+      if (defer) {
+        return new Promise((resolve) => { complete = resolve; });
+      }
+      if (failed) {
+        throw new Error('offline');
+      }
+      return empty ? [] : Array.from({ length: limit }, (_, i) => row(before - i - 1));
+    }
+  });
+  for (let page = 0; page < 6; page += 1) {
+    await audit.older();
+  }
+  check('decision window keeps one 50-row page and reports dropped back pages',
+    audit.trail.length === 51 && audit.trail[1].cursor === 749 && audit.note !== null);
+  const last = audit.trail.at(-1);
+  failed = true;
+  await audit.older();
+  check('failed decision page retains the window and allows retry',
+    audit.error === 'offline' && audit.trail.at(-1) === last && !audit.paging && !audit.exhausted);
+  failed = false;
+  empty = true;
+  await audit.older();
+  check('empty continuation exhausts the window and keeps its last page',
+    audit.exhausted && audit.trail.at(-1) === last);
+  for (let page = 0; page < 4; page += 1) {
+    audit.newer();
+  }
+  check('only four decision back pages are reachable', audit.trail[1].cursor === 949 && !audit.exhausted);
+  audit.newer();
+  check('newer can return to the head', audit.trail.length === 1 && !audit.showNewer);
+
+  defer = true;
+  const pending = audit.older();
+  head = [{ ...head[0], cursor: 2000 }];
+  complete([row(999)]);
+  await pending;
+  check('new continuation boundary rejects an old window response',
+    audit.trail.length === 1 && audit.trail[0].cursor === 2000 && !audit.paging);
+  const superseded = audit.older();
+  audit.reset();
+  complete([row(1999)]);
+  await superseded;
+  check('decision mutation invalidates an in-flight audit page',
+    audit.trail.length === 1 && !audit.paging);
 }

@@ -113,8 +113,7 @@ function check(name, cond) {
 // independent operations inside createPager, so a reload that lands
 // after a page start still applies instead of being dropped.
 {
-  const { get } = await import('svelte/store');
-  const { createPager } = await import('../src/lib/pager.js');
+  const { createPager } = await import('../src/lib/pager.svelte.js');
   const pending = [];
   const pager = createPager({
     fetchPage: (cursor) => new Promise((resolve) => pending.push({ cursor, resolve })),
@@ -123,11 +122,11 @@ function check(name, cond) {
   const pReset = pager.loadMore(true); // reload starts first
   const pPage = pager.loadMore(); // page starts after, lands first
   pending[1].resolve({ rows: [{ id: 'p' }], nextAfter: 'p1' });
-  check('page landing first applies', (await pPage) === 'applied' && get(pager.rows).length === 1);
+  check('page landing first applies', (await pPage) === 'applied' && pager.rows.length === 1);
   pending[0].resolve({ rows: [{ id: 'r' }], nextAfter: '' });
   check('reload landing after a page start still applies',
-    (await pReset) === 'applied' && get(pager.rows).length === 1 && get(pager.rows)[0].id === 'r' &&
-    get(pager.exhausted));
+    (await pReset) === 'applied' && pager.rows.length === 1 && pager.rows[0].id === 'r' &&
+    pager.exhausted);
   // Reverse order: an append requested before a successful reset never
   // lands after it — a late page cannot reopen an exhausted list.
   {
@@ -140,11 +139,11 @@ function check(name, cond) {
     const pReload = relisting.reset(); // reset requested after
     late[1].resolve({ rows: [{ id: 'n' }], nextAfter: '' });
     check('reset landing before a pending append still applies',
-      (await pReload) === 'applied' && get(relisting.rows).length === 1 && get(relisting.rows)[0].id === 'n');
+      (await pReload) === 'applied' && relisting.rows.length === 1 && relisting.rows[0].id === 'n');
     late[0].resolve({ rows: [{ id: 'o' }], nextAfter: 'old' });
     check('late append from the previous cursor lands stale',
-      (await pPage) === 'stale' && get(relisting.rows).length === 1 && get(relisting.rows)[0].id === 'n' &&
-      get(relisting.exhausted));
+      (await pPage) === 'stale' && relisting.rows.length === 1 && relisting.rows[0].id === 'n' &&
+      relisting.exhausted);
   }
   // Reload-first order: the append is requested after the reset but
   // still against the old cursor. The reset commits first and retires
@@ -160,11 +159,11 @@ function check(name, cond) {
     check('append runs against the pre-reset cursor', early[1].cursor === '');
     early[0].resolve({ rows: [{ id: 'n' }], nextAfter: '' });
     check('reload committing first still applies',
-      (await pReload) === 'applied' && get(reloading.rows).length === 1 && get(reloading.rows)[0].id === 'n');
+      (await pReload) === 'applied' && reloading.rows.length === 1 && reloading.rows[0].id === 'n');
     early[1].resolve({ rows: [{ id: 'o' }], nextAfter: 'old' });
     check('append landing after a committed reset lands stale',
-      (await pPage) === 'stale' && get(reloading.rows).length === 1 && get(reloading.rows)[0].id === 'n' &&
-      get(reloading.exhausted));
+      (await pPage) === 'stale' && reloading.rows.length === 1 && reloading.rows[0].id === 'n' &&
+      reloading.exhausted);
   }
   // A failed reset changes nothing: a pending append against the
   // still-valid cursor lands and fills the list instead of going
@@ -179,11 +178,11 @@ function check(name, cond) {
     const pReload = retrying.reset();
     recovering[1].reject(new Error('offline'));
     check('failed reset reports failure without rows',
-      (await pReload) === 'failed' && get(retrying.rows).length === 0 && get(retrying.error) === 'offline');
+      (await pReload) === 'failed' && retrying.rows.length === 0 && retrying.error === 'offline');
     recovering[0].resolve({ rows: [{ id: 'o' }], nextAfter: 'old' });
     check('pending append survives a failed reset',
-      (await pPage) === 'applied' && get(retrying.rows).length === 1 && get(retrying.rows)[0].id === 'o' &&
-      !get(retrying.exhausted));
+      (await pPage) === 'applied' && retrying.rows.length === 1 && retrying.rows[0].id === 'o' &&
+      !retrying.exhausted);
   }
   // Retry follows the displayed failure even when the last click
   // started the other operation.
@@ -212,7 +211,7 @@ function check(name, cond) {
     const message = resetFailsLast ? 'reload failed' : 'page failed';
     check(`visible failure identifies the operation when ${message} last`,
       reloadRequest.cursor === '' && appendRequest.cursor === 'next' &&
-      get(overlapping.error) === message && get(overlapping.failure)?.reset === resetFailsLast);
+      overlapping.error === message && overlapping.failure?.reset === resetFailsLast);
   }
   // Snapshot seeding: seeded rows render with no fetch; a failed reset
   // keeps them with an error instead of emptying the list.
@@ -222,9 +221,9 @@ function check(name, cond) {
     // Thunk form, as .svelte callers pass it (init-capture rule).
     initial: () => ({ rows: [{ id: 's' }], nextAfter: 'c9' })
   });
-  check('seed renders without fetching', get(seeded.rows).length === 1 && get(seeded.started) === true);
+  check('seed renders without fetching', seeded.rows.length === 1 && seeded.started === true);
   check('failed reset keeps the seed with an error',
-    (await seeded.reset()) === 'failed' && get(seeded.rows).length === 1 && get(seeded.error) === 'offline');
+    (await seeded.reset()) === 'failed' && seeded.rows.length === 1 && seeded.error === 'offline');
 }
 
 // lib/briefingView: pure dossier derivations with unit coverage.
@@ -349,28 +348,27 @@ function check(name, cond) {
     r4.error === null && r4.notice === null);
 }
 {
-  const { get } = await import('svelte/store');
-  const { createPager } = await import('../src/lib/pager.js');
+  const { createPager } = await import('../src/lib/pager.svelte.js');
   const pages = {
     '': { rows: [{ id: 'a' }, { id: 'b' }], nextAfter: 'c1' },
     c1: { rows: [{ id: 'b' }, { id: 'c' }], nextAfter: '' }
   };
   const pager = createPager({ fetchPage: async (c) => pages[c], keyOf: (r) => r.id, cap: 10 });
-  check('first page applies', (await pager.loadMore()) === 'applied' && get(pager.rows).length === 2);
+  check('first page applies', (await pager.loadMore()) === 'applied' && pager.rows.length === 2);
   check('second page dedupes and exhausts',
-    (await pager.loadMore()) === 'applied' && get(pager.rows).length === 3 && get(pager.exhausted));
-  check('reset replaces rows', (await pager.reset()) === 'applied' && get(pager.rows).length === 2);
+    (await pager.loadMore()) === 'applied' && pager.rows.length === 3 && pager.exhausted);
+  check('reset replaces rows', (await pager.reset()) === 'applied' && pager.rows.length === 2);
   const failing = createPager({
     fetchPage: async () => { throw new Error('offline'); }, keyOf: (r) => r.id, cap: 10
   });
   check('failed page keeps rows empty with error',
-    (await failing.loadMore()) === 'failed' && get(failing.rows).length === 0 && get(failing.error) === 'offline');
+    (await failing.loadMore()) === 'failed' && failing.rows.length === 0 && failing.error === 'offline');
   const capped = createPager({
     fetchPage: async () => ({ rows: [{ id: 'x' }], nextAfter: 'more' }),
     keyOf: (r) => r.id, cap: 1
   });
   await capped.loadMore();
-  check('cap flag names the limit', get(capped.capped) === true);
+  check('cap flag names the limit', capped.capped === true);
   // Replace restarts from applied data: in-flight pages land stale.
   const gated = (() => { let r; const p = new Promise((res) => { r = res; }); return { promise: p, resolve: r }; })();
   const swapping = createPager({ fetchPage: () => gated.promise, keyOf: (r) => r.id, cap: 10 });
@@ -378,8 +376,8 @@ function check(name, cond) {
   swapping.replace([{ id: 'fresh' }], '');
   gated.resolve({ rows: [{ id: 'old' }], nextAfter: 'c' });
   check('replace wins over an in-flight page',
-    (await late) === 'stale' && get(swapping.rows).length === 1 && get(swapping.rows)[0].id === 'fresh' &&
-    get(swapping.exhausted) === true && get(swapping.error) === null);
+    (await late) === 'stale' && swapping.rows.length === 1 && swapping.rows[0].id === 'fresh' &&
+    swapping.exhausted === true && swapping.error === null);
 }
 
 // lib/stream: transport lifecycle with an injectable source. Errors
@@ -473,7 +471,8 @@ function check(name, cond) {
     help.length === 2 && help.some((h) => h.key === '?' && h.label === 'Toggle shortcuts'));
 }
 
-const { checkSelectedResource } = await import('./state-cases.svelte.js');
+const { checkSelectedResource, checkWindowPager } = await import('./state-cases.svelte.js');
 await checkSelectedResource(check);
+await checkWindowPager(check);
 
 console.log(`characterize: ${pass} checks passed`);
