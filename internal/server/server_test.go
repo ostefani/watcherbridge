@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -940,17 +942,6 @@ func seedClosedGroups(t *testing.T, h *harness, n int) []string {
 	return ids
 }
 
-func seededDone(t *testing.T, h *harness, ids []string) bool {
-	t.Helper()
-	for _, id := range ids {
-		st, err := h.srv.events.GroupStatus(context.Background(), id)
-		if err != nil || st != "done" {
-			return false
-		}
-	}
-	return true
-}
-
 func briefingDeps(t *testing.T, h *harness) briefing.Deps {
 	t.Helper()
 	return briefing.Deps{
@@ -970,14 +961,26 @@ func briefingDeps(t *testing.T, h *harness) briefing.Deps {
 
 type relayTimingTransport struct {
 	base    http.RoundTripper
-	elapsed time.Duration
+	mu      sync.Mutex
+	byEvent map[string]time.Duration
 }
 
 func (t *relayTimingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	start := time.Now()
 	res, err := t.base.RoundTrip(req)
-	t.elapsed += time.Since(start)
+	elapsed := time.Since(start)
+	t.mu.Lock()
+	t.byEvent[req.Header.Get("X-SubnetLens-Event-ID")] += elapsed
+	t.mu.Unlock()
 	return res, err
+}
+
+func (t *relayTimingTransport) take(eventID string) time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	elapsed := t.byEvent[eventID]
+	delete(t.byEvent, eventID)
+	return elapsed
 }
 
 func TestClosureDrainBudgets(t *testing.T) {
@@ -985,26 +988,47 @@ func TestClosureDrainBudgets(t *testing.T) {
 	now := time.Now()
 	seeded := seedClosedGroups(t, h, 256)
 
-	// Only the serial ingest loop uses this client. Keep timing with
-	// each request so a slow ingest can be matched to its relay call.
+	// Install before starting either goroutine. The test uses 100 distinct
+	// event IDs and consumes each timing after the request returns.
 	base := h.srv.proxy.Transport
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	relay := &relayTimingTransport{base: base}
+	relay := &relayTimingTransport{base: base, byEvent: make(map[string]time.Duration)}
 	h.srv.proxy.Transport = relay
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	deps := briefingDeps(t, h)
+	pending := make(map[string]struct{}, len(seeded))
+	for _, id := range seeded {
+		pending[id] = struct{}{}
+	}
+	drainDone := make(chan time.Time, 1)
+	deps.OnBriefing = func(b store.Briefing) {
+		if _, ok := pending[b.GroupID]; ok {
+			delete(pending, b.GroupID)
+			if len(pending) == 0 {
+				drainDone <- time.Now()
+			}
+		}
+	}
+
 	runDone := make(chan error, 1)
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-runDone:
+			if err != nil {
+				t.Errorf("briefing worker: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("briefing worker did not stop after cancellation")
+		}
+	})
+
+	const drainBudget = 5 * time.Second
 	start := time.Now()
 	go func() { runDone <- briefing.Run(ctx, deps) }()
-	defer func() {
-		cancel()
-		if err := <-runDone; err != nil {
-			t.Errorf("briefing worker: %v", err)
-		}
-	}()
 
 	// Pace requests at up to 50/s and keep sampling after the drain,
 	// which can finish well before the 100-request workload ends.
@@ -1025,10 +1049,11 @@ func TestClosureDrainBudgets(t *testing.T) {
 		var res ingestResult
 		for i := 0; i < 100; i++ {
 			<-tick.C
-			relay.elapsed = 0
 			reqStart := time.Now()
-			rec := h.signedPost(t, uniqueID(), "host-bg", "host.appeared", now)
-			res.samples = append(res.samples, sample{reqStart, time.Since(reqStart), relay.elapsed})
+			id := uniqueID()
+			rec := h.signedPost(t, id, "host-bg", "host.appeared", now)
+			elapsed := time.Since(reqStart)
+			res.samples = append(res.samples, sample{started: reqStart, total: elapsed, relay: relay.take(id)})
 			switch rec.Code {
 			case http.StatusAccepted:
 			case http.StatusServiceUnavailable:
@@ -1040,19 +1065,27 @@ func TestClosureDrainBudgets(t *testing.T) {
 		ingestDone <- res
 	}()
 
-	for time.Since(start) < 5*time.Second && !seededDone(t, h, seeded) {
-		time.Sleep(10 * time.Millisecond)
+	var drainCommitted time.Time
+	timer := time.NewTimer(time.Until(start.Add(drainBudget)))
+	defer timer.Stop()
+	select {
+	case drainCommitted = <-drainDone:
+	case <-timer.C:
+		// The observer may have published before the deadline even if
+		// both channels became ready before this goroutine was scheduled.
+		select {
+		case drainCommitted = <-drainDone:
+		default:
+		}
 	}
-	drainObserved := time.Now()
 	res := <-ingestDone
-	if elapsed := drainObserved.Sub(start); elapsed > 5*time.Second {
-		t.Fatalf("256 seeded groups not observed done within 5s (polled for %v)", elapsed)
+	if drainCommitted.IsZero() || drainCommitted.Sub(start) > drainBudget {
+		t.Fatalf("%d seeded groups did not finish within %v", len(seeded), drainBudget)
 	}
-	t.Logf("256-group drain observed in %v (budget 5s)", drainObserved.Sub(start))
+	t.Logf("%d-group drain completed in %v (budget %v)", len(seeded), drainCommitted.Sub(start), drainBudget)
 	var during, after []sample
 	for _, req := range res.samples {
-		// Polling gives an upper bound on when the drain completed.
-		if req.started.Before(drainObserved) {
+		if req.started.Before(drainCommitted) {
 			during = append(during, req)
 		} else {
 			after = append(after, req)
@@ -1063,17 +1096,19 @@ func TestClosureDrainBudgets(t *testing.T) {
 			t.Logf("%s: 0 requests", label)
 			return 0
 		}
-		sort.Slice(samples, func(a, b int) bool { return samples[a].total < samples[b].total })
+		slices.SortFunc(samples, func(a, b sample) int { return cmp.Compare(a.total, b.total) })
 		// Nearest rank, converted from a one-based rank to a slice index.
 		p99 := samples[(99*len(samples)+99)/100-1]
-		max := samples[len(samples)-1]
-		t.Logf("%s: %d requests, p99 %v (relay %v), max %v (relay %v)",
-			label, len(samples), p99.total, p99.relay, max.total, max.relay)
+		slowest := samples[len(samples)-1]
+		t.Logf("%s: %d requests, p99 %v (relay to headers %v), max %v (relay to headers %v)",
+			label, len(samples), p99.total, p99.relay, slowest.total, slowest.relay)
 		return p99.total
 	}
+	// The drain can finish in a few ticker intervals. Keep the gate
+	// over the full workload and report the small drain cohort separately.
 	p99 := report("all proxy ingest", res.samples)
-	report("started before drain completion was observed", during)
-	report("started after drain completion was observed", after)
+	report("started before the final seeded briefing committed", during)
+	report("started after the final seeded briefing committed", after)
 	if p99 > 50*time.Millisecond {
 		t.Errorf("proxy ingest p99 %v exceeds 50ms", p99)
 	}
