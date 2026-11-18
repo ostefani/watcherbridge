@@ -975,12 +975,12 @@ func (t *relayTimingTransport) RoundTrip(req *http.Request) (*http.Response, err
 	return res, err
 }
 
-func (t *relayTimingTransport) take(eventID string) time.Duration {
+func (t *relayTimingTransport) take(eventID string) (time.Duration, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	elapsed := t.byEvent[eventID]
+	elapsed, ok := t.byEvent[eventID]
 	delete(t.byEvent, eventID)
-	return elapsed
+	return elapsed, ok
 }
 
 func TestClosureDrainBudgets(t *testing.T) {
@@ -997,7 +997,7 @@ func TestClosureDrainBudgets(t *testing.T) {
 	relay := &relayTimingTransport{base: base, byEvent: make(map[string]time.Duration)}
 	h.srv.proxy.Transport = relay
 
-	ctx, cancel := context.WithCancel(t.Context())
+	ctx := t.Context()
 	deps := briefingDeps(t, h)
 	pending := make(map[string]struct{}, len(seeded))
 	for _, id := range seeded {
@@ -1015,7 +1015,6 @@ func TestClosureDrainBudgets(t *testing.T) {
 
 	runDone := make(chan error, 1)
 	t.Cleanup(func() {
-		cancel()
 		select {
 		case err := <-runDone:
 			if err != nil {
@@ -1053,9 +1052,13 @@ func TestClosureDrainBudgets(t *testing.T) {
 			id := uniqueID()
 			rec := h.signedPost(t, id, "host-bg", "host.appeared", now)
 			elapsed := time.Since(reqStart)
-			res.samples = append(res.samples, sample{started: reqStart, total: elapsed, relay: relay.take(id)})
+			relayElapsed, forwarded := relay.take(id)
+			res.samples = append(res.samples, sample{started: reqStart, total: elapsed, relay: relayElapsed})
 			switch rec.Code {
 			case http.StatusAccepted:
+				if !forwarded {
+					t.Errorf("accepted proxy request %s has no relay timing for its event ID", id)
+				}
 			case http.StatusServiceUnavailable:
 				res.saturated++
 			default:
@@ -1110,7 +1113,7 @@ func TestClosureDrainBudgets(t *testing.T) {
 	report("started before the final seeded briefing committed", during)
 	report("started after the final seeded briefing committed", after)
 	if p99 > 50*time.Millisecond {
-		t.Errorf("proxy ingest p99 %v exceeds 50ms", p99)
+		t.Errorf("proxy ingest p99 across all %d requests was %v (budget 50ms)", len(res.samples), p99)
 	}
 	if res.saturated != 0 || res.lost != 0 {
 		t.Errorf("ingest loss: saturated=%d lost=%d", res.saturated, res.lost)
