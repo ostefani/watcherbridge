@@ -1,0 +1,33 @@
+name: load
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 8 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CGO_ENABLED: 1
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Verify load verdict calculations
+        run: python3 -m unittest discover -s e2e -p test_load_verdict.py
+      - name: Check tap and proxy load budgets
+        run: bash e2e/load.sh
+      - name: Upload load evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: load-results
+          path: e2e/results/
