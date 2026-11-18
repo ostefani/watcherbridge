@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Evaluate a completed Step 31 synthetic load run."""
-import json, glob, os, re, sys
+import json, glob, math, os, re, sys
 
 def summary(phase, resdir):
     with open(os.path.join(resdir, phase + ".summary")) as f:
@@ -34,7 +34,7 @@ def pctl(path, p):
             r = json.loads(line)
             xs.append(r["lat_ms"])
     xs.sort()
-    return xs[min(int(p * len(xs)), len(xs) - 1)] if xs else -1
+    return xs[math.ceil(p * len(xs)) - 1] if xs else -1
 
 def paired_proxy_delta_p99(proxy_path, direct_path):
     # Both phases offer the same fixture and reference at each index with
@@ -58,7 +58,6 @@ def paired_proxy_delta_p99(proxy_path, direct_path):
     if not proxy or proxy.keys() != direct.keys():
         return None
     deltas = sorted(proxy[index] - direct[index] for index in proxy)
-    import math
     return deltas[math.ceil(0.99 * len(deltas)) - 1]
 
 def main():
@@ -75,7 +74,7 @@ def main():
             overhead = paired_proxy_delta_p99(f"{resdir}/proxy-{workload}-{rep}.jsonl",
                                                f"{resdir}/direct-{workload}-{rep}.jsonl")
             if overhead is None:
-                pending.append(f"{workload} rep{rep}: proxy/direct successful event indexes did not match")
+                breaches.append(f"{workload} rep{rep}: cannot verify proxy budget without matching successful proxy/direct samples")
             tap_stored = stored(f"tap-{rep}.db", f"tap-{workload}-{rep}", datadir)
             proxy_stored = stored(f"proxy-{rep}.db", f"proxy-{workload}-{rep}", datadir)
             checks = {

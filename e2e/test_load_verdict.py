@@ -28,6 +28,10 @@ class LoadVerdictTest(unittest.TestCase):
         direct = self.records("direct", [2, 3, 4, 5])
         self.assertEqual(load_verdict.paired_proxy_delta_p99(proxy, direct), 9)
 
+    def test_p99_excludes_maximum_for_100_samples(self):
+        tap = self.records("tap", range(1, 101))
+        self.assertEqual(load_verdict.pctl(tap, 0.99), 99)
+
     def test_missing_pair_cannot_pass(self):
         proxy = self.records("proxy", [10, 12])
         direct = self.records("direct", [2])
