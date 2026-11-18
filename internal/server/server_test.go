@@ -968,22 +968,53 @@ func briefingDeps(t *testing.T, h *harness) briefing.Deps {
 	}
 }
 
+type relayTimingTransport struct {
+	base    http.RoundTripper
+	elapsed time.Duration
+}
+
+func (t *relayTimingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	start := time.Now()
+	res, err := t.base.RoundTrip(req)
+	t.elapsed += time.Since(start)
+	return res, err
+}
+
 func TestClosureDrainBudgets(t *testing.T) {
 	h := newHarness(t, func(c *config.Config) { c.Mode = config.ModeProxy })
 	now := time.Now()
 	seeded := seedClosedGroups(t, h, 256)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	runDone := make(chan error, 1)
-	go func() { runDone <- briefing.Run(ctx, briefingDeps(t, h)) }()
-	start := time.Now()
+	// Only the serial ingest loop uses this client. Keep timing with
+	// each request so a slow ingest can be matched to its relay call.
+	base := h.srv.proxy.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	relay := &relayTimingTransport{base: base}
+	h.srv.proxy.Transport = relay
 
-	// Background ingest at 50 ev/s on its own goroutine while the main
-	// goroutine polls the seeded groups: every request lands while the
-	// worker holds the shared writer.
+	ctx, cancel := context.WithCancel(context.Background())
+	deps := briefingDeps(t, h)
+	runDone := make(chan error, 1)
+	start := time.Now()
+	go func() { runDone <- briefing.Run(ctx, deps) }()
+	defer func() {
+		cancel()
+		if err := <-runDone; err != nil {
+			t.Errorf("briefing worker: %v", err)
+		}
+	}()
+
+	// Pace requests at up to 50/s and keep sampling after the drain,
+	// which can finish well before the 100-request workload ends.
+	type sample struct {
+		started time.Time
+		total   time.Duration
+		relay   time.Duration
+	}
 	type ingestResult struct {
-		durs      []time.Duration
+		samples   []sample
 		lost      int
 		saturated int
 	}
@@ -994,9 +1025,10 @@ func TestClosureDrainBudgets(t *testing.T) {
 		var res ingestResult
 		for i := 0; i < 100; i++ {
 			<-tick.C
+			relay.elapsed = 0
 			reqStart := time.Now()
 			rec := h.signedPost(t, uniqueID(), "host-bg", "host.appeared", now)
-			res.durs = append(res.durs, time.Since(reqStart))
+			res.samples = append(res.samples, sample{reqStart, time.Since(reqStart), relay.elapsed})
 			switch rec.Code {
 			case http.StatusAccepted:
 			case http.StatusServiceUnavailable:
@@ -1007,23 +1039,46 @@ func TestClosureDrainBudgets(t *testing.T) {
 		}
 		ingestDone <- res
 	}()
-	for !seededDone(t, h, seeded) {
-		if time.Since(start) > 5*time.Second {
-			t.Fatal("256 seeded groups not briefed within 5s")
-		}
+
+	for time.Since(start) < 5*time.Second && !seededDone(t, h, seeded) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	drainElapsed := time.Since(start)
-	t.Logf("256-group drain took %v (budget 5s)", drainElapsed)
+	drainObserved := time.Now()
 	res := <-ingestDone
-	sort.Slice(res.durs, func(a, b int) bool { return res.durs[a] < res.durs[b] })
-	p99 := res.durs[int(float64(len(res.durs))*0.99)]
-	t.Logf("ingest p99 during drain over %d requests: %v (budget 50ms)", len(res.durs), p99)
+	if elapsed := drainObserved.Sub(start); elapsed > 5*time.Second {
+		t.Fatalf("256 seeded groups not observed done within 5s (polled for %v)", elapsed)
+	}
+	t.Logf("256-group drain observed in %v (budget 5s)", drainObserved.Sub(start))
+	var during, after []sample
+	for _, req := range res.samples {
+		// Polling gives an upper bound on when the drain completed.
+		if req.started.Before(drainObserved) {
+			during = append(during, req)
+		} else {
+			after = append(after, req)
+		}
+	}
+	report := func(label string, samples []sample) time.Duration {
+		if len(samples) == 0 {
+			t.Logf("%s: 0 requests", label)
+			return 0
+		}
+		sort.Slice(samples, func(a, b int) bool { return samples[a].total < samples[b].total })
+		// Nearest rank, converted from a one-based rank to a slice index.
+		p99 := samples[(99*len(samples)+99)/100-1]
+		max := samples[len(samples)-1]
+		t.Logf("%s: %d requests, p99 %v (relay %v), max %v (relay %v)",
+			label, len(samples), p99.total, p99.relay, max.total, max.relay)
+		return p99.total
+	}
+	p99 := report("all proxy ingest", res.samples)
+	report("started before drain completion was observed", during)
+	report("started after drain completion was observed", after)
 	if p99 > 50*time.Millisecond {
-		t.Fatalf("ingest p99 %v exceeds 50ms during drain", p99)
+		t.Errorf("proxy ingest p99 %v exceeds 50ms", p99)
 	}
 	if res.saturated != 0 || res.lost != 0 {
-		t.Fatalf("ingest loss during drain: saturated=%d lost=%d", res.saturated, res.lost)
+		t.Errorf("ingest loss: saturated=%d lost=%d", res.saturated, res.lost)
 	}
 	var mem runtime.MemStats
 	runtime.GC()
