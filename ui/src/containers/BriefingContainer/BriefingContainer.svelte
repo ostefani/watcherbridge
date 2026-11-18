@@ -2,7 +2,7 @@
   import Notice from '@/components/Notice/Notice.svelte';
   import { onMount, untrack } from 'svelte';
   import { fetchBriefing } from '@/api.js';
-  import { createResource } from '@/lib/resource.js';
+  import { createSelectedResource } from '@/lib/resource.svelte.js';
   import { reviewTitle, reportRange, singleViewIdentity } from '@/lib/format.js';
   import { priorityDiffers, lookupLimits, lookupReceipts, identityComplete } from '@/lib/briefingView.js';
   import { revealEvidence } from '@/lib/evidenceNavigation.js';
@@ -39,25 +39,12 @@
 
   let articleElement = $state(null);
   let decisions = $state(null);
-  let resource = $state(null);
-  const shown = $derived($resource?.data ?? initial);
-  const notice = $derived($resource?.error ?? $resource?.refreshError ?? null);
-
-  // Reset the resource when the briefing changes: the previous
-  // briefing must never render while the next one fetches (was BUG-2).
-  // A provided snapshot renders as-is and never refetches.
-  $effect(() => {
-    const current = id;
-    const next = createResource(() => fetchBriefing(current));
-    resource = next;
-    if (initial === null) {
-      next.refresh();
-    }
-    return () => next.invalidate();
-  });
+  const resource = createSelectedResource(() => id, fetchBriefing, () => initial);
+  const shown = $derived(resource().shown);
+  const notice = $derived(resource().error ?? resource().notice);
 
   function load() {
-    resource?.refresh();
+    return resource().refresh();
   }
 
   const title = $derived(shown === null ? '' : reviewTitle(shown.kind, shown.observations, shown.referenced_events));

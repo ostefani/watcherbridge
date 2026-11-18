@@ -34,7 +34,7 @@ components/<Name>/  Name.svelte  Name.module.css  index.js
 containers/<Name>/  Name.svelte  (Name.css only when the container has its own markup)
 ```
 
-`src/lib` is flat: every helper is one `lib/*.js` module, no
+`src/lib` is flat: helpers live in `lib/*.js` or `lib/*.svelte.js`, with no
 subfolders, no barrels. `Pill`, `TimeStamp` and `Notice` own badges,
 timestamps and status/alert banners, so no global class remains for
 them — transitional globals are deleted, not parked.
@@ -76,13 +76,10 @@ allowlist / forbidden automation stack). JSDoc wire typedefs with
 
 - `npm run smoke` — SSR render assertions (wire shapes, hostile text
   inertness) plus pure-unit asserts (guard, paging, undo, purge).
-- `npm run characterize` — pins current behavior plus unit coverage
-  for fencing, pager seeding/replace/reset/commit ordering, reconnect
-  paths, decision payloads, briefing derivations
-  and the evidence-key contract. The BUG-1/2/3 pins flipped green with
-  their owning migrations (Devices pager, Briefing resource reset,
-  Health snapshot reconnect); only lifecycle behavior stays on the
-  manual checklist, which smoke cannot mount.
+- `npm run characterize` — covers request fencing, pager ordering,
+  snapshots, reconnect conditions, decision payloads and evidence keys.
+  Client-compiled rune tests exercise briefing identity changes and
+  late responses. Mounted interactions stay on the manual checklist.
 - `npm run styleguard` — fails on any inline `<style>` block; runs in
   `make ui-check`.
 - Release sign-off remains the human walkthrough in
@@ -99,7 +96,6 @@ allowlist / forbidden automation stack). JSDoc wire typedefs with
   dependencies) where dynamic imports need it.
 - Health migrates first, Briefing and Decisions last; one screen per
   step so the app stays shippable.
-- `lib/` helpers are plain JS over `svelte/store`, not `.svelte.js` runes:
-  runes need the compiler, which plain node lacks, and no test runner
-  may be added — so unit coverage lives in `scripts/characterize.mjs`.
-  Components consume the stores with `$data` as usual.
+- Resource helpers use reactive getters in `lib/*.svelte.js`. Vite compiles
+  them for production. The Node checks use `svelte/compiler` for their
+  client and SSR targets. Pure helpers remain plain JavaScript.

@@ -5,7 +5,7 @@
 import { readdirSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { compile } from 'svelte/compiler';
+import { compile, compileModule } from 'svelte/compiler';
 import { render } from 'svelte/server';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -89,7 +89,11 @@ for (const full of collectJs(lib)) {
   // Helpers import each other through `@/`, which plain node cannot
   // resolve here — map them onto the flat copies like the compiled
   // components above, so a new helper import just lands.
-  const helperCode = readFileSync(full, 'utf8')
+  const source = readFileSync(full, 'utf8');
+  const compiled = base.endsWith('.svelte.js')
+    ? compileModule(source, { generate: 'server', filename: full }).js.code
+    : source;
+  const helperCode = compiled
     .replaceAll("from '@/api.js'", "from './api.js'")
     .replaceAll(/from '@\/lib\/(?:[^']*\/)?([^'/]+)'/g, "from './$1'");
   writeFileSync(join(out, base), helperCode);

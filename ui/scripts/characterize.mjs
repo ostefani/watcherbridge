@@ -1,16 +1,7 @@
-// Characterization for the folder split (plan steps 6-7). Plain node,
-// no test runner: SSR-incompatible runtime behavior is pinned here at
-// the unit level, and component wiring bugs are pinned structurally
-// until Phase 5 replaces them with behavioral tests. Anything marked
-// BUG-* fails today by design; Phase 2/5 flips those pins green.
-//
-// Covered by scripts/smoke.mjs already (not duplicated here): SSE
-// incident recovery, undo member continuation, purge attention flags,
-// guard latest-wins basics. Covered only by the human checklist:
-// focus movement, reconnect rendering, decision submit/undo round-trips.
+// Plain Node checks for viewer state, including client-compiled rune
+// modules. Mounted screen and browser interaction remain manual checks.
 import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { compileModule } from 'svelte/compiler';
 import { registerHooks } from 'node:module';
 import { createFetchGuard } from '../src/lib/freshness.js';
 import { nextPageRows } from '../src/lib/paging.js';
@@ -26,6 +17,14 @@ registerHooks({
       return { url: new URL(`../src/${specifier.slice(2)}`, import.meta.url).href, shortCircuit: true };
     }
     return next(specifier, context);
+  },
+  load(url, context, next) {
+    if (url.startsWith('file:') && url.endsWith('.svelte.js')) {
+      const source = readFileSync(new URL(url), 'utf8');
+      const { js } = compileModule(source, { generate: 'client', filename: new URL(url).pathname });
+      return { format: 'module', source: js.code, shortCircuit: true };
+    }
+    return next(url, context);
   }
 });
 import {
@@ -33,9 +32,7 @@ import {
   reportRange, reviewTitle, singleViewIdentity, randomizedLabel
 } from '../src/lib/format.js';
 
-const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 let pass = 0;
-const bugs = [];
 function check(name, cond) {
   if (!cond) {
     console.error(`FAIL ${name}`);
@@ -44,16 +41,6 @@ function check(name, cond) {
   }
   pass += 1;
 }
-// A failing pin documents a suspected bug with a reproducible case.
-// It stays red until the owning migration fixes the root cause.
-function bugPin(id, name, cond) {
-  if (cond) {
-    pass += 1;
-    return;
-  }
-  bugs.push(`${id}: ${name}`);
-}
-
 // Latest-wins fencing across reload and paging intents.
 {
   const guard = createFetchGuard();
@@ -295,24 +282,15 @@ function bugPin(id, name, cond) {
     eventKey('evt-1') === 'event:evt-1' && stepKey(2) === 'step:2' && REPORTS_KEY === 'reports');
 }
 
-// BUG-2 (fixed by the Briefing migration): the briefing resource
-// resets when the id changes, so the previous briefing never renders
-// while the next one fetches. Resetting is lifecycle, so the pin stays
-// structural on the owning mechanism; selection switches stay on the
-// manual checklist with the rest of the runtime behavior smoke cannot
-// mount.
+// A failed refresh with a prerender snapshot stays non-blocking.
 {
-  const container = readFileSync(join(root, 'src/containers/BriefingContainer/BriefingContainer.svelte'), 'utf8');
-  const effect = container.slice(container.indexOf('Reset the resource'));
-  bugPin('BUG-2', 'id change resets the briefing resource before refetch',
-    /createResource/.test(effect) && /invalidate/.test(effect));
+  const { createResource } = await import('../src/lib/resource.svelte.js');
+  const resource = createResource(() => Promise.reject(new Error('offline')), () => 'snapshot');
+  check('snapshot is immediately available through the resource', resource.shown === 'snapshot');
+  check('snapshot survives a failed refresh with a notice',
+    (await resource.refresh()) === 'failed' && resource.shown === 'snapshot' && resource.notice === 'offline');
 }
 
-// Reconnect edge and failure visibility, behaviorally. BUG-3's fix is
-// the edge decision plus the snapshot-aware notice — both pure units,
-// so no source regex is needed. Container wiring (calling refresh on a
-// true edge) stays on the manual reconnect checklist with the rest of
-// the runtime behavior smoke cannot mount.
 {
   const { shouldRefreshOnReconnect } = await import('../src/lib/reconnect.js');
   const edge = (over) => shouldRefreshOnReconnect({ live: false, wasLive: false, data: null, initial: null, ...over });
@@ -321,16 +299,6 @@ function bugPin(id, name, cond) {
   check('no edge without liveness change or content',
     !edge({ live: true }) && !edge({ live: true, wasLive: true, initial: 'snap' }) &&
     !edge({ live: false, initial: 'snap' }) && !edge({ live: true, data: null, initial: null }));
-  const { failureNotice } = await import('../src/lib/resource.js');
-  const failed = (over) => failureNotice({ data: null, initial: null, error: null, refreshError: null, ...over });
-  check('snapshot plus failing fetch yields a visible notice',
-    failed({ initial: 'snap', error: 'offline' }) === 'offline');
-  check('fetched data plus failing fetch yields a visible notice',
-    failed({ data: 'rows', refreshError: 'offline' }) === 'offline');
-  check('data-less failure is an error, not a notice',
-    failed({ error: 'offline' }) === null);
-  check('quiet state yields no notice',
-    failed({ data: 'rows' }) === null && failed({}) === null);
 }
 
 // lib: per-operation guards never cancel each other (latestOnly), resources
@@ -346,8 +314,7 @@ function bugPin(id, name, cond) {
   check('invalidate voids only its operation', !reloadOp.current(reloadToken) && pageOp.current(pageOp.start()));
 }
 {
-  const { get } = await import('svelte/store');
-  const { createResource } = await import('../src/lib/resource.js');
+  const { createResource } = await import('../src/lib/resource.svelte.js');
   const deferred = () => {
     let resolve, reject;
     const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
@@ -359,15 +326,15 @@ function bugPin(id, name, cond) {
   const p1 = r1.refresh();
   const p2 = r1.refresh();
   slow.resolve('second');
-  check('stale refresh yields', (await p1) === 'stale' && (await p2) === 'applied' && get(r1.data) === 'second');
+  check('stale refresh yields', (await p1) === 'stale' && (await p2) === 'applied' && r1.data === 'second');
   // Failure without data is an error; with data it is a notice.
   const r2 = createResource(() => Promise.reject(new Error('offline')));
-  check('data-less failure is an error', (await r2.refresh()) === 'failed' && get(r2.error) === 'offline');
+  check('data-less failure is an error', (await r2.refresh()) === 'failed' && r2.error === 'offline');
   let calls = 0;
   const r3 = createResource(() => ((calls += 1) === 1 ? Promise.resolve('first') : Promise.reject(new Error('offline'))));
   check('first load applies', (await r3.refresh()) === 'applied');
   check('failed refresh keeps data with notice', (await r3.refresh()) === 'failed' &&
-    get(r3.data) === 'first' && get(r3.refreshError) === 'offline' && get(r3.error) === null);
+    r3.data === 'first' && r3.notice === 'offline' && r3.error === null);
   // Invalidate voids in flight without clearing rendered data.
   let answer = () => Promise.resolve('seeded');
   const r4 = createResource(() => answer());
@@ -378,8 +345,8 @@ function bugPin(id, name, cond) {
   r4.invalidate();
   gate.resolve('late');
   check('invalidated refresh keeps rendered data',
-    (await pending) === 'stale' && get(r4.data) === 'seeded' &&
-    get(r4.error) === null && get(r4.refreshError) === null);
+    (await pending) === 'stale' && r4.data === 'seeded' &&
+    r4.error === null && r4.notice === null);
 }
 {
   const { get } = await import('svelte/store');
@@ -506,10 +473,7 @@ function bugPin(id, name, cond) {
     help.length === 2 && help.some((h) => h.key === '?' && h.label === 'Toggle shortcuts'));
 }
 
+const { checkSelectedResource } = await import('./state-cases.svelte.js');
+await checkSelectedResource(check);
+
 console.log(`characterize: ${pass} checks passed`);
-if (bugs.length > 0) {
-  for (const b of bugs) {
-    console.log(`KNOWN BUG (failing pin): ${b}`);
-  }
-  process.exitCode = 1;
-}

@@ -169,3 +169,7 @@ export function randomizedLabel(value) {
   }
   return 'Randomization unknown';
 }
+
+export function toErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}

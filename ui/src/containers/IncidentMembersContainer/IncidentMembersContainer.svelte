@@ -1,7 +1,8 @@
 <script>
   import Notice from '@/components/Notice/Notice.svelte';
   import Pill from '@/components/Pill/Pill.svelte';
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
+  import { createResource } from '@/lib/resource.svelte.js';
   import { fetchIncident } from '@/api.js';
   import { getConnectionOrNull } from '@/lib/context.js';
 
@@ -14,15 +15,8 @@
   // next invalidation.
   let { incidentId, expanded = false } = $props();
 
-  let members = $state(undefined);
-  let loadError = $state(undefined);
-  let loading = $state(false);
-  let alive = true;
-  let generation = 0;
+  const resource = createResource(async () => (await fetchIncident(incidentId)).members);
 
-  // Live updates arrive through the shared connection's incident
-  // revision; standalone renders without a provider keep the legacy
-  // window subscription as a fallback.
   const connection = getConnectionOrNull();
   const incidentRevision = connection?.incidentRevision ?? null;
   let seenRevision = -1;
@@ -37,7 +31,7 @@
     }
     if (rev !== seenRevision) {
       seenRevision = rev;
-      refreshMembers();
+      untrack(refreshMembers);
     }
   });
 
@@ -50,55 +44,29 @@
   });
 
   function refreshMembers() {
-    if (!expanded) {
-      return;
+    if (expanded) {
+      resource.clear();
+      resource.refresh();
     }
-    // Clear first like the old list did, so a slow reload reads as
-    // loading instead of showing rows from before the invalidation.
-    members = undefined;
-    loadError = undefined;
-    loadMembers();
   }
 
-  onDestroy(() => {
-    alive = false;
-  });
+  onDestroy(resource.invalidate);
 
   $effect(() => {
-    if (expanded && alive && members === undefined && loadError === undefined && !loading) {
-      loadMembers();
+    if (expanded && resource.data === null && resource.error === null && !resource.loading) {
+      untrack(resource.refresh);
     }
   });
-
-  async function loadMembers() {
-    const token = ++generation;
-    loadError = undefined;
-    loading = true;
-    try {
-      const detail = await fetchIncident(incidentId);
-      if (alive && token === generation) {
-        members = detail.members;
-      }
-    } catch (err) {
-      if (alive && token === generation) {
-        loadError = err instanceof Error ? err.message : String(err);
-      }
-    } finally {
-      if (alive && token === generation) {
-        loading = false;
-      }
-    }
-  }
 </script>
 
 {#if expanded}
-  {#if loading && members === undefined}
+  {#if resource.loading}
     <Notice>Loading members…</Notice>
-  {:else if loadError !== undefined}
-    <Notice kind="alert">{loadError}</Notice>
-  {:else if members !== undefined}
+  {:else if resource.error !== null}
+    <Notice kind="alert">{resource.error}</Notice>
+  {:else if resource.data !== null}
     <ol>
-      {#each members as m (m.briefing_id)}
+      {#each resource.data as m (m.briefing_id)}
         <li>
           <a href={`#/briefing/${m.briefing_id}`}>{m.briefing_id}</a>
           <Pill>{m.priority}</Pill>

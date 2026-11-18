@@ -1,8 +1,8 @@
 <script>
   import Notice from '@/components/Notice/Notice.svelte';
-  import { onDestroy, onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { fetchIncident } from '@/api.js';
-  import { createResource } from '@/lib/resource.js';
+  import { createResource } from '@/lib/resource.svelte.js';
   import { getConnectionOrNull } from '@/lib/context.js';
   import IncidentHeader from '@/components/IncidentHeader/IncidentHeader.svelte';
   import IncidentScope from '@/components/IncidentScope/IncidentScope.svelte';
@@ -19,10 +19,22 @@
   // container through ondecided so it owns its own refetching.
   // `initial` carries a server snapshot: when set the screen renders it
   // without fetching, exactly as a completion would.
-  // Live updates arrive through the shared connection's incident
-  // revision; standalone renders without a provider keep the legacy
-  // window subscription as a fallback.
   let { id, initial = null } = $props();
+
+  const resource = createResource(() => fetchIncident(id), () => initial);
+  const shown = $derived(resource.shown);
+  const notice = $derived(resource.error ?? resource.notice);
+
+  const INCIDENT_KIND_HELP = {
+    expected: 'Mark reviewed: this incident needs no further action. Members stay untouched unless included below.',
+    not_expected: 'Flag for follow-up: this incident still needs a check.',
+    snooze: 'Hide until a time. Empty keeps the server default (24h).',
+    note: 'Free-text note, kept with the audit (max 2000 characters).'
+  };
+
+  function reload() {
+    resource.refresh();
+  }
 
   const connection = getConnectionOrNull();
   const incidentRevision = connection?.incidentRevision ?? null;
@@ -38,44 +50,23 @@
     }
     if (rev !== seenRevision) {
       seenRevision = rev;
-      reload();
+      untrack(reload);
     }
   });
 
-  const resource = createResource(() => fetchIncident(id));
-  const { data, error, refreshError } = resource;
-  const shown = $derived($data ?? initial);
-  // A single notice slot: the only failure mode the old screen had.
-  // With no snapshot the loading state renders beneath it.
-  const notice = $derived($error ?? $refreshError);
-
-  const INCIDENT_KIND_HELP = {
-    expected: 'Mark reviewed: this incident needs no further action. Members stay untouched unless included below.',
-    not_expected: 'Flag for follow-up: this incident still needs a check.',
-    snooze: 'Hide until a time. Empty keeps the server default (24h).',
-    note: 'Free-text note, kept with the audit (max 2000 characters).'
-  };
-
-  function reload() {
-    resource.refresh();
-  }
-
-  // App bumps the incident revision on live frames, reconnect and
-  // resync. These events have no sequence ID and cannot use briefing
-  // replay.
   onMount(() => {
     if (initial === null) {
       reload();
     }
-    if (incidentRevision) {
-      return;
+    if (!incidentRevision) {
+      window.addEventListener('watcherbridge:incident', reload);
     }
-    window.addEventListener('watcherbridge:incident', reload);
-    return () => window.removeEventListener('watcherbridge:incident', reload);
-  });
-
-  onDestroy(() => {
-    resource.invalidate();
+    return () => {
+      if (!incidentRevision) {
+        window.removeEventListener('watcherbridge:incident', reload);
+      }
+      resource.invalidate();
+    };
   });
 </script>
 

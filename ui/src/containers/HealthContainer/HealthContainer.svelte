@@ -1,8 +1,8 @@
 <script>
   import Notice from '@/components/Notice/Notice.svelte';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { fetchHealth } from '@/api.js';
-  import { createResource, failureNotice } from '@/lib/resource.js';
+  import { createResource } from '@/lib/resource.svelte.js';
   import { shouldRefreshOnReconnect } from '@/lib/reconnect.js';
   import { getConnectionOrNull } from '@/lib/context.js';
   import HealthSummary from '@/components/HealthSummary/HealthSummary.svelte';
@@ -22,52 +22,42 @@
   // drilled prop; standalone renders simply never refresh on an edge.
   const connection = getConnectionOrNull();
 
-  // Snapshot-first rendering: fetched data wins once it lands, but the
-  // mount-time snapshot fills in until (or instead of) the fetch. Reads
-  // stay reactive so SSR and the compiler's init-capture rule hold;
-  // parents pass `initial` once and never rewrite it.
-  const resource = createResource(fetchHealth);
-  const { data, error, refreshError } = resource;
-  const shown = $derived($data ?? initial);
-  // A failed refresh on a snapshot screen must surface: the resource
-  // only knows fetch state, so the snapshot-aware notice lives here.
-  const notice = $derived(failureNotice({ data: $data, initial, error: $error, refreshError: $refreshError }));
+  const resource = createResource(fetchHealth, () => initial);
+  const shown = $derived(resource.shown);
 
   onMount(() => {
     if (initial === null) {
       resource.refresh();
     }
+    return resource.invalidate;
   });
 
-  // Refresh live health on the reconnect edge — including snapshots.
-  // A mounted snapshot is renderable state, not a reason to stay
-  // stale (was BUG-3: the edge required fetched data to exist).
   let wasLive = false;
   $effect(() => {
     if (!connection) {
       return;
     }
-    return connection.connection.subscribe((state) => {
+    return connection.connection.subscribe((state) => untrack(() => {
       const live = state === 'live';
-      const edge = shouldRefreshOnReconnect({ live, wasLive, data: $data, initial });
+      const edge = shouldRefreshOnReconnect({ live, wasLive, data: resource.data, initial });
       wasLive = live;
       if (edge) {
         resource.refresh();
       }
-    });
+    }));
   });
 </script>
 
 <section aria-label="Health">
   <h2>Health</h2>
   <p class="section-note">Source coverage, processing, and retention. Liveness describes the source, not host presence.</p>
-  {#if $error !== null && shown === null}
-    <Notice kind="alert">The bridge did not return health ({$error}).</Notice>
+  {#if resource.error !== null && shown === null}
+    <Notice kind="alert">The bridge did not return health ({resource.error}).</Notice>
     <button type="button" onclick={() => resource.refresh()}>Retry</button>
   {:else if shown === null}
     <Notice>Loading health…</Notice>
   {:else}
-    <HealthSummary health={shown} refreshError={notice} onRetry={() => resource.refresh()} />
+    <HealthSummary health={shown} refreshError={resource.notice} onRetry={() => resource.refresh()} />
     <SourceList sources={shown.sources} />
     <PipelineDetails process={shown.process} />
     <PurgeDetails purge={shown.purge} retention={shown.retention} />
