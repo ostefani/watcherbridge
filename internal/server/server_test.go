@@ -997,6 +997,7 @@ func TestClosureDrainBudgets(t *testing.T) {
 	relay := &relayTimingTransport{base: base, byEvent: make(map[string]time.Duration)}
 	h.srv.proxy.Transport = relay
 
+	// The test cancels this context before cleanup waits for the worker.
 	ctx := t.Context()
 	deps := briefingDeps(t, h)
 	pending := make(map[string]struct{}, len(seeded))
@@ -1004,6 +1005,7 @@ func TestClosureDrainBudgets(t *testing.T) {
 		pending[id] = struct{}{}
 	}
 	drainDone := make(chan time.Time, 1)
+	// OnBriefing runs on the worker goroutine, which owns pending.
 	deps.OnBriefing = func(b store.Briefing) {
 		if _, ok := pending[b.GroupID]; ok {
 			delete(pending, b.GroupID)
@@ -1037,9 +1039,11 @@ func TestClosureDrainBudgets(t *testing.T) {
 		relay   time.Duration
 	}
 	type ingestResult struct {
-		samples   []sample
-		lost      int
-		saturated int
+		samples           []sample
+		lost              int
+		saturated         int
+		missingRelay      int
+		firstMissingRelay string
 	}
 	ingestDone := make(chan ingestResult, 1)
 	go func() {
@@ -1057,7 +1061,10 @@ func TestClosureDrainBudgets(t *testing.T) {
 			switch rec.Code {
 			case http.StatusAccepted:
 				if !forwarded {
-					t.Errorf("accepted proxy request %s has no relay timing for its event ID", id)
+					if res.missingRelay == 0 {
+						res.firstMissingRelay = id
+					}
+					res.missingRelay++
 				}
 			case http.StatusServiceUnavailable:
 				res.saturated++
@@ -1082,6 +1089,9 @@ func TestClosureDrainBudgets(t *testing.T) {
 		}
 	}
 	res := <-ingestDone
+	if res.missingRelay > 0 {
+		t.Errorf("%d accepted proxy requests missing relay timing (first event ID: %s)", res.missingRelay, res.firstMissingRelay)
+	}
 	if drainCommitted.IsZero() || drainCommitted.Sub(start) > drainBudget {
 		t.Fatalf("%d seeded groups did not finish within %v", len(seeded), drainBudget)
 	}
