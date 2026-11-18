@@ -1,8 +1,9 @@
 <script>
   import Notice from '@/components/Notice/Notice.svelte';
-  import { onDestroy, onMount } from 'svelte';
+  import { onMount } from 'svelte';
   import { fetchIncident } from '@/api.js';
-  import { createResource } from '@/lib/resource.js';
+  import { createResource } from '@/lib/resource.svelte.js';
+  import { watchIncidents } from '@/lib/stream.svelte.js';
   import { getConnectionOrNull } from '@/lib/context.js';
   import IncidentHeader from '@/components/IncidentHeader/IncidentHeader.svelte';
   import IncidentScope from '@/components/IncidentScope/IncidentScope.svelte';
@@ -19,35 +20,11 @@
   // container through ondecided so it owns its own refetching.
   // `initial` carries a server snapshot: when set the screen renders it
   // without fetching, exactly as a completion would.
-  // Live updates arrive through the shared connection's incident
-  // revision; standalone renders without a provider keep the legacy
-  // window subscription as a fallback.
   let { id, initial = null } = $props();
 
-  const connection = getConnectionOrNull();
-  const incidentRevision = connection?.incidentRevision ?? null;
-  let seenRevision = -1;
-  $effect(() => {
-    if (!incidentRevision) {
-      return;
-    }
-    const rev = $incidentRevision;
-    if (seenRevision === -1) {
-      seenRevision = rev;
-      return;
-    }
-    if (rev !== seenRevision) {
-      seenRevision = rev;
-      reload();
-    }
-  });
-
-  const resource = createResource(() => fetchIncident(id));
-  const { data, error, refreshError } = resource;
-  const shown = $derived($data ?? initial);
-  // A single notice slot: the only failure mode the old screen had.
-  // With no snapshot the loading state renders beneath it.
-  const notice = $derived($error ?? $refreshError);
+  const resource = createResource(() => fetchIncident(id), () => initial);
+  const shown = $derived(resource.shown);
+  const notice = $derived(resource.error ?? resource.notice);
 
   const INCIDENT_KIND_HELP = {
     expected: 'Mark reviewed: this incident needs no further action. Members stay untouched unless included below.',
@@ -60,22 +37,13 @@
     resource.refresh();
   }
 
-  // App bumps the incident revision on live frames, reconnect and
-  // resync. These events have no sequence ID and cannot use briefing
-  // replay.
+  watchIncidents(getConnectionOrNull(), reload);
+
   onMount(() => {
     if (initial === null) {
       reload();
     }
-    if (incidentRevision) {
-      return;
-    }
-    window.addEventListener('watcherbridge:incident', reload);
-    return () => window.removeEventListener('watcherbridge:incident', reload);
-  });
-
-  onDestroy(() => {
-    resource.invalidate();
+    return resource.invalidate;
   });
 </script>
 

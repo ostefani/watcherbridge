@@ -25,7 +25,7 @@ jobs:
         run: test -z "$(gofmt -l $(git ls-files '*.go'))"
       - name: vet
         run: go vet $(go list ./... | grep -v '/node_modules/')
-      - name: ui-check (lint, dist build, 200 KiB gzip budget)
+      - name: ui-check (lint, dist build, SSR, state checks, 200 KiB gzip budget)
         run: make ui-check
       - name: build
         run: go build $(go list ./... | grep -v '/node_modules/')

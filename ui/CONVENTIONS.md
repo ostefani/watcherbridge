@@ -34,7 +34,7 @@ components/<Name>/  Name.svelte  Name.module.css  index.js
 containers/<Name>/  Name.svelte  (Name.css only when the container has its own markup)
 ```
 
-`src/lib` is flat: every helper is one `lib/*.js` module, no
+`src/lib` is flat: helpers live in `lib/*.js` or `lib/*.svelte.js`, with no
 subfolders, no barrels. `Pill`, `TimeStamp` and `Notice` own badges,
 timestamps and status/alert banners, so no global class remains for
 them — transitional globals are deleted, not parked.
@@ -74,17 +74,14 @@ allowlist / forbidden automation stack). JSDoc wire typedefs with
 
 ## Testing
 
-- `npm run smoke` — SSR render assertions (wire shapes, hostile text
-  inertness) plus pure-unit asserts (guard, paging, undo, purge).
-- `npm run characterize` — pins current behavior plus unit coverage
-  for fencing, pager seeding/replace/reset/commit ordering, reconnect
-  paths, decision payloads, briefing derivations
-  and the evidence-key contract. The BUG-1/2/3 pins flipped green with
-  their owning migrations (Devices pager, Briefing resource reset,
-  Health snapshot reconnect); only lifecycle behavior stays on the
-  manual checklist, which smoke cannot mount.
-- `npm run styleguard` — fails on any inline `<style>` block; runs in
-  `make ui-check`.
+`make ui-check` runs lint, the style guard, the production build, SSR
+smoke tests, client state checks and the gzip budget check.
+
+- `npm run smoke` renders view fixtures in SSR mode to check wire shapes
+  and inert handling of untrusted text. It also checks pure helpers.
+- `npm run characterize` exercises client-compiled rune state in Node,
+  including briefing selection, fetch fencing, paging, and SSE watchers.
+- `npm run styleguard` rejects inline `<style>` blocks.
 - Release sign-off remains the human walkthrough in
   `.innerdoc/ui-manual-checklist.md`.
 
@@ -97,9 +94,12 @@ allowlist / forbidden automation stack). JSDoc wire typedefs with
   Node-run scripts keep relative paths; the harness resolves `@`
   through an inline `module.registerHooks()` resolver (own code, zero
   dependencies) where dynamic imports need it.
-- Health migrates first, Briefing and Decisions last; one screen per
-  step so the app stays shippable.
-- `lib/` helpers are plain JS over `svelte/store`, not `.svelte.js` runes:
-  runes need the compiler, which plain node lacks, and no test runner
-  may be added — so unit coverage lives in `scripts/characterize.mjs`.
-  Components consume the stores with `$data` as usual.
+- Use Svelte 5 runes, callback props and snippets in components. Shared
+  resources, pagination and event streams expose reactive getters and
+  actions from `lib/*.svelte.js`. Read getters in the reactive context
+  that needs their value. Keep pure helpers in plain JavaScript.
+- App owns the event stream. Screens observe live edges or incident
+  revisions through context and own their refresh policy. Watchers
+  untrack callbacks so resource and view reads cannot retrigger them.
+- Vite compiles rune modules for production. The existing Node checks
+  compile them for the client and SSR targets with `svelte/compiler`.

@@ -1,13 +1,12 @@
 // SSE connection lifecycle for GET /events. Transport only: connection
 // state, overview frames and an incident revision counter. Parsing
 // failures degrade to the next frame; refresh ownership stays with the
-// screens, which subscribe to `incidentRevision` for refetch/markStale.
+// screens, which watch the connection and incident revision.
 // No module singletons: App creates one instance and shares it through
 // `./context.js`, so prerender never connects.
 //
 // `open`/`incident`/`resync` all mean "incident state may have
-// changed". Screens subscribe to `incidentRevision` from context, so
-// no window-event bus remains.
+// changed". Screens watch `incidentRevision` through App context.
 //
 // Reconnects are native while the source is still connecting: on a
 // mid-stream drop the source stays open and the browser retries with
@@ -18,7 +17,7 @@
 // recreating a live source would drop the cursor (a fresh EventSource
 // sends no Last-Event-ID).
 
-import { writable } from 'svelte/store';
+import { untrack } from 'svelte';
 
 export const INCIDENT_KINDS = ['open', 'incident', 'resync'];
 
@@ -41,9 +40,10 @@ export function createEventStream({
   onOverview = () => {},
   onIncident = () => {}
 } = {}) {
-  const connection = writable('connecting');
-  const incidentRevision = writable(0);
+  let connection = $state('connecting');
+  let incidentRevision = $state(0);
   let source = null;
+  let listeners = [];
   let timer = null;
   // Generation fences late callbacks after disconnect/reconnect, the
   // same stale-continuation rule screens apply to fetches.
@@ -57,45 +57,44 @@ export function createEventStream({
     }
     if (source !== null) {
       source.onopen = null;
-      source.onmessage = null;
       source.onerror = null;
-      for (const kind of [...INCIDENT_KINDS, 'overview']) {
-        source.removeEventListener?.(kind, listeners[kind]);
+      for (const [kind, handle] of listeners) {
+        source.removeEventListener(kind, handle);
       }
+      listeners = [];
       source.close();
       source = null;
     }
   }
 
-  // Named listeners so cleanup removes exactly what connect added.
-  const listeners = {};
-  for (const kind of INCIDENT_KINDS) {
-    listeners[kind] = () => {
-      incidentRevision.update((n) => n + 1);
-      onIncident(kind);
-    };
-  }
-  listeners.overview = (/** @type {MessageEvent} */ ev) => {
-    try {
-      onOverview(JSON.parse(ev.data));
-    } catch {
-      // Malformed frame degrades to the next refresh, never a crash.
-    }
-  };
-
   function connect() {
     cleanup();
     const my = gen;
-    connection.set('connecting');
+    connection = 'connecting';
     const next = createSource(url);
     source = next;
     next.onopen = () => {
       if (my === gen) {
-        connection.set('live');
+        connection = 'live';
       }
     };
-    for (const kind of [...INCIDENT_KINDS, 'overview']) {
-      next.addEventListener(kind, listeners[kind]);
+    listeners = INCIDENT_KINDS.map((kind) => [kind, () => {
+      if (my === gen) {
+        incidentRevision += 1;
+        onIncident(kind);
+      }
+    }]);
+    listeners.push(['overview', (ev) => {
+      if (my === gen) {
+        try {
+          onOverview(JSON.parse(ev.data));
+        } catch {
+          // Malformed frames degrade to the next refresh.
+        }
+      }
+    }]);
+    for (const [kind, handle] of listeners) {
+      next.addEventListener(kind, handle);
     }
     next.onerror = () => {
       if (my !== gen) {
@@ -108,7 +107,7 @@ export function createEventStream({
         // fresh snapshot and overview, and the client loads state as
         // on first load.
         cleanup();
-        connection.set('retrying');
+        connection = 'retrying';
         const mine = gen;
         timer = schedule(() => {
           if (mine === gen) {
@@ -121,7 +120,7 @@ export function createEventStream({
       // the browser's native retry carries Last-Event-ID and the
       // server resumes instead of restarting. The next onopen flips
       // back to live; disconnect() still closes explicitly.
-      connection.set('retrying');
+      connection = 'retrying';
     };
   }
 
@@ -129,5 +128,35 @@ export function createEventStream({
     cleanup();
   }
 
-  return { connection, incidentRevision, connect, disconnect };
+  return {
+    get connection() { return connection; },
+    get incidentRevision() { return incidentRevision; },
+    connect, disconnect
+  };
+}
+
+// Preserve the initial live edge for screens mounted on an open stream.
+export function watchLive(stream, callback) {
+  let wasLive = false;
+  $effect(() => {
+    const live = stream?.connection === 'live';
+    const entered = live && !wasLive;
+    wasLive = live;
+    if (entered) {
+      untrack(callback);
+    }
+  });
+}
+
+export function watchIncidents(stream, callback) {
+  // Subscribe from the current revision, including frames arriving
+  // between component creation and its first effect.
+  let seen = untrack(() => stream?.incidentRevision);
+  $effect(() => {
+    const revision = stream?.incidentRevision;
+    if (revision !== seen) {
+      seen = revision;
+      untrack(callback);
+    }
+  });
 }

@@ -1,11 +1,11 @@
 <script>
   import Notice from '@/components/Notice/Notice.svelte';
   import { onMount } from 'svelte';
-  import { get } from 'svelte/store';
+  import { watchLive } from '@/lib/stream.svelte.js';
   import { fetchDevice } from '@/api.js';
   import { getConnectionOrNull } from '@/lib/context.js';
-  import { createResource, failureNotice } from '@/lib/resource.js';
-  import { createPager } from '@/lib/pager.js';
+  import { createResource } from '@/lib/resource.svelte.js';
+  import { createPager } from '@/lib/pager.svelte.js';
   import DeviceProfile from '@/components/DeviceProfile/DeviceProfile.svelte';
   import LatestEvidence from '@/components/LatestEvidence/LatestEvidence.svelte';
   import HistoryList from '@/components/HistoryList/HistoryList.svelte';
@@ -31,10 +31,9 @@
 
   const HISTORY_CAP = 200;
 
-  const profileResource = createResource(() => fetchDevice(id));
-  const { data, error, refreshError } = profileResource;
-  const profile = $derived($data ?? initial);
-  const notice = $derived(failureNotice({ data: $data, initial, error: $error, refreshError: $refreshError }));
+  const profileResource = createResource(() => fetchDevice(id), () => initial);
+  const profile = $derived(profileResource.shown);
+  const notice = $derived(profileResource.notice);
 
   const historyPager = createPager({
     fetchPage: async (cursor) => {
@@ -47,14 +46,13 @@
     // it at component top level trips the init-capture rule.
     initial: () => (initial ? { rows: initial.history ?? [], nextAfter: initial.history_next_after ?? '' } : null)
   });
-  const { rows: historyRows, error: historyLoadError, exhausted: historyExhausted, capped: historyCapped } = historyPager;
 
   let stale = $state(false);
 
   async function load() {
     const status = await profileResource.refresh();
     if (status === 'applied') {
-      const fresh = get(data);
+      const fresh = profileResource.data;
       historyPager.replace(fresh?.history ?? [], fresh?.history_next_after ?? '');
       stale = false;
     }
@@ -68,30 +66,23 @@
     if (initial === null) {
       load();
     }
+    return () => {
+      profileResource.invalidate();
+      historyPager.invalidate();
+    };
   });
 
-  // A reconnect edge marks the page stale without resetting history
-  // paging; the operator keeps position and reloads explicitly.
-  let wasLive = false;
-  $effect(() => {
-    if (!connection) {
-      return;
+  watchLive(connection, () => {
+    if (profile !== null) {
+      stale = true;
     }
-    return connection.connection.subscribe((state) => {
-      const live = state === 'live';
-      const edge = live && !wasLive && profile !== null;
-      wasLive = live;
-      if (edge) {
-        stale = true;
-      }
-    });
   });
 </script>
 
-{#if $error !== null && profile === null}
+{#if profileResource.error !== null && profile === null}
   <section aria-label="Reported host unavailable">
     <h2>Reported host unavailable</h2>
-    <p>The bridge did not return this profile ({$error}).</p>
+    <p>The bridge did not return this profile ({profileResource.error}).</p>
     <p><a href="#/devices">Back to reported hosts</a> <button type="button" onclick={load}>Retry</button></p>
   </section>
 {:else if profile === null}
@@ -115,10 +106,10 @@
     />
     <LatestEvidence latest={profile.latest} />
     <HistoryList
-      observations={$historyRows}
-      historyError={$historyLoadError}
-      exhausted={$historyExhausted}
-      capped={$historyCapped}
+      observations={historyPager.rows}
+      historyError={historyPager.error}
+      exhausted={historyPager.exhausted}
+      capped={historyPager.capped}
       cap={HISTORY_CAP}
       onOlder={older}
       onRetry={older}

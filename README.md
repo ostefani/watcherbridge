@@ -9,10 +9,6 @@ Network scanners tell you what’s happening. But what does it actually mean? I 
 
 I built **WatcherBridge** to fill that gap. It receives signed reports from a network scanner and turns them into a local review inbox, with plain explanations of what changed, why it matters, and what to check next. I used SubnetLens Pro as the event source for this project. The demo can use synthetic reports, so reviewers can try it without a scanner or real network data.
 
-## Building notes
-
-Biggest obstacle during the hackathon: repeated power and internet outages in the final days of the build. I worked in short windows when connected, and submitted before the deadline. Wasn't able to update the submission form to add this note there due to the outage too.
-
 ## Deployment modes
 
 ![WatcherBridge deployment diagram. Standalone runs without a relay. In tap mode the scanner can deliver separately to WatcherBridge and ScanRelay. In proxy mode WatcherBridge forwards the original report to ScanRelay. All setups provide local review.](docs/images/architecture.svg)

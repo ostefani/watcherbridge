@@ -1,16 +1,7 @@
-// Characterization for the folder split (plan steps 6-7). Plain node,
-// no test runner: SSR-incompatible runtime behavior is pinned here at
-// the unit level, and component wiring bugs are pinned structurally
-// until Phase 5 replaces them with behavioral tests. Anything marked
-// BUG-* fails today by design; Phase 2/5 flips those pins green.
-//
-// Covered by scripts/smoke.mjs already (not duplicated here): SSE
-// incident recovery, undo member continuation, purge attention flags,
-// guard latest-wins basics. Covered only by the human checklist:
-// focus movement, reconnect rendering, decision submit/undo round-trips.
+// Plain Node checks for viewer state, including client-compiled rune
+// modules. Mounted screen and browser interaction remain manual checks.
 import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { compileModule } from 'svelte/compiler';
 import { registerHooks } from 'node:module';
 import { createFetchGuard } from '../src/lib/freshness.js';
 import { nextPageRows } from '../src/lib/paging.js';
@@ -26,6 +17,14 @@ registerHooks({
       return { url: new URL(`../src/${specifier.slice(2)}`, import.meta.url).href, shortCircuit: true };
     }
     return next(specifier, context);
+  },
+  load(url, context, next) {
+    if (url.startsWith('file:') && url.endsWith('.svelte.js')) {
+      const source = readFileSync(new URL(url), 'utf8');
+      const { js } = compileModule(source, { generate: 'client', filename: new URL(url).pathname });
+      return { format: 'module', source: js.code, shortCircuit: true };
+    }
+    return next(url, context);
   }
 });
 import {
@@ -33,9 +32,7 @@ import {
   reportRange, reviewTitle, singleViewIdentity, randomizedLabel
 } from '../src/lib/format.js';
 
-const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 let pass = 0;
-const bugs = [];
 function check(name, cond) {
   if (!cond) {
     console.error(`FAIL ${name}`);
@@ -44,16 +41,6 @@ function check(name, cond) {
   }
   pass += 1;
 }
-// A failing pin documents a suspected bug with a reproducible case.
-// It stays red until the owning migration fixes the root cause.
-function bugPin(id, name, cond) {
-  if (cond) {
-    pass += 1;
-    return;
-  }
-  bugs.push(`${id}: ${name}`);
-}
-
 // Latest-wins fencing across reload and paging intents.
 {
   const guard = createFetchGuard();
@@ -126,8 +113,7 @@ function bugPin(id, name, cond) {
 // independent operations inside createPager, so a reload that lands
 // after a page start still applies instead of being dropped.
 {
-  const { get } = await import('svelte/store');
-  const { createPager } = await import('../src/lib/pager.js');
+  const { createPager } = await import('../src/lib/pager.svelte.js');
   const pending = [];
   const pager = createPager({
     fetchPage: (cursor) => new Promise((resolve) => pending.push({ cursor, resolve })),
@@ -136,11 +122,11 @@ function bugPin(id, name, cond) {
   const pReset = pager.loadMore(true); // reload starts first
   const pPage = pager.loadMore(); // page starts after, lands first
   pending[1].resolve({ rows: [{ id: 'p' }], nextAfter: 'p1' });
-  check('page landing first applies', (await pPage) === 'applied' && get(pager.rows).length === 1);
+  check('page landing first applies', (await pPage) === 'applied' && pager.rows.length === 1);
   pending[0].resolve({ rows: [{ id: 'r' }], nextAfter: '' });
   check('reload landing after a page start still applies',
-    (await pReset) === 'applied' && get(pager.rows).length === 1 && get(pager.rows)[0].id === 'r' &&
-    get(pager.exhausted));
+    (await pReset) === 'applied' && pager.rows.length === 1 && pager.rows[0].id === 'r' &&
+    pager.exhausted);
   // Reverse order: an append requested before a successful reset never
   // lands after it — a late page cannot reopen an exhausted list.
   {
@@ -153,11 +139,11 @@ function bugPin(id, name, cond) {
     const pReload = relisting.reset(); // reset requested after
     late[1].resolve({ rows: [{ id: 'n' }], nextAfter: '' });
     check('reset landing before a pending append still applies',
-      (await pReload) === 'applied' && get(relisting.rows).length === 1 && get(relisting.rows)[0].id === 'n');
+      (await pReload) === 'applied' && relisting.rows.length === 1 && relisting.rows[0].id === 'n');
     late[0].resolve({ rows: [{ id: 'o' }], nextAfter: 'old' });
     check('late append from the previous cursor lands stale',
-      (await pPage) === 'stale' && get(relisting.rows).length === 1 && get(relisting.rows)[0].id === 'n' &&
-      get(relisting.exhausted));
+      (await pPage) === 'stale' && relisting.rows.length === 1 && relisting.rows[0].id === 'n' &&
+      relisting.exhausted);
   }
   // Reload-first order: the append is requested after the reset but
   // still against the old cursor. The reset commits first and retires
@@ -173,11 +159,11 @@ function bugPin(id, name, cond) {
     check('append runs against the pre-reset cursor', early[1].cursor === '');
     early[0].resolve({ rows: [{ id: 'n' }], nextAfter: '' });
     check('reload committing first still applies',
-      (await pReload) === 'applied' && get(reloading.rows).length === 1 && get(reloading.rows)[0].id === 'n');
+      (await pReload) === 'applied' && reloading.rows.length === 1 && reloading.rows[0].id === 'n');
     early[1].resolve({ rows: [{ id: 'o' }], nextAfter: 'old' });
     check('append landing after a committed reset lands stale',
-      (await pPage) === 'stale' && get(reloading.rows).length === 1 && get(reloading.rows)[0].id === 'n' &&
-      get(reloading.exhausted));
+      (await pPage) === 'stale' && reloading.rows.length === 1 && reloading.rows[0].id === 'n' &&
+      reloading.exhausted);
   }
   // A failed reset changes nothing: a pending append against the
   // still-valid cursor lands and fills the list instead of going
@@ -192,11 +178,11 @@ function bugPin(id, name, cond) {
     const pReload = retrying.reset();
     recovering[1].reject(new Error('offline'));
     check('failed reset reports failure without rows',
-      (await pReload) === 'failed' && get(retrying.rows).length === 0 && get(retrying.error) === 'offline');
+      (await pReload) === 'failed' && retrying.rows.length === 0 && retrying.error === 'offline');
     recovering[0].resolve({ rows: [{ id: 'o' }], nextAfter: 'old' });
     check('pending append survives a failed reset',
-      (await pPage) === 'applied' && get(retrying.rows).length === 1 && get(retrying.rows)[0].id === 'o' &&
-      !get(retrying.exhausted));
+      (await pPage) === 'applied' && retrying.rows.length === 1 && retrying.rows[0].id === 'o' &&
+      !retrying.exhausted);
   }
   // Retry follows the displayed failure even when the last click
   // started the other operation.
@@ -225,7 +211,7 @@ function bugPin(id, name, cond) {
     const message = resetFailsLast ? 'reload failed' : 'page failed';
     check(`visible failure identifies the operation when ${message} last`,
       reloadRequest.cursor === '' && appendRequest.cursor === 'next' &&
-      get(overlapping.error) === message && get(overlapping.failure)?.reset === resetFailsLast);
+      overlapping.error === message && overlapping.failure?.reset === resetFailsLast);
   }
   // Snapshot seeding: seeded rows render with no fetch; a failed reset
   // keeps them with an error instead of emptying the list.
@@ -235,9 +221,9 @@ function bugPin(id, name, cond) {
     // Thunk form, as .svelte callers pass it (init-capture rule).
     initial: () => ({ rows: [{ id: 's' }], nextAfter: 'c9' })
   });
-  check('seed renders without fetching', get(seeded.rows).length === 1 && get(seeded.started) === true);
+  check('seed renders without fetching', seeded.rows.length === 1 && seeded.started === true);
   check('failed reset keeps the seed with an error',
-    (await seeded.reset()) === 'failed' && get(seeded.rows).length === 1 && get(seeded.error) === 'offline');
+    (await seeded.reset()) === 'failed' && seeded.rows.length === 1 && seeded.error === 'offline');
 }
 
 // lib/briefingView: pure dossier derivations with unit coverage.
@@ -295,42 +281,13 @@ function bugPin(id, name, cond) {
     eventKey('evt-1') === 'event:evt-1' && stepKey(2) === 'step:2' && REPORTS_KEY === 'reports');
 }
 
-// BUG-2 (fixed by the Briefing migration): the briefing resource
-// resets when the id changes, so the previous briefing never renders
-// while the next one fetches. Resetting is lifecycle, so the pin stays
-// structural on the owning mechanism; selection switches stay on the
-// manual checklist with the rest of the runtime behavior smoke cannot
-// mount.
+// A failed refresh with a prerender snapshot stays non-blocking.
 {
-  const container = readFileSync(join(root, 'src/containers/BriefingContainer/BriefingContainer.svelte'), 'utf8');
-  const effect = container.slice(container.indexOf('Reset the resource'));
-  bugPin('BUG-2', 'id change resets the briefing resource before refetch',
-    /createResource/.test(effect) && /invalidate/.test(effect));
-}
-
-// Reconnect edge and failure visibility, behaviorally. BUG-3's fix is
-// the edge decision plus the snapshot-aware notice — both pure units,
-// so no source regex is needed. Container wiring (calling refresh on a
-// true edge) stays on the manual reconnect checklist with the rest of
-// the runtime behavior smoke cannot mount.
-{
-  const { shouldRefreshOnReconnect } = await import('../src/lib/reconnect.js');
-  const edge = (over) => shouldRefreshOnReconnect({ live: false, wasLive: false, data: null, initial: null, ...over });
-  check('snapshot plus reconnect edge refreshes',
-    edge({ live: true, initial: 'snap' }) && edge({ live: true, data: 'fetched' }));
-  check('no edge without liveness change or content',
-    !edge({ live: true }) && !edge({ live: true, wasLive: true, initial: 'snap' }) &&
-    !edge({ live: false, initial: 'snap' }) && !edge({ live: true, data: null, initial: null }));
-  const { failureNotice } = await import('../src/lib/resource.js');
-  const failed = (over) => failureNotice({ data: null, initial: null, error: null, refreshError: null, ...over });
-  check('snapshot plus failing fetch yields a visible notice',
-    failed({ initial: 'snap', error: 'offline' }) === 'offline');
-  check('fetched data plus failing fetch yields a visible notice',
-    failed({ data: 'rows', refreshError: 'offline' }) === 'offline');
-  check('data-less failure is an error, not a notice',
-    failed({ error: 'offline' }) === null);
-  check('quiet state yields no notice',
-    failed({ data: 'rows' }) === null && failed({}) === null);
+  const { createResource } = await import('../src/lib/resource.svelte.js');
+  const resource = createResource(() => Promise.reject(new Error('offline')), () => 'snapshot');
+  check('snapshot is immediately available through the resource', resource.shown === 'snapshot');
+  check('snapshot survives a failed refresh with a notice',
+    (await resource.refresh()) === 'failed' && resource.shown === 'snapshot' && resource.notice === 'offline');
 }
 
 // lib: per-operation guards never cancel each other (latestOnly), resources
@@ -346,8 +303,7 @@ function bugPin(id, name, cond) {
   check('invalidate voids only its operation', !reloadOp.current(reloadToken) && pageOp.current(pageOp.start()));
 }
 {
-  const { get } = await import('svelte/store');
-  const { createResource } = await import('../src/lib/resource.js');
+  const { createResource } = await import('../src/lib/resource.svelte.js');
   const deferred = () => {
     let resolve, reject;
     const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
@@ -359,15 +315,15 @@ function bugPin(id, name, cond) {
   const p1 = r1.refresh();
   const p2 = r1.refresh();
   slow.resolve('second');
-  check('stale refresh yields', (await p1) === 'stale' && (await p2) === 'applied' && get(r1.data) === 'second');
+  check('stale refresh yields', (await p1) === 'stale' && (await p2) === 'applied' && r1.data === 'second');
   // Failure without data is an error; with data it is a notice.
   const r2 = createResource(() => Promise.reject(new Error('offline')));
-  check('data-less failure is an error', (await r2.refresh()) === 'failed' && get(r2.error) === 'offline');
+  check('data-less failure is an error', (await r2.refresh()) === 'failed' && r2.error === 'offline');
   let calls = 0;
   const r3 = createResource(() => ((calls += 1) === 1 ? Promise.resolve('first') : Promise.reject(new Error('offline'))));
   check('first load applies', (await r3.refresh()) === 'applied');
   check('failed refresh keeps data with notice', (await r3.refresh()) === 'failed' &&
-    get(r3.data) === 'first' && get(r3.refreshError) === 'offline' && get(r3.error) === null);
+    r3.data === 'first' && r3.notice === 'offline' && r3.error === null);
   // Invalidate voids in flight without clearing rendered data.
   let answer = () => Promise.resolve('seeded');
   const r4 = createResource(() => answer());
@@ -378,32 +334,31 @@ function bugPin(id, name, cond) {
   r4.invalidate();
   gate.resolve('late');
   check('invalidated refresh keeps rendered data',
-    (await pending) === 'stale' && get(r4.data) === 'seeded' &&
-    get(r4.error) === null && get(r4.refreshError) === null);
+    (await pending) === 'stale' && r4.data === 'seeded' &&
+    r4.error === null && r4.notice === null);
 }
 {
-  const { get } = await import('svelte/store');
-  const { createPager } = await import('../src/lib/pager.js');
+  const { createPager } = await import('../src/lib/pager.svelte.js');
   const pages = {
     '': { rows: [{ id: 'a' }, { id: 'b' }], nextAfter: 'c1' },
     c1: { rows: [{ id: 'b' }, { id: 'c' }], nextAfter: '' }
   };
   const pager = createPager({ fetchPage: async (c) => pages[c], keyOf: (r) => r.id, cap: 10 });
-  check('first page applies', (await pager.loadMore()) === 'applied' && get(pager.rows).length === 2);
+  check('first page applies', (await pager.loadMore()) === 'applied' && pager.rows.length === 2);
   check('second page dedupes and exhausts',
-    (await pager.loadMore()) === 'applied' && get(pager.rows).length === 3 && get(pager.exhausted));
-  check('reset replaces rows', (await pager.reset()) === 'applied' && get(pager.rows).length === 2);
+    (await pager.loadMore()) === 'applied' && pager.rows.length === 3 && pager.exhausted);
+  check('reset replaces rows', (await pager.reset()) === 'applied' && pager.rows.length === 2);
   const failing = createPager({
     fetchPage: async () => { throw new Error('offline'); }, keyOf: (r) => r.id, cap: 10
   });
   check('failed page keeps rows empty with error',
-    (await failing.loadMore()) === 'failed' && get(failing.rows).length === 0 && get(failing.error) === 'offline');
+    (await failing.loadMore()) === 'failed' && failing.rows.length === 0 && failing.error === 'offline');
   const capped = createPager({
     fetchPage: async () => ({ rows: [{ id: 'x' }], nextAfter: 'more' }),
     keyOf: (r) => r.id, cap: 1
   });
   await capped.loadMore();
-  check('cap flag names the limit', get(capped.capped) === true);
+  check('cap flag names the limit', capped.capped === true);
   // Replace restarts from applied data: in-flight pages land stale.
   const gated = (() => { let r; const p = new Promise((res) => { r = res; }); return { promise: p, resolve: r }; })();
   const swapping = createPager({ fetchPage: () => gated.promise, keyOf: (r) => r.id, cap: 10 });
@@ -411,16 +366,14 @@ function bugPin(id, name, cond) {
   swapping.replace([{ id: 'fresh' }], '');
   gated.resolve({ rows: [{ id: 'old' }], nextAfter: 'c' });
   check('replace wins over an in-flight page',
-    (await late) === 'stale' && get(swapping.rows).length === 1 && get(swapping.rows)[0].id === 'fresh' &&
-    get(swapping.exhausted) === true && get(swapping.error) === null);
+    (await late) === 'stale' && swapping.rows.length === 1 && swapping.rows[0].id === 'fresh' &&
+    swapping.exhausted === true && swapping.error === null);
 }
 
-// lib/stream: transport lifecycle with an injectable source. Errors
-// never close the source: the browser's native retry carries
-// Last-Event-ID so the server resumes bounded replay.
+// Stream lifecycle with an injectable source. Native retries reuse the
+// source and Last-Event-ID. A closed handshake needs a new source.
 {
-  const { get } = await import('svelte/store');
-  const { createEventStream, INCIDENT_KINDS } = await import('../src/lib/stream.js');
+  const { createEventStream, INCIDENT_KINDS } = await import('../src/lib/stream.svelte.js');
   class FakeSource {
     constructor() { this.handlers = {}; this.closed = false; this.onopen = null; this.onerror = null; this.readyState = 0; }
     addEventListener(kind, fn) { ((this.handlers[kind] ??= [])).push(fn); }
@@ -440,34 +393,40 @@ function bugPin(id, name, cond) {
     onIncident: (k) => seen.incidents.push(k)
   });
   stream.connect();
-  check('stream opens connecting on the right url', get(stream.connection) === 'connecting' && sources[0].url === '/events');
+  check('stream opens connecting on the right url', stream.connection === 'connecting' && sources[0].url === '/events');
   sources[0].onopen();
-  check('open means live', get(stream.connection) === 'live');
+  check('open means live', stream.connection === 'live');
   sources[0].emit('overview', '{"verdict":"quiet"}');
   sources[0].emit('overview', 'not json{{{');
   check('valid frame lands, malformed degrades silently',
-    seen.overviews.length === 1 && seen.overviews[0].verdict === 'quiet' && get(stream.connection) === 'live');
+    seen.overviews.length === 1 && seen.overviews[0].verdict === 'quiet' && stream.connection === 'live');
   check('incident kinds are open/incident/resync', INCIDENT_KINDS.join(',') === 'open,incident,resync');
   for (const kind of INCIDENT_KINDS) { sources[0].emit(kind); }
   check('every incident kind bumps the revision once',
-    get(stream.incidentRevision) === 3 && seen.incidents.join(',') === 'open,incident,resync');
+    stream.incidentRevision === 3 && seen.incidents.join(',') === 'open,incident,resync');
   sources[0].onerror();
   check('mid-stream error marks retrying without closing the source',
-    !sources[0].closed && get(stream.connection) === 'retrying' && sources.length === 1 && scheduled.length === 0);
+    !sources[0].closed && stream.connection === 'retrying' && sources.length === 1 && scheduled.length === 0);
   sources[0].onopen();
   check('native retry on the same source resumes live',
-    get(stream.connection) === 'live' && sources.length === 1 && !sources[0].closed);
+    stream.connection === 'live' && sources.length === 1 && !sources[0].closed);
+  const retiredIncident = sources[0].handlers.incident[0];
+  const retiredOverview = sources[0].handlers.overview[0];
   sources[0].readyState = 2; // rejected handshake (e.g. the 503 subscriber cap)
   sources[0].onerror();
   check('closed source reconnects explicitly after the specified delay',
-    sources[0].closed && get(stream.connection) === 'retrying' && scheduled.length === 1 && scheduled[0].ms === 3000);
+    sources[0].closed && stream.connection === 'retrying' && scheduled.length === 1 && scheduled[0].ms === 3000);
   scheduled[0].fn();
   check('explicit retry opens a fresh source', sources.length === 2 && !sources[1].closed);
+  retiredIncident();
+  retiredOverview({ data: '{"verdict":"old"}' });
+  check('retired transport callbacks cannot publish frames',
+    stream.incidentRevision === 3 && seen.overviews.length === 1 && sources[0].handlers.incident.length === 0);
   sources[1].readyState = 2;
   sources[1].onerror();
   stream.disconnect();
   scheduled[1].fn();
-  check('disconnect voids the pending retry', sources.length === 2 && get(stream.connection) === 'retrying');
+  check('disconnect voids the pending retry', sources.length === 2 && stream.connection === 'retrying');
 }
 
 // lib/routes: table parity with App's inline parser.
@@ -506,10 +465,9 @@ function bugPin(id, name, cond) {
     help.length === 2 && help.some((h) => h.key === '?' && h.label === 'Toggle shortcuts'));
 }
 
+const { checkSelectedResource, checkStreamWatchers, checkWindowPager } = await import('./state-cases.svelte.js');
+await checkSelectedResource(check);
+checkStreamWatchers(check);
+await checkWindowPager(check);
+
 console.log(`characterize: ${pass} checks passed`);
-if (bugs.length > 0) {
-  for (const b of bugs) {
-    console.log(`KNOWN BUG (failing pin): ${b}`);
-  }
-  process.exitCode = 1;
-}
