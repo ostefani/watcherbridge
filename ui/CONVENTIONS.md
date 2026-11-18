@@ -74,14 +74,14 @@ allowlist / forbidden automation stack). JSDoc wire typedefs with
 
 ## Testing
 
-- `npm run smoke` — SSR render assertions (wire shapes, hostile text
-  inertness) plus pure-unit asserts (guard, paging, undo, purge).
-- `npm run characterize` — covers request fencing, pager ordering,
-  snapshots, reconnect conditions, decision payloads and evidence keys.
-  Client-compiled rune tests exercise briefing identity changes and
-  late responses. Mounted interactions stay on the manual checklist.
-- `npm run styleguard` — fails on any inline `<style>` block; runs in
-  `make ui-check`.
+`make ui-check` runs lint, the style guard, the production build, SSR
+smoke tests, client state checks and the gzip budget check.
+
+- `npm run smoke` renders view fixtures in SSR mode to check wire shapes
+  and inert handling of untrusted text. It also checks pure helpers.
+- `npm run characterize` exercises client-compiled rune state in Node,
+  including briefing selection, fetch fencing, paging, and SSE watchers.
+- `npm run styleguard` rejects inline `<style>` blocks.
 - Release sign-off remains the human walkthrough in
   `.innerdoc/ui-manual-checklist.md`.
 
@@ -94,8 +94,12 @@ allowlist / forbidden automation stack). JSDoc wire typedefs with
   Node-run scripts keep relative paths; the harness resolves `@`
   through an inline `module.registerHooks()` resolver (own code, zero
   dependencies) where dynamic imports need it.
-- Health migrates first, Briefing and Decisions last; one screen per
-  step so the app stays shippable.
-- Resource helpers use reactive getters in `lib/*.svelte.js`. Vite compiles
-  them for production. The Node checks use `svelte/compiler` for their
-  client and SSR targets. Pure helpers remain plain JavaScript.
+- Use Svelte 5 runes, callback props and snippets in components. Shared
+  resources, pagination and event streams expose reactive getters and
+  actions from `lib/*.svelte.js`. Read getters in the reactive context
+  that needs their value. Keep pure helpers in plain JavaScript.
+- App owns the event stream. Screens observe live edges or incident
+  revisions through context and own their refresh policy. Watchers
+  untrack callbacks so resource and view reads cannot retrigger them.
+- Vite compiles rune modules for production. The existing Node checks
+  compile them for the client and SSR targets with `svelte/compiler`.

@@ -8,6 +8,7 @@ export async function checkSelectedResource(check) {
   let id = $state('first');
   let snapshot = $state(null);
   let resource;
+  let unmounted;
   const dispose = $effect.root(() => {
     resource = createSelectedResource(() => id, (key) => new Promise((resolve) => {
       pending[key] = resolve;
@@ -31,9 +32,18 @@ export async function checkSelectedResource(check) {
     });
     check('briefing snapshot renders without an automatic fetch',
       resource().shown === 'saved briefing' && !pending.snapshot);
+
+    flushSync(() => {
+      id = 'unmounted';
+      snapshot = null;
+    });
+    unmounted = resource();
   } finally {
     dispose();
   }
+  pending.unmounted('completion after unmount');
+  await Promise.resolve();
+  check('unmounted briefing cannot apply a pending fetch', unmounted.data === null && !unmounted.loading);
 }
 
 export function checkStreamWatchers(check) {
