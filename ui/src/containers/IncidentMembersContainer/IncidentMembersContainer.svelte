@@ -1,8 +1,9 @@
 <script>
   import Notice from '@/components/Notice/Notice.svelte';
   import Pill from '@/components/Pill/Pill.svelte';
-  import { onDestroy, onMount, untrack } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { createResource } from '@/lib/resource.svelte.js';
+  import { watchIncidents } from '@/lib/stream.svelte.js';
   import { fetchIncident } from '@/api.js';
   import { getConnectionOrNull } from '@/lib/context.js';
 
@@ -17,38 +18,12 @@
 
   const resource = createResource(async () => (await fetchIncident(incidentId)).members);
 
-  const connection = getConnectionOrNull();
-  const incidentRevision = connection?.incidentRevision ?? null;
-  let seenRevision = -1;
-  $effect(() => {
-    if (!incidentRevision) {
-      return;
-    }
-    const rev = $incidentRevision;
-    if (seenRevision === -1) {
-      seenRevision = rev;
-      return;
-    }
-    if (rev !== seenRevision) {
-      seenRevision = rev;
-      untrack(refreshMembers);
-    }
-  });
-
-  onMount(() => {
-    if (incidentRevision) {
-      return;
-    }
-    window.addEventListener('watcherbridge:incident', refreshMembers);
-    return () => window.removeEventListener('watcherbridge:incident', refreshMembers);
-  });
-
-  function refreshMembers() {
+  watchIncidents(getConnectionOrNull(), () => {
     if (expanded) {
       resource.clear();
       resource.refresh();
     }
-  }
+  });
 
   onDestroy(resource.invalidate);
 

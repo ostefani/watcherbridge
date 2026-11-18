@@ -1,6 +1,7 @@
 <script>
   import Notice from '@/components/Notice/Notice.svelte';
-  import { onMount, untrack } from 'svelte';
+  import { onMount } from 'svelte';
+  import { watchLive } from '@/lib/stream.svelte.js';
   import { fetchDevice } from '@/api.js';
   import { getConnectionOrNull } from '@/lib/context.js';
   import { createResource } from '@/lib/resource.svelte.js';
@@ -71,19 +72,10 @@
     };
   });
 
-  let wasLive = false;
-  $effect(() => {
-    if (!connection) {
-      return;
+  watchLive(connection, () => {
+    if (profile !== null) {
+      stale = true;
     }
-    return connection.connection.subscribe((state) => untrack(() => {
-      const live = state === 'live';
-      const edge = live && !wasLive && profile !== null;
-      wasLive = live;
-      if (edge) {
-        stale = true;
-      }
-    }));
   });
 </script>
 

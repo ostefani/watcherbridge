@@ -290,16 +290,6 @@ function check(name, cond) {
     (await resource.refresh()) === 'failed' && resource.shown === 'snapshot' && resource.notice === 'offline');
 }
 
-{
-  const { shouldRefreshOnReconnect } = await import('../src/lib/reconnect.js');
-  const edge = (over) => shouldRefreshOnReconnect({ live: false, wasLive: false, data: null, initial: null, ...over });
-  check('snapshot plus reconnect edge refreshes',
-    edge({ live: true, initial: 'snap' }) && edge({ live: true, data: 'fetched' }));
-  check('no edge without liveness change or content',
-    !edge({ live: true }) && !edge({ live: true, wasLive: true, initial: 'snap' }) &&
-    !edge({ live: false, initial: 'snap' }) && !edge({ live: true, data: null, initial: null }));
-}
-
 // lib: per-operation guards never cancel each other (latestOnly), resources
 // keep data across failed refreshes, pagers merge by key under a cap.
 {
@@ -380,12 +370,10 @@ function check(name, cond) {
     swapping.exhausted === true && swapping.error === null);
 }
 
-// lib/stream: transport lifecycle with an injectable source. Errors
-// never close the source: the browser's native retry carries
-// Last-Event-ID so the server resumes bounded replay.
+// Stream lifecycle with an injectable source. Native retries reuse the
+// source and Last-Event-ID. A closed handshake needs a new source.
 {
-  const { get } = await import('svelte/store');
-  const { createEventStream, INCIDENT_KINDS } = await import('../src/lib/stream.js');
+  const { createEventStream, INCIDENT_KINDS } = await import('../src/lib/stream.svelte.js');
   class FakeSource {
     constructor() { this.handlers = {}; this.closed = false; this.onopen = null; this.onerror = null; this.readyState = 0; }
     addEventListener(kind, fn) { ((this.handlers[kind] ??= [])).push(fn); }
@@ -405,34 +393,40 @@ function check(name, cond) {
     onIncident: (k) => seen.incidents.push(k)
   });
   stream.connect();
-  check('stream opens connecting on the right url', get(stream.connection) === 'connecting' && sources[0].url === '/events');
+  check('stream opens connecting on the right url', stream.connection === 'connecting' && sources[0].url === '/events');
   sources[0].onopen();
-  check('open means live', get(stream.connection) === 'live');
+  check('open means live', stream.connection === 'live');
   sources[0].emit('overview', '{"verdict":"quiet"}');
   sources[0].emit('overview', 'not json{{{');
   check('valid frame lands, malformed degrades silently',
-    seen.overviews.length === 1 && seen.overviews[0].verdict === 'quiet' && get(stream.connection) === 'live');
+    seen.overviews.length === 1 && seen.overviews[0].verdict === 'quiet' && stream.connection === 'live');
   check('incident kinds are open/incident/resync', INCIDENT_KINDS.join(',') === 'open,incident,resync');
   for (const kind of INCIDENT_KINDS) { sources[0].emit(kind); }
   check('every incident kind bumps the revision once',
-    get(stream.incidentRevision) === 3 && seen.incidents.join(',') === 'open,incident,resync');
+    stream.incidentRevision === 3 && seen.incidents.join(',') === 'open,incident,resync');
   sources[0].onerror();
   check('mid-stream error marks retrying without closing the source',
-    !sources[0].closed && get(stream.connection) === 'retrying' && sources.length === 1 && scheduled.length === 0);
+    !sources[0].closed && stream.connection === 'retrying' && sources.length === 1 && scheduled.length === 0);
   sources[0].onopen();
   check('native retry on the same source resumes live',
-    get(stream.connection) === 'live' && sources.length === 1 && !sources[0].closed);
+    stream.connection === 'live' && sources.length === 1 && !sources[0].closed);
+  const retiredIncident = sources[0].handlers.incident[0];
+  const retiredOverview = sources[0].handlers.overview[0];
   sources[0].readyState = 2; // rejected handshake (e.g. the 503 subscriber cap)
   sources[0].onerror();
   check('closed source reconnects explicitly after the specified delay',
-    sources[0].closed && get(stream.connection) === 'retrying' && scheduled.length === 1 && scheduled[0].ms === 3000);
+    sources[0].closed && stream.connection === 'retrying' && scheduled.length === 1 && scheduled[0].ms === 3000);
   scheduled[0].fn();
   check('explicit retry opens a fresh source', sources.length === 2 && !sources[1].closed);
+  retiredIncident();
+  retiredOverview({ data: '{"verdict":"old"}' });
+  check('retired transport callbacks cannot publish frames',
+    stream.incidentRevision === 3 && seen.overviews.length === 1 && sources[0].handlers.incident.length === 0);
   sources[1].readyState = 2;
   sources[1].onerror();
   stream.disconnect();
   scheduled[1].fn();
-  check('disconnect voids the pending retry', sources.length === 2 && get(stream.connection) === 'retrying');
+  check('disconnect voids the pending retry', sources.length === 2 && stream.connection === 'retrying');
 }
 
 // lib/routes: table parity with App's inline parser.
@@ -471,8 +465,9 @@ function check(name, cond) {
     help.length === 2 && help.some((h) => h.key === '?' && h.label === 'Toggle shortcuts'));
 }
 
-const { checkSelectedResource, checkWindowPager } = await import('./state-cases.svelte.js');
+const { checkSelectedResource, checkStreamWatchers, checkWindowPager } = await import('./state-cases.svelte.js');
 await checkSelectedResource(check);
+checkStreamWatchers(check);
 await checkWindowPager(check);
 
 console.log(`characterize: ${pass} checks passed`);

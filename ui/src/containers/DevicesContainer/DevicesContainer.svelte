@@ -1,6 +1,7 @@
 <script>
   import Notice from '@/components/Notice/Notice.svelte';
-  import { onMount, untrack } from 'svelte';
+  import { onMount } from 'svelte';
+  import { watchLive } from '@/lib/stream.svelte.js';
   import { fetchDevices } from '@/api.js';
   import { createPager } from '@/lib/pager.svelte.js';
   import { getConnectionOrNull } from '@/lib/context.js';
@@ -64,20 +65,10 @@
     return pager.invalidate;
   });
 
-  // A reconnect edge marks the list stale without resetting paging.
-  let wasLive = false;
-  $effect(() => {
-    if (!connection) {
-      return;
+  watchLive(connection, () => {
+    if (pager.rows.length > 0) {
+      stale = true;
     }
-    return connection.connection.subscribe((state) => untrack(() => {
-      const live = state === 'live';
-      const edge = live && !wasLive && pager.rows.length > 0;
-      wasLive = live;
-      if (edge) {
-        stale = true;
-      }
-    }));
   });
 </script>
 

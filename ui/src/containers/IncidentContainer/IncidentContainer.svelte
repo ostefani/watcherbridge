@@ -1,8 +1,9 @@
 <script>
   import Notice from '@/components/Notice/Notice.svelte';
-  import { onMount, untrack } from 'svelte';
+  import { onMount } from 'svelte';
   import { fetchIncident } from '@/api.js';
   import { createResource } from '@/lib/resource.svelte.js';
+  import { watchIncidents } from '@/lib/stream.svelte.js';
   import { getConnectionOrNull } from '@/lib/context.js';
   import IncidentHeader from '@/components/IncidentHeader/IncidentHeader.svelte';
   import IncidentScope from '@/components/IncidentScope/IncidentScope.svelte';
@@ -36,37 +37,13 @@
     resource.refresh();
   }
 
-  const connection = getConnectionOrNull();
-  const incidentRevision = connection?.incidentRevision ?? null;
-  let seenRevision = -1;
-  $effect(() => {
-    if (!incidentRevision) {
-      return;
-    }
-    const rev = $incidentRevision;
-    if (seenRevision === -1) {
-      seenRevision = rev;
-      return;
-    }
-    if (rev !== seenRevision) {
-      seenRevision = rev;
-      untrack(reload);
-    }
-  });
+  watchIncidents(getConnectionOrNull(), reload);
 
   onMount(() => {
     if (initial === null) {
       reload();
     }
-    if (!incidentRevision) {
-      window.addEventListener('watcherbridge:incident', reload);
-    }
-    return () => {
-      if (!incidentRevision) {
-        window.removeEventListener('watcherbridge:incident', reload);
-      }
-      resource.invalidate();
-    };
+    return resource.invalidate;
   });
 </script>
 

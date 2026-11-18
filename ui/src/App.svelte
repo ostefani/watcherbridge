@@ -1,8 +1,9 @@
 <script>
   import { onMount } from 'svelte';
   import { fetchOverview } from '@/api.js';
+  import { toErrorMessage } from '@/lib/format.js';
   import { createFetchGuard } from '@/lib/freshness.js';
-  import { createEventStream } from '@/lib/stream.js';
+  import { createEventStream } from '@/lib/stream.svelte.js';
   import { setConnection } from '@/lib/context.js';
   import { createShortcutRegistry } from '@/lib/registry.js';
   import { parseRoute, routeTitle } from '@/lib/routes.js';
@@ -49,7 +50,6 @@
   // no stream prop is drilled. Never a module-level singleton, so
   // prerender stays connection-free.
   setConnection(stream);
-  const { connection: connectionState } = stream;
 
   shortcuts.register('global', '?', 'Toggle this shortcut list', (ev) => {
     showHelp = !showHelp;
@@ -80,7 +80,7 @@
       // A stale failure must never hide a valid overview; a current
       // failure only surfaces when no overview exists yet.
       if (guard.current(token) && overview === null) {
-        loadError = err instanceof Error ? err.message : String(err);
+        loadError = toErrorMessage(err);
       }
     }
   }
@@ -128,6 +128,7 @@
       window.removeEventListener('hashchange', onHash);
       window.removeEventListener('keydown', onKey);
       window.clearTimeout(pendingTimer);
+      guard.invalidate();
       stream.disconnect();
     };
   });
@@ -135,7 +136,7 @@
 
 <SkipLink />
 <div class="app-shell">
-  <AppHeader routeName={route.name} helpOpen={showHelp} connectionState={$connectionState} onToggleHelp={() => (showHelp = !showHelp)} />
+  <AppHeader routeName={route.name} helpOpen={showHelp} connectionState={stream.connection} onToggleHelp={() => (showHelp = !showHelp)} />
   {#if showHelp}
     <ShortcutsHelp {shortcuts} />
   {/if}

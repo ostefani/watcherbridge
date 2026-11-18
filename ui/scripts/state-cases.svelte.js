@@ -1,5 +1,6 @@
 import { flushSync } from 'svelte';
 import { createSelectedResource } from '@/lib/resource.svelte.js';
+import { watchIncidents, watchLive } from '@/lib/stream.svelte.js';
 import { createWindowPager } from '@/lib/windowPager.svelte.js';
 
 export async function checkSelectedResource(check) {
@@ -33,6 +34,34 @@ export async function checkSelectedResource(check) {
   } finally {
     dispose();
   }
+}
+
+export function checkStreamWatchers(check) {
+  const stream = $state({ connection: 'live', incidentRevision: 10 });
+  let live = 0;
+  let incidents = 0;
+  let incidental = $state(0);
+  let unprovided = 0;
+  const dispose = $effect.root(() => {
+    watchLive(stream, () => { live += incidental + 1; });
+    watchIncidents(stream, () => { incidents += 1; });
+    watchLive(null, () => { unprovided += 1; });
+    watchIncidents(null, () => { unprovided += 1; });
+  });
+  flushSync();
+  check('already-live mount observes one live edge and no old incident', live === 1 && incidents === 0);
+  flushSync(() => { incidental = 1; });
+  check('watcher callbacks do not capture unrelated state', live === 1);
+  flushSync(() => { stream.connection = 'retrying'; });
+  flushSync(() => {
+    stream.connection = 'live';
+    stream.incidentRevision += 1;
+  });
+  check('reconnect and new incident revision notify their watchers', live === 3 && incidents === 1);
+  dispose();
+  flushSync(() => { stream.incidentRevision += 1; });
+  check('disposed stream watchers stay quiet', incidents === 1);
+  check('standalone screens receive no stream events', unprovided === 0);
 }
 
 export async function checkWindowPager(check) {

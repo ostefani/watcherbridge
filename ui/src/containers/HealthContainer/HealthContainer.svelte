@@ -1,9 +1,9 @@
 <script>
   import Notice from '@/components/Notice/Notice.svelte';
-  import { onMount, untrack } from 'svelte';
+  import { onMount } from 'svelte';
   import { fetchHealth } from '@/api.js';
   import { createResource } from '@/lib/resource.svelte.js';
-  import { shouldRefreshOnReconnect } from '@/lib/reconnect.js';
+  import { watchLive } from '@/lib/stream.svelte.js';
   import { getConnectionOrNull } from '@/lib/context.js';
   import HealthSummary from '@/components/HealthSummary/HealthSummary.svelte';
   import SourceList from '@/components/SourceList/SourceList.svelte';
@@ -32,19 +32,10 @@
     return resource.invalidate;
   });
 
-  let wasLive = false;
-  $effect(() => {
-    if (!connection) {
-      return;
+  watchLive(connection, () => {
+    if (shown !== null) {
+      resource.refresh();
     }
-    return connection.connection.subscribe((state) => untrack(() => {
-      const live = state === 'live';
-      const edge = shouldRefreshOnReconnect({ live, wasLive, data: resource.data, initial });
-      wasLive = live;
-      if (edge) {
-        resource.refresh();
-      }
-    }));
   });
 </script>
 

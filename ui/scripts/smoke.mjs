@@ -831,7 +831,7 @@ console.log('smoke: freshness guard holds');
 // Live incident invalidation now travels through the event stream's
 // incidentRevision counter (covered behaviorally by characterize);
 // the window-event forwarder it replaced is deleted, and screens
-// subscribe from context with a standalone fallback.
+// observe the revision through context.
 
 // Exercise the same bounded continuation state the undo panel uses.
 {
